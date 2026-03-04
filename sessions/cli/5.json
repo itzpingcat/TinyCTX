@@ -1,0 +1,65 @@
+{
+  "name": "cli",
+  "version": 5,
+  "id": "cli_5",
+  "created_at": "2026-03-03T04:53:55.100549+00:00",
+  "updated_at": "2026-03-03T04:54:46.899024+00:00",
+  "dialogue": [
+    {
+      "id": "a980ed10-166b-4925-ad42-30e2b96d9f64",
+      "role": "user",
+      "content": "do you have tools",
+      "tool_calls": [],
+      "tool_call_id": null,
+      "index": 0
+    },
+    {
+      "id": "02593e33-3403-4d0e-924d-95753884f74b",
+      "role": "assistant",
+      "content": "Yes! I can interact with the workspace using a set of built\u2011in tools. Here\u2019s a quick rundown of what I can do:\n\n| Tool | What it does | Typical usage |\n|------|--------------|---------------|\n| **`shell`** | Run a PowerShell command \u2013 useful for file operations, installing packages, listing directories, grepping, etc. | `shell({ command: \"Get-ChildItem\" })` |\n| **`view`** | Read a file (with line numbers) or list a directory. For supported file types (PDF, images, etc.) the content is automatically converted to plain text. You can specify a line range if you only want a snippet. | `view({ path: \"README.md\", view_range: [1, 20] })` |\n| **`create_file`** | Create a new file with the supplied content. Fails if the file already exists. | `create_file({ path: \"new.txt\", content: \"Hello, world!\" })` |\n| **`str_replace`** | Replace a unique string in an existing file. The string to replace must appear exactly once; otherwise you can add more context. | `str_replace({ path: \"config.json\", old_str: \"\\\"debug\\\": true\", new_str: \"\\\"debug\\\": false\" })` |\n\nJust let me know what you need, and I\u2019ll call the appropriate tool for you!",
+      "tool_calls": [],
+      "tool_call_id": null,
+      "index": 1
+    },
+    {
+      "id": "6a361ca7-dc5b-4da5-9010-f24deee29b3d",
+      "role": "user",
+      "content": "can you test the shell tool",
+      "tool_calls": [],
+      "tool_call_id": null,
+      "index": 2
+    },
+    {
+      "id": "02f99bcd-a6ba-4389-88ea-eb50a0e47a6b",
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+        {
+          "id": "bIJaHYuqE1BAvUVeIu1n31fWC0Bm77l5",
+          "name": "shell",
+          "arguments": {
+            "command": "Write-Output 'Hello from PowerShell'"
+          }
+        }
+      ],
+      "tool_call_id": null,
+      "index": 3
+    },
+    {
+      "id": "d7080dd9-e1c6-44f2-8b12-ab6c15e4b8fd",
+      "role": "tool",
+      "content": "Hello from PowerShell",
+      "tool_calls": [],
+      "tool_call_id": "bIJaHYuqE1BAvUVeIu1n31fWC0Bm77l5",
+      "index": 4
+    },
+    {
+      "id": "7afb81d0-b846-465b-8a68-1680628c4d55",
+      "role": "assistant",
+      "content": "\u2705 I just ran a quick PowerShell command:\n\n```powershell\nWrite-Output 'Hello from PowerShell'\n```\n\nand it returned:\n\n```\nHello from PowerShell\n```\n\nSo the `shell` tool is working. Let me know what you'd like to do next!",
+      "tool_calls": [],
+      "tool_call_id": null,
+      "index": 5
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "name": "cli",
+  "version": 2,
+  "id": "cli_2",
+  "created_at": "2026-03-03T04:00:01.570713+00:00",
+  "updated_at": "2026-03-03T04:00:19.862309+00:00",
+  "dialogue": [
+    {
+      "id": "17fdec16-d28b-4f43-a0e7-40e918ae59e7",
+      "role": "user",
+      "content": "can you test that the bash command works?",
+      "tool_calls": [],
+      "tool_call_id": null,
+      "index": 0
+    },
+    {
+      "id": "7485888a-a38b-4ffb-a8ad-ebf1e9c50605",
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+        {
+          "id": "v4Ycw2kp4wcsU3RK2HUukozipCV9gmkv",
+          "name": "bash",
+          "arguments": {
+            "command": "echo \"Hello\""
+          }
+        }
+      ],
+      "tool_call_id": null,
+      "index": 1
+    },
+    {
+      "id": "0b9dfcd4-c1f1-48f1-88e3-2b35410bc47a",
+      "role": "tool",
+      "content": "[error: [WinError 267] The directory name is invalid]",
+      "tool_calls": [],
+      "tool_call_id": "v4Ycw2kp4wcsU3RK2HUukozipCV9gmkv",
+      "index": 2
+    }
+  ]
+}

@@ -1,0 +1,28 @@
+# config.yaml — Safe to commit. No secrets.
+# API key lives in the environment variable named by llm.api_key_env.
+
+llm:
+  model: gpt-oss-20b-richard-erkhov
+  base_url: http://100.64.72.3:5000/v1   # any OpenAI-compat endpoint works
+  api_key_env: N/A         # name of the env var holding your key
+
+gateway:
+  host: 127.0.0.1
+  port: 8765
+
+bridges:
+  discord:
+    enabled: false
+
+  matrix:
+    enabled: false
+    homeserver: https://pingchat.moe
+    username: "@tinyctx:pingchat.moe"
+
+memory:
+  workspace_path: ~/.agent/workspace
+
+logging:
+  level: INFO
+
+max_tool_cycles: 10

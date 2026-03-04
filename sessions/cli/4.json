@@ -1,0 +1,25 @@
+{
+  "name": "cli",
+  "version": 4,
+  "id": "cli_4",
+  "created_at": "2026-03-03T04:51:51.445104+00:00",
+  "updated_at": "2026-03-03T04:52:05.799914+00:00",
+  "dialogue": [
+    {
+      "id": "efbf4826-4ca3-43d7-b96f-7b5348a6f611",
+      "role": "user",
+      "content": "do you have tools?",
+      "tool_calls": [],
+      "tool_call_id": null,
+      "index": 0
+    },
+    {
+      "id": "0bd08a58-4986-4cef-89fb-7edc1eeb7da3",
+      "role": "assistant",
+      "content": "I\u2019m a \u201ctool\u2011enabled\u201d version of ChatGPT, which means I can use a handful of built\u2011in tools to help me answer your questions more accurately and efficiently. Here\u2019s a quick rundown:\n\n| Tool | What it does | Typical use\u2011cases |\n|------|--------------|-------------------|\n| **BROWSER** | Searches the web in real time and fetches the most up\u2011to\u2011date information. | Latest news, recent studies, up\u2011to\u2011date statistics, verifying facts. |\n| **CODE** | Executes Python code, lets me run simulations, do calculations, generate plots, etc. | Math problems, data analysis, algorithm demonstrations, quick calculations. |\n| **TEXT** | Generates or edits text (summaries, explanations, creative writing). | Writing drafts, summarizing documents, paraphrasing. |\n| **IMAGE** | (If enabled) Generates simple images or visual diagrams. | Quick visual aids, sketches. |\n\nYou can ask me to use any of these tools by specifying the request, and I\u2019ll let you know which one I\u2019m using. If you\u2019d like to see an example, just let me know what you need!",
+      "tool_calls": [],
+      "tool_call_id": null,
+      "index": 1
+    }
+  ]
+}
