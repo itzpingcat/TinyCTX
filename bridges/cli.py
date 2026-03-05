@@ -92,6 +92,7 @@ class CLIBridge:
 
 
 async def main() -> None:
+    """Standalone CLI entrypoint — use main.py for full multi-bridge startup."""
     cfg = load_config()
     apply_logging(cfg.logging)
     gw     = Gateway(config=cfg)

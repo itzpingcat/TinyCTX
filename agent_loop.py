@@ -21,6 +21,7 @@ from contracts import InboundMessage, OutboundReply, ToolCall, ToolResult, Sessi
 from context import Context, HistoryEntry
 from config import Config
 from ai import LLM, TextDelta, ToolCallAssembled, LLMError
+from utils.tool_handler import ToolCallHandler
 
 logger = logging.getLogger(__name__)
 
@@ -32,9 +33,10 @@ class AgentLoop:
     Yields OutboundReply chunks that the Lane forwards to the gateway.
     """
 
-    def __init__(self, session_key: SessionKey, config: Config) -> None:
+    def __init__(self, session_key: SessionKey, config: Config, registry: ToolCallHandler | None = None) -> None:
         self.session_key = session_key
         self.config      = config
+        self.registry: ToolCallHandler | None = registry
         self.context     = Context()
         self._turn_count = 0
         self._llm        = LLM(
@@ -69,7 +71,8 @@ class AgentLoop:
             tool_calls:  list[ToolCall]   = []
             error:       str | None       = None
 
-            async for event in self._llm.stream(messages):
+            tools = self.registry.get_tool_definitions() if self.registry else None
+            async for event in self._llm.stream(messages, tools=tools):
                 if isinstance(event, TextDelta):
                     text_chunks.append(event.text)
                 elif isinstance(event, ToolCallAssembled):
@@ -120,13 +123,20 @@ class AgentLoop:
     # ------------------------------------------------------------------
 
     async def _execute_tool(self, call: ToolCall) -> ToolResult:
-        """STUB — replace with tool registry dispatch."""
-        logger.debug("[%s] _execute_tool '%s' (STUB)", self.session_key, call.tool_name)
+        if not self.registry:
+            return ToolResult(call_id=call.call_id, tool_name=call.tool_name,
+                              output="[error: no tool handler]", is_error=True)
+        # Adapt our ToolCall into the dict format ToolCallHandler expects
+        proxy = {
+            "function": {"name": call.tool_name, "arguments": call.args},
+            "id": call.call_id,
+        }
+        result = self.registry.execute_tool_call(proxy)
         return ToolResult(
             call_id=call.call_id,
             tool_name=call.tool_name,
-            output=f"[stub] tool '{call.tool_name}' not yet implemented",
-            is_error=True,
+            output=str(result.get("result", result.get("error", "[no output]"))),
+            is_error=not result.get("success", False),
         )
 
     # ------------------------------------------------------------------

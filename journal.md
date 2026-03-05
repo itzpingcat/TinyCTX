@@ -347,3 +347,67 @@ always include `/v1` (or whatever version prefix the server uses).
 ### `bridges/cli.py`
 - `/reset` command — calls `gateway.reset_session(CLI_SESSION)`, clears
   reply buffer, prints `[context cleared]`
+
+---
+
+## Session 4 — Tool registry + filesystem tools
+
+### `tools/registry.py` (new)
+- `ToolEntry(name, schema, handler)` — one registered tool
+- `ToolRegistry`:
+  - `register(name, schema, handler)` — add a tool
+  - `schemas()` → `list[dict]` — OpenAI-format tool definitions, passed to LLM
+  - `execute(ToolCall)` → `ToolResult` — dispatches to handler, catches exceptions
+
+### `tools/filesystem.py` (new)
+`register(registry, workspace)` registers four tools:
+- `shell` — runs shell command in workspace via `subprocess`, returns stdout/stderr/exit
+- `view` — reads file with line numbers or lists directory; supports `view_range`
+- `create_file` — creates new file; errors if file exists
+- `str_replace` — replaces unique string in file; errors if 0 or 2+ matches
+
+All paths resolve relative to `workspace`. Absolute paths pass through unchanged.
+
+### `agent_loop.py` updated
+- `__init__` accepts optional `registry: ToolRegistry`
+- `_infer` passes `registry.schemas()` to `LLM.stream()` as `tools=`
+- `_execute_tool` now dispatches to `registry.execute()` instead of stub
+
+### `gateway.py` updated
+- `Lane`, `SessionRouter`, `Gateway` all accept and thread through
+  `registry: ToolRegistry | None`
+
+### `bridges/cli.py` updated
+- `main()` builds a `ToolRegistry`, calls `register_filesystem()`, passes to `Gateway`
+
+### Next: memory layer
+With filesystem tools working, the agent can already read/write files.
+Next step is loading `SOUL.md`, `AGENTS.md`, `MEMORY.md` from workspace as
+prompt providers so the agent has persistent identity and memory.
+
+---
+
+## Session 4 hotfix — move registry wiring to main.py
+
+CLI bridge was incorrectly building the tool registry. Bridges are transport
+only — they have no business knowing what tools exist.
+
+### `main.py` (new)
+Single wiring point for the whole application:
+- Loads config
+- Builds `ToolRegistry` and registers filesystem tools
+- Builds `Gateway(config, registry)`
+- Starts CLI bridge always, Discord/Matrix if enabled in config
+- Waits for first bridge to exit, then cancels others and shuts down gateway
+- Run with: `python main.py`
+
+### `bridges/cli.py` updated
+- Registry imports and wiring removed entirely
+- `main()` now just loads config, creates a bare `Gateway`, runs the bridge
+- Used for standalone CLI testing only — normal operation goes through `main.py`
+
+### Correct run command
+```
+python main.py        # full stack — tools, all enabled bridges
+python -m bridges.cli # CLI only, no tools (testing transport only)
+```
