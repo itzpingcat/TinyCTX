@@ -179,27 +179,3 @@ class ToolCallHandler:
                 'error': str(e),
                 'success': False
             }
-
-    async def process_tool_calls(self, tool_calls: List = None):
-        """Handle an LLM response that has tool calls"""
-        results = []
-
-        if tool_calls:
-            print("Executing tool calls...")
-            for tool_call in tool_calls:
-                function_name = tool_call.function.name if hasattr(tool_call, 'function') else 'unknown'
-                print(f"Calling: {function_name}")
-                result = await self.execute_tool_call(tool_call)
-
-                if result['success']:
-                    if result['result'] is not None:
-                        results.append(result['result'])
-                        print(f"✓ Success")
-                    else:
-                        print(f"✓ Success (None)")
-                else:
-                    error_message = f"Error calling {function_name}: {result.get('error', 'Unknown error')}"
-                    results.append(error_message)
-                    print(f"✗ Error: {result.get('error', 'Unknown error')}")
-
-        return results
