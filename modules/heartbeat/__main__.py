@@ -20,7 +20,7 @@ Active hours: if configured, ticks outside the window are skipped.
 The task still sleeps its normal interval; it just does nothing on waking
 outside the allowed window.
 
-Convention: register(agent_loop) — no imports from gateway or bridges.
+Convention: register(agent) — no imports from gateway or bridges.
 """
 from __future__ import annotations
 
@@ -73,7 +73,7 @@ def _resolve_session(session_cfg: str, main_key: "SessionKey") -> "SessionKey":
     return main_key
 
 
-def register(agent_loop) -> None:
+def register(agent) -> None:
     try:
         from modules.heartbeat import EXTENSION_META
         cfg: dict = EXTENSION_META.get("default_config", {})
@@ -94,21 +94,21 @@ def register(agent_loop) -> None:
     # Resolve session key. "main" (default) uses the agent's own session.
     # Any other string is parsed as "dm:<id>" or "group:<platform>:<id>".
     session_cfg = cfg.get("session", "main")
-    session_key = _resolve_session(session_cfg, agent_loop.session_key)
+    session_key = _resolve_session(session_cfg, agent.session_key)
 
     interval_secs = every_minutes * 60
 
     task = asyncio.get_event_loop().create_task(
         _heartbeat_loop(
-            agent_loop, interval_secs,
+            agent, interval_secs,
             prompt, continuation_prompt,
             ack_max, max_continuations,
             active_hours, session_key,
         ),
-        name=f"heartbeat:{agent_loop.session_key}",
+        name=f"heartbeat:{agent.session_key}",
     )
 
-    _patch_reset(agent_loop, task)
+    _patch_reset(agent, task)
 
     logger.info(
         "[heartbeat] started — every %dm, session=%s, active_hours=%s",
@@ -121,7 +121,7 @@ def register(agent_loop) -> None:
 # ---------------------------------------------------------------------------
 
 async def _heartbeat_loop(
-    agent_loop,
+    agent,
     interval_secs: int,
     prompt: str,
     continuation_prompt: str,
@@ -137,7 +137,7 @@ async def _heartbeat_loop(
         try:
             if _in_active_window(active_hours):
                 await _tick(
-                    agent_loop, prompt, continuation_prompt,
+                    agent, prompt, continuation_prompt,
                     ack_max, max_continuations, session_key,
                 )
             else:
@@ -155,7 +155,7 @@ async def _heartbeat_loop(
 # ---------------------------------------------------------------------------
 
 async def _tick(
-    agent_loop,
+    agent,
     prompt: str,
     continuation_prompt: str,
     ack_max: int,
@@ -169,7 +169,7 @@ async def _tick(
     logger.debug("[heartbeat] tick start")
 
     # Initial turn
-    reply = await _run_turn(agent_loop, prompt, session_key)
+    reply = await _run_turn(agent, prompt, session_key)
     is_ok, alert = _parse_reply(reply, ack_max)
 
     if is_ok:
@@ -181,7 +181,7 @@ async def _tick(
 
     for turn in range(1, max_continuations + 1):
         logger.debug("[heartbeat] continuation turn %d/%d", turn, max_continuations)
-        reply = await _run_turn(agent_loop, continuation_prompt, session_key)
+        reply = await _run_turn(agent, continuation_prompt, session_key)
         is_ok, alert = _parse_reply(reply, ack_max)
 
         if is_ok:
@@ -196,7 +196,7 @@ async def _tick(
     )
 
 
-async def _run_turn(agent_loop, text: str, session_key: "SessionKey") -> str:
+async def _run_turn(agent, text: str, session_key: "SessionKey") -> str:
     """Inject a synthetic message and collect the full reply."""
     msg = InboundMessage(
         session_key=session_key,
@@ -207,7 +207,7 @@ async def _run_turn(agent_loop, text: str, session_key: "SessionKey") -> str:
         timestamp=time.time(),
     )
     parts: list[str] = []
-    async for chunk in agent_loop.run(msg):
+    async for chunk in agent.run(msg):
         parts.append(chunk.text)
         if not chunk.is_partial:
             break
@@ -276,9 +276,9 @@ def _in_active_window(active_hours: dict | None) -> bool:
 # Reset hook
 # ---------------------------------------------------------------------------
 
-def _patch_reset(agent_loop, task: asyncio.Task) -> None:
-    """Cancel the heartbeat task when agent_loop.reset() is called."""
-    original_reset = agent_loop.reset
+def _patch_reset(agent, task: asyncio.Task) -> None:
+    """Cancel the heartbeat task when agent.reset() is called."""
+    original_reset = agent.reset
 
     def patched_reset():
         original_reset()
@@ -286,4 +286,4 @@ def _patch_reset(agent_loop, task: asyncio.Task) -> None:
             task.cancel()
             logger.info("[heartbeat] task cancelled on session reset")
 
-    agent_loop.reset = patched_reset
+    agent.reset = patched_reset

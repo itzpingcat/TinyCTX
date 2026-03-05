@@ -40,7 +40,7 @@ Job schema (CRON.json):
 The agent edits CRON.json directly using str_replace / view / create_file.
 cron_list is the only tool registered — it validates and summarises jobs.
 
-Convention: register(agent_loop) — no imports from gateway or bridges.
+Convention: register(agent) — no imports from gateway or bridges.
 """
 from __future__ import annotations
 
@@ -353,8 +353,8 @@ class _CronRunner:
     than polling on a fixed interval.
     """
 
-    def __init__(self, agent_loop, store_path: Path) -> None:
-        self._agent_loop = agent_loop
+    def __init__(self, agent, store_path: Path) -> None:
+        self._agent = agent
         self._store_path = store_path
         self._jobs:       list[CronJob] = []
         self._version:    int           = 1
@@ -454,7 +454,7 @@ class _CronRunner:
                 timestamp=time.time(),
             )
             parts: list[str] = []
-            async for chunk in self._agent_loop.run(msg):
+            async for chunk in self._agent.run(msg):
                 parts.append(chunk.text)
                 if not chunk.is_partial:
                     break
@@ -489,26 +489,26 @@ class _CronRunner:
 # register()
 # ---------------------------------------------------------------------------
 
-def register(agent_loop) -> None:
+def register(agent) -> None:
     try:
         from modules.cron import EXTENSION_META
         cfg: dict = EXTENSION_META.get("default_config", {})
     except ImportError:
         cfg = {}
 
-    workspace  = Path(agent_loop.config.memory.workspace_path).expanduser().resolve()
+    workspace  = Path(agent.config.memory.workspace_path).expanduser().resolve()
     store_path = workspace / cfg.get("store_file", "CRON.json")
 
-    runner = _CronRunner(agent_loop, store_path)
+    runner = _CronRunner(agent, store_path)
     runner.start()
 
     # Cancel runner on session reset
-    original_reset = agent_loop.reset
+    original_reset = agent.reset
     def patched_reset():
         original_reset()
         runner.stop()
         logger.info("[cron] runner stopped on session reset")
-    agent_loop.reset = patched_reset
+    agent.reset = patched_reset
 
     # Register cron_list tool
     def cron_list() -> str:
@@ -518,5 +518,5 @@ def register(agent_loop) -> None:
         """
         return _build_cron_list(store_path)
 
-    agent_loop.tool_handler.register_tool(cron_list)
+    agent.tool_handler.register_tool(cron_list)
     logger.info("[cron] registered — store: %s", store_path)
