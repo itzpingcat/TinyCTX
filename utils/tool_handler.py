@@ -70,22 +70,6 @@ class ToolCallHandler:
                 continue
             if stripped in ("Returns:", "Raises:"):
                 in_args = False
-            if not in_args:
-                if stripped:
-                    description_lines.append(stripped)
-            else:
-                if stripped:
-                    if ":" in stripped:
-                        param_part, desc_part = stripped.split(":", 1)
-                        param_name = param_part.strip().split()[0]
-                        arg_descs[param_name] = desc_part.strip()
-        for line in lines:
-            stripped = line.strip()
-            if stripped in ("Args:", "Parameters:"):
-                in_args = True
-                continue
-            if stripped in ("Returns:", "Raises:"):
-                in_args = False
             if in_args and ":" in stripped:
                 param, desc = stripped.split(":", 1)
                 arg_descs[param.strip().split()[0]] = desc.strip()
