@@ -21,8 +21,10 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import json
 import logging
 import os
+import time
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -76,7 +78,6 @@ class AgentLoop:
         for entry in sorted(MODULES_DIR.iterdir()):
             if not entry.is_dir():
                 continue
-            # Must have at least one of these to be a valid module package
             has_main = (entry / "__main__.py").exists()
             has_init = (entry / "__init__.py").exists()
             if not (has_main or has_init):
@@ -84,7 +85,6 @@ class AgentLoop:
 
             module_name = f"modules.{entry.name}"
             try:
-                # Try __main__ first, fall back to __init__
                 for suffix in (".__main__", ""):
                     try:
                         mod = importlib.import_module(module_name + suffix)
@@ -209,8 +209,54 @@ class AgentLoop:
         logger.info("[%s] context reset", self.session_key)
 
     async def _flush_history(self) -> None:
-        """STUB — replace with Markdown log write when memory layer is built."""
-        logger.debug("[%s] _flush_history (STUB)", self.session_key)
+        """
+        Persist the current dialogue to sessions/<session_key>/<version>.json.
+        Version is auto-incremented — finds the highest existing N.json, writes N+1.
+        Called automatically after every reply.
+        """
+        # sessions/dm_cli-owner/  or  sessions/group_discord_123456/
+        safe_key = str(self.session_key).replace(":", "_")
+        sessions_dir = Path("sessions") / safe_key
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+
+        version = self._next_session_version(sessions_dir)
+        path = sessions_dir / f"{version}.json"
+
+        dialogue_raw = [
+            {
+                "id":           e.id,
+                "role":         e.role,
+                "content":      e.content,
+                "tool_calls":   e.tool_calls,
+                "tool_call_id": e.tool_call_id,
+                "index":        e.index,
+            }
+            for e in self.context.dialogue
+        ]
+
+        data = {
+            "session_key": str(self.session_key),
+            "version":     version,
+            "turn":        self._turn_count,
+            "saved_at":    time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "dialogue":    dialogue_raw,
+        }
+
+        try:
+            path.write_text(
+                json.dumps(data, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            logger.debug("[%s] flushed v%d -> %s", self.session_key, version, path)
+        except Exception as exc:
+            logger.warning("[%s] _flush_history failed: %s", self.session_key, exc)
+
+    def _next_session_version(self, sessions_dir: Path) -> int:
+        """Return the next unused integer filename (1, 2, 3, ...) in sessions_dir."""
+        existing = [
+            int(p.stem) for p in sessions_dir.glob("*.json") if p.stem.isdigit()
+        ]
+        return max(existing, default=0) + 1
 
 
 def _has_api_key(config: Config) -> bool:
