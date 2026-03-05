@@ -71,18 +71,13 @@ class ToolCallHandler:
             if stripped in ("Returns:", "Raises:"):
                 in_args = False
             if not in_args:
-                # Accumulate main description lines until Args or Returns
                 if stripped:
                     description_lines.append(stripped)
             else:
-                # Parsing arg descriptions line by line
-                # Expecting format: param_name (type): description...
-                # or param_name: description...
                 if stripped:
                     if ":" in stripped:
-                        # split at first colon
                         param_part, desc_part = stripped.split(":", 1)
-                        param_name = param_part.strip().split()[0]  # first word is param name
+                        param_name = param_part.strip().split()[0]
                         arg_descs[param_name] = desc_part.strip()
         for line in lines:
             stripped = line.strip()
@@ -99,7 +94,6 @@ class ToolCallHandler:
         return main_line or f"Function: {func.__name__}", arg_descs
 
     def _python_type_to_json_schema(self, annotation) -> Dict[str, Any]:
-        # Simplified type mapping, you can expand this
         mapping = {
             str: {"type": "string"},
             int: {"type": "integer"},
@@ -127,16 +121,14 @@ class ToolCallHandler:
             })
         return definitions
     
-    def execute_tool_call(self, tool_call) -> Dict[str, Any]:
+    async def execute_tool_call(self, tool_call) -> Dict[str, Any]:
         """Execute a tool call from the LLM"""
         try:
-            # Handle ToolCall object (not dict)
             if hasattr(tool_call, 'function'):
                 function_name = tool_call.function.name
                 arguments = tool_call.function.arguments
                 tool_call_id = getattr(tool_call, 'id', 'unknown')
             else:
-                # Fallback for dict format
                 function_name = tool_call.get('function', {}).get('name')
                 arguments = tool_call.get('function', {}).get('arguments', '{}')
                 tool_call_id = tool_call.get('id', 'unknown')
@@ -156,7 +148,6 @@ class ToolCallHandler:
                     'success': False
                 }
                         
-            # Parse arguments if they're a string
             if isinstance(arguments, str):
                 try:
                     args = json.loads(arguments)
@@ -169,8 +160,10 @@ class ToolCallHandler:
             else:
                 args = arguments
                         
-            # Execute the function
+            # Call the function — await it if it's async
             result = self.tools[function_name]['function'](**args)
+            if inspect.iscoroutine(result):
+                result = await result
                         
             return {
                 'tool_call_id': tool_call_id,
@@ -187,7 +180,7 @@ class ToolCallHandler:
                 'success': False
             }
 
-    def process_tool_calls(self, tool_calls: List = None):
+    async def process_tool_calls(self, tool_calls: List = None):
         """Handle an LLM response that has tool calls"""
         results = []
 
@@ -196,20 +189,17 @@ class ToolCallHandler:
             for tool_call in tool_calls:
                 function_name = tool_call.function.name if hasattr(tool_call, 'function') else 'unknown'
                 print(f"Calling: {function_name}")
-                result = self.execute_tool_call(tool_call)
+                result = await self.execute_tool_call(tool_call)
 
                 if result['success']:
                     if result['result'] is not None:
-                        # Append only the actual result content
                         results.append(result['result'])
-                        print(f"✓ Success") # : {result['result']}")
+                        print(f"✓ Success")
                     else:
-                        print(f"✓ Success (None)") # : Skipping result for {function_name}")
+                        print(f"✓ Success (None)")
                 else:
-                    # Append the error message as a string
                     error_message = f"Error calling {function_name}: {result.get('error', 'Unknown error')}"
                     results.append(error_message)
                     print(f"✗ Error: {result.get('error', 'Unknown error')}")
 
         return results
-
