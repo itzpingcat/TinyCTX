@@ -31,6 +31,10 @@ class GatewayConfig:
     port: int = 8765
 
 @dataclass
+class CLIConfig:
+    enabled: bool = True
+
+@dataclass
 class DiscordConfig:
     enabled: bool = False
     @property
@@ -52,6 +56,7 @@ class MatrixConfig:
 
 @dataclass
 class BridgesConfig:
+    cli:     CLIConfig     = field(default_factory=CLIConfig)
     discord: DiscordConfig = field(default_factory=DiscordConfig)
     matrix:  MatrixConfig  = field(default_factory=MatrixConfig)
 
@@ -110,6 +115,7 @@ def load(path="config.yaml") -> Config:
             port=int(gw_raw.get("port", 8765)),
         ),
         bridges=BridgesConfig(
+            cli=CLIConfig(enabled=bool(br_raw.get("cli", {}).get("enabled", True))),
             discord=DiscordConfig(enabled=bool(br_raw.get("discord", {}).get("enabled", False))),
             matrix=MatrixConfig(
                 enabled=bool(br_raw.get("matrix", {}).get("enabled", False)),

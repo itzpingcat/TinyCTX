@@ -1,0 +1,31 @@
+# config.yaml — Safe to commit. No secrets.
+# API key lives in the environment variable named by llm.api_key_env.
+
+llm:
+  model: claude-sonnet-4-20250514
+  base_url: https://api.anthropic.com/v1   # any OpenAI-compat endpoint works
+  api_key_env: ANTHROPIC_API_KEY           # name of the env var holding your key
+
+gateway:
+  host: 127.0.0.1
+  port: 8765
+
+bridges:
+  cli:
+    enabled: true
+
+  discord:
+    enabled: false
+
+  matrix:
+    enabled: false
+    homeserver: https://matrix.org
+    username: "@yourbot:matrix.org"
+
+memory:
+  workspace_path: ~/.agent/workspace
+
+logging:
+  level: INFO
+
+max_tool_cycles: 10

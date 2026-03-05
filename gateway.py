@@ -14,7 +14,6 @@ from typing import Callable, Awaitable
 from contracts import InboundMessage, OutboundReply, SessionKey, ChatType
 from agent_loop import AgentLoop
 from config import Config
-from utils.tool_handler import ToolCallHandler
 
 logger = logging.getLogger(__name__)
 
@@ -30,13 +29,12 @@ class Lane:
     session_key:   SessionKey
     config:        Config
     reply_handler: ReplyHandler
-    registry:      ToolCallHandler | None = None
-    loop:          AgentLoop           = field(init=False)
+    loop:          AgentLoop = field(init=False)
     queue:         asyncio.Queue = field(default_factory=asyncio.Queue)
     _worker:       asyncio.Task | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
-        self.loop = AgentLoop(session_key=self.session_key, config=self.config, registry=self.registry)
+        self.loop = AgentLoop(session_key=self.session_key, config=self.config)
 
     def start(self) -> None:
         if self._worker is None or self._worker.done():
@@ -79,10 +77,9 @@ class Lane:
 # ---------------------------------------------------------------------------
 
 class SessionRouter:
-    def __init__(self, config: Config, reply_handler: ReplyHandler, registry: ToolCallHandler | None = None) -> None:
+    def __init__(self, config: Config, reply_handler: ReplyHandler) -> None:
         self._config        = config
         self._reply_handler = reply_handler
-        self._registry      = registry
         self._lanes: dict[SessionKey, Lane] = {}
 
     async def route(self, msg: InboundMessage) -> None:
@@ -92,7 +89,7 @@ class SessionRouter:
 
     def _get_or_create(self, key: SessionKey) -> Lane:
         if key not in self._lanes:
-            lane = Lane(session_key=key, config=self._config, reply_handler=self._reply_handler, registry=self._registry)
+            lane = Lane(session_key=key, config=self._config, reply_handler=self._reply_handler)
             lane.start()
             self._lanes[key] = lane
             logger.info("Opened lane %s", key)

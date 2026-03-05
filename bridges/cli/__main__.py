@@ -1,13 +1,9 @@
 """
-bridges/cli.py — Interactive CLI bridge using prompt_toolkit.
-Connects to the gateway as any other bridge would.
+bridges/cli/__main__.py — Interactive CLI bridge.
 
-DM session: always uses SessionKey.dm(CLI_USER_ID) — it's always you.
-Buffers streamed reply chunks internally, prints on final chunk.
-
-Run directly:  python -m bridges.cli
+Exposes run(gateway) for main.py loader.
+Can still be run standalone: python -m bridges.cli
 """
-
 from __future__ import annotations
 
 import asyncio
@@ -22,42 +18,31 @@ from contracts import (
     Platform, ContentType,
     SessionKey, UserIdentity, InboundMessage, OutboundReply,
 )
-from config import load as load_config, apply_logging
-from gateway import Gateway
 
 logger = logging.getLogger(__name__)
 
-# Stable CLI identity — it's always the local user
 CLI_USER_ID = "cli-owner"
 CLI_USER    = UserIdentity(platform=Platform.CLI, user_id=CLI_USER_ID, username="you")
 CLI_SESSION = SessionKey.dm(CLI_USER_ID)
 
 
 class CLIBridge:
-    """
-    Reads input from the terminal, pushes InboundMessages to the gateway,
-    and prints OutboundReply chunks when the final chunk arrives.
-    """
-
-    def __init__(self, gateway: Gateway) -> None:
+    def __init__(self, gateway) -> None:
         self._gateway   = gateway
         self._prompt    = PromptSession()
         self._reply_buf: list[str] = []
 
     async def handle_reply(self, reply: OutboundReply) -> None:
-        """Registered with gateway. Buffers partials, prints on final chunk."""
         self._reply_buf.append(reply.text)
         if not reply.is_partial:
             full = "".join(self._reply_buf)
             self._reply_buf.clear()
             print(f"\nagent: {full}\n")
 
-    async def run(self) -> NoReturn:
+    async def run(self) -> None:
         self._gateway.register_reply_handler(Platform.CLI.value, self.handle_reply)
         print("CLI bridge ready. Type a message, Ctrl-C or 'exit' to quit.\n")
 
-        # patch_stdout keeps prompt_toolkit's input line intact
-        # when handle_reply calls print() from an async task
         with patch_stdout():
             while True:
                 try:
@@ -88,17 +73,22 @@ class CLIBridge:
                 )
                 await self._gateway.push(msg)
 
-        await self._gateway.shutdown()
 
-
-async def main() -> None:
-    """Standalone CLI entrypoint — use main.py for full multi-bridge startup."""
-    cfg = load_config()
-    apply_logging(cfg.logging)
-    gw     = Gateway(config=cfg)
-    bridge = CLIBridge(gateway=gw)
+async def run(gateway) -> None:
+    """Entry point called by main.py loader."""
+    bridge = CLIBridge(gateway)
     await bridge.run()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Standalone mode
+    import asyncio
+    from config import load as load_config, apply_logging
+    from gateway import Gateway
+
+    async def _standalone():
+        cfg = load_config()
+        apply_logging(cfg.logging)
+        await run(Gateway(config=cfg))
+
+    asyncio.run(_standalone())

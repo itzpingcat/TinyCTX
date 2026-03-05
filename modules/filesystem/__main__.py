@@ -1,18 +1,18 @@
 """
-tools/filesystem.py — Filesystem tools: shell, view, create_file, str_replace.
-Plain typed functions registered into ToolCallHandler.
-All paths resolve relative to workspace.
+modules/filesystem/__main__.py
+
+Registers filesystem tools (shell, view, create_file, str_replace) into the
+agent loop's tool_handler. No imports from utils or contracts — everything
+arrives through the agent_loop argument.
 """
 from __future__ import annotations
 
 import subprocess
 from pathlib import Path
 
-from utils.tool_handler import ToolCallHandler
 
-
-def register(handler: ToolCallHandler, workspace: Path) -> None:
-    workspace = Path(workspace).expanduser().resolve()
+def register(agent_loop) -> None:
+    workspace = Path(agent_loop.config.memory.workspace_path).expanduser().resolve()
     workspace.mkdir(parents=True, exist_ok=True)
 
     def resolve(raw: str) -> Path:
@@ -50,30 +50,23 @@ def register(handler: ToolCallHandler, workspace: Path) -> None:
         p = resolve(path)
         if not p.exists():
             return f"[error: not found: {p}]"
-
         if p.is_dir():
             entries = sorted(p.iterdir(), key=lambda e: (e.is_file(), e.name))
             if not entries:
                 return f"[empty directory: {p}]"
-            lines = [f"[{p}]"] + [f"  {e.name}{'/' if e.is_dir() else ''}" for e in entries]
-            return "\n".join(lines)
-
+            return f"[{p}]\n" + "\n".join(f"  {e.name}{'/' if e.is_dir() else ''}" for e in entries)
         try:
             text = p.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             return "[error: binary file, cannot read as text]"
-
         lines = text.splitlines()
         total = len(lines)
-
         if view_range:
             start = max(1, int(view_range[0]))
             end   = min(int(view_range[1]) if view_range[1] != -1 else total, total)
-            lines = lines[start - 1:end]
             return f"[{p} | lines {start}–{end} of {total}]\n" + "\n".join(
-                f"{i:>6}\t{l}" for i, l in enumerate(lines, start)
+                f"{i:>6}\t{l}" for i, l in enumerate(lines[start-1:end], start)
             )
-
         return f"[{p} | {total} lines]\n" + "\n".join(
             f"{i:>6}\t{l}" for i, l in enumerate(lines, 1)
         )
@@ -112,7 +105,7 @@ def register(handler: ToolCallHandler, workspace: Path) -> None:
         p.write_text(original.replace(old_str, new_str, 1), encoding="utf-8")
         return f"[replaced 1 occurrence in {p}]"
 
-    handler.register_tool(shell)
-    handler.register_tool(view)
-    handler.register_tool(create_file)
-    handler.register_tool(str_replace)
+    agent_loop.tool_handler.register_tool(shell)
+    agent_loop.tool_handler.register_tool(view)
+    agent_loop.tool_handler.register_tool(create_file)
+    agent_loop.tool_handler.register_tool(str_replace)
