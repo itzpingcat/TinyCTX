@@ -14,6 +14,7 @@ from pathlib import Path
 def register(agent) -> None:
     workspace = Path(agent.config.memory.workspace_path).expanduser().resolve()
     workspace.mkdir(parents=True, exist_ok=True)
+    
     shell_timeout = getattr(agent.config, 'shell_timeout', 60)
     def resolve(raw: str) -> Path:
         p = Path(raw)
