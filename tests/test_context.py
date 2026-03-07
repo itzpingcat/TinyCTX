@@ -293,16 +293,19 @@ class TestHooks:
 
 class TestTokenBudget:
     def test_old_turns_dropped_when_over_budget(self):
-        # token_limit=50 is tight enough that the oldest message must be dropped
+        # Use alternating roles so messages are NOT merged, then blow the budget
+        # with a huge assistant turn followed by a short user turn.
         ctx = Context(token_limit=50)
-        ctx.add(HistoryEntry.user("A" * 100))   # old, over budget alone
-        ctx.add(HistoryEntry.user("short"))      # new
+        ctx.add(HistoryEntry.user("hi"))
+        ctx.add(HistoryEntry.assistant("A" * 200))  # old, blows budget on its own
+        ctx.add(HistoryEntry.user("short"))          # new, must survive
 
         messages = ctx.assemble()
         contents = [m["content"] for m in messages]
-        # The short message should survive; the huge one should be dropped
+        # The short user message should survive
         assert any("short" in c for c in contents)
-        assert not any("A" * 100 in c for c in contents)
+        # The giant assistant turn should have been dropped
+        assert not any("A" * 200 in c for c in contents)
 
     def test_tokens_used_stored_in_state(self):
         ctx = Context()
