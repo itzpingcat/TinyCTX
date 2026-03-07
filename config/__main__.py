@@ -165,7 +165,7 @@ def load(path="config.yaml") -> Config:
     if primary not in models:
         raise ValueError(f"llm.primary '{primary}' is not defined under models:")
 
-    fallback = list(llm_raw.get("fallback", []))
+    fallback = list(llm_raw.get("fallback") or [])
     for name in fallback:
         if name not in models:
             raise ValueError(f"llm.fallback entry '{name}' is not defined under models:")

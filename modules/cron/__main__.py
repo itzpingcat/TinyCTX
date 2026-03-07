@@ -269,7 +269,7 @@ def _build_cron_list(path: Path) -> str:
     if not path.exists():
         return (
             "No CRON.json found in workspace.\n\n"
-            "To create scheduled jobs, create workspace/CRON.json using create_file.\n"
+            f"To create scheduled jobs, create {path} using create_file.\n"
             "See the CRON.json schema in the cron module docstring for the format."
         )
 

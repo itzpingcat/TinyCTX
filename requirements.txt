@@ -5,3 +5,4 @@ pyyaml
 playwright
 duckduckgo-search
 mcp
+prompt_toolkit

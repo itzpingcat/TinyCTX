@@ -68,12 +68,18 @@ class AgentLoop:
     """
 
     def __init__(self, session_key: SessionKey, config: Config) -> None:
-        self.session_key  = session_key
-        self.config       = config
-        self.context      = Context(token_limit=config.context)
-        self.tool_handler = ToolCallHandler()
-        self._turn_count  = 0
-        self.gateway      = None  # set by Lane.__post_init__ after construction
+        self.session_key      = session_key
+        self.config           = config
+        self.context          = Context(token_limit=config.context)
+        self.tool_handler     = ToolCallHandler()
+        self._turn_count      = 0
+        self.gateway          = None  # set by Lane.__post_init__ after construction
+
+        # Resume from the highest existing version on disk, or start at 1.
+        self._session_version = self._load_latest_version()
+
+        # Restore dialogue from that version file so context isn't blank.
+        self._restore_history()
 
         # Build the full model pool from config.models
         self._models: dict[str, LLM] = {
@@ -284,20 +290,66 @@ class AgentLoop:
         """Clear conversation context. Called by /reset commands."""
         self.context.clear()
         self._turn_count = 0
-        logger.info("[%s] context reset", self.session_key)
+        self._session_version += 1  # next flush writes to a new file
+        logger.info("[%s] context reset (now v%d)", self.session_key, self._session_version)
+
+    def _load_latest_version(self) -> int:
+        """
+        Scan the sessions directory for this session and return the highest
+        existing version number. Returns 1 if no prior sessions exist.
+        """
+        safe_key = str(self.session_key).replace(":", "_")
+        sessions_dir = Path("sessions") / safe_key
+        if not sessions_dir.exists():
+            return 1
+        existing = [
+            int(p.stem) for p in sessions_dir.glob("*.json") if p.stem.isdigit()
+        ]
+        return max(existing, default=1)
+
+    def _restore_history(self) -> None:
+        """
+        Load dialogue from the current version's JSON file back into context.
+        Called once at startup so history survives process restarts.
+        Silently skips if the file doesn't exist or is malformed.
+        """
+        safe_key = str(self.session_key).replace(":", "_")
+        path = Path("sessions") / safe_key / f"{self._session_version}.json"
+
+        if not path.exists():
+            return
+
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            self._turn_count = data.get("turn", 0)
+            for raw in data.get("dialogue", []):
+                entry = HistoryEntry(
+                    role=raw["role"],
+                    content=raw.get("content", ""),
+                    id=raw.get("id", ""),
+                    index=raw.get("index", 0),
+                    tool_calls=raw.get("tool_calls") or [],
+                    tool_call_id=raw.get("tool_call_id"),
+                )
+                self.context.dialogue.append(entry)
+            logger.info(
+                "[%s] restored %d dialogue entries from v%d",
+                self.session_key, len(self.context.dialogue), self._session_version,
+            )
+        except Exception as exc:
+            logger.warning("[%s] _restore_history failed: %s", self.session_key, exc)
 
     async def _flush_history(self) -> None:
         """
         Persist the current dialogue to sessions/<session_key>/<version>.json.
-        Version is auto-incremented — finds the highest existing N.json, writes N+1.
-        Called automatically after every reply.
+        Overwrites the current version's file on every turn.
+        Version only increments when reset() is called.
         """
         safe_key = str(self.session_key).replace(":", "_")
         sessions_dir = Path("sessions") / safe_key
         sessions_dir.mkdir(parents=True, exist_ok=True)
 
-        version = self._next_session_version(sessions_dir)
-        path    = sessions_dir / f"{version}.json"
+        path = sessions_dir / f"{self._session_version}.json"
 
         dialogue_raw = [
             {
@@ -313,7 +365,7 @@ class AgentLoop:
 
         data = {
             "session_key": str(self.session_key),
-            "version":     version,
+            "version":     self._session_version,
             "turn":        self._turn_count,
             "saved_at":    time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "dialogue":    dialogue_raw,
@@ -324,12 +376,6 @@ class AgentLoop:
                 json.dumps(data, indent=2, ensure_ascii=False),
                 encoding="utf-8",
             )
-            logger.debug("[%s] flushed v%d -> %s", self.session_key, version, path)
+            logger.debug("[%s] flushed v%d -> %s", self.session_key, self._session_version, path)
         except Exception as exc:
             logger.warning("[%s] _flush_history failed: %s", self.session_key, exc)
-
-    def _next_session_version(self, sessions_dir: Path) -> int:
-        existing = [
-            int(p.stem) for p in sessions_dir.glob("*.json") if p.stem.isdigit()
-        ]
-        return max(existing, default=0) + 1
