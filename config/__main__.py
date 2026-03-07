@@ -65,7 +65,7 @@ class BridgeConfig:
 
 @dataclass
 class MemoryConfig:
-    workspace_path: Path = field(default_factory=lambda: Path("~/.agent/workspace").expanduser())
+    workspace_path: Path = field(default_factory=lambda: Path("~/.tinyctx").expanduser())
 
     def __post_init__(self):
         self.workspace_path = Path(self.workspace_path).expanduser().resolve()
@@ -193,7 +193,7 @@ def load(path="config.yaml") -> Config:
         ),
         bridges=bridges,
         memory=MemoryConfig(
-            workspace_path=Path(mem_raw.get("workspace_path", "~/.agent/workspace"))
+            workspace_path=Path(mem_raw.get("workspace_path", "~/.tinyctx"))
         ),
         logging=LoggingConfig(level=log_raw.get("level", "INFO")),
         max_tool_cycles=int(raw.get("max_tool_cycles", 10)),

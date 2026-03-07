@@ -93,7 +93,7 @@ Modules must not import from `gateway.py` or any bridge. They receive everything
 - **Tool functions can be sync or async.** `ToolCallHandler.execute_tool_call` handles both.
 - **Context hooks run in priority order** (lower = first). Use `priority=0` for early hooks (dedup), `priority=10+` for later ones (trim).
 - **Sessions persist to `sessions/<session_key>/<N>.json`** after every turn. Auto-incrementing version numbers.
-- **Workspace is `~/.agent/workspace`** (configurable). Modules write files here. SOUL.md, MEMORY.md, AGENTS.md, CRON.json all live here.
+- **Workspace is `~/.tinyctx`** (configurable). Modules write files here. SOUL.md, MEMORY.md, AGENTS.md, CRON.json all live here.
 
 ---
 

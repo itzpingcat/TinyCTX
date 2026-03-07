@@ -53,7 +53,7 @@ bridges:
     username: "@yourbot:matrix.org"
 
 memory:
-  workspace_path: ~/.agent/workspace
+  workspace_path: ~/.tinyctx
 
 logging:
   level: INFO
