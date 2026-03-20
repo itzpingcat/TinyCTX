@@ -141,7 +141,7 @@ def register(agent) -> None:
     except ImportError:
         cfg = {}
 
-    workspace = Path(agent.config.memory.workspace_path).expanduser().resolve()
+    workspace = Path(agent.config.workspace.path).expanduser().resolve()
 
     configured: list[Path] = []
     for raw in cfg.get("skill_dirs", ["skills"]):

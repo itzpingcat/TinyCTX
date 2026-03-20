@@ -8,6 +8,6 @@ from config.__main__ import (
     FallbackOnConfig,
     GatewayConfig,
     BridgeConfig,
-    MemoryConfig,
+    WorkspaceConfig,
     LoggingConfig,
 )

@@ -33,13 +33,21 @@ ROLE_TOOL      = "tool"
 ROLE_SYSTEM    = "system"
 
 # ---------------------------------------------------------------------------
-# Hook stages — executed in this order during assemble()
+# Hook stages
 # ---------------------------------------------------------------------------
 
-HOOK_PRE_ASSEMBLE   = "pre_assemble"    # fn(ctx) -> None
-HOOK_FILTER_TURN    = "filter_turn"     # fn(entry, age, ctx) -> bool  (False = drop)
-HOOK_TRANSFORM_TURN = "transform_turn"  # fn(entry, age, ctx) -> HistoryEntry | None
-HOOK_POST_ASSEMBLE  = "post_assemble"   # fn(messages, ctx) -> list[dict] | None
+HOOK_PRE_ASSEMBLE       = "pre_assemble"        # fn(ctx) -> None          — sync, runs inside assemble()
+HOOK_PRE_ASSEMBLE_ASYNC = "pre_assemble_async"  # async fn(ctx) -> None    — awaited by agent BEFORE assemble()
+HOOK_FILTER_TURN        = "filter_turn"          # fn(entry, age, ctx) -> bool   (False = drop)
+HOOK_TRANSFORM_TURN     = "transform_turn"       # fn(entry, age, ctx) -> HistoryEntry | None
+HOOK_POST_ASSEMBLE      = "post_assemble"        # fn(messages, ctx) -> list[dict] | None
+
+# Execution order per turn:
+#   agent awaits run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC)
+#   agent calls ctx.assemble()
+#     → HOOK_PRE_ASSEMBLE (sync, e.g. cache warm)
+#     → HOOK_FILTER_TURN / HOOK_TRANSFORM_TURN  (per entry)
+#     → HOOK_POST_ASSEMBLE (final reshape)
 
 
 # ---------------------------------------------------------------------------
@@ -59,10 +67,6 @@ class HistoryEntry:
     index:        int            = 0     # position in dialogue; set by Context.add()
     tool_calls:   list[dict]     = field(default_factory=list)
     tool_call_id: str | None     = None
-
-    # ------------------------------------------------------------------
-    # Convenience constructors
-    # ------------------------------------------------------------------
 
     @staticmethod
     def user(content: str) -> HistoryEntry:
@@ -111,12 +115,18 @@ class Context:
     Assembles a list[dict] suitable for the LLM API from dialogue history
     and registered prompt providers, passing turns through a hook pipeline.
 
+    Async hooks (HOOK_PRE_ASSEMBLE_ASYNC) are NOT run by assemble() — they
+    must be awaited by the caller (AgentLoop) via run_async_hooks() before
+    calling assemble(). This keeps assemble() synchronous and simple.
+
     Usage:
         ctx = Context()
         ctx.register_prompt("soul", lambda c: soul_md_contents)
         ctx.register_hook(HOOK_FILTER_TURN, my_trim_fn)
+        ctx.register_hook(HOOK_PRE_ASSEMBLE_ASYNC, my_async_fn)
         ctx.add(HistoryEntry.user("hello"))
-        messages = ctx.assemble()   # → send to LLM
+        await ctx.run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC)
+        messages = ctx.assemble()
     """
 
     def __init__(self, token_limit: int = 16384) -> None:
@@ -132,7 +142,6 @@ class Context:
         # Arbitrary state bag for hooks/modules to share data during assembly
         self.state: dict[str, Any] = {}
 
-        # Token limit for the assembled context.
         self.token_limit = token_limit
 
     # ------------------------------------------------------------------
@@ -140,13 +149,33 @@ class Context:
     # ------------------------------------------------------------------
 
     def register_hook(self, stage: str, fn: Callable, *, priority: int = 0) -> None:
-        """Lower priority = runs first. Valid stages are the HOOK_* constants."""
+        """
+        Register a hook for a pipeline stage.
+        Lower priority = runs first.
+        For HOOK_PRE_ASSEMBLE_ASYNC, fn must be an async callable.
+        """
         self._hook_counter += 1
         self._hooks[stage].append((priority, self._hook_counter, fn))
         self._hooks[stage].sort(key=lambda x: (x[0], x[1]))
 
     def unregister_hook(self, stage: str, fn: Callable) -> None:
         self._hooks[stage] = [e for e in self._hooks[stage] if e[2] is not fn]
+
+    async def run_async_hooks(self, stage: str) -> None:
+        """
+        Await all hooks registered for an async stage in priority order.
+        Exceptions are caught and logged so one failing hook doesn't block
+        the rest.
+
+        Call this from AgentLoop before assemble():
+            await ctx.run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC)
+            messages = ctx.assemble()
+        """
+        for _, _, fn in self._hooks[stage]:
+            try:
+                await fn(self)
+            except Exception as exc:
+                print(f"[context] async hook '{fn.__name__}' raised: {exc}")
 
     # ------------------------------------------------------------------
     # Prompt provider registration
@@ -160,11 +189,6 @@ class Context:
         role: str = ROLE_SYSTEM,
         priority: int = 0,
     ) -> None:
-        """
-        Register a callable that produces prompt content each assemble().
-        Returning None from the callable skips injection for that turn.
-        Extension owns whether/what to inject; Context owns where.
-        """
         self._prompts[pid] = (PromptSlot(pid=pid, role=role, priority=priority), provider)
 
     def unregister_prompt(self, pid: str) -> None:
@@ -196,22 +220,23 @@ class Context:
         ) + tool_chars) // 4
 
     # ------------------------------------------------------------------
-    # Assembly
+    # Assembly (sync)
     # ------------------------------------------------------------------
 
     def assemble(self, tools: list[dict] | None = None) -> list[dict]:
         """
-        Run the four-stage pipeline and return API-ready messages.
+        Run the sync pipeline and return API-ready messages.
+        Async hooks must have been awaited via run_async_hooks() beforehand.
 
-        Stage order:
+        Stage order (sync):
           1. pre_assemble   — hooks may mutate self.dialogue or warm caches
-          2. filter_turn    — drop turns (e.g. old low-value turns)
-          3. transform_turn — replace turns (e.g. summarise old turns)
-          4. post_assemble  — reshape final message list (e.g. token budget trim)
+          2. filter_turn    — drop turns
+          3. transform_turn — replace/summarise turns
+          4. post_assemble  — reshape final message list
         """
         n = len(self.dialogue)
 
-        # 1. pre_assemble
+        # 1. pre_assemble (sync)
         for _, _, fn in self._hooks[HOOK_PRE_ASSEMBLE]:
             fn(self)
 
@@ -228,7 +253,7 @@ class Context:
             if content is not None:
                 resolved.append((slot, content))
 
-        # Build system block from registered prompts
+        # Build system block
         messages: list[dict] = []
         system_lines = [c for s, c in resolved if s.role == ROLE_SYSTEM]
         if system_lines:
@@ -237,11 +262,10 @@ class Context:
             if slot.role != ROLE_SYSTEM:
                 messages.append({"role": slot.role, "content": content})
 
-        # 2 & 3. filter_turn + transform_turn per dialogue entry
+        # 2 & 3. filter + transform per dialogue entry
         for entry in self.dialogue:
             age = n - 1 - entry.index
 
-            # filter
             drop = False
             for _, _, fn in self._hooks[HOOK_FILTER_TURN]:
                 if fn(entry, age, self) is False:
@@ -250,7 +274,6 @@ class Context:
             if drop:
                 continue
 
-            # transform
             for _, _, fn in self._hooks[HOOK_TRANSFORM_TURN]:
                 result = fn(entry, age, self)
                 if result is not None:
@@ -280,27 +303,21 @@ class Context:
             else:
                 merged.append(dict(m))
 
-        # Count tokens (including tool definitions) and enforce limit.
-        # Drop oldest non-system messages first.
-        # Tool call pairs (assistant + tool result) are dropped together to keep
-        # the message list valid for the API.
+        # Token budget enforcement — drop oldest non-system messages first.
+        # Tool call + result pairs are dropped together to keep API validity.
         self.state["tokens_used"] = self._count_tokens(merged, tools)
 
         while self.state["tokens_used"] > self.token_limit:
-            # Find the oldest non-system message
             drop_idx = next(
                 (i for i, m in enumerate(merged) if m["role"] != ROLE_SYSTEM),
                 None,
             )
             if drop_idx is None:
-                break  # only system messages left, cannot trim further
+                break
 
-            # If it's an assistant message with tool calls, also drop the
-            # immediately following tool result messages to keep pairs intact.
             if merged[drop_idx].get("tool_calls"):
                 call_ids = {tc["id"] for tc in merged[drop_idx]["tool_calls"]}
                 merged.pop(drop_idx)
-                # Remove associated tool results (now at same index after pop)
                 while drop_idx < len(merged) and merged[drop_idx]["role"] == ROLE_TOOL and merged[drop_idx].get("tool_call_id") in call_ids:
                     merged.pop(drop_idx)
             else:
@@ -311,7 +328,6 @@ class Context:
         return merged
 
     def _render(self, entry: HistoryEntry) -> dict:
-        """Convert a HistoryEntry to an API-ready message dict."""
         if entry.role == ROLE_TOOL:
             return {
                 "role":         ROLE_TOOL,

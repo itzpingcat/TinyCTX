@@ -76,11 +76,20 @@ class BridgeConfig:
 
 
 @dataclass
-class MemoryConfig:
-    workspace_path: Path = field(default_factory=lambda: Path("~/.tinyctx").expanduser())
+class WorkspaceConfig:
+    """
+    Global workspace directory. All modules that need a persistent home on
+    disk resolve their paths relative to this.
+
+    Configured via the top-level 'workspace:' key in config.yaml:
+
+        workspace:
+          path: ~/.tinyctx
+    """
+    path: Path = field(default_factory=lambda: Path("~/.tinyctx").expanduser())
 
     def __post_init__(self):
-        self.workspace_path = Path(self.workspace_path).expanduser().resolve()
+        self.path = Path(self.path).expanduser().resolve()
 
 
 @dataclass
@@ -98,15 +107,15 @@ class LoggingConfig:
 class Config:
     models:          dict[str, ModelConfig]
     llm:             LLMRoutingConfig
-    gateway:         GatewayConfig         = field(default_factory=GatewayConfig)
+    gateway:         GatewayConfig           = field(default_factory=GatewayConfig)
     bridges:         dict[str, BridgeConfig] = field(default_factory=dict)
-    memory:          MemoryConfig           = field(default_factory=MemoryConfig)
-    logging:         LoggingConfig          = field(default_factory=LoggingConfig)
-    max_tool_cycles: int                    = 10
-    context:         int                    = 16384
+    workspace:       WorkspaceConfig         = field(default_factory=WorkspaceConfig)
+    logging:         LoggingConfig           = field(default_factory=LoggingConfig)
+    max_tool_cycles: int                     = 10
+    context:         int                     = 16384
     # Catch-all for unknown top-level keys (e.g. mcp:, custom module config, etc.)
     # Modules access this via agent.config.extra.get("mcp", {})
-    extra:           dict                   = field(default_factory=dict)
+    extra:           dict                    = field(default_factory=dict)
 
     def get_model_config(self, name: str) -> ModelConfig:
         """
@@ -167,7 +176,7 @@ def _parse_model(raw: dict) -> ModelConfig:
 
 # Known top-level keys — everything else goes into Config.extra
 _KNOWN_KEYS = {
-    "models", "llm", "gateway", "bridges", "memory",
+    "models", "llm", "gateway", "bridges", "workspace",
     "logging", "max_tool_cycles", "context",
 }
 
@@ -192,7 +201,6 @@ def load(path="config.yaml") -> Config:
             raise ValueError(f"models.{name}: {exc}") from exc
 
     # ------------------------------------------------------------------ llm routing
-    # Only chat models are eligible for the llm: routing block.
     chat_models = {n for n, m in models.items() if not m.is_embedding}
 
     llm_raw = raw.get("llm", {})
@@ -213,16 +221,20 @@ def load(path="config.yaml") -> Config:
             )
 
     fallback_on = _parse_fallback_on(llm_raw.get("fallback_on", {}))
+    llm = LLMRoutingConfig(primary=primary, fallback=fallback, fallback_on=fallback_on)
 
-    llm = LLMRoutingConfig(
-        primary=primary,
-        fallback=fallback,
-        fallback_on=fallback_on,
-    )
+    # ------------------------------------------------------------------ workspace
+    ws_raw = raw.get("workspace", {})
+    # Legacy fallback: if old 'memory.workspace_path' key is present and
+    # the new 'workspace' key is absent, migrate transparently.
+    if not ws_raw:
+        legacy_path = raw.get("memory", {}).get("workspace_path")
+        if legacy_path:
+            ws_raw = {"path": legacy_path}
+    workspace = WorkspaceConfig(path=Path(ws_raw.get("path", "~/.tinyctx")))
 
     # ------------------------------------------------------------------ rest
     gw_raw  = raw.get("gateway", {})
-    mem_raw = raw.get("memory", {})
     log_raw = raw.get("logging", {})
 
     bridges: dict[str, BridgeConfig] = {}
@@ -243,9 +255,7 @@ def load(path="config.yaml") -> Config:
             port=int(gw_raw.get("port", 8765)),
         ),
         bridges=bridges,
-        memory=MemoryConfig(
-            workspace_path=Path(mem_raw.get("workspace_path", "~/.tinyctx"))
-        ),
+        workspace=workspace,
         logging=LoggingConfig(level=log_raw.get("level", "INFO")),
         max_tool_cycles=int(raw.get("max_tool_cycles", 10)),
         context=int(raw.get("context", 16384)),

@@ -214,7 +214,7 @@ def register(agent) -> None:
     except ImportError:
         cfg = {}
 
-    workspace     = Path(agent.config.memory.workspace_path).expanduser().resolve()
+    workspace     = Path(agent.config.workspace.path).expanduser().resolve()
     downloads_dir = workspace / cfg.get("downloads_dir", "downloads")
     downloads_dir.mkdir(parents=True, exist_ok=True)
 

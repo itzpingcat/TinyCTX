@@ -5,7 +5,7 @@ Yields OutboundReply chunks; never calls the gateway directly.
 
 Stages:
   1. Intake           — add user message to Context
-  2. Context Assembly — build message list via Context.assemble()
+  2. Context Assembly — await async hooks, then build message list via Context.assemble()
   3. Inference        — stream LLM, collect text + tool calls
   4. Tool Execution   — dispatch ToolCalls via tool_handler
   5. Result Backfill  — inject ToolResults back into Context
@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import AsyncIterator
 
 from contracts import InboundMessage, OutboundReply, ToolCall, ToolResult, SessionKey
-from context import Context, HistoryEntry
+from context import Context, HistoryEntry, HOOK_PRE_ASSEMBLE_ASYNC
 from config import Config, ModelConfig
 from ai import LLM, TextDelta, ToolCallAssembled, LLMError
 from utils.tool_handler import ToolCallHandler
@@ -83,16 +83,15 @@ class AgentLoop:
         self._turn_count      = 0
         self.gateway          = None  # set by Lane.__post_init__ after construction
 
-        # Resume from the highest existing version on disk, or start at 1.
         self._session_version = self._load_latest_version()
-
-        # Restore dialogue from that version file so context isn't blank.
         self._restore_history()
 
-        # Build the full model pool from config.models
+        # Build the full model pool from config.models.
+        # Embedding models (kind='embedding') are skipped — they're not LLM instances.
         self._models: dict[str, LLM] = {
             name: _build_llm(mc)
             for name, mc in config.models.items()
+            if not mc.is_embedding
         }
 
         self._load_modules()
@@ -167,26 +166,19 @@ class AgentLoop:
 
         for cycle in range(max_cycles):
             # Stage 2: Context Assembly
+            # Run async pre-assemble hooks first (e.g. memory indexing + embedding),
+            # then call the sync assemble() pipeline.
+            await self.context.run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC)
             tools    = self.tool_handler.get_tool_definitions() or None
             messages = self.context.assemble(tools=tools)
 
             # Stage 3: Inference — walk primary → fallback chain
-            #
-            # On every cycle we need to know whether tool calls follow the
-            # text, so we always buffer tool-call cycles.  On the *final*
-            # cycle (no tool calls returned) we stream text chunks directly.
-            # We detect "final" lazily: start streaming, and if a ToolCall
-            # arrives we switch to buffered mode (the partial chunks already
-            # sent are still valid — they're just the preamble text).
-
             text_chunks: list[str]      = []
             tool_calls:  list[ToolCall] = []
             error:       str | None     = None
 
-            # Partial chunks emitted this cycle (for final-cycle streaming).
-            # We accumulate them so we can reconstruct final_text if needed.
             streamed_text: list[str] = []
-            streaming_active = False   # True once we start yielding partials
+            streaming_active = False
 
             model_chain = [self.config.llm.primary] + list(self.config.llm.fallback)
 
@@ -203,8 +195,6 @@ class AgentLoop:
                     if isinstance(event, TextDelta):
                         text_chunks.append(event.text)
 
-                        # Stream this chunk immediately if we're on the final
-                        # cycle (no tool calls seen yet this cycle).
                         if not tool_calls:
                             streamed_text.append(event.text)
                             streaming_active = True
@@ -240,7 +230,6 @@ class AgentLoop:
                         )
                     break
 
-                # Decide whether to try the next model
                 fo = self.config.llm.fallback_on
                 should_fallback = fo.any_error or (
                     last_http_status is not None
@@ -268,13 +257,9 @@ class AgentLoop:
             ))
 
             if not tool_calls:
-                # This was the final cycle. Text was already streamed as
-                # partials — just record it and break.
                 final_text = response_text
                 break
 
-            # Tool calls present — execute them (stages 4 & 5).
-            # Any partial text already sent is the preamble; that's fine.
             logger.debug("[%s] cycle %d — %d tool call(s)", self.session_key, cycle, len(tool_calls))
             for tc in tool_calls:
                 result = await self._execute_tool(tc)
@@ -284,13 +269,6 @@ class AgentLoop:
             logger.warning("[%s] hit max_tool_cycles (%d)", self.session_key, max_cycles)
             final_text = final_text or "[Tool cycle limit reached.]"
 
-        # Stage 6: close the stream.
-        #
-        # If the final cycle streamed partials, send a closing is_partial=False
-        # chunk with an empty string — bridges use this as the "done" signal.
-        #
-        # If nothing was streamed (error path, or final_text came from a
-        # tool-cycle fallback), send the full text as a single non-partial chunk.
         if streaming_active and not error:
             yield OutboundReply(
                 session_key=self.session_key,
@@ -332,17 +310,12 @@ class AgentLoop:
     # ------------------------------------------------------------------
 
     def reset(self) -> None:
-        """Clear conversation context. Called by /reset commands."""
         self.context.clear()
         self._turn_count = 0
-        self._session_version += 1  # next flush writes to a new file
+        self._session_version += 1
         logger.info("[%s] context reset (now v%d)", self.session_key, self._session_version)
 
     def _load_latest_version(self) -> int:
-        """
-        Scan the sessions directory for this session and return the highest
-        existing version number. Returns 1 if no prior sessions exist.
-        """
         safe_key = str(self.session_key).replace(":", "_")
         sessions_dir = Path("sessions") / safe_key
         if not sessions_dir.exists():
@@ -353,11 +326,6 @@ class AgentLoop:
         return max(existing, default=1)
 
     def _restore_history(self) -> None:
-        """
-        Load dialogue from the current version's JSON file back into context.
-        Called once at startup so history survives process restarts.
-        Silently skips if the file doesn't exist or is malformed.
-        """
         safe_key = str(self.session_key).replace(":", "_")
         path = Path("sessions") / safe_key / f"{self._session_version}.json"
 
@@ -385,11 +353,6 @@ class AgentLoop:
             logger.warning("[%s] _restore_history failed: %s", self.session_key, exc)
 
     async def _flush_history(self) -> None:
-        """
-        Persist the current dialogue to sessions/<session_key>/<version>.json.
-        Overwrites the current version's file on every turn.
-        Version only increments when reset() is called.
-        """
         safe_key = str(self.session_key).replace(":", "_")
         sessions_dir = Path("sessions") / safe_key
         sessions_dir.mkdir(parents=True, exist_ok=True)

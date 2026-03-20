@@ -3,10 +3,16 @@
 
 context: 16384
 
-# Named model definitions — add as many as you need.
-# kind: chat      (default) — used for /v1/chat/completions
-# kind: embedding           — used for /v1/embeddings (memory, RAG, etc.)
-#                             max_tokens and temperature are ignored for embeddings.
+# ---------------------------------------------------------------------------
+# models:
+#   Named model definitions. Add as many as you need.
+#
+#   kind: chat      (default) — /v1/chat/completions, used for inference
+#   kind: embedding           — /v1/embeddings, used by the memory module
+#                               max_tokens and temperature are ignored
+#
+#   Embedding models are NOT eligible for llm: routing.
+# ---------------------------------------------------------------------------
 models:
   smart:
     base_url: https://api.anthropic.com/v1
@@ -29,29 +35,44 @@ models:
     max_tokens: 8192
     temperature: 0.6
 
-  # Embedding model — referenced by name in module configs (e.g. memory, rag).
-  # Not eligible for llm: routing. kind: embedding is required.
   embed:
     kind: embedding
     base_url: http://localhost:11434/v1
     api_key_env: N/A
-    model: nomic-embed-text
+    model: nomic-embed-text   # or mxbai-embed-large, all-minilm, etc.
 
-# LLM routing — which model to use and when to fall back.
-# Only chat models (kind: chat or no kind) are allowed here.
+# ---------------------------------------------------------------------------
+# llm:
+#   Which chat model to use and when to fall back.
+#   Only kind: chat models (or models with no kind) are valid here.
+# ---------------------------------------------------------------------------
 llm:
-  primary: smart              # key into models: above
+  primary: smart
   fallback:
     - fast
     - local
   fallback_on:
-    any_error: false          # true = fall back on any LLMError
-    http_codes: [429, 500, 502, 503, 504]  # fall back on these HTTP status codes
+    any_error: false
+    http_codes: [429, 500, 502, 503, 504]
 
+# ---------------------------------------------------------------------------
+# workspace:
+#   Global persistent directory. All modules resolve their data paths here.
+#   Sessions, memory index, and other module state live under this root.
+# ---------------------------------------------------------------------------
+workspace:
+  path: ~/.tinyctx
+
+# ---------------------------------------------------------------------------
+# gateway:
+# ---------------------------------------------------------------------------
 gateway:
   host: 127.0.0.1
   port: 8765
 
+# ---------------------------------------------------------------------------
+# bridges:
+# ---------------------------------------------------------------------------
 bridges:
   cli:
     enabled: true
@@ -64,9 +85,78 @@ bridges:
     homeserver: https://matrix.org
     username: "@yourbot:matrix.org"
 
-memory:
-  workspace_path: ~/.tinyctx
+# ---------------------------------------------------------------------------
+# memory_search:  (extra key — consumed by modules/memory)
+#
+# All keys are optional. Defaults are in modules/memory/__init__.py.
+#
+# Static prompt files — read fresh every turn, injected as system prompts.
+# Paths are relative to workspace.path unless absolute.
+#   soul_file / agents_file / memory_file
+#   soul_priority / agents_priority / memory_priority  (lower = injected first)
+#
+# Search index
+#   memory_dir    directory scanned recursively for *.md files
+#   db_file       SQLite cache path (relative to workspace.path)
+#
+# Chunking
+#   chunk_strategy   "markdown" | "tokens" | "chars" | "delimiter"
+#   chunk_kwargs     strategy-specific overrides (see examples below)
+#
+# Embedding
+#   embedding_model  key from models: with kind: embedding
+#                    omit or set "" for BM25-only mode (no embedding server needed)
+#
+# Retrieval
+#   top_k            chunks fetched from the index (before budget trimming)
+#   bm25_weight      BM25 share of hybrid score  (vector = 1 - bm25_weight)
+#
+# Memory budget
+#   memory_budget_tokens  max tokens the injected <memory> block may use.
+#                         Chunks are added highest-score-first; once the next
+#                         chunk would exceed the budget it is dropped and a
+#                         truncation note is appended instead.
+#                         Set to 0 to disable (inject all top_k results).
+#                         Rule of thumb: keep << context / 4 so search results
+#                         don't crowd out conversation history.
+#
+# Auto-inject
+#   auto_inject      true:  inject budgeted results as a system prompt every turn
+#                    false: retrieval only when the agent calls memory_search()
+#   search_priority  system prompt priority for the injected block
+# ---------------------------------------------------------------------------
+memory_search:
+  # soul_file:    SOUL.md
+  # agents_file:  AGENTS.md
+  # memory_file:  MEMORY.md
+  # soul_priority:    0
+  # agents_priority: 10
+  # memory_priority: 20
 
+  # memory_dir: memory
+  # db_file:    memory/cache.db
+
+  # chunk_strategy: markdown
+  # chunk_kwargs: {}
+  # chunk_kwargs examples:
+  #   tokens:    {chunk_tokens: 256, overlap_tokens: 32}
+  #   chars:     {chunk_size: 800, overlap: 100}
+  #   delimiter: {delimiter: "---"}
+  #   markdown:  {min_chunk_chars: 100}
+
+  embedding_model: embed    # remove or set "" for BM25-only mode
+
+  # top_k: 5
+  # bm25_weight: 0.3
+
+  # memory_budget_tokens: 2048
+
+  # auto_inject: true
+  # search_priority: 25
+
+# ---------------------------------------------------------------------------
+# logging:
+# ---------------------------------------------------------------------------
 logging:
   level: INFO
 
