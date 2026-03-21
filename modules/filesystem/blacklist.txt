@@ -1,0 +1,391 @@
+# ============================================================
+# PowerShell MCP Blacklist (LLM-Safe, Non-Bulk Edition)
+#
+# Goal:
+# - Allow single-file operations (delete, copy, move, edit)
+# - Block bulk, recursive, wildcard, system-wide, or hidden mass actions
+# - Block execution, persistence, privilege escalation, and obfuscation
+#
+# Matching:
+# - Case-insensitive
+# - Glob-style patterns
+# - Blacklist checked BEFORE whitelist
+# ============================================================
+
+
+# ------------------------------------------------------------
+# BULK / RECURSIVE OPERATIONS (primary risk)
+# ------------------------------------------------------------
+
+# Recursion flags (any cmdlet)
+*-recurse*
+*-r *
+
+# Wildcards (bulk targets)
+*\**
+*\*.*
+
+# Comma-separated targets (multiple items)
+*,*
+* , *
+
+
+# ------------------------------------------------------------
+# BULK DESTRUCTIVE FILE OPERATIONS
+# (single-item delete is allowed)
+# ------------------------------------------------------------
+
+# Remove / delete with bulk indicators
+*remove-item*recurse*
+*remove-item*\**
+*rm *\**
+*del *\**
+*erase *\**
+
+# Directory wipes
+clear-content*\**
+clear-item*\**
+rmdir*\**
+rd*\**
+
+
+# ------------------------------------------------------------
+# BULK WRITE / OVERWRITE OPERATIONS
+# (single-file writes allowed)
+# ------------------------------------------------------------
+
+# Bulk content modification
+set-content*\**
+add-content*\**
+out-file*\**
+set-content*,*
+add-content*,*
+out-file*,*
+
+# Bulk copy / move
+copy-item*\**
+move-item*\**
+copy-item*,*
+move-item*,*
+
+
+# ------------------------------------------------------------
+# SYSTEM PATH PROTECTION (mass-impact prevention)
+# ------------------------------------------------------------
+
+# Block bulk ops in sensitive locations
+*\\windows\\*\**
+*\\system32\\*\**
+*\\program files\\*\**
+*\\programdata\\*\**
+
+# Direct system root targeting
+*system32*
+*\\windows\\system*
+
+
+# ------------------------------------------------------------
+# PROCESS, SERVICE, AND EXECUTION CONTROL
+# ------------------------------------------------------------
+
+# Process termination
+stop-process*
+kill*
+taskkill*
+
+# Service manipulation
+stop-service*
+restart-service*
+set-service*
+new-service*
+remove-service*
+
+# Code execution / loaders
+start-process*
+iex*
+invoke-expression*
+start-job*
+new-object system.diagnostics*
+new-object system.net*
+
+
+# ------------------------------------------------------------
+# REMOTE / PERSISTENCE / AUTOMATION
+# ------------------------------------------------------------
+
+# Remote execution
+invoke-command*
+enter-pssession*
+new-pssession*
+
+# Scheduled tasks
+register-scheduledtask*
+new-scheduledtask*
+set-scheduledtask*
+unregister-scheduledtask*
+
+
+# ------------------------------------------------------------
+# USER, PERMISSION, AND SECURITY CHANGES
+# ------------------------------------------------------------
+
+# Local users / groups
+new-localuser*
+remove-localuser*
+set-localuser*
+add-localgroupmember*
+remove-localgroupmember*
+net user*
+net localgroup*
+
+# ACL / ownership manipulation
+takeown*
+icacls*
+cacls*
+
+# Execution policy & file blocking
+set-executionpolicy*
+unblock-file*
+
+
+# ------------------------------------------------------------
+# DISK, BOOT, AND LOW-LEVEL SYSTEM CONTROL
+# ------------------------------------------------------------
+
+format-volume*
+clear-disk*
+initialize-disk*
+remove-partition*
+diskpart*
+bcdedit*
+format.com*
+
+
+# ------------------------------------------------------------
+# REGISTRY (bulk or sensitive hives)
+# ------------------------------------------------------------
+
+*reg delete*
+*reg add*
+remove-item*hk*
+set-item*hk*
+new-item*hk*
+
+
+# ------------------------------------------------------------
+# OBFUSCATION / BYPASS TECHNIQUES
+# ------------------------------------------------------------
+
+# Encoded or hidden payloads
+*-encodedcommand*
+*-enc *
+*frombase64string*
+*[system.*]::*
+
+# WMI execution
+*win32_process*create*
+*win32_service*
+invoke-wmimethod*
+
+
+# ------------------------------------------------------------
+# POWER CONTROL / SESSION TERMINATION
+# ------------------------------------------------------------
+
+shutdown*
+restart-computer*
+stop-computer*
+logoff*
+
+
+# ============================================================
+# LINUX / BASH SECTION
+# ============================================================
+
+
+# ------------------------------------------------------------
+# BULK / RECURSIVE DESTRUCTION
+# ------------------------------------------------------------
+
+# rm with force+recursive (the classic footgun)
+rm -rf*
+rm -fr*
+rm --recursive*
+rm --force*
+
+# Find-based mass delete
+find * -delete*
+find * -exec rm*
+find * -exec sh*
+find * -exec bash*
+
+# Overwrite disk / partitions
+dd if=*
+shred *
+wipe *
+
+
+# ------------------------------------------------------------
+# SHELL INJECTION / REMOTE CODE EXECUTION
+# ------------------------------------------------------------
+
+# Pipe into shell (curl | bash, wget | sh, etc.)
+*| bash*
+*| sh*
+*| python*
+*| perl*
+*| ruby*
+
+# Download and execute
+curl * bash*
+wget * bash*
+curl *-o* && *
+wget *-o* && *
+
+# Eval / exec patterns
+eval *
+exec *
+
+# Here-string execution
+bash -c *
+sh -c *
+
+
+# ------------------------------------------------------------
+# PRIVILEGE ESCALATION
+# ------------------------------------------------------------
+
+sudo *
+su *
+doas *
+pkexec *
+newgrp *
+chmod +s*
+chown root*
+
+# Setuid tricks
+chmod 4*
+chmod 6*
+
+
+# ------------------------------------------------------------
+# PERSISTENCE / CRON / INIT
+# ------------------------------------------------------------
+
+crontab *
+*> /etc/cron*
+*> /etc/rc*
+*> /etc/init*
+*> /etc/systemd*
+systemctl enable*
+systemctl disable*
+systemctl mask*
+chkconfig *
+update-rc.d *
+
+
+# ------------------------------------------------------------
+# USER AND GROUP MANIPULATION
+# ------------------------------------------------------------
+
+useradd *
+usermod *
+userdel *
+groupadd *
+groupmod *
+groupdel *
+passwd *
+chpasswd *
+gpasswd *
+
+
+# ------------------------------------------------------------
+# NETWORK / FIREWALL CHANGES
+# ------------------------------------------------------------
+
+iptables *
+nft *
+ufw *
+firewall-cmd *
+ip rule *
+ip route *
+ifconfig * down
+ifconfig * up
+ip link set * down
+ip link set * up
+
+
+# ------------------------------------------------------------
+# SYSTEM PATHS (direct writes)
+# ------------------------------------------------------------
+
+*> /etc/*
+*> /usr/*
+*> /bin/*
+*> /sbin/*
+*> /lib/*
+*> /boot/*
+*> /proc/*
+*> /sys/*
+*>> /etc/*
+*>> /usr/*
+*>> /bin/*
+*>> /sbin/*
+
+# Package managers (system-wide installs)
+apt install*
+apt-get install*
+apt remove*
+apt-get remove*
+pacman -S *
+pacman -R *
+dnf install*
+dnf remove*
+yum install*
+yum remove*
+
+
+# ------------------------------------------------------------
+# DISK / FILESYSTEM
+# ------------------------------------------------------------
+
+mkfs*
+fsck*
+mount *
+umount *
+fdisk *
+parted *
+mkswap *
+swapon *
+swapoff *
+
+
+# ------------------------------------------------------------
+# OBFUSCATION / BYPASS
+# ------------------------------------------------------------
+
+# Base64 decode-and-run
+*base64 -*d* | *
+*base64 --decode* | *
+
+# Python/perl one-liners used as shells
+python* -c *import os*
+python* -c *subprocess*
+perl* -e *system*
+perl* -e *exec*
+
+# /dev/tcp shell
+*>/dev/tcp/*
+*</dev/tcp/*
+
+
+# ------------------------------------------------------------
+# POWER / REBOOT
+# ------------------------------------------------------------
+
+shutdown *
+reboot*
+halt*
+poweroff*
+init 0*
+init 6*

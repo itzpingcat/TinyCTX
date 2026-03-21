@@ -4,42 +4,42 @@ modules/filesystem/__main__.py
 Registers filesystem tools (shell, view, create_file, str_replace) into the
 agent loop's tool_handler. No imports from utils or contracts — everything
 arrives through the agent argument.
+
+Shell execution is delegated to shell.py, which handles platform detection,
+blacklist enforcement, and subprocess dispatch.
 """
 from __future__ import annotations
 
-import subprocess
+import logging
 from pathlib import Path
+
+from modules.filesystem.shell import load_blacklist, run_command
+
+logger = logging.getLogger(__name__)
 
 
 def register(agent) -> None:
     workspace = Path(agent.config.workspace.path).expanduser().resolve()
     workspace.mkdir(parents=True, exist_ok=True)
-    
-    shell_timeout = getattr(agent.config, 'shell_timeout', 60)
+
+    shell_timeout: int = getattr(agent.config, 'shell_timeout', 60)
+
+    # Load blacklist once at register time. Restart to pick up edits.
+    blacklist = load_blacklist()
+
     def resolve(raw: str) -> Path:
         p = Path(raw)
         return p if p.is_absolute() else workspace / p
 
     def shell(command: str) -> str:
         """Run a shell command in the workspace. Returns stdout, stderr, and exit code.
+        On Linux/macOS runs via bash. On Windows runs via PowerShell.
+        Blocked commands return an error string without executing.
 
         Args:
             command: The shell command to run.
         """
-        try:
-            result = subprocess.run(
-                command, shell=True, cwd=workspace,
-                capture_output=True, text=True, timeout=shell_timeout,
-            )
-            parts = []
-            if result.stdout: parts.append(result.stdout.rstrip())
-            if result.stderr: parts.append(f"[stderr]\n{result.stderr.rstrip()}")
-            if result.returncode != 0: parts.append(f"[exit {result.returncode}]")
-            return "\n".join(parts) if parts else "[no output]"
-        except subprocess.TimeoutExpired:
-            return "[error: timed out after 60s]"
-        except Exception as e:
-            return f"[error: {e}]"
+        return run_command(command, cwd=workspace, timeout=shell_timeout, blacklist=blacklist)
 
     def view(path: str, view_range: list = None) -> str:
         """Read a file with line numbers, or list a directory.
