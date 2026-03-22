@@ -350,19 +350,27 @@ class AgentLoop:
     # ------------------------------------------------------------------
 
     def reset(self) -> None:
-        """Hard reset — wipe current session JSON from disk and clear in-memory context."""
-        safe_key = str(self.session_key).replace(":", "_")
-        path = Path("sessions") / safe_key / f"{self._session_version}.json"
-        if path.exists():
-            try:
-                path.unlink()
-                logger.info("[%s] deleted session v%d from disk", self.session_key, self._session_version)
-            except Exception as exc:
-                logger.warning("[%s] failed to delete session JSON: %s", self.session_key, exc)
+        """Hard reset — clear in-memory context and overwrite session JSON with empty dialogue."""
         self.context.clear()
         self._turn_count = 0
-        self._session_version += 1
-        logger.info("[%s] context reset (now v%d)", self.session_key, self._session_version)
+        # Overwrite the current session file with empty dialogue
+        safe_key = str(self.session_key).replace(":", "_")
+        sessions_dir = Path("sessions") / safe_key
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+        path = sessions_dir / f"{self._session_version}.json"
+        try:
+            data = {
+                "session_key": str(self.session_key),
+                "version":     self._session_version,
+                "turn":        0,
+                "saved_at":    time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "dialogue":    [],
+            }
+            path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+            logger.info("[%s] reset session v%d on disk", self.session_key, self._session_version)
+        except Exception as exc:
+            logger.warning("[%s] failed to write reset session JSON: %s", self.session_key, exc)
+        logger.info("[%s] context reset (v%d)", self.session_key, self._session_version)
 
     def next_session(self) -> None:
         """Archive current session JSON and start a fresh version."""
