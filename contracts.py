@@ -27,6 +27,13 @@ class ContentType(str, Enum):
     TEXT = "text"
 
 
+class AttachmentKind(str, Enum):
+    IMAGE    = "image"     # image/* — inline as image_url block (vision models)
+    TEXT     = "text"      # text/*, .md, .py, .json etc. — read + inline as text
+    DOCUMENT = "document"  # .pdf — Anthropic document block or text-extracted
+    BINARY   = "binary"    # everything else — reference only, saved to uploads/
+
+
 class ChatType(str, Enum):
     DM      = "dm"       # 1-on-1 — session shared across platforms
     GROUP   = "group"    # group/public chat — session is platform-specific
@@ -85,6 +92,27 @@ class UserIdentity:
 
 
 # ---------------------------------------------------------------------------
+# Attachments
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Attachment:
+    """
+    A file attached to an inbound message.
+    Bridges populate this; attachments.py decides how to deliver it to the LLM.
+
+    filename  — original filename (used for extension sniffing and uploads/ path)
+    data      — raw bytes
+    mime_type — MIME type as reported by the bridge (e.g. 'image/png', 'application/pdf')
+    kind      — classified by attachments.py after construction
+    """
+    filename:  str
+    data:      bytes
+    mime_type: str
+    kind:      AttachmentKind = AttachmentKind.BINARY
+
+
+# ---------------------------------------------------------------------------
 # Inbound message envelope
 # ---------------------------------------------------------------------------
 
@@ -100,6 +128,7 @@ class InboundMessage:
     message_id:   str
     timestamp:    float
     reply_to_id:  str | None = None
+    attachments:  tuple["Attachment", ...] = field(default_factory=tuple)
     trace_id:     str = field(default_factory=lambda: str(uuid.uuid4()))
 
 

@@ -54,6 +54,7 @@ Path safety for workspace files:
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import time
@@ -64,7 +65,7 @@ from aiohttp import web
 from config import GatewayConfig
 from contracts import (
     Platform, ContentType,
-    SessionKey, UserIdentity, InboundMessage,
+    SessionKey, UserIdentity, InboundMessage, Attachment,
     AgentTextChunk, AgentTextFinal, AgentToolCall, AgentToolResult, AgentError,
 )
 
@@ -141,20 +142,41 @@ async def handle_message(request: web.Request) -> web.StreamResponse:
     do_stream    = bool(body.get("stream", True))
     session_type = body.get("session_type", "dm")
 
-    if not text:
+    if not text and not body.get("attachments"):
         raise web.HTTPBadRequest(
             content_type="application/json",
-            body=json.dumps({"error": "text is required"}),
+            body=json.dumps({"error": "text or attachments is required"}),
         )
+
+    # Parse attachments: [{"name": str, "data_b64": str, "mime_type": str}, ...]
+    raw_atts = body.get("attachments") or []
+    attachments: tuple[Attachment, ...] = ()
+    if raw_atts:
+        parsed = []
+        for item in raw_atts:
+            try:
+                data = base64.b64decode(item["data_b64"])
+            except Exception:
+                raise web.HTTPBadRequest(
+                    content_type="application/json",
+                    body=json.dumps({"error": f"invalid base64 in attachment '{item.get('name', '?')}'"}),
+                )
+            parsed.append(Attachment(
+                filename=item.get("name", "file"),
+                data=data,
+                mime_type=item.get("mime_type", "application/octet-stream"),
+            ))
+        attachments = tuple(parsed)
 
     sk = _session_key(session_id, session_type)
     msg = InboundMessage(
         session_key=sk,
         author=_API_AUTHOR,
-        content_type=ContentType.TEXT,
+        content_type=ContentType.TEXT if not attachments else ContentType.MIXED,
         text=text,
         message_id=str(time.time_ns()),
         timestamp=time.time(),
+        attachments=attachments,
     )
 
     if do_stream:

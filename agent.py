@@ -50,6 +50,7 @@ from context import Context, HistoryEntry, HOOK_PRE_ASSEMBLE_ASYNC
 from config import Config, ModelConfig
 from ai import LLM, TextDelta, ToolCallAssembled, LLMError
 from utils.tool_handler import ToolCallHandler
+from utils.attachments import build_content_blocks
 
 logger = logging.getLogger(__name__)
 
@@ -171,7 +172,20 @@ class AgentLoop:
         )
 
         # Stage 1: Intake
-        self.context.add(HistoryEntry.user(msg.text))
+        # If the message has attachments, build a content block list;
+        # otherwise just use the plain text string.
+        if msg.attachments:
+            primary_cfg = self.config.get_model_config(self.config.llm.primary)
+            user_content = build_content_blocks(
+                text=msg.text,
+                attachments=msg.attachments,
+                model_cfg=primary_cfg,
+                att_cfg=self.config.attachments,
+                workspace=self.config.workspace.path,
+            )
+        else:
+            user_content = msg.text
+        self.context.add(HistoryEntry.user(user_content))
 
         max_cycles = self.config.max_tool_cycles
         final_text = ""
@@ -355,9 +369,12 @@ class AgentLoop:
             data = json.loads(path.read_text(encoding="utf-8"))
             self._turn_count = data.get("turn", 0)
             for raw in data.get("dialogue", []):
+                # content may be a str (plain text) or list (content blocks with
+                # images/attachments) — preserve whichever was serialised.
+                raw_content = raw.get("content", "")
                 entry = HistoryEntry(
                     role=raw["role"],
-                    content=raw.get("content", ""),
+                    content=raw_content if isinstance(raw_content, (str, list)) else str(raw_content),
                     id=raw.get("id", ""),
                     index=raw.get("index", 0),
                     tool_calls=raw.get("tool_calls") or [],

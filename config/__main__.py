@@ -28,6 +28,11 @@ class ModelConfig:
     budget_tokens:    int | None = None   # Anthropic extended thinking: budget_tokens > 0
     reasoning_effort: str | None = None   # OpenAI-compat: "low" | "medium" | "high"
     cache_prompts:    bool        = False  # Anthropic prompt caching on last system message
+    vision:           bool        = False  # True = model accepts image_url content blocks
+
+    @property
+    def supports_vision(self) -> bool:
+        return self.vision
 
     @property
     def api_key(self) -> str:
@@ -43,6 +48,24 @@ class ModelConfig:
     @property
     def is_embedding(self) -> bool:
         return self.kind.lower() == "embedding"
+
+
+@dataclass
+class AttachmentConfig:
+    """
+    Thresholds that control whether attachments are inlined into the
+    LLM message or saved to workspace/uploads/ with a reference note.
+
+    Configured via the top-level 'attachments:' key in config.yaml:
+
+        attachments:
+          inline_max_files: 3        # max number of files to inline per message
+          inline_max_bytes: 204800   # max total bytes to inline (~200 KB)
+          uploads_dir: uploads       # relative to workspace root
+    """
+    inline_max_files: int = 3
+    inline_max_bytes: int = 200 * 1024   # 200 KB
+    uploads_dir:      str = "uploads"
 
 
 @dataclass
@@ -137,6 +160,7 @@ class Config:
     logging:         LoggingConfig           = field(default_factory=LoggingConfig)
     max_tool_cycles: int                     = 10
     context:         int                     = 16384
+    attachments:     AttachmentConfig        = field(default_factory=AttachmentConfig)
     # Catch-all for unknown top-level keys (e.g. mcp:, custom module config, etc.)
     # Modules access this via agent.config.extra.get("mcp", {})
     extra:           dict                    = field(default_factory=dict)
@@ -188,6 +212,7 @@ def _parse_model(raw: dict) -> ModelConfig:
     kind = raw.get("kind", "chat").lower()
     if kind not in ("chat", "embedding"):
         raise ValueError(f"Model kind must be 'chat' or 'embedding', got '{kind}'")
+    vision = bool(raw.get("vision", False))
     reasoning_effort = raw.get("reasoning_effort")
     if reasoning_effort is not None and reasoning_effort not in ("low", "medium", "high"):
         raise ValueError(
@@ -210,13 +235,14 @@ def _parse_model(raw: dict) -> ModelConfig:
         budget_tokens=budget_tokens,
         reasoning_effort=reasoning_effort,
         cache_prompts=bool(raw.get("cache_prompts", False)),
+        vision=vision,
     )
 
 
 # Known top-level keys — everything else goes into Config.extra
 _KNOWN_KEYS = {
     "models", "llm", "router", "bridges", "gateway", "workspace",
-    "logging", "max_tool_cycles", "context",
+    "logging", "max_tool_cycles", "context", "attachments",
 }
 
 
@@ -298,6 +324,14 @@ def load(path="config.yaml") -> Config:
         api_key=gw_raw.get("api_key", ""),
     )
 
+    # ------------------------------------------------------------------ attachments
+    att_raw = raw.get("attachments", {})
+    attachments = AttachmentConfig(
+        inline_max_files=int(att_raw.get("inline_max_files", 3)),
+        inline_max_bytes=int(att_raw.get("inline_max_bytes", 200 * 1024)),
+        uploads_dir=att_raw.get("uploads_dir", "uploads"),
+    )
+
     # ------------------------------------------------------------------ extra
     extra = {k: v for k, v in raw.items() if k not in _KNOWN_KEYS}
 
@@ -314,6 +348,7 @@ def load(path="config.yaml") -> Config:
         logging=LoggingConfig(level=log_raw.get("level", "INFO")),
         max_tool_cycles=int(raw.get("max_tool_cycles", 10)),
         context=int(raw.get("context", 16384)),
+        attachments=attachments,
         extra=extra,
     )
 

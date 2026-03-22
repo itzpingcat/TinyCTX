@@ -75,16 +75,26 @@ class HistoryEntry:
     One turn in the conversation. Covers all four roles.
     tool_calls is populated for assistant turns that invoked tools.
     tool_call_id is populated for tool result turns.
+
+    content may be:
+      str        — plain text (the common case)
+      list[dict] — OpenAI-compat content block list, used when the user
+                   message includes image or file attachments.
+                   Blocks follow the format:
+                     {"type": "text", "text": "..."}
+                     {"type": "image_url", "image_url": {"url": "data:..."}}
+                   Only user-role entries ever carry a list; assistant / tool
+                   / system entries always use plain strings.
     """
     role:         str
-    content:      str
+    content:      str | list     # str for most roles; list[dict] for user+attachments
     id:           str            = field(default_factory=lambda: str(uuid.uuid4()))
     index:        int            = 0     # position in dialogue; set by Context.add()
     tool_calls:   list[dict]     = field(default_factory=list)
     tool_call_id: str | None     = None
 
     @staticmethod
-    def user(content: str) -> HistoryEntry:
+    def user(content: str | list) -> HistoryEntry:
         return HistoryEntry(role=ROLE_USER, content=content)
 
     @staticmethod
@@ -333,8 +343,12 @@ class Context:
 
     def _count_tokens(self, messages: list[dict], tools: list[dict] | None = None) -> int:
         tool_chars = len(json.dumps(tools)) if tools else 0
+        def _content_len(c) -> int:
+            if isinstance(c, list):
+                return sum(len(json.dumps(b)) for b in c)
+            return len(str(c or ""))
         return (sum(
-            len(str(m.get("content", ""))) +
+            _content_len(m.get("content", "")) +
             len(json.dumps(m.get("tool_calls", [])))
             for m in messages
         ) + tool_chars) // 4
@@ -407,19 +421,23 @@ class Context:
             if result is not None:
                 messages = result
 
-        # Merge adjacent same-role non-tool messages
+        # Merge adjacent same-role non-tool messages.
+        # Only merge when both sides have plain-string content — never merge
+        # content-block lists (they may contain images that must stay distinct).
         merged: list[dict] = []
         for m in messages:
-            if (
-                merged
-                and m["role"] == merged[-1]["role"]
+            prev = merged[-1] if merged else None
+            can_merge = (
+                prev is not None
+                and m["role"] == prev["role"]
                 and m["role"] in (ROLE_USER, ROLE_ASSISTANT)
                 and not m.get("tool_calls")
-                and not merged[-1].get("tool_calls")
-            ):
-                merged[-1]["content"] = (
-                    merged[-1]["content"] + "\n\n" + m["content"]
-                ).strip()
+                and not prev.get("tool_calls")
+                and isinstance(m.get("content"), str)
+                and isinstance(prev.get("content"), str)
+            )
+            if can_merge:
+                prev["content"] = (prev["content"] + "\n\n" + m["content"]).strip()
             else:
                 merged.append(dict(m))
 

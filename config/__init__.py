@@ -11,4 +11,5 @@ from config.__main__ import (
     GatewayConfig,
     WorkspaceConfig,
     LoggingConfig,
+    AttachmentConfig,
 )
