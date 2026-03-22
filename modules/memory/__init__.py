@@ -56,5 +56,19 @@ EXTENSION_META = {
         "auto_inject": True,
         # System prompt priority for the injected block (after MEMORY.md at 20).
         "search_priority": 25,
+
+        # --- Context nudge ---
+        # Inject a reminder to write important info to memory when the tokens
+        # accumulated *since the last nudge* exceed this fraction of the context
+        # window. Tracks delta, not absolute fill, so the nudge recurs only when
+        # enough new content has arrived since the agent last saved.
+        # Set to 0.0 to disable nudging entirely.
+        "nudge_threshold": 0.80,
+        # The nudge message injected as a user turn at the end of the context.
+        "nudge_message": (
+            "Your context window is getting full. "
+            "Please write any important information, decisions, or ongoing tasks "
+            "to memory/session-{date}.md or MEMORY.md before continuing."
+        ),
     },
 }

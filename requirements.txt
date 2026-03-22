@@ -6,8 +6,9 @@ playwright
 duckduckgo-search
 mcp
 prompt_toolkit
-sqlite3
 numpy
 tiktoken
 structlog
 tenacity
+discord.py
+matrix-nio

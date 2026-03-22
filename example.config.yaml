@@ -1,5 +1,5 @@
-# config.yaml — Safe to commit. No secrets.
-# API keys live in environment variables named by each model's api_key_env.
+# example.config.yaml — Full configuration reference. Safe to commit (no secrets).
+# Copy to config.yaml and edit. API keys live in environment variables only.
 
 context: 16384
 
@@ -81,18 +81,108 @@ workspace:
 
 # ---------------------------------------------------------------------------
 # bridges:
+#
+# Only bridges with enabled: true are loaded at startup.
+# Each bridge reads its token/password from an environment variable —
+# never put credentials directly in config.yaml.
+#
+# Options specific to each bridge live under the bridge's `options:` key.
 # ---------------------------------------------------------------------------
 bridges:
+  # --------------------------------------------------------------------------
+  # CLI bridge — interactive terminal session.
+  # No extra options needed.
+  # --------------------------------------------------------------------------
   cli:
     enabled: true
 
+  # --------------------------------------------------------------------------
+  # Discord bridge
+  #
+  # Required setup:
+  #   1. Create a bot at https://discord.com/developers/applications
+  #   2. Enable "Message Content Intent" and "Server Members Intent"
+  #      under Bot → Privileged Gateway Intents
+  #   3. export DISCORD_BOT_TOKEN=your-token-here
+  #
+  # Invite URL scopes: bot
+  # Invite URL permissions: Read Messages, Send Messages, Read Message History
+  #
+  # Finding your user ID:
+  #   Enable Developer Mode in Discord (Settings → Advanced → Developer Mode),
+  #   then right-click your username and select "Copy User ID".
+  #
+  # Options:
+  #   token_env        Env var holding the bot token. Default: DISCORD_BOT_TOKEN
+  #   allowed_users    Allowlist of Discord user IDs (integers). Only these users
+  #                    can interact with the bot. Empty = open to everyone
+  #                    (NOT recommended if the bot has tool access).
+  #   dm_enabled       Allow DMs to the bot. Default: true
+  #   guild_ids        Whitelist of guild IDs (integers). Empty = all guilds.
+  #   prefix_required  In guild channels, only respond when @mentioned or when
+  #                    the message starts with command_prefix. Default: true
+  #   command_prefix   Text prefix that triggers the bot in guild channels.
+  #                    Default: "!"
+  #   max_reply_length Max characters per Discord message before chunking.
+  #                    Default: 1900 (stays under Discord's 2000-char limit)
+  #   typing_indicator Show "Bot is typing..." while the agent is running.
+  #                    Default: true
+  # --------------------------------------------------------------------------
   discord:
     enabled: false
+    options:
+      token_env: DISCORD_BOT_TOKEN
+      allowed_users: []           # e.g. [123456789012345678, 987654321098765432]
+      dm_enabled: true
+      guild_ids: []               # e.g. [123456789012345678]
+      prefix_required: true
+      command_prefix: "!"
+      max_reply_length: 1900
+      typing_indicator: true
 
+  # --------------------------------------------------------------------------
+  # Matrix bridge
+  #
+  # Required setup:
+  #   1. pip install matrix-nio  (or matrix-nio[e2e] for E2EE support)
+  #   2. export MATRIX_PASSWORD=your-password-here
+  #
+  # Finding your MXID:
+  #   Your full Matrix ID is shown in your client under Settings → Profile,
+  #   in the format @username:homeserver.tld
+  #
+  # Options:
+  #   homeserver       Full URL of your homeserver.
+  #   username         Full Matrix ID of the bot account (@bot:server.tld).
+  #   password_env     Env var holding the account password. Default: MATRIX_PASSWORD
+  #   device_name      Device label shown in account sessions. Default: TinyCTX
+  #   store_path       nio key store path, relative to workspace. Default: matrix_store
+  #   allowed_users    Allowlist of full MXIDs (@user:server.tld). Only these users
+  #                    can interact with the bot. Empty = open to everyone
+  #                    (NOT recommended if the bot has tool access).
+  #   dm_enabled       Respond in 1-on-1 rooms. Default: true
+  #   room_ids         Whitelist of room IDs. Empty = all joined rooms.
+  #   prefix_required  In group rooms, only respond when @mentioned or prefixed.
+  #                    Default: true
+  #   command_prefix   Default: "!"
+  #   max_reply_length Default: 16000
+  #   sync_timeout_ms  Long-poll timeout per /sync call. Default: 30000
+  # --------------------------------------------------------------------------
   matrix:
     enabled: false
-    homeserver: https://matrix.org
-    username: "@yourbot:matrix.org"
+    options:
+      homeserver: https://matrix.org
+      username: "@yourbot:matrix.org"
+      password_env: MATRIX_PASSWORD
+      device_name: TinyCTX
+      store_path: matrix_store
+      allowed_users: []           # e.g. ["@you:matrix.org", "@friend:matrix.org"]
+      dm_enabled: true
+      room_ids: []
+      prefix_required: true
+      command_prefix: "!"
+      max_reply_length: 16000
+      sync_timeout_ms: 30000
 
 # ---------------------------------------------------------------------------
 # memory_search:  (extra key — consumed by modules/memory)

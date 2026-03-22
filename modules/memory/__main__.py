@@ -36,7 +36,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from context import HOOK_PRE_ASSEMBLE_ASYNC
+from context import HOOK_PRE_ASSEMBLE_ASYNC, HistoryEntry
 
 logger = logging.getLogger(__name__)
 
@@ -249,6 +249,44 @@ def register(agent) -> None:
         _pre_assemble_async,
         priority=0,
     )
+
+    # ------------------------------------------------------------------
+    # 3b. Context nudge — recurs on delta, not absolute fill
+    # ------------------------------------------------------------------
+
+    nudge_threshold = float(cfg.get("nudge_threshold", 0.80))
+    nudge_message   = cfg.get("nudge_message", "")
+
+    if nudge_threshold > 0.0 and nudge_message:
+        token_limit = agent.config.context
+        nudge_delta = int(nudge_threshold * token_limit)
+
+        async def _nudge_hook(ctx) -> None:
+            tokens_now      = ctx.state.get("tokens_used", 0)
+            tokens_at_nudge = ctx.state.get("memory_nudge_tokens_at_last", 0)
+
+            if tokens_now - tokens_at_nudge >= nudge_delta:
+                import datetime
+                date_str = datetime.date.today().strftime("%d-%m-%Y")
+                msg = nudge_message.format(date=date_str)
+                ctx.dialogue.append(HistoryEntry.user(msg))
+                ctx.state["memory_nudge_tokens_at_last"] = tokens_now
+                logger.info(
+                    "[memory] nudge injected (delta %d/%d tokens since last nudge)",
+                    tokens_now - tokens_at_nudge, nudge_delta,
+                )
+
+        agent.context.register_hook(
+            HOOK_PRE_ASSEMBLE_ASYNC,
+            _nudge_hook,
+            priority=100,  # run after search (priority=0)
+        )
+        logger.info(
+            "[memory] context nudge enabled — threshold %.0f%% delta (%d tokens)",
+            nudge_threshold * 100, nudge_delta,
+        )
+    else:
+        logger.info("[memory] context nudge disabled")
 
     # ------------------------------------------------------------------
     # 4. Auto-inject prompt provider
