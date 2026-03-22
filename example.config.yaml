@@ -73,11 +73,11 @@ workspace:
 # ---------------------------------------------------------------------------
 # gateway:  (HTTP/SSE API — enable to allow external clients)
 # ---------------------------------------------------------------------------
-# gateway:
-#   enabled: true
-#   host: 127.0.0.1
-#   port: 8080
-#   api_key: "your-secret-token"
+gateway:
+  enabled: true
+  host: 127.0.0.1
+  port: 8080
+  api_key: "your-secret-token"
 
 # ---------------------------------------------------------------------------
 # bridges:

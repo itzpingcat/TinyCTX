@@ -1,7 +1,8 @@
 import json
 import inspect
+import math
+import re
 from typing import Dict, Any, Callable, List, Optional
-from datetime import datetime
 
 class ToolCallHandler:
     def __init__(self):
@@ -105,24 +106,30 @@ class ToolCallHandler:
         Args:
             query: Keyword or description of the capability you're looking for.
         """
-        q = query.lower()
-        matches = [
-            name for name, tool in self.tools.items()
-            if name not in self.enabled
-            and (q in name.lower() or q in tool['description'].lower())
-        ]
-        self.enabled.update(matches)
-        if not matches:
-            # Also report what's already enabled that matched, for context
-            already = [
-                name for name, tool in self.tools.items()
-                if name in self.enabled
-                and (q in name.lower() or q in tool['description'].lower())
-            ]
+        from utils.bm25 import BM25
+
+        corpus = {
+            name: f"{name.replace('_', ' ')} {tool['description']}"
+            for name, tool in self.tools.items()
+        }
+        if not corpus:
+            return "No tools found matching that query."
+
+        bm25   = BM25(corpus)
+        scored = bm25.search(query, top_k=len(corpus))
+        # Only surface results with a positive BM25 score
+        hits   = [name for name, score in scored if score > 0.0]
+
+        new     = [n for n in hits if n not in self.enabled]
+        already = [n for n in hits if n in self.enabled]
+
+        self.enabled.update(new)
+
+        if not new:
             if already:
                 return f"No new tools found. Already enabled: {', '.join(already)}"
             return "No tools found matching that query."
-        return f"Enabled: {', '.join(matches)}"
+        return f"Enabled: {', '.join(new)}"
 
     def get_tool_definitions(self) -> List[Dict[str, Any]]:
         definitions = []

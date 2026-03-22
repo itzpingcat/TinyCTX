@@ -53,7 +53,8 @@ main.py
 | `agent.py` | The 6-stage loop. Owns `Context`, `ToolCallHandler`, and LLM pool. Yields `AgentEvent` stream. Skips embedding models when building LLM pool. Stage 1 calls `build_content_blocks` when `msg.attachments` is non-empty. |
 | `context.py` | Dialogue history + hook pipeline. Sync stages: `pre_assemble`, `filter_turn`, `transform_turn`, `post_assemble`. Async stage: `HOOK_PRE_ASSEMBLE_ASYNC` (awaited by agent before each `assemble()` call). Smart `delete()` / `edit()` / `strip_tool_calls()` for dialogue mutation. `HistoryEntry.content` is `str \| list` — list for user turns with attachments. |
 | `ai.py` | Async OpenAI-compatible clients. `LLM` streams SSE → `TextDelta` / `ToolCallAssembled` / `LLMError`. Retries on `ClientConnectionError` (3 attempts, exp backoff via tenacity). `Embedder` calls `/v1/embeddings`, auto-batches, numpy fast-path. |
-| `utils/tool_handler.py` | Registers Python functions (sync or async) as LLM tools. Auto-extracts JSON schema from type hints + docstring `Args:` block. |
+| `utils/tool_handler.py` | Registers Python functions (sync or async) as LLM tools. Auto-extracts JSON schema from type hints + docstring `Args:` block. Maintains an `enabled` set — only enabled tools are sent to the LLM. Deferred tools live in `self.tools` but not `self.enabled`; the agent discovers them via `tools_search`. |
+| `utils/bm25.py` | Pure-stdlib in-memory Okapi BM25. Used by `tools_search` to rank tool names+descriptions against a query. Tokeniser splits on underscores/hyphens so `web_search` matches query `"search"`. |
 | `utils/attachments.py` | Attachment classification, saving, and LLM content-block assembly. Pure utility — no tools, hooks, or prompts. Called by bridges and the gateway. |
 
 **Session identity:**
@@ -264,7 +265,7 @@ GET    /v1/health                          status, uptime_s, per-session queue_d
 
 1. Create `modules/<n>/__init__.py` (holds `EXTENSION_META` with `default_config`) and `modules/<n>/__main__.py`.
 2. Expose `register(agent)` in `__main__.py`.
-3. Wire tools: `agent.tool_handler.register_tool(fn)` — sync or async functions both work.
+3. Wire tools: `agent.tool_handler.register_tool(fn, always_on=False)` — sync or async functions both work. Pass `always_on=True` for tools that should always appear in the LLM's tool list. Omit it (or pass `False`) for deferred tools that the agent discovers via `tools_search`.
 4. Register sync prompt providers: `agent.context.register_prompt(pid, fn)`.
 5. Register sync hooks: `agent.context.register_hook(stage, fn)`.
 6. Register async pre-assemble hooks: `agent.context.register_hook(HOOK_PRE_ASSEMBLE_ASYNC, async_fn)`.
@@ -297,6 +298,69 @@ Modules must not import from `router.py`, `gateway/`, or any bridge.
 
 ---
 
+## Tool system
+
+`ToolCallHandler` (`utils/tool_handler.py`) has two dicts:
+
+- `self.tools` — all registered tools. Populated at module `register()` time.
+- `self.enabled` — the subset currently sent to the LLM on every call.
+
+**Registration:**
+
+```python
+agent.tool_handler.register_tool(fn, always_on=True)   # always in tool list
+agent.tool_handler.register_tool(fn)                   # deferred — not in tool list until searched
+agent.tool_handler.enable("tool_name")                 # enable programmatically (returns bool)
+```
+
+**`tools_search` (always on):** Registered by `AgentLoop.__init__` before any module loads. The agent calls it to discover and enable deferred tools by keyword. Backed by in-memory BM25 (`utils/bm25.py`) — only tools with a positive BM25 score are enabled. Tool names with underscores/hyphens are split into words before indexing, so `"search"` matches `web_search`.
+
+**Per-module defaults:**
+
+| Module | Always-on tools | Deferred tools |
+|--------|----------------|----------------|
+| `filesystem` | `shell`, `view`, `write_file`, `str_replace` | — |
+| `memory` | `memory_search` | — |
+| `skills` | `use_skill` | — |
+| `web` | `web_search`, `navigate` | `http_request`, `click`, `type_text`, `extract_text`, `extract_html`, `screenshot`, `wait_for`, `manage_browser` |
+| `mcp` | configurable per-tool (see below) | all tools default to deferred |
+| `cron` | `cron_list` | — |
+
+All defaults can be overridden in `config.yaml` per-module under a `tools:` sub-key:
+
+```yaml
+web:
+  tools:
+    http_request: always_on   # promote from deferred
+    screenshot:   disabled    # never register
+
+memory_search:
+  tools:
+    memory_search: deferred   # demote from always_on
+
+skills:
+  tools:
+    use_skill: deferred
+
+mcp:
+  servers:
+    filesystem:
+      command: npx
+      args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+      tools:
+        read_file:   always_on
+        write_file:  deferred
+        delete_file: disabled
+```
+
+**Visibility values:** `always_on` — in every LLM call. `deferred` — registered but hidden until `tools_search` enables it. `disabled` — never registered.
+
+**`get_tool_definitions()`** only returns tools in `self.enabled`. `execute_tool_call()` dispatches via `self.tools` (not `self.enabled`), so a tool enabled mid-turn is callable in the same cycle.
+
+**`reset()` does not clear `enabled`.** The enabled set survives a `/reset` — tools the agent searched for in a prior turn remain enabled for the next session.
+
+---
+
 ## Context mutation
 
 `Context` supports direct dialogue mutation (all methods re-index after changes):
@@ -317,13 +381,13 @@ Token-budget trimming in `assemble()` follows the same rules: assistant turns wi
 | Module | What it does |
 |--------|-------------|
 | `memory` | Static: injects SOUL.md, AGENTS.md, MEMORY.md as system prompts. Dynamic: hybrid BM25+vector search over `workspace/memory/**/*.md` via async pre-assemble hook + `memory_search` tool. Config key: `memory_search:`. |
-| `filesystem` | Tools: `shell`, `view`, `create_file`, `str_replace`. Sandboxed to workspace. Shell execution split into `shell.py` (platform detection, blacklist, subprocess dispatch). On Linux/macOS runs via `bash -c`; on Windows via `powershell -NonInteractive`. Blacklist (`blacklist.txt`, glob patterns, case-insensitive) enforced on both platforms — covers bulk destruction, RCE, privilege escalation, persistence, system path writes, and more. Blocked commands return an error string. Blacklist loaded at `register()` time; restart to reload. |
-| `web` | Tools: `web_search` (DuckDuckGo), `http_request`, `navigate`/`click`/`type_text`/`extract_text`/`extract_html`/`screenshot`/`wait_for` (Playwright), `manage_browser`. |
+| `filesystem` | Tools: `shell`, `view`, `write_file`, `str_replace` — all always-on. Sandboxed to workspace. Shell execution split into `shell.py` (platform detection, blacklist, subprocess dispatch). On Linux/macOS runs via `bash -c`; on Windows via `powershell -NonInteractive`. Blacklist (`blacklist.txt`, glob patterns, case-insensitive) enforced on both platforms — covers bulk destruction, RCE, privilege escalation, persistence, system path writes, and more. Blocked commands return an error string. Blacklist loaded at `register()` time; restart to reload. |
+| `web` | Tools: `web_search` (DuckDuckGo) and `navigate` are always-on. `http_request`, `click`, `type_text`, `extract_text`, `extract_html`, `screenshot`, `wait_for`, `manage_browser` (Playwright) are deferred. |
 | `cron` | Scheduled agent turns. Jobs in `workspace/CRON.json`. Schedule kinds: `every`, `at`, `cron` (requires `croniter`). Tool: `cron_list`. Each job gets its own isolated session (`dm:cron-<id>`). `reset_after_run: true` wipes session context after each run. |
 | `heartbeat` | Periodic timer turns. Agent replies `HEARTBEAT_OK` if nothing needs attention; otherwise triggers a continuation loop. Configurable active hours. |
 | `ctx_tools` | Context pipeline hooks: deduplicates repeated identical tool calls, strips `<think>` CoT blocks from old turns, truncates/trims large tool outputs. |
-| `skills` | agentskills.io standard. Scans configured dirs + `~/.agents/skills/` for `SKILL.md` files, injects a compact index as system prompt, tool: `use_skill(name)`. |
-| `mcp` | stdio MCP server client. Connects at startup, discovers tools, registers them as `mcp__<server>__<tool>`. Config under `mcp.servers:`. Requires `pip install mcp`. |
+| `skills` | agentskills.io standard. Scans configured dirs + `~/.agents/skills/` for `SKILL.md` files, injects a compact index as system prompt, tool: `use_skill(name)` (always-on). |
+| `mcp` | stdio MCP server client. Connects at startup, discovers tools, registers them as `mcp__<server>__<tool>`. All tools deferred by default; configure per-tool visibility under `mcp.servers.<n>.tools:`. Requires `pip install mcp`. |
 
 ---
 

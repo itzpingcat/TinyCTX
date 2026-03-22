@@ -8,6 +8,82 @@ Run with:
 """
 import pytest
 from utils.tool_handler import ToolCallHandler
+from utils.bm25 import BM25, _tokenise
+
+
+# ---------------------------------------------------------------------------
+# BM25 unit tests
+# ---------------------------------------------------------------------------
+
+class TestTokenise:
+    def test_lowercases(self):
+        assert _tokenise("Hello World") == ["hello", "world"]
+
+    def test_splits_underscores(self):
+        assert _tokenise("web_search") == ["web", "search"]
+
+    def test_splits_hyphens(self):
+        assert _tokenise("read-file") == ["read", "file"]
+
+    def test_drops_empty(self):
+        assert "" not in _tokenise("  a  b  ")
+
+    def test_empty_string(self):
+        assert _tokenise("") == []
+
+
+class TestBM25:
+    def _corpus(self):
+        return {
+            "shell":      "Run shell commands in the workspace",
+            "view":       "Read a file with line numbers or list a directory",
+            "web_search": "Search the web for current information",
+            "screenshot": "Take a screenshot of the current browser page",
+        }
+
+    def test_empty_query_returns_empty(self):
+        bm25 = BM25(self._corpus())
+        assert bm25.search("") == []
+
+    def test_exact_name_match(self):
+        bm25 = BM25(self._corpus())
+        hits = bm25.search("shell")
+        assert hits[0][0] == "shell"
+        assert hits[0][1] > 0.0
+
+    def test_description_match(self):
+        bm25 = BM25(self._corpus())
+        hits = bm25.search("read file")
+        assert hits[0][0] == "view"
+
+    def test_no_match_scores_zero(self):
+        bm25 = BM25(self._corpus())
+        hits = bm25.search("zzznomatch")
+        assert all(score == 0.0 for _, score in hits)
+
+    def test_results_sorted_descending(self):
+        bm25 = BM25(self._corpus())
+        hits = bm25.search("search web information")
+        scores = [s for _, s in hits]
+        assert scores == sorted(scores, reverse=True)
+
+    def test_top_k_limits_results(self):
+        bm25 = BM25(self._corpus())
+        hits = bm25.search("the", top_k=2)
+        assert len(hits) <= 2
+
+    def test_underscore_split_enables_partial_name_match(self):
+        """Query 'search' should hit web_search because it tokenises as ['web','search']."""
+        bm25 = BM25(self._corpus())
+        hit_names = {name for name, score in bm25.search("search") if score > 0}
+        assert "web_search" in hit_names
+
+    def test_case_insensitive(self):
+        bm25 = BM25(self._corpus())
+        lower = bm25.search("screenshot")
+        upper = bm25.search("SCREENSHOT")
+        assert lower[0][0] == upper[0][0]
+        assert lower[0][1] == pytest.approx(upper[0][1])
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +226,7 @@ class TestAlwaysOnDeferred:
 
 
 # ---------------------------------------------------------------------------
-# tools_search()
+# tools_search() — BM25-backed
 # ---------------------------------------------------------------------------
 
 class TestToolsSearch:
@@ -169,7 +245,7 @@ class TestToolsSearch:
 
     def test_search_enables_matching_tool(self):
         self._add("web_search", "Search the web for information")
-        result = self.handler.tools_search("web")
+        result = self.handler.tools_search("web search")
         assert "web_search" in self.handler.enabled
         assert "web_search" in result
 
@@ -179,26 +255,47 @@ class TestToolsSearch:
         assert "fetch_page" in self.handler.enabled
 
     def test_search_case_insensitive(self):
+        """BM25 tokeniser lowercases everything so queries are case-insensitive."""
         self._add("screenshot", "Take a screenshot of the page")
         self.handler.tools_search("SCREENSHOT")
         assert "screenshot" in self.handler.enabled
 
     def test_search_no_match_returns_message(self):
+        """A query with no BM25-positive matches returns a no-results message."""
+        self._add("shell", "Run shell commands in the workspace")
         result = self.handler.tools_search("zzznomatch")
         assert "No" in result or "no" in result
+        assert "shell" not in self.handler.enabled
 
     def test_search_skips_already_enabled(self):
-        self._add("already", "Already enabled tool", always_on=True)
-        result = self.handler.tools_search("already")
+        self._add("already", "Already enabled unique tool", always_on=True)
+        result = self.handler.tools_search("already enabled")
         # Should not re-add, should report it's already enabled
-        assert "Already" in result or "already" in result.lower()
+        assert "already" in result.lower()
+        assert "No new" in result or "Already" in result
+
+    def test_search_ranks_best_match_first(self):
+        """The tool most relevant to the query should be enabled."""
+        self._add("read_file", "Read the contents of a file from disk")
+        self._add("web_search", "Search the web for information")
+        self.handler.tools_search("read file contents")
+        assert "read_file" in self.handler.enabled
 
     def test_search_multiple_matches(self):
+        """Both tools sharing query terms should be enabled."""
         self._add("click", "Click an element on the page")
-        self._add("double_click", "Double-click an element")
-        self.handler.tools_search("click")
+        self._add("double_click", "Double click an element on the page")
+        self.handler.tools_search("click element")
         assert "click" in self.handler.enabled
         assert "double_click" in self.handler.enabled
+
+    def test_underscore_names_matched_as_words(self):
+        """web_search is tokenised as ['web', 'search'] so query 'search' hits it."""
+        self._add("web_search", "Search the web for current information")
+        self._add("view", "Read a file with line numbers")
+        self.handler.tools_search("search")
+        assert "web_search" in self.handler.enabled
+        assert "view" not in self.handler.enabled
 
     def test_tools_search_itself_always_on(self):
         """tools_search should always be in the tool definitions."""
