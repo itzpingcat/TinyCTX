@@ -344,6 +344,39 @@ class MatrixBridge:
             text = text[len(self._prefix):]
         return text.strip()
 
+    def _extract_text(
+        self, room, event
+    ) -> str | None:
+        """
+        Extract and normalise the user-visible text from a Matrix message.
+
+        Returns the text the agent should receive, or None if the message
+        should be silently ignored (group room, trigger required, no trigger).
+
+        DM rooms:   always return the stripped body.
+        Group rooms:
+          - If the message starts with the command prefix or mentions the bot
+            → strip the trigger and return the remainder.
+          - Otherwise, if prefix_required is True → return None.
+          - Otherwise → return the stripped body.
+        """
+        body = event.body.strip()
+
+        if self._is_dm_room(room):
+            return body
+
+        # Group room
+        mentioned = self._is_mentioned(body)
+        prefixed = body.startswith(self._prefix)
+
+        if mentioned or prefixed:
+            return self._strip_trigger(body)
+
+        if self._prefix_required:
+            return None
+
+        return body
+
     # ------------------------------------------------------------------
     # Event handler registered with Router
     # ------------------------------------------------------------------
