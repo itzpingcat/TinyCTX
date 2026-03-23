@@ -92,10 +92,11 @@ class HistoryEntry:
     index:        int            = 0     # position in dialogue; set by Context.add()
     tool_calls:   list[dict]     = field(default_factory=list)
     tool_call_id: str | None     = None
+    author_id:    str | None     = None  # set for group chat user turns; None for DM / assistant / tool / system
 
     @staticmethod
-    def user(content: str | list) -> HistoryEntry:
-        return HistoryEntry(role=ROLE_USER, content=content)
+    def user(content: str | list, author_id: str | None = None) -> HistoryEntry:
+        return HistoryEntry(role=ROLE_USER, content=content, author_id=author_id)
 
     @staticmethod
     def assistant(content: str = "", tool_calls: list[ToolCall] | None = None) -> HistoryEntry:

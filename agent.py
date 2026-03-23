@@ -414,6 +414,7 @@ class AgentLoop:
                     index=raw.get("index", 0),
                     tool_calls=raw.get("tool_calls") or [],
                     tool_call_id=raw.get("tool_call_id"),
+                    author_id=raw.get("author_id"),
                 )
                 self.context.dialogue.append(entry)
             logger.info(
@@ -438,6 +439,7 @@ class AgentLoop:
                 "tool_calls":   e.tool_calls,
                 "tool_call_id": e.tool_call_id,
                 "index":        e.index,
+                "author_id":    e.author_id,
             }
             for e in self.context.dialogue
         ]

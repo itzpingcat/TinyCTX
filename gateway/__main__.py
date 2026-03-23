@@ -295,6 +295,7 @@ async def handle_history_get(request: web.Request) -> web.Response:
             "tool_calls":   e.tool_calls,
             "tool_call_id": e.tool_call_id,
             "index":        e.index,
+            "author_id":    e.author_id,
         }
         for e in list(lane.loop.context.dialogue)
     ]
