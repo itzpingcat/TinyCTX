@@ -46,7 +46,7 @@ main.py
 
 | File | Role |
 |------|------|
-| `contracts.py` | Pure data types. No logic. Everything imports from here, never the reverse. |
+| `contracts.py` | Pure data types. No logic. Everything imports from here, never the reverse. `InboundMessage` carries `author` (`UserIdentity`) for all messages. |
 | `config/` | YAML loader + env var resolution. `WorkspaceConfig` (global workspace path). `ModelConfig` supports `kind: chat` (default) or `kind: embedding`, plus `vision: bool`. `AttachmentConfig` (inline thresholds). |
 | `router.py` | Session routing. One `Lane` (bounded queue maxsize=32 + crash-recovering worker task) per `SessionKey`. `router.push()` returns `bool` — `False` means lane queue full. Bridges register platform/session handlers. |
 | `gateway/` | HTTP/SSE API gateway. External clients (SillyTavern, custom scripts, etc.) connect here. `run(router, cfg)` called by `main.py`. Accepts `attachments: [{name, data_b64, mime_type}]` on POST /message. |
@@ -61,6 +61,10 @@ main.py
 
 - DM sessions: `SessionKey(chat_type=DM, conversation_id=<user_id>)` — platform-agnostic.
 - Group sessions: `SessionKey(chat_type=GROUP, conversation_id=<channel_id>, platform=<platform>)` — platform-specific.
+
+**Group chat sender attribution:**
+
+`HistoryEntry` carries `author_id: str | None` — set to the sender's `user_id` for group chat user turns, `None` for DM / assistant / tool / system turns. Bridges populate this via `HistoryEntry.user(content, author_id=...)`. Persisted in session JSON and exposed in the gateway `GET /history` response. Bridges own all group-specific logic (buffering, mention detection, `/reset` admin checks) and push pre-formatted attributed text to the router.
 
 **Agent event stream:**
 
@@ -371,6 +375,8 @@ mcp:
 | `delete(entry_id)` | Smart-delete: removes entry + dependents (assistant tool_calls cascade to their results; tool results cascade back to their assistant turn + siblings). |
 | `strip_tool_calls(entry_id)` | Remove `tool_calls` from an assistant entry and drop its results, preserving the assistant's text content. |
 | `clear()` | Wipe entire dialogue. |
+
+`HistoryEntry` fields: `role`, `content` (str or list), `id`, `index`, `tool_calls`, `tool_call_id`, `author_id` (str or None).
 
 Token-budget trimming in `assemble()` follows the same rules: assistant turns with text content preserve the text when tool calls are trimmed. Adjacent user/assistant turns are only merged when both have plain-string content — list content (attachment blocks) is never merged.
 

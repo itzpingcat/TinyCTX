@@ -15,9 +15,10 @@ Config (in config.yaml under bridges.matrix.options):
   allowed_users:    Allowlist of Matrix user IDs (full MXIDs, e.g.
                     "@you:matrix.org") permitted to interact with the bot.
                     Empty list = open to everyone.
-                    Messages from any user not on this list are silently
-                    ignored before being pushed to the router.
                     Default: []  (WARNING: open access — set this!)
+  admin_users:      List of Matrix user IDs (full MXIDs) permitted to use
+                    /reset in group rooms. Empty = nobody can reset.
+                    Default: []
   dm_enabled:       Respond to 1-on-1 rooms. Default: true
   room_ids:         Whitelist of room IDs to respond in. Empty = all rooms
                     the bot is joined to. Default: []
@@ -25,8 +26,13 @@ Config (in config.yaml under bridges.matrix.options):
                     the message starts with command_prefix. Default: true
   command_prefix:   Text prefix that triggers the bot in rooms.
                     Default: "!"
+  reset_command:    Command string that triggers a session reset in group rooms.
+                    Default: "/reset"
+  buffer_timeout_s: In group rooms, seconds to wait after a non-trigger
+                    message before flushing buffered messages anyway.
+                    0 = disabled (only flush on trigger). Default: 0
   max_reply_length: Max characters per Matrix message before chunking.
-                    Default: 16000  (Matrix has no hard 2000-char limit)
+                    Default: 16000
   sync_timeout_ms:  Long-poll timeout per /sync call in ms. Default: 30000
 
 Password setup:
@@ -35,17 +41,15 @@ Password setup:
 Required:
   pip install matrix-nio
   For E2EE support: pip install matrix-nio[e2e]
-
-Finding your Matrix user ID:
-  Your full MXID is shown in your Matrix client under Settings → Profile,
-  in the format @username:homeserver.tld
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import os
+import re
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from nio import (
@@ -56,8 +60,6 @@ from nio import (
     RoomMessageText,
     SyncError,
 )
-# Media event types were added in matrix-nio 0.20+. Import defensively so the
-# bridge still loads on older installs — media attachments just won't work.
 try:
     from nio import (
         RoomMessageAudio,
@@ -80,7 +82,6 @@ from contracts import (
     AgentToolCall,
     AgentToolResult,
     Attachment,
-    ContentType,
     content_type_for,
     InboundMessage,
     Platform,
@@ -102,10 +103,13 @@ DEFAULTS = {
     "device_name": "TinyCTX",
     "store_path": "matrix_store",
     "allowed_users": [],
+    "admin_users": [],
     "dm_enabled": True,
     "room_ids": [],
     "prefix_required": True,
     "command_prefix": "!",
+    "reset_command": "/reset",
+    "buffer_timeout_s": 0,
     "max_reply_length": 16000,
     "sync_timeout_ms": 30000,
     "typing_indicator": True,
@@ -116,7 +120,116 @@ DEFAULTS = {
 
 
 # ---------------------------------------------------------------------------
-# Reply accumulator (same pattern as Discord bridge)
+# Mention humanization
+#
+# Matrix plain-body mentions are already human-readable (@user:server), but
+# formatted bodies use HTML <a href="https://matrix.to/#/@user:server">Name</a>.
+# We normalize both to @localpart for LLM readability.
+# ---------------------------------------------------------------------------
+
+_MATRIX_HTML_MENTION = re.compile(
+    r'<a\s+href="https://matrix\.to/#/(@[^"]+)"[^>]*>([^<]*)</a>',
+    re.IGNORECASE,
+)
+_MATRIX_PLAIN_MXID = re.compile(r"@[\w\-.]+:[\w\-.]+")
+
+
+def _humanize_matrix_mentions(text: str, own_mxid: str) -> str:
+    """
+    Normalize Matrix mention formats to @localpart for LLM readability.
+    - HTML anchor mentions -> @localpart (from the MXID in href)
+    - Full MXIDs (@user:server) -> @localpart
+    The bot's own MXID is stripped entirely (it's the trigger, not context).
+    """
+    # Strip HTML anchor mentions, replacing with @localpart.
+    def _replace_html(m: re.Match) -> str:
+        mxid = m.group(1)           # e.g. @alice:matrix.org
+        if mxid == own_mxid:
+            return ""
+        return f"@{mxid.split(':')[0].lstrip('@')}"
+
+    text = _MATRIX_HTML_MENTION.sub(_replace_html, text)
+
+    # Normalize remaining plain MXIDs (@user:server -> @localpart),
+    # stripping the bot's own MXID.
+    def _replace_plain(m: re.Match) -> str:
+        mxid = m.group(0)
+        if mxid == own_mxid:
+            return ""
+        return f"@{mxid.split(':')[0].lstrip('@')}"
+
+    text = _MATRIX_PLAIN_MXID.sub(_replace_plain, text)
+    return text.strip()
+
+
+# ---------------------------------------------------------------------------
+# GroupBuffer (identical logic to Discord bridge)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _BufferedLine:
+    user_id: str
+    display_name: str
+    text: str
+
+
+class GroupBuffer:
+    def __init__(self, timeout_s: float) -> None:
+        self._timeout_s = timeout_s
+        self._lines: list[_BufferedLine] = []
+        self._flush_task: asyncio.Task | None = None
+        self._flush_callback = None
+
+    def set_flush_callback(self, cb) -> None:
+        self._flush_callback = cb
+
+    def add(self, user_id: str, display_name: str, text: str) -> None:
+        self._lines.append(_BufferedLine(user_id, display_name, text))
+        if self._timeout_s > 0:
+            self._reset_timer()
+
+    def flush(
+        self,
+        trigger_user_id: str | None = None,
+        trigger_display_name: str | None = None,
+        trigger_text: str | None = None,
+    ) -> list[_BufferedLine]:
+        self._cancel_timer()
+        lines = list(self._lines)
+        if trigger_text and trigger_user_id and trigger_display_name:
+            lines.append(_BufferedLine(trigger_user_id, trigger_display_name, trigger_text))
+        self._lines.clear()
+        return lines
+
+    def clear(self) -> None:
+        self._cancel_timer()
+        self._lines.clear()
+
+    def _reset_timer(self) -> None:
+        self._cancel_timer()
+        if self._flush_callback:
+            self._flush_task = asyncio.create_task(self._timeout_flush())
+
+    def _cancel_timer(self) -> None:
+        if self._flush_task and not self._flush_task.done():
+            self._flush_task.cancel()
+        self._flush_task = None
+
+    async def _timeout_flush(self) -> None:
+        try:
+            await asyncio.sleep(self._timeout_s)
+            if self._lines and self._flush_callback:
+                await self._flush_callback()
+        except asyncio.CancelledError:
+            pass
+
+
+def _format_buffer(lines: list[_BufferedLine]) -> str:
+    return "\n".join(f"[{line.display_name}]: {line.text}" for line in lines)
+
+
+# ---------------------------------------------------------------------------
+# Reply accumulator
 # ---------------------------------------------------------------------------
 
 class _ReplyAccumulator:
@@ -139,14 +252,12 @@ class _ReplyAccumulator:
         self._done.set()
 
     async def wait(self) -> list[str]:
-        """Wait for the turn to complete and return chunks to send."""
         await self._done.wait()
         if self._error:
             return [f"⚠️ {self._error}"]
         text = "".join(self._buf).strip()
         if not text:
             return []
-        # Chunk at max_reply_length.
         return [text[i : i + self._max_len] for i in range(0, len(text), self._max_len)]
 
 
@@ -164,6 +275,7 @@ class MatrixBridge:
         self._max_len: int = int(self._opts["max_reply_length"])
         self._prefix: str = str(self._opts["command_prefix"])
         self._prefix_required: bool = bool(self._opts["prefix_required"])
+        self._reset_command: str = str(self._opts["reset_command"])
         self._dm_enabled: bool = bool(self._opts["dm_enabled"])
         self._room_ids: set[str] = set(self._opts["room_ids"])
         self._sync_timeout: int = int(self._opts["sync_timeout_ms"])
@@ -171,33 +283,28 @@ class MatrixBridge:
         self._typing_on_thinking: bool = bool(self._opts["typing_on_thinking"])
         self._typing_on_tools: bool = bool(self._opts["typing_on_tools"])
         self._typing_on_reply: bool = bool(self._opts["typing_on_reply"])
+        self._buffer_timeout_s: float = float(self._opts["buffer_timeout_s"])
 
-        # allowed_users: empty set = open access (warn at startup)
         raw_allowed: list = self._opts["allowed_users"]
         self._allowed_users: set[str] = {str(u) for u in raw_allowed}
 
-        # Resolve store path against workspace.
+        raw_admin: list = self._opts["admin_users"]
+        self._admin_users: set[str] = {str(u) for u in raw_admin}
+
         workspace = str(router.config.workspace.path)
         raw_store = str(self._opts["store_path"])
-        if os.path.isabs(raw_store):
-            self._store_path = raw_store
-        else:
-            self._store_path = os.path.join(workspace, raw_store)
+        self._store_path = raw_store if os.path.isabs(raw_store) else os.path.join(workspace, raw_store)
         os.makedirs(self._store_path, exist_ok=True)
 
-        # session_key_str → _ReplyAccumulator for the active turn
+        # session_key_str → _ReplyAccumulator
         self._accumulators: dict[str, _ReplyAccumulator] = {}
-        # session_key_str → asyncio.Event signalling that typing should be active
+        # session_key_str → asyncio.Event signalling typing should be active
         self._typing_active: dict[str, asyncio.Event] = {}
-
-        # event_id → list[Attachment] — media events queued until their
-        # paired text event (or standalone) is ready to dispatch.
-        # Matrix sends media as separate events, not inline with text.
-        # We buffer them keyed by sender+room so they attach to the next
-        # message from that sender in that room.
+        # room_id → GroupBuffer
+        self._group_buffers: dict[str, GroupBuffer] = {}
+        # sender+room_id → pending Attachments (media arrives before text in Matrix)
         self._pending_attachments: dict[str, list[Attachment]] = {}
 
-        # Populated in run() after login
         self._client: AsyncClient | None = None
         self._own_user_id: str = ""
 
@@ -206,40 +313,33 @@ class MatrixBridge:
     # ------------------------------------------------------------------
 
     def _is_allowed(self, sender: str) -> bool:
-        """Return True if this MXID is permitted to interact with the bot.
-        An empty allowlist means open access (with a startup warning)."""
         if not self._allowed_users:
             return True
         return sender in self._allowed_users
 
+    def _is_admin(self, sender: str) -> bool:
+        return sender in self._admin_users
+
     def _is_dm_room(self, room: MatrixRoom) -> bool:
-        """Heuristic: a DM room has exactly 2 members."""
         return room.member_count == 2
 
-    def _extract_text(self, room: MatrixRoom, event: RoomMessageText) -> str | None:
-        """
-        Strip @mention and command prefix from a message body.
-        Returns None if prefix_required and no trigger is present.
-        """
-        is_dm = self._is_dm_room(room)
-        body = event.body.strip()
+    def _get_or_create_buffer(self, room_id: str) -> GroupBuffer:
+        if room_id not in self._group_buffers:
+            self._group_buffers[room_id] = GroupBuffer(self._buffer_timeout_s)
+        return self._group_buffers[room_id]
 
-        if is_dm:
-            return body  # always respond in DMs
+    def _display_name(self, room: MatrixRoom, sender: str) -> str:
+        return room.user_name(sender) or sender.split(":")[0].lstrip("@")
 
-        # Group room — check trigger.
-        mention = f"@{self._username.split(':')[0].lstrip('@')}"
-        full_mention = self._username  # e.g. @bot:matrix.org
+    def _is_mentioned(self, body: str) -> bool:
+        """Check whether the bot's MXID or local part appears in the message."""
+        local = self._username.split(":")[0].lstrip("@")
+        return self._username in body or f"@{local}" in body
 
-        mentioned = mention in body or full_mention in body
-        prefixed = body.startswith(self._prefix)
-
-        if self._prefix_required and not mentioned and not prefixed:
-            return None
-
-        # Strip mention and prefix.
-        text = body
-        text = text.replace(full_mention, "").replace(mention, "")
+    def _strip_trigger(self, text: str) -> str:
+        """Strip bot mention and command prefix from message text."""
+        local = self._username.split(":")[0].lstrip("@")
+        text = text.replace(self._username, "").replace(f"@{local}", "")
         if text.startswith(self._prefix):
             text = text[len(self._prefix):]
         return text.strip()
@@ -260,28 +360,21 @@ class MatrixBridge:
         if isinstance(event, AgentThinkingChunk):
             if typing_ev and self._typing_on_thinking:
                 typing_ev.set()
-
         elif isinstance(event, AgentTextChunk):
             if typing_ev and self._typing_on_reply:
                 typing_ev.set()
             acc.feed(event.text)
-
         elif isinstance(event, AgentTextFinal):
             acc.finish(event.text)
-
         elif isinstance(event, AgentToolCall):
             if typing_ev and self._typing_on_tools:
                 typing_ev.set()
             logger.debug("Matrix: tool call %s in session %s", event.tool_name, session_key_str)
-
         elif isinstance(event, AgentToolResult):
             logger.debug(
                 "Matrix: tool result %s (%s) in session %s",
-                event.tool_name,
-                "error" if event.is_error else "ok",
-                session_key_str,
+                event.tool_name, "error" if event.is_error else "ok", session_key_str,
             )
-
         elif isinstance(event, AgentError):
             acc.error(event.message)
 
@@ -290,21 +383,17 @@ class MatrixBridge:
     # ------------------------------------------------------------------
 
     async def _on_message(self, room: MatrixRoom, event: RoomMessageText) -> None:
-        # Ignore own messages.
         if event.sender == self._own_user_id:
             return
 
-        # Ignore messages older than startup (nio replays history on first sync).
+        # Ignore replayed history from before startup.
         age_ms = getattr(event, "server_timestamp", 0)
         now_ms = int(time.time() * 1000)
         if age_ms and (now_ms - age_ms) > 60_000:
             return
 
-        # Access control — drop silently if sender not on allowlist.
         if not self._is_allowed(event.sender):
-            logger.debug(
-                "Matrix: ignoring message from unauthorized user %s", event.sender
-            )
+            logger.debug("Matrix: ignoring message from unauthorized user %s", event.sender)
             return
 
         is_dm = self._is_dm_room(room)
@@ -315,60 +404,106 @@ class MatrixBridge:
         if self._room_ids and room.room_id not in self._room_ids:
             return
 
-        text = self._extract_text(room, event)
-        if text is None or not text:
-            return
+        body = event.body.strip()
 
+        # ----------------------------------------------------------------
+        # DM path
+        # ----------------------------------------------------------------
         if is_dm:
             session_key = SessionKey.dm(event.sender)
-        else:
-            session_key = SessionKey.group(Platform.MATRIX, room.room_id)
+            att_key = f"{event.sender}:{room.room_id}"
+            attachments = tuple(self._pending_attachments.pop(att_key, []))
 
-        author = UserIdentity(
-            platform=Platform.MATRIX,
-            user_id=event.sender,
-            username=room.user_name(event.sender) or event.sender,
-        )
-        # Collect any attachment for this sender+room that arrived just before
-        # this text event (Matrix sends media as a separate event).
+            author = UserIdentity(
+                platform=Platform.MATRIX,
+                user_id=event.sender,
+                username=self._display_name(room, event.sender),
+            )
+            msg = InboundMessage(
+                session_key=session_key,
+                author=author,
+                content_type=content_type_for(body, bool(attachments)),
+                text=body,
+                message_id=event.event_id,
+                timestamp=time.time(),
+                attachments=attachments,
+            )
+            session_key_str = str(session_key)
+            acc = _ReplyAccumulator(self._max_len)
+            self._accumulators[session_key_str] = acc
+            asyncio.create_task(
+                self._handle_turn(msg, room.room_id, session_key_str, acc)
+            )
+            return
+
+        # ----------------------------------------------------------------
+        # Group room path
+        # ----------------------------------------------------------------
+        session_key = SessionKey.group(Platform.MATRIX, room.room_id)
+        buf = self._get_or_create_buffer(room.room_id)
+
+        # /reset — admin only
+        if body == self._reset_command:
+            if self._is_admin(event.sender):
+                buf.clear()
+                self._router.reset_session(session_key)
+                await self._send(room.room_id, "✅ Session reset.")
+                logger.info(
+                    "Matrix: group session %s reset by admin %s",
+                    room.room_id, event.sender,
+                )
+            else:
+                await self._send(room.room_id, "⛔ Only admins can reset the session.")
+            return
+
+        mentioned = self._is_mentioned(body)
+        prefixed = body.startswith(self._prefix)
+        is_trigger = mentioned or prefixed
+
+        display = self._display_name(room, event.sender)
+
+        if self._prefix_required and not is_trigger:
+            # Non-trigger: humanize mentions and buffer.
+            humanized = _humanize_matrix_mentions(body, self._own_user_id)
+
+            async def _timeout_flush_cb(
+                _buf=buf, _room=room, _session_key=session_key,
+            ):
+                await self._flush_group_buffer(
+                    _buf, _room, _session_key,
+                    trigger_user_id=None, trigger_display_name=None, trigger_text=None,
+                )
+
+            buf.set_flush_callback(_timeout_flush_cb)
+            buf.add(event.sender, display, humanized)
+            logger.debug(
+                "Matrix: buffered non-trigger message from %s in room %s",
+                display, room.room_id,
+            )
+            return
+
+        # Trigger: strip bot mention/prefix, humanize, collect attachments, flush.
+        stripped = self._strip_trigger(body)
+        humanized_trigger = _humanize_matrix_mentions(stripped, self._own_user_id)
+
         att_key = f"{event.sender}:{room.room_id}"
         attachments = tuple(self._pending_attachments.pop(att_key, []))
 
-        msg = InboundMessage(
-            session_key=session_key,
-            author=author,
-            content_type=content_type_for(text, bool(attachments)),
-            text=text,
-            message_id=event.event_id,
-            timestamp=time.time(),
+        await self._flush_group_buffer(
+            buf, room, session_key,
+            trigger_user_id=event.sender,
+            trigger_display_name=display,
+            trigger_text=humanized_trigger,
             attachments=attachments,
+            trigger_event_id=event.event_id,
         )
 
-        session_key_str = str(session_key)
-        acc = _ReplyAccumulator(self._max_len)
-        self._accumulators[session_key_str] = acc
-
-        asyncio.create_task(
-            self._handle_turn(msg, room.room_id, session_key_str, acc)
-        )
-
-    async def _on_media(self, room: MatrixRoom, event: RoomMessageMedia) -> None:
-        """Handle m.image / m.file / m.audio / m.video events.
-
-        Matrix media arrives as a separate event from any accompanying text.
-        We download the bytes immediately and stash them in
-        _pending_attachments keyed by sender+room.  The next _on_message
-        call from the same sender in the same room picks them up.
-
-        If no text follows within the same turn, the media is lost — bridges
-        are expected to send a text message alongside media (or the agent will
-        only receive a reference note via build_content_blocks).
-        """
+    async def _on_media(self, room: MatrixRoom, event) -> None:
+        """Buffer media attachments — Matrix sends these as separate events from text."""
         if event.sender == self._own_user_id:
             return
         if not self._is_allowed(event.sender):
             return
-
         if self._client is None:
             return
 
@@ -378,7 +513,6 @@ class MatrixBridge:
             or getattr(event, "body", None)
             or "attachment"
         )
-        # Infer MIME from the event info dict or fall back to octet-stream.
         info: dict = getattr(event, "info", None) or {}
         mime: str = info.get("mimetype", "application/octet-stream")
 
@@ -398,13 +532,73 @@ class MatrixBridge:
         self._pending_attachments.setdefault(key, []).append(att)
         logger.debug("Matrix: buffered attachment %s (%s) from %s", filename, mime, event.sender)
 
+    # ------------------------------------------------------------------
+    # Group flush
+    # ------------------------------------------------------------------
+
+    async def _flush_group_buffer(
+        self,
+        buf: GroupBuffer,
+        room: MatrixRoom,
+        session_key: SessionKey,
+        trigger_user_id: str | None,
+        trigger_display_name: str | None,
+        trigger_text: str | None,
+        attachments: tuple = (),
+        trigger_event_id: str | None = None,
+    ) -> None:
+        lines = buf.flush(
+            trigger_user_id=trigger_user_id,
+            trigger_display_name=trigger_display_name,
+            trigger_text=trigger_text,
+        )
+        if not lines and not attachments:
+            return
+
+        combined_text = _format_buffer(lines)
+
+        if trigger_user_id:
+            author_uid = trigger_user_id
+            author_name = trigger_display_name or trigger_user_id
+            msg_id = trigger_event_id or str(time.time_ns())
+        else:
+            first = lines[0] if lines else None
+            author_uid = first.user_id if first else "unknown"
+            author_name = first.display_name if first else "unknown"
+            msg_id = str(time.time_ns())
+
+        author = UserIdentity(
+            platform=Platform.MATRIX,
+            user_id=author_uid,
+            username=author_name,
+        )
+        msg = InboundMessage(
+            session_key=session_key,
+            author=author,
+            content_type=content_type_for(combined_text, bool(attachments)),
+            text=combined_text,
+            message_id=msg_id,
+            timestamp=time.time(),
+            attachments=attachments,
+        )
+
+        session_key_str = str(session_key)
+        acc = _ReplyAccumulator(self._max_len)
+        self._accumulators[session_key_str] = acc
+        asyncio.create_task(
+            self._handle_turn(msg, room.room_id, session_key_str, acc)
+        )
+
+    # ------------------------------------------------------------------
+    # Turn handling
+    # ------------------------------------------------------------------
+
     async def _typing_keepalive(
         self,
         room_id: str,
         active_event: asyncio.Event,
         done_event: asyncio.Event,
     ) -> None:
-        """Sends typing notifications while active_event is set, until done_event fires."""
         while not done_event.is_set():
             await active_event.wait()
             if done_event.is_set():
@@ -414,12 +608,10 @@ class MatrixBridge:
                     await self._client.room_typing(room_id, typing_state=True, timeout=30000)
                 except Exception:
                     pass
-            # Re-send every 25s (Matrix typing times out at 30s)
             try:
                 await asyncio.wait_for(done_event.wait(), timeout=25.0)
             except asyncio.TimeoutError:
                 pass
-        # Clear typing indicator when done
         if self._client:
             try:
                 await self._client.room_typing(room_id, typing_state=False)
@@ -451,7 +643,7 @@ class MatrixBridge:
                     chunks = await acc.wait()
                 finally:
                     done_event.set()
-                    typing_ev.set()  # unblock keepalive if still waiting
+                    typing_ev.set()
                     keepalive.cancel()
             else:
                 chunks = await acc.wait()
@@ -488,12 +680,10 @@ class MatrixBridge:
             )
 
         device_name = str(self._opts["device_name"])
-
         config = AsyncClientConfig(
             store_sync_tokens=True,
-            encryption_enabled=False,  # flip to True if matrix-nio[e2e] installed
+            encryption_enabled=False,
         )
-
         client = AsyncClient(
             homeserver=self._homeserver,
             user=self._username,
@@ -515,14 +705,14 @@ class MatrixBridge:
                 "Matrix bridge: allowed_users is empty — the bot will respond "
                 "to anyone. Set bridges.matrix.options.allowed_users in config.yaml."
             )
-        else:
-            logger.info(
-                "Matrix bridge: %d allowed user(s) configured.", len(self._allowed_users)
+        if not self._admin_users:
+            logger.warning(
+                "Matrix bridge: admin_users is empty — nobody can use %s in group rooms.",
+                self._reset_command,
             )
 
         self._router.register_platform_handler(Platform.MATRIX.value, self.handle_event)
 
-        # Register nio callbacks — text and all media types.
         client.add_event_callback(self._on_message, RoomMessageText)
         if _HAS_MEDIA_EVENTS:
             for media_cls in (RoomMessageImage, RoomMessageFile, RoomMessageAudio, RoomMessageVideo):
@@ -535,9 +725,7 @@ class MatrixBridge:
 
         logger.info("Matrix bridge: starting sync loop")
         try:
-            # Perform one initial sync to load room state before processing messages.
             await client.sync(timeout=0, full_state=True)
-            # Continuous sync loop.
             await client.sync_forever(timeout=self._sync_timeout, full_state=False)
         finally:
             await client.close()
