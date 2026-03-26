@@ -1,29 +1,25 @@
 /**
  * TinyCTX — SillyTavern Extension
  * ================================
- * Turns SillyTavern into a seamless thin client for a TinyCTX gateway.
- * Users interact with ST exactly as they always have — the extension
- * transparently remaps every ST chat action to gateway API calls.
+ * Thin client for a TinyCTX gateway. One fixed session ID (configurable),
+ * whose versions are the "chat list". ST actions map transparently:
  *
- * Managed character: "TinyCTX Agent" (auto-created on first load)
- *   description  → AGENTS.md  (gateway workspace)
- *   personality  → SOUL.md
- *   scenario     → MEMORY.md
+ *   Send            → POST   /v1/sessions/{id}/message  (stream)
+ *   Regenerate/Swipe→ DELETE /history/{last_assistant_eid}
+ *                     + PUT  /generation  (stream)
+ *   Continue        → PUT    /generation  (no history mutation)
+ *   Abort           → DELETE /generation
+ *   Edit message    → PATCH  /history/{eid}
+ *   Delete message  → DELETE /history/{eid}
+ *   Start new chat  → POST   /sessions/{id}/next  (bump version)
+ *   Rename chat     → PATCH  /sessions/{id}/rename
+ *   Manage chats    → version list from GET /sessions/{id}/versions
+ *   Impersonate     → ST native (interceptor returns undefined)
  *
- * ST action → TinyCTX mapping:
- *   Send message        → POST   /v1/sessions/{id}/message          (stream)
- *   Regenerate / Swipe  → DELETE last assistant entry + re-send
- *   Continue            → POST   /v1/sessions/{id}/message  {text: "[CONTINUE]"}
- *   Edit message        → PATCH  /v1/sessions/{id}/history/{eid}
- *   Delete message      → DELETE /v1/sessions/{id}/history/{eid}
- *   Start new chat      → switch to a new session UUID
- *   Manage chat files   → session list panel (replaces ST's file list)
- *   Rename chat         → PATCH  /v1/sessions/{id}/rename
- *   Delete chat         → DELETE /v1/sessions/{id}
- *   Impersonate         → ST handles natively (goes through generate interceptor
- *                         with type="impersonate"; we skip and let ST do it)
- *
- * Gateway config lives in extensionSettings — no per-card hacks.
+ * Card fields sync to gateway workspace:
+ *   description → AGENTS.md
+ *   personality → SOUL.md
+ *   scenario    → MEMORY.md
  */
 
 // ---------------------------------------------------------------------------
@@ -39,9 +35,6 @@ const FIELD_MAP = {
     scenario:     "MEMORY.md",
 };
 
-// Internal sentinel sent to trigger a "continue" on the agent side
-const CONTINUE_SENTINEL = "\x00__TINYCTX_CONTINUE__\x00";
-
 // ---------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------
@@ -49,7 +42,7 @@ const CONTINUE_SENTINEL = "\x00__TINYCTX_CONTINUE__\x00";
 const DEFAULT_SETTINGS = Object.freeze({
     endpoint:         "http://127.0.0.1:8080",
     api_key:          "",
-    active_session:   "default",
+    session_id:       "sillytavern",
     show_tool_events: true,
     sync_card_fields: true,
 });
@@ -75,12 +68,14 @@ function saveSettings() {
 // State
 // ---------------------------------------------------------------------------
 
-let isTinyCTXActive  = false;
-let healthPollTimer  = null;
+let isTinyCTXActive = false;
+let healthPollTimer = null;
 
 // ---------------------------------------------------------------------------
-// Gateway
+// Gateway helpers
 // ---------------------------------------------------------------------------
+
+function sid() { return getSettings().session_id || "sillytavern"; }
 
 function gw(path) {
     return getSettings().endpoint.replace(/\/$/, "") + path;
@@ -104,23 +99,14 @@ async function gwHealth() {
     } catch { return null; }
 }
 
-async function gwSessions() {
-    try {
-        const r = await gwFetch("/v1/sessions");
-        return r.ok ? await r.json() : [];
-    } catch { return []; }
-}
-
-function activeSession() { return getSettings().active_session || "default"; }
-
 // ---------------------------------------------------------------------------
 // Status bar
 // ---------------------------------------------------------------------------
 
 function setStatus(text, cls = "idle") {
-    document.querySelector(".tinyctx-dot")    ?.setAttribute("data-state", cls);
-    document.getElementById("tinyctx-status-text") &&
-        (document.getElementById("tinyctx-status-text").textContent = text);
+    document.querySelector(".tinyctx-dot")?.setAttribute("data-state", cls);
+    const el = document.getElementById("tinyctx-status-text");
+    if (el) el.textContent = text;
 }
 
 // ---------------------------------------------------------------------------
@@ -128,9 +114,9 @@ function setStatus(text, cls = "idle") {
 // ---------------------------------------------------------------------------
 
 async function syncField(field, value) {
-    if (!getSettings().sync_card_fields) return;
+    if (!getSettings().sync_card_fields || value == null) return;
     const file = FIELD_MAP[field];
-    if (!file || value == null) return;
+    if (!file) return;
     try {
         await gwFetch(`/v1/workspace/files/${file}`, {
             method: "PUT",
@@ -145,145 +131,35 @@ async function syncAllFields() {
     const { characters, characterId } = SillyTavern.getContext();
     const char = characters?.[characterId];
     if (!char) return;
-    for (const [field] of Object.entries(FIELD_MAP)) {
+    for (const field of Object.keys(FIELD_MAP)) {
         await syncField(field, char[field] ?? char.data?.[field] ?? "");
     }
 }
 
-// ---------------------------------------------------------------------------
-// History helpers — fetch from gateway and render into ST's chat array
-// ---------------------------------------------------------------------------
-
 /**
- * Load gateway history for the current session into ST's mutable chat array.
- * This makes ST render the correct conversation when switching sessions.
+ * Pull workspace files back into the character card fields.
+ * Called once on activate so gateway edits to SOUL/AGENTS/MEMORY.md
+ * (e.g. by the agent itself) are reflected in the ST character card.
  */
-async function loadHistoryIntoST() {
-    const ctx = SillyTavern.getContext();
-    if (!ctx || !ctx.chat) return;
+async function pullFieldsFromGateway() {
+    if (!getSettings().sync_card_fields) return;
+    const { characters, characterId, writeExtensionField } = SillyTavern.getContext();
+    const char = characters?.[characterId];
+    if (!char) return;
 
-    try {
-        const r = await gwFetch(`/v1/sessions/${encodeURIComponent(activeSession())}/history`);
-        if (!r.ok) return;
-        const entries = await r.json();
-
-        // Clear ST's local chat array and repopulate with gateway entries
-        ctx.chat.length = 0;
-
-        for (const e of entries) {
-            if (e.role === "user") {
-                ctx.chat.push({
-                    is_user:   true,
-                    name:      ctx.name1 ?? "You",
-                    mes:       typeof e.content === "string" ? e.content : "",
-                    send_date: Date.now(),
-                    extra:     { tinyctx_entry_id: e.id },
-                });
-            } else if (e.role === "assistant" && typeof e.content === "string" && e.content) {
-                ctx.chat.push({
-                    is_user:   false,
-                    name:      CHAR_NAME,
-                    mes:       e.content,
-                    send_date: Date.now(),
-                    extra:     { tinyctx_entry_id: e.id },
-                });
-            }
-            // Skip tool_call / tool_result / system entries from display
-        }
-
-        // Re-render chat
-        if (typeof ctx.reloadCurrentChat === "function") {
-            await ctx.reloadCurrentChat();
-        }
-    } catch (e) {
-        console.warn("[TinyCTX] loadHistory failed:", e);
-    }
-}
-
-/** Get the last assistant entry_id from gateway history. */
-async function getLastAssistantEntryId() {
-    try {
-        const r = await gwFetch(`/v1/sessions/${encodeURIComponent(activeSession())}/history`);
-        if (!r.ok) return null;
-        const entries = await r.json();
-        // Walk back to find last assistant text entry
-        for (let i = entries.length - 1; i >= 0; i--) {
-            if (entries[i].role === "assistant" && typeof entries[i].content === "string") {
-                return entries[i].id;
-            }
-        }
-    } catch {}
-    return null;
-}
-
-/** Get the last user message text from ST's chat (before the current generation). */
-function getLastUserText() {
-    const { chat } = SillyTavern.getContext();
-    for (let i = (chat?.length ?? 0) - 1; i >= 0; i--) {
-        if (chat[i].is_user) return chat[i].mes?.trim() ?? "";
-    }
-    return "";
-}
-
-// ---------------------------------------------------------------------------
-// Core: send to TinyCTX and stream response
-// Returns the accumulated assistant text string.
-// ---------------------------------------------------------------------------
-
-async function sendMessage(text) {
-    const sid = activeSession();
-    setStatus(`Sending → ${sid}…`, "connecting");
-
-    let response;
-    try {
-        response = await fetch(gw(`/v1/sessions/${encodeURIComponent(sid)}/message`), {
-            method:  "POST",
-            headers: gwHeaders(),
-            body:    JSON.stringify({ text, stream: true, session_type: "dm" }),
-        });
-    } catch (e) {
-        setStatus("Network error", "err");
-        throw e;
-    }
-
-    if (response.status === 429) {
-        setStatus("Busy — retrying…", "connecting");
-        await new Promise(r => setTimeout(r, 1500));
-        return sendMessage(text);
-    }
-
-    if (!response.ok) {
-        setStatus(`Error ${response.status}`, "err");
-        throw new Error(`Gateway ${response.status}`);
-    }
-
-    let   accumulated = "";
-    const toolLines   = [];
-    const showTools   = getSettings().show_tool_events;
-
-    for await (const ev of readSSE(response)) {
-        switch (ev.type) {
-            case "text_chunk":   accumulated += ev.text; break;
-            case "text_final":   if (ev.text) accumulated = ev.text; break;
-            case "tool_call":
-                if (showTools) toolLines.push(`*🔧 ${ev.name}(${JSON.stringify(ev.args ?? {})})*`);
-                break;
-            case "tool_result": {
-                if (showTools) {
-                    const sym     = ev.is_error ? "✗" : "✓";
-                    const preview = (ev.output ?? "").slice(0, 100).replace(/\n/g, " ");
-                    toolLines.push(`*${sym} ${ev.name}: ${preview}${(ev.output?.length ?? 0) > 100 ? "…" : ""}*`);
-                }
-                break;
-            }
-            case "error":   setStatus(`Agent error: ${ev.message}`, "err"); break;
-            case "done":    setStatus(`Session: ${sid}`, "ok"); break;
+    for (const [field, file] of Object.entries(FIELD_MAP)) {
+        try {
+            const r = await gwFetch(`/v1/workspace/files/${file}`);
+            if (!r.ok) continue;
+            const { content } = await r.json();
+            if (typeof content !== "string") continue;
+            // Update the in-memory character object so ST re-renders the card
+            char[field] = content;
+            if (char.data) char.data[field] = content;
+        } catch (e) {
+            console.warn(`[TinyCTX] pull ${file}→${field} failed:`, e);
         }
     }
-
-    return toolLines.length
-        ? toolLines.join("\n") + "\n\n" + accumulated
-        : accumulated;
 }
 
 // ---------------------------------------------------------------------------
@@ -310,109 +186,302 @@ async function* readSSE(response) {
 }
 
 // ---------------------------------------------------------------------------
+// Stream a generation from an already-started fetch response.
+// Collects tool_call/tool_result events and injects them as ST-native
+// tool messages. Returns the final assistant text.
+// ---------------------------------------------------------------------------
+
+async function streamGeneration(response) {
+    if (response.status === 429) {
+        setStatus("Busy — retrying…", "connecting");
+        await new Promise(r => setTimeout(r, 1500));
+        return null; // caller should retry
+    }
+    if (!response.ok) {
+        setStatus(`Error ${response.status}`, "err");
+        throw new Error(`Gateway ${response.status}`);
+    }
+
+    const ctx         = SillyTavern.getContext();
+    const showTools   = getSettings().show_tool_events;
+    let   accumulated = "";
+    // Collect tool events for one "call + result" pair, then inject into ST chat
+    let   pendingCall  = null;
+
+    for await (const ev of readSSE(response)) {
+        switch (ev.type) {
+            case "text_chunk":
+                accumulated += ev.text;
+                break;
+
+            case "text_final":
+                if (ev.text) accumulated = ev.text;
+                break;
+
+            case "tool_call":
+                if (showTools) {
+                    // Inject a tool_call message into ST's chat natively
+                    pendingCall = ev;
+                    await ctx.addOneMessage({
+                        is_user:   false,
+                        name:      CHAR_NAME,
+                        mes:       "",
+                        send_date: Date.now(),
+                        extra: {
+                            type: "tool_calls",
+                            tool_calls: [{
+                                id:       ev.call_id,
+                                type:     "function",
+                                function: { name: ev.name, arguments: JSON.stringify(ev.args ?? {}) },
+                            }],
+                        },
+                    }, { scroll: false, render: true });
+                }
+                break;
+
+            case "tool_result":
+                if (showTools && pendingCall) {
+                    // Inject a tool result message
+                    await ctx.addOneMessage({
+                        is_user:   false,
+                        name:      CHAR_NAME,
+                        mes:       "",
+                        send_date: Date.now(),
+                        extra: {
+                            type: "tool_result",
+                            tool_call_id: ev.call_id,
+                            tool_name:    ev.name,
+                            result:       ev.output,
+                            is_error:     ev.is_error,
+                        },
+                    }, { scroll: false, render: true });
+                    pendingCall = null;
+                }
+                break;
+
+            case "error":
+                setStatus(`Agent error: ${ev.message}`, "err");
+                break;
+
+            case "done":
+                setStatus(`Session: ${sid()}`, "ok");
+                break;
+        }
+    }
+
+    return accumulated;
+}
+
+// ---------------------------------------------------------------------------
+// Get last assistant entry id from gateway history
+// ---------------------------------------------------------------------------
+
+async function getLastAssistantEntryId() {
+    try {
+        const r = await gwFetch(`/v1/sessions/${encodeURIComponent(sid())}/history`);
+        if (!r.ok) return null;
+        const entries = await r.json();
+        for (let i = entries.length - 1; i >= 0; i--) {
+            if (entries[i].role === "assistant" && typeof entries[i].content === "string") {
+                return entries[i].id;
+            }
+        }
+    } catch {}
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// Load a version's history into ST's chat array
+// ---------------------------------------------------------------------------
+
+async function loadVersionIntoST(version) {
+    const ctx = SillyTavern.getContext();
+    if (!ctx?.chat) return;
+
+    const url = version != null
+        ? `/v1/sessions/${encodeURIComponent(sid())}/history?version=${version}`
+        : `/v1/sessions/${encodeURIComponent(sid())}/history`;
+
+    try {
+        const r = await gwFetch(url);
+        if (!r.ok) return;
+        const entries = await r.json();
+
+        ctx.chat.length = 0;
+        for (const e of entries) {
+            if (e.role === "user" && typeof e.content === "string") {
+                ctx.chat.push({
+                    is_user:   true,
+                    name:      ctx.name1 ?? "You",
+                    mes:       e.content,
+                    send_date: Date.now(),
+                    extra:     { tinyctx_entry_id: e.id },
+                });
+            } else if (e.role === "assistant" && typeof e.content === "string" && e.content) {
+                ctx.chat.push({
+                    is_user:   false,
+                    name:      CHAR_NAME,
+                    mes:       e.content,
+                    send_date: Date.now(),
+                    extra:     { tinyctx_entry_id: e.id },
+                });
+            }
+            // tool_call / tool_result / system entries skipped — they're ephemeral UI
+        }
+
+        if (typeof ctx.reloadCurrentChat === "function") {
+            await ctx.reloadCurrentChat();
+        }
+    } catch (e) {
+        console.warn("[TinyCTX] loadVersionIntoST failed:", e);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Version panel (replaces ST's "manage chat files" for TinyCTX char)
+// ---------------------------------------------------------------------------
+
+const VERSION_PANEL_HTML = `
+<div id="tinyctx-version-panel" style="display:none;">
+    <div class="tinyctx-session-header">
+        <span>Chat history</span>
+        <button id="tinyctx-new-chat-btn" title="Start new chat">＋ New</button>
+    </div>
+    <div id="tinyctx-version-list"></div>
+</div>
+`;
+
+function escapeHtml(s) {
+    return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+async function renderVersionPanel() {
+    const list = document.getElementById("tinyctx-version-list");
+    if (!list) return;
+
+    let versions = [];
+    let activeV  = null;
+    try {
+        const r = await gwFetch(`/v1/sessions/${encodeURIComponent(sid())}/versions`);
+        if (r.ok) {
+            const data = await r.json();
+            versions   = data.versions ?? [];
+            activeV    = data.active_version;
+        }
+    } catch {}
+
+    list.innerHTML = "";
+
+    if (!versions.length) {
+        list.innerHTML = `<div class="tinyctx-session-empty">No history yet</div>`;
+        return;
+    }
+
+    // Show newest first
+    for (const v of [...versions].reverse()) {
+        const item = document.createElement("div");
+        item.className = "tinyctx-session-item" + (v === activeV ? " active" : "");
+        item.innerHTML = `
+            <span class="tinyctx-session-icon">💬</span>
+            <span class="tinyctx-session-name">Chat ${v}</span>
+            ${v === activeV ? '<span class="tinyctx-session-turns">current</span>' : ''}
+        `;
+        item.addEventListener("click", () => switchVersion(v));
+        list.appendChild(item);
+    }
+}
+
+async function switchVersion(version) {
+    setStatus(`Loading chat ${version}…`, "connecting");
+    await loadVersionIntoST(version);
+    await renderVersionPanel();
+    setStatus(`Session: ${sid()} v${version}`, "ok");
+}
+
+function showVersionPanel() {
+    document.getElementById("tinyctx-version-panel")?.style.setProperty("display", "");
+}
+
+function hideVersionPanel() {
+    document.getElementById("tinyctx-version-panel")?.style.setProperty("display", "none");
+}
+
+// ---------------------------------------------------------------------------
 // Generate interceptor  (manifest: generate_interceptor: "tinyCTXIntercept")
 //
-// ST calls this with (chat, type) where type is one of:
-//   "normal"      — regular user send
-//   "regenerate"  — user hit regenerate / swipe
-//   "continue"    — user hit Continue
-//   "impersonate" — user hit Impersonate (AI writes as user)
-//   "quiet"       — background generation (summarisation, etc.)
+// ST calls tinyCTXIntercept(chat, type) before generation.
+// Returning a string → ST uses it as the assistant reply.
+// Returning undefined → ST proceeds normally.
 //
-// Return a string → ST uses it as the reply.
-// Return undefined / null → ST proceeds with its own generation.
+// Types we handle: "normal", "regenerate", "continue"
+// Types we pass through: "impersonate", "quiet"
 // ---------------------------------------------------------------------------
 
 window.tinyCTXIntercept = async function(chat, type) {
-    if (!isTinyCTXActive) return; // not our character, pass through
+    if (!isTinyCTXActive) return;
+    if (type === "impersonate" || type === "quiet") return;
 
-    // Impersonate: let ST handle it natively with its own pipeline.
-    // ST generates a user-voice message; TinyCTX has nothing to add.
-    if (type === "impersonate") return;
-
-    // Quiet background calls (e.g. summarisation extensions): pass through.
-    if (type === "quiet") return;
+    const sessionId = sid();
+    setStatus(`Generating…`, "connecting");
 
     try {
         if (type === "regenerate") {
-            // Delete the last assistant entry from gateway history, then re-send
-            // the last user message so the agent produces a fresh response.
+            // 1. Delete the last assistant entry only (no cascading back through tool turns)
             const eid = await getLastAssistantEntryId();
             if (eid) {
                 await gwFetch(
-                    `/v1/sessions/${encodeURIComponent(activeSession())}/history/${eid}`,
+                    `/v1/sessions/${encodeURIComponent(sessionId)}/history/${eid}`,
                     { method: "DELETE" }
                 );
             }
-            const userText = getLastUserText();
-            if (!userText) return "[TinyCTX: no user message to regenerate from]";
-            return await sendMessage(userText);
+            // 2. Queue a new generation against existing context
+            const r = await fetch(gw(`/v1/sessions/${encodeURIComponent(sessionId)}/generation`), {
+                method:  "PUT",
+                headers: gwHeaders(),
+                body:    JSON.stringify({ stream: true }),
+            });
+            return await streamGeneration(r) ?? "[TinyCTX: no response]";
         }
 
         if (type === "continue") {
-            // Send a special sentinel; TinyCTX's agent will treat it as "continue"
-            // (the SOUL.md / system prompt should instruct the agent on this, or the
-            // gateway can strip it and send an empty continuation turn).
-            return await sendMessage(CONTINUE_SENTINEL);
+            // Send ST's configured continue nudge prompt as a normal user message.
+            // This is the string the user set in ST's Advanced Formatting settings.
+            const nudge = document.getElementById("continue_nudge_prompt_textarea")?.value?.trim()
+                ?? "[Continue your last message without repeating its original content.]";
+            const r = await fetch(gw(`/v1/sessions/${encodeURIComponent(sessionId)}/message`), {
+                method:  "POST",
+                headers: gwHeaders(),
+                body:    JSON.stringify({ text: nudge, stream: true, session_type: "dm" }),
+            });
+            return await streamGeneration(r) ?? "[TinyCTX: no response]";
         }
 
-        // Default: "normal" send — extract the latest user message
+        // Normal send
         const lastUser = [...chat].reverse().find(m => m.is_user);
         if (!lastUser) return;
         const text = lastUser.mes?.trim();
         if (!text) return;
 
-        return await sendMessage(text);
+        const r = await fetch(gw(`/v1/sessions/${encodeURIComponent(sessionId)}/message`), {
+            method:  "POST",
+            headers: gwHeaders(),
+            body:    JSON.stringify({ text, stream: true, session_type: "dm" }),
+        });
+        return await streamGeneration(r) ?? "[TinyCTX: no response]";
 
     } catch (e) {
         console.error("[TinyCTX] intercept error:", e);
+        setStatus("Error", "err");
         return `[TinyCTX error: ${e.message}]`;
     }
 };
 
 // ---------------------------------------------------------------------------
-// Hook: message edit  (MESSAGE_EDITED event)
-// When the user edits a message in ST, sync the change to gateway history.
+// ST event hooks
 // ---------------------------------------------------------------------------
-
-async function onMessageEdited(messageId) {
-    if (!isTinyCTXActive) return;
-
-    const { chat } = SillyTavern.getContext();
-    const msg = chat?.[messageId];
-    if (!msg) return;
-
-    const entryId = msg.extra?.tinyctx_entry_id;
-    if (!entryId) return; // new message without gateway backing
-
-    await gwFetch(
-        `/v1/sessions/${encodeURIComponent(activeSession())}/history/${entryId}`,
-        { method: "PATCH", body: JSON.stringify({ content: msg.mes }) }
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Hook: message delete  (MESSAGE_DELETED event)
-// ---------------------------------------------------------------------------
-
-async function onMessageDeleted(messageId) {
-    if (!isTinyCTXActive) return;
-
-    // ST passes the index; we need to look it up from what we stored before deletion
-    // ST fires MESSAGE_DELETED after removal, so we track deletions via a pre-delete hook
-    // on the delete button click. See bindChatDeleteHook() below.
-}
-
-// ---------------------------------------------------------------------------
-// Hook: new chat  (CHAT_CHANGED event — when new chat is started)
-// ST's "Start new chat" creates a new JSONL file. We intercept by detecting
-// when the chat becomes empty and switching to a new session UUID.
-// ---------------------------------------------------------------------------
-
-let _lastChatId = null;
 
 async function onChatChanged() {
-    const { characters, characterId, chatId } = SillyTavern.getContext();
+    const { characters, characterId } = SillyTavern.getContext();
     const char = characters?.[characterId];
 
     if (char?.name !== CHAR_NAME) {
@@ -422,130 +491,98 @@ async function onChatChanged() {
 
     if (!isTinyCTXActive) await activate();
 
-    // Detect if ST started a new chat (new chatId = user hit "Start new chat")
-    if (chatId && chatId !== _lastChatId) {
-        _lastChatId = chatId;
-        // If ST created a brand-new empty chat, map it to a new session UUID
-        const ctx = SillyTavern.getContext();
-        if ((ctx.chat?.length ?? 0) === 0) {
-            // Start a new TinyCTX session with a timestamp-based ID
-            const newId = `session-${Date.now()}`;
-            getSettings().active_session = newId;
-            saveSettings();
-            renderSessionPanel();
-            setStatus(`New session: ${newId}`, "ok");
-        } else {
-            // Existing chat loaded — pull history from gateway
-            await loadHistoryIntoST();
-        }
-    }
+    // Load current version's history into ST's chat array
+    await loadVersionIntoST(null);
+    await renderVersionPanel();
 }
 
-// ---------------------------------------------------------------------------
-// Hook: rename chat
-// ST fires CHAT_RENAMED (or user calls renameChat from context).
-// We intercept the rename input by patching the "rename" confirmation flow.
-// ---------------------------------------------------------------------------
 
-function bindRenameHook() {
-    // ST's rename chat button is #chat_rename_button or similar.
-    // We listen for a rename submit and call gateway rename.
-    // The exact selector depends on ST version — we attach to the known form.
-    const renameBtn = document.getElementById("chat_rename_confirm_button")
-        ?? document.querySelector(".rename_chat_confirm");
-    if (!renameBtn || renameBtn.dataset.tinyCTXBound) return;
-    renameBtn.dataset.tinyCTXBound = "1";
+async function onMessageEdited(messageId) {
+    if (!isTinyCTXActive) return;
+    const { chat } = SillyTavern.getContext();
+    const msg      = chat?.[messageId];
+    if (!msg) return;
+    const entryId  = msg.extra?.tinyctx_entry_id;
+    if (!entryId) return;
+    await gwFetch(
+        `/v1/sessions/${encodeURIComponent(sid())}/history/${entryId}`,
+        { method: "PATCH", body: JSON.stringify({ content: msg.mes }) }
+    );
+}
 
-    renameBtn.addEventListener("click", async () => {
+async function onMessageDeleted(messageId) {
+    if (!isTinyCTXActive) return;
+    // ST fires this after removal — we need the entry id we cached before
+    // We store it on the message object in extra.tinyctx_entry_id during load.
+    // By the time this fires the message is gone from ctx.chat, so we track it
+    // in a pre-delete hook instead (see bindDeleteHook).
+}
+
+// Wire up pre-delete so we can grab the entry id before ST removes the message
+function bindDeleteHook() {
+    // ST's delete button fires a click on .mes_block .del_mes_but
+    // We intercept via event delegation on #chat
+    const chatEl = document.getElementById("chat");
+    if (!chatEl || chatEl.dataset.tinyCTXDelete) return;
+    chatEl.dataset.tinyCTXDelete = "1";
+
+    chatEl.addEventListener("click", async (e) => {
         if (!isTinyCTXActive) return;
-        const input = document.getElementById("chat_rename_input")
+        const btn = e.target.closest(".mes_delete, [title='Delete message']");
+        if (!btn) return;
+        const mesEl  = btn.closest(".mes");
+        if (!mesEl) return;
+        const mesId  = parseInt(mesEl.dataset.mesid, 10);
+        if (isNaN(mesId)) return;
+        const { chat } = SillyTavern.getContext();
+        const msg       = chat?.[mesId];
+        const entryId   = msg?.extra?.tinyctx_entry_id;
+        if (!entryId) return;
+        // Fire-and-forget — ST will remove the message from its side
+        gwFetch(
+            `/v1/sessions/${encodeURIComponent(sid())}/history/${entryId}`,
+            { method: "DELETE" }
+        ).catch(e => console.warn("[TinyCTX] delete failed:", e));
+    }, true); // capture phase so we run before ST's own handler
+}
+
+// Wire up abort to ST's stop generation button
+function bindAbortHook() {
+    // ST's stop button: #stop_generation or .stop_generation_button
+    const stopBtn = document.getElementById("stop_generation")
+        ?? document.querySelector(".stop_generation_button");
+    if (!stopBtn || stopBtn.dataset.tinyCTXAbort) return;
+    stopBtn.dataset.tinyCTXAbort = "1";
+
+    stopBtn.addEventListener("click", () => {
+        if (!isTinyCTXActive) return;
+        gwFetch(`/v1/sessions/${encodeURIComponent(sid())}/generation`, { method: "DELETE" })
+            .catch(e => console.warn("[TinyCTX] abort failed:", e));
+    });
+}
+
+// Wire up rename chat
+function bindRenameHook() {
+    const btn = document.getElementById("chat_rename_confirm_button")
+        ?? document.querySelector(".rename_chat_confirm");
+    if (!btn || btn.dataset.tinyCTXRename) return;
+    btn.dataset.tinyCTXRename = "1";
+
+    btn.addEventListener("click", async () => {
+        if (!isTinyCTXActive) return;
+        const input   = document.getElementById("chat_rename_input")
             ?? document.querySelector(".rename_chat_input");
         const newName = input?.value?.trim();
         if (!newName) return;
-        const oldId = activeSession();
+        const oldId   = sid();
         await gwFetch(`/v1/sessions/${encodeURIComponent(oldId)}/rename`, {
             method: "PATCH",
             body:   JSON.stringify({ new_id: newName }),
         });
-        getSettings().active_session = newName;
+        getSettings().session_id = newName;
         saveSettings();
-        renderSessionPanel();
+        await renderVersionPanel();
     });
-}
-
-// ---------------------------------------------------------------------------
-// Session panel — replaces "Manage chat files" for the TinyCTX char
-// Injected into ST's right panel above the character list.
-// ---------------------------------------------------------------------------
-
-const SESSION_PANEL_HTML = `
-<div id="tinyctx-session-panel" style="display:none;">
-    <div class="tinyctx-session-header">
-        <span>Sessions</span>
-        <button id="tinyctx-new-session-btn" title="Start new session">＋ New</button>
-    </div>
-    <div id="tinyctx-session-list"></div>
-</div>
-`;
-
-function escapeHtml(s) {
-    return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
-
-async function renderSessionPanel() {
-    const list = document.getElementById("tinyctx-session-list");
-    if (!list) return;
-
-    const sessions = await gwSessions();
-    const cur      = activeSession();
-    list.innerHTML = "";
-
-    if (!sessions.length) {
-        list.innerHTML = `<div class="tinyctx-session-empty">No sessions yet</div>`;
-        return;
-    }
-
-    for (const s of sessions) {
-        const item = document.createElement("div");
-        item.className = "tinyctx-session-item" + (s.id === cur ? " active" : "");
-        item.innerHTML = `
-            <span class="tinyctx-session-icon">💬</span>
-            <span class="tinyctx-session-name">${escapeHtml(s.id)}</span>
-            <span class="tinyctx-session-turns">${s.turns}t</span>
-            <button class="tinyctx-session-delete" title="Delete session" data-id="${escapeHtml(s.id)}">🗑</button>
-        `;
-        item.querySelector(".tinyctx-session-name").addEventListener("click", () => switchSession(s.id));
-        item.querySelector(".tinyctx-session-delete").addEventListener("click", async (e) => {
-            e.stopPropagation();
-            if (!confirm(`Delete session "${s.id}"?`)) return;
-            await gwFetch(`/v1/sessions/${encodeURIComponent(s.id)}`, { method: "DELETE" });
-            if (s.id === activeSession()) {
-                getSettings().active_session = "default";
-                saveSettings();
-            }
-            await renderSessionPanel();
-        });
-        list.appendChild(item);
-    }
-}
-
-async function switchSession(id) {
-    getSettings().active_session = id;
-    saveSettings();
-    setStatus(`Loading session: ${id}…`, "connecting");
-    await loadHistoryIntoST();
-    await renderSessionPanel();
-    setStatus(`Session: ${id}`, "ok");
-}
-
-function showSessionPanel() {
-    const p = document.getElementById("tinyctx-session-panel");
-    if (p) p.style.display = "";
-}
-
-function hideSessionPanel() {
-    const p = document.getElementById("tinyctx-session-panel");
-    if (p) p.style.display = "none";
 }
 
 // ---------------------------------------------------------------------------
@@ -555,16 +592,18 @@ function hideSessionPanel() {
 async function activate() {
     isTinyCTXActive = true;
     setStatus("Connecting…", "connecting");
-    showSessionPanel();
+    showVersionPanel();
+    // Pull first (gateway is authoritative for agent-written edits),
+    // then push any local card changes on top.
+    await pullFieldsFromGateway();
     await syncAllFields();
-    await renderSessionPanel();
     startPolling();
 }
 
 function deactivate() {
     isTinyCTXActive = false;
     stopPolling();
-    hideSessionPanel();
+    hideVersionPanel();
     setStatus("Inactive — select TinyCTX Agent", "idle");
 }
 
@@ -592,7 +631,6 @@ async function pollOnce() {
 async function ensureCharacter() {
     const { characters } = SillyTavern.getContext();
     if ((characters ?? []).some(c => c.name === CHAR_NAME)) return;
-
     try {
         await fetch("/api/characters/create", {
             method:  "POST",
@@ -602,16 +640,13 @@ async function ensureCharacter() {
                 description:   "<!-- Edit to update AGENTS.md on the TinyCTX gateway -->",
                 personality:   "<!-- Edit to update SOUL.md on the TinyCTX gateway -->",
                 scenario:      "<!-- Edit to update MEMORY.md on the TinyCTX gateway -->",
-                first_mes:     "TinyCTX connected. Select a session from the panel above.",
+                first_mes:     "TinyCTX connected.",
                 mes_example:   "",
                 creator_notes: "Managed by TinyCTX extension — do not rename.",
                 tags:          ["tinyctx"],
             }),
         });
         console.log("[TinyCTX] Created managed character.");
-        // Reload character list if possible
-        const ctx = SillyTavern.getContext();
-        if (typeof ctx.reloadCurrentChat === "function") await ctx.reloadCurrentChat();
     } catch (e) {
         console.error("[TinyCTX] Failed to create character:", e);
     }
@@ -638,6 +673,11 @@ const SETTINGS_HTML = `
         <input type="password" id="tinyctx-apikey" placeholder="blank = no auth">
     </div>
 
+    <div class="tinyctx-field">
+        <label for="tinyctx-session-id">Session ID</label>
+        <input type="text" id="tinyctx-session-id" placeholder="sillytavern">
+    </div>
+
     <div class="tinyctx-row">
         <input type="checkbox" id="tinyctx-tool-events">
         <label for="tinyctx-tool-events">Show tool events in chat</label>
@@ -657,26 +697,29 @@ const SETTINGS_HTML = `
 `;
 
 function bindSettings() {
-    const s = getSettings();
+    const s   = getSettings();
     const ep  = document.getElementById("tinyctx-endpoint");
     const key = document.getElementById("tinyctx-apikey");
+    const sid_el = document.getElementById("tinyctx-session-id");
     const te  = document.getElementById("tinyctx-tool-events");
     const sf  = document.getElementById("tinyctx-sync-fields");
     if (!ep) return;
 
-    ep.value   = s.endpoint;
-    key.value  = s.api_key;
-    te.checked = s.show_tool_events;
-    sf.checked = s.sync_card_fields;
+    ep.value     = s.endpoint;
+    key.value    = s.api_key;
+    sid_el.value = s.session_id;
+    te.checked   = s.show_tool_events;
+    sf.checked   = s.sync_card_fields;
 
     const persist = () => {
         s.endpoint         = ep.value.trim().replace(/\/$/, "") || "http://127.0.0.1:8080";
         s.api_key          = key.value.trim();
+        s.session_id       = sid_el.value.trim() || "sillytavern";
         s.show_tool_events = te.checked;
         s.sync_card_fields = sf.checked;
         saveSettings();
     };
-    [ep, key, te, sf].forEach(el => {
+    [ep, key, sid_el, te, sf].forEach(el => {
         el.addEventListener("change", persist);
         el.addEventListener("input",  persist);
     });
@@ -693,9 +736,7 @@ function bindSettings() {
         setStatus("Synced", "ok");
     });
 
-    document.getElementById("tinyctx-btn-recreate")?.addEventListener("click", async () => {
-        await ensureCharacter();
-    });
+    document.getElementById("tinyctx-btn-recreate")?.addEventListener("click", ensureCharacter);
 }
 
 // ---------------------------------------------------------------------------
@@ -703,7 +744,7 @@ function bindSettings() {
 // ---------------------------------------------------------------------------
 
 (async () => {
-    const { eventSource, eventTypes } = SillyTavern.getContext();
+    const { eventSource, event_types } = SillyTavern.getContext();
 
     // Settings panel
     $("#extensions_settings").append(`
@@ -717,35 +758,33 @@ function bindSettings() {
     `);
     bindSettings();
 
-    // Session panel — inject into right nav panel above character list
+    // Version panel — inject above the character list
     const anchor = document.getElementById("rm_print_characters_block")
         ?? document.getElementById("right-nav-panel")
         ?? document.body;
-    anchor.insertAdjacentHTML("afterbegin", SESSION_PANEL_HTML);
+    anchor.insertAdjacentHTML("afterbegin", VERSION_PANEL_HTML);
 
-    document.getElementById("tinyctx-new-session-btn")?.addEventListener("click", async () => {
-        const id = `session-${Date.now()}`;
-        getSettings().active_session = id;
-        saveSettings();
-        setStatus(`New session: ${id}`, "ok");
-        // Trigger ST to start a new chat, which will call onChatChanged
-        // which will see an empty chat and pick up the new session.
-        const { generate } = SillyTavern.getContext();
-        // Use ST's "new chat" UI button if available
-        document.getElementById("option_start_new_chat")?.click()
-            ?? document.querySelector("[data-i18n='Start new chat']")?.click();
+    // "New chat" button → POST /next to bump version
+    document.getElementById("tinyctx-new-chat-btn")?.addEventListener("click", async () => {
+        if (!isTinyCTXActive) return;
+        await gwFetch(`/v1/sessions/${encodeURIComponent(sid())}/next`, { method: "POST" });
+        await loadVersionIntoST(null);
+        await renderVersionPanel();
+        setStatus(`New chat started`, "ok");
     });
 
-    // Events
-    eventSource.on(eventTypes.CHAT_CHANGED,     onChatChanged);
-    eventSource.on(eventTypes.CHARACTER_EDITED, async () => {
+    // Events — note: it's event_types (snake_case), not eventTypes
+    eventSource.on(event_types.CHAT_CHANGED,     onChatChanged);
+    eventSource.on(event_types.CHARACTER_EDITED, async () => {
         if (isTinyCTXActive) await syncAllFields();
     });
-    eventSource.on(eventTypes.MESSAGE_EDITED,   onMessageEdited);
-    eventSource.on(eventTypes.APP_READY, async () => {
+    eventSource.on(event_types.MESSAGE_EDITED,   onMessageEdited);
+    eventSource.on(event_types.APP_READY, async () => {
         await ensureCharacter();
         await onChatChanged();
         bindRenameHook();
+        bindAbortHook();
+        bindDeleteHook();
     });
 
     console.log("[TinyCTX] Extension loaded.");

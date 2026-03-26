@@ -650,6 +650,20 @@ async def handle_health(request: web.Request) -> web.Response:
 
 
 # ---------------------------------------------------------------------------
+# Session next
+# ---------------------------------------------------------------------------
+
+async def handle_session_next(request: web.Request) -> web.Response:
+    """POST /v1/sessions/{session_id}/next — archive current version, start a fresh one."""
+    router       = request.app["router"]
+    session_id   = request.match_info["session_id"]
+    session_type = request.rel_url.query.get("session_type", "dm")
+    sk           = _session_key(session_id, session_type)
+    router.next_session(sk)
+    return web.Response(status=204)
+
+
+# ---------------------------------------------------------------------------
 # App factory + entrypoint
 # ---------------------------------------------------------------------------
 
@@ -674,11 +688,14 @@ def _make_app(router, cfg: GatewayConfig) -> web.Application:
     app.router.add_put(   "/v1/sessions/{session_id}/generation",          handle_generation_put)
     app.router.add_delete("/v1/sessions/{session_id}/generation",          handle_generation_delete)
 
+    # Session lifecycle
+    app.router.add_post(  "/v1/sessions/{session_id}/reset",               handle_session_reset)
+    app.router.add_post(  "/v1/sessions/{session_id}/next",                handle_session_next)
+
     # History
     app.router.add_get(   "/v1/sessions/{session_id}/history",             handle_history_get)
     app.router.add_patch( "/v1/sessions/{session_id}/history/{entry_id}",  handle_history_patch)
     app.router.add_delete("/v1/sessions/{session_id}/history/{entry_id}",  handle_history_delete)
-    app.router.add_post(  "/v1/sessions/{session_id}/reset",               handle_session_reset)
 
     # Workspace
     app.router.add_get(   "/v1/workspace/files/{path:.+}",                 handle_workspace_get)
