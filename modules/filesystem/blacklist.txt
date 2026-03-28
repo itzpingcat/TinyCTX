@@ -14,23 +14,6 @@
 
 
 # ------------------------------------------------------------
-# BULK / RECURSIVE OPERATIONS (primary risk)
-# ------------------------------------------------------------
-
-# Recursion flags (any cmdlet)
-*-recurse*
-*-r *
-
-# Wildcards (bulk targets)
-*\**
-*\*.*
-
-# Comma-separated targets (multiple items)
-*,*
-* , *
-
-
-# ------------------------------------------------------------
 # BULK DESTRUCTIVE FILE OPERATIONS
 # (single-item delete is allowed)
 # ------------------------------------------------------------
@@ -48,6 +31,10 @@ clear-item*\**
 rmdir*\**
 rd*\**
 
+copy-item*,*
+move-item*,*
+set-content*,*
+add-content*,*
 
 # ------------------------------------------------------------
 # BULK WRITE / OVERWRITE OPERATIONS

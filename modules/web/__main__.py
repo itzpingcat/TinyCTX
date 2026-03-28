@@ -257,6 +257,7 @@ def register(agent) -> None:
             num_results: How many results to return (default 5).
         """
         from ddgs import DDGS
+        num_results = int(num_results)
         try:
             with DDGS() as ddgs:
                 results = list(ddgs.text(query, max_results=num_results))
