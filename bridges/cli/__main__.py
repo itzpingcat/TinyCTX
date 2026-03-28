@@ -23,82 +23,19 @@ from contracts import (
 )
 
 logger = logging.getLogger(__name__)
+logging.getLogger("markdown_it").setLevel(logging.WARNING)
 
-# --- LaTeX → Unicode Logic ---
+# --- Code block label injection ---
+# Rich's Markdown renderer syntax-highlights fenced blocks but drops the language label.
+# We prepend an italic label above each tagged block so the user can see the language.
 
-try:
-    from sympy import pretty
-    from sympy.parsing.latex import parse_latex as _parse_latex
-    # antlr4 is required at runtime — probe it now so we don't silently fall back later
-    _parse_latex(r'x^2')
-    _SYMPY = True
-except Exception:
-    _SYMPY = False
-    logger.warning(
-        "LaTeX -> unicode rendering disabled. "
-        "Install sympy + antlr4-python3-runtime==4.11.0 to enable it."
-    )
+_FENCED_CODE = re.compile(r'^```[ \t]*(\w+)[ \t]*\n(.*?)\n```[ \t]*$', re.DOTALL | re.MULTILINE)
 
-def _latex_to_unicode(latex: str) -> str:
-    if not _SYMPY:
-        return latex
-    try:
-        clean_latex = latex.strip().replace("**", "")
-        expr = _parse_latex(clean_latex)
-        return str(pretty(expr, use_unicode=True))
-    except Exception:
-        return latex
-
-_BLOCK_MATH_DOLLARS  = re.compile(r'\$\$(.+?)\$\$', re.DOTALL)
-_BLOCK_MATH_BRACKET  = re.compile(r'\\\[(.+?)\\\]', re.DOTALL)
-_INLINE_MATH_DOLLARS = re.compile(r'(?<!\$)\$(?!\$)(.+?)(?<!\$)\$(?!\$)', re.DOTALL)
-_INLINE_MATH_PAREN   = re.compile(r'\\\((.+?)\\\)', re.DOTALL)
-_FENCED_LATEX        = re.compile(r'^```[ \t]*(latex|math|tex)\s*\n(.+?)\n```[ \t]*$', re.DOTALL | re.MULTILINE | re.IGNORECASE)
-_FENCED_CODE         = re.compile(r'^```[ \t]*(\w+)[ \t]*\n(.*?)\n```[ \t]*$', re.DOTALL | re.MULTILINE)
-_FENCED_PLAIN        = re.compile(r'^```[ \t]*\n(.*?)\n```[ \t]*$', re.DOTALL | re.MULTILINE)
-
-def _render_block(content: str) -> str:
-    """Render a latex string as an indented unicode block."""
-    rendered = _latex_to_unicode(content)
-    indented = "\n".join("    " + line for line in rendered.splitlines())
-    return f"\n{indented}\n"
-
-def _preprocess_code_labels(text: str) -> str:
-    """Prepend a dim language label above fenced code blocks since Rich drops it."""
+def _preprocess(text: str) -> str:
     def _label(m: re.Match) -> str:
-        lang = m.group(1)
-        body = m.group(2)
+        lang, body = m.group(1), m.group(2)
         return f'*{lang}*\n```{lang}\n{body}\n```'
     return _FENCED_CODE.sub(_label, text)
-
-def _preprocess_latex(text: str) -> str:
-    """Replaces LaTeX spans with unicode before Markdown rendering.
-    Handles fenced ```latex blocks and all four math delimiter styles.
-    """
-    def _fenced(m: re.Match) -> str:
-        return _render_block(m.group(2))
-
-    def _block(m: re.Match) -> str:
-        return _render_block(m.group(1))
-
-    def _inline(m: re.Match) -> str:
-        return _latex_to_unicode(m.group(1))
-
-    def _plain_fenced(m: re.Match) -> str:
-        # No language tag — attempt LaTeX, fall back to plain code block
-        content = m.group(1)
-        rendered = _latex_to_unicode(content)
-        if rendered != content:  # sympy changed it, treat as math
-            return _render_block(content)
-        return m.group(0)  # leave untouched for Rich to render
-
-    text = _FENCED_LATEX.sub(_fenced, text)
-    text = _FENCED_PLAIN.sub(_plain_fenced, text)
-    text = _BLOCK_MATH_DOLLARS.sub(_block, text)
-    text = _BLOCK_MATH_BRACKET.sub(_block, text)
-    text = _INLINE_MATH_DOLLARS.sub(_inline, text)
-    text = _INLINE_MATH_PAREN.sub(_inline, text)
-    return text
 
 # --- Theme & UI ---
 
@@ -136,7 +73,6 @@ class CLIBridge:
         self._console = Console(highlight=False)
         self._reply_done = asyncio.Event()
 
-        # State for the current turn
         self._current_content = ""
         self._is_thinking = False
         self._thinking_shown = False
@@ -148,7 +84,6 @@ class CLIBridge:
         if isinstance(event, AgentThinkingChunk):
             if not self._thinking_shown:
                 self._thinking_shown = True
-                # Simple inline indicator — no Live, no cursor fighting
                 self._console.print(
                     f"[{c('thinking')}]{t('agent_label')}: ⠋ thinking...[/{c('thinking')}]",
                     end="\r"
@@ -156,23 +91,19 @@ class CLIBridge:
 
         elif isinstance(event, AgentTextChunk):
             self._is_thinking = False
-            # Just buffer — rendering live conflicts with Rich's output
             self._current_content += event.text
 
         elif isinstance(event, AgentTextFinal):
-            # Clear the thinking line if it was shown
             if self._thinking_shown:
                 self._console.print(" " * 60, end="\r")
 
             final_text = (self._current_content + (event.text or "")).strip()
-            processed = _preprocess_latex(final_text)
-            processed = _preprocess_code_labels(processed)
+            processed = _preprocess(final_text)
 
             self._console.print(f"[{c('agent_label')}]{t('agent_label')}:[/{c('agent_label')}]")
             self._console.print(Markdown(processed))
             self._console.print()
 
-            # Reset turn state
             self._current_content = ""
             self._is_thinking = False
             self._thinking_shown = False
@@ -194,14 +125,12 @@ class CLIBridge:
             self._reply_done.set()
 
     async def _prompt(self, prompt_str: str) -> str:
-        """Async input using a thread executor — no prompt_toolkit needed."""
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, lambda: input(prompt_str))
 
     async def run(self) -> None:
         self._gateway.register_platform_handler(Platform.CLI.value, self.handle_event)
 
-        # Banner
         banner_text = Text()
         banner_text.append(pyfiglet.figlet_format(self._theme.t("name"), font="slant"), style=self._theme.c("banner"))
         banner_text.append(f"  {self._theme.t('tagline')}", style=self._theme.c("tagline"))
@@ -211,8 +140,6 @@ class CLIBridge:
         c = self._theme.c
         t = self._theme.t
 
-        # Build a plain-text prompt string (Rich markup won't work in input())
-        # Use ANSI directly for the colored prompt
         ANSI_RESET = "\033[0m"
         ANSI_GREEN = "\033[32m"
         prompt_str = f"{ANSI_GREEN}{t('user_label')}{ANSI_RESET}: "
