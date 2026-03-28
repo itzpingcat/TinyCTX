@@ -63,24 +63,24 @@ def register(agent) -> None:
         lines = text.splitlines()
         total = len(lines)
         if view_range:
-            # --- FIX STARTS HERE ---
             try:
                 # If the agent sent a string like "1,20", convert it to a list [1, 20]
                 if isinstance(view_range, str):
-                    view_range = [x.strip() for x in view_range.split(',')]
-                
-                # Now we safely extract and cast to int
-                start = max(1, int(view_range[0]))
-                
-                # Check for -1 or EOF strings
-                end_val = view_range[1]
-                if str(end_val) == "-1" or str(end_val).lower() == "eof":
-                    end = total
-                else:
-                    end = min(int(end_val), total)
+                    parts = []
+                    
+                    for chunk in view_range.split(','):
+                        chunk = chunk.strip()
+                        
+                        # Handle range like "1-20"
+                        if '-' in chunk:
+                            start, end = chunk.split('-', 1)
+                            parts.extend([start.strip(), end.strip()])
+                        else:
+                            parts.append(chunk)                    
+                    view_range = parts
             except (ValueError, IndexError):
                 return "[error: view_range must be [start, end] or 'start,end' integers]"
-            # --- FIX ENDS HERE ---
+
 
         return f"[{p} | {total} lines]\n" + "\n".join(
             f"{i:>6}\t{l}" for i, l in enumerate(lines, 1)
