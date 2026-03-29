@@ -189,6 +189,9 @@ class CLIBridge:
             handlers=[RichHandler(console=self._console, rich_tracebacks=True, markup=False)],
             force=True,
         )
+        # markdown-it-py logs every parser rule at DEBUG; silence it regardless
+        # of the configured log level — it's never useful in the CLI output.
+        logging.getLogger("markdown_it").setLevel(logging.WARNING)
         self._gateway.register_platform_handler(Platform.CLI.value, self.handle_event)
         self._cursor = _load_cli_cursor(self._gateway)
 
