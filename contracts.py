@@ -167,17 +167,23 @@ class InboundMessage:
     For group sessions, bridges should set group_policy so the router's
     GroupLane can enforce trigger detection, stripping, and buffering.
     Bridges pass raw (unstripped) text; GroupLane handles everything.
+
+    tail_node_id: tree-refactor field. When set, the router routes this
+    message to the lane keyed by this node_id rather than session_key.
+    Bridges set this once the tree refactor is complete (Phase 2). Until
+    then, session_key is the primary routing key.
     """
-    session_key:  SessionKey
-    author:       UserIdentity
-    content_type: ContentType
-    text:         str
-    message_id:   str
-    timestamp:    float
-    reply_to_id:  str | None    = None
-    attachments:  tuple["Attachment", ...] = field(default_factory=tuple)
-    trace_id:     str           = field(default_factory=lambda: str(uuid.uuid4()))
-    group_policy: "GroupPolicy | None" = None  # set by bridge for group messages
+    session_key:   SessionKey
+    author:        UserIdentity
+    content_type:  ContentType
+    text:          str
+    message_id:    str
+    timestamp:     float
+    reply_to_id:   str | None    = None
+    attachments:   tuple["Attachment", ...] = field(default_factory=tuple)
+    trace_id:      str           = field(default_factory=lambda: str(uuid.uuid4()))
+    group_policy:  "GroupPolicy | None" = None  # set by bridge for group messages
+    tail_node_id:  str | None    = None          # tree refactor: cursor node_id
 
 
 # ---------------------------------------------------------------------------
@@ -193,11 +199,12 @@ class InboundMessage:
 #   reply_to_message_id  — the inbound message_id that triggered this turn
 # ---------------------------------------------------------------------------
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class _AgentEventBase:
     session_key:         SessionKey
     trace_id:            str
     reply_to_message_id: str
+    tail_node_id:        str | None = None  # tree refactor: tail node after this turn
 
 
 @dataclass(frozen=True)

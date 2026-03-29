@@ -19,8 +19,15 @@ Streaming behaviour:
 Abort:
   Lane passes its abort_event to run(). The loop checks it between every
   inference cycle and inside the LLM stream. If set, yields AgentError and
-  exits cleanly. No flush on abort — history is consistent because no partial
-  assistant entry was committed.
+  exits cleanly.
+
+Tree refactor (Phase 1):
+  AgentLoop now opens agent.db (via ConversationDB) and wires it into Context.
+  _tail_node_id tracks the current branch cursor. On first start for a
+  session, a child of the global root is created as the session's home node.
+  All context.add() calls write immediately to the DB; no end-of-turn flush.
+  _flush_history, _restore_history, _load_latest_version, and next_session
+  are deleted. reset() clears in-memory state only — it does not touch the DB.
 
 Model pool:
   All named chat models from config.models are pre-instantiated.
@@ -37,7 +44,6 @@ import asyncio
 import importlib
 import json
 import logging
-import time
 import uuid
 from pathlib import Path
 from typing import AsyncIterator
@@ -52,6 +58,7 @@ from config import Config, ModelConfig
 from ai import LLM, TextDelta, ThinkingDelta, ToolCallAssembled, LLMError
 from utils.tool_handler import ToolCallHandler
 from utils.attachments import build_content_blocks
+from db import ConversationDB
 
 logger = logging.getLogger(__name__)
 
@@ -77,19 +84,18 @@ def _build_llm(cfg: ModelConfig) -> LLM:
 
 class AgentLoop:
     def __init__(self, session_key: SessionKey, config: Config, version_override: int | None = None) -> None:
-        self.session_key      = session_key
-        self.config           = config
-        self.context          = Context(token_limit=config.context)
-        self.tool_handler     = ToolCallHandler()
-        self._turn_count      = 0
-        self.gateway          = None  # set by Lane after construction
+        self.session_key   = session_key
+        self.config        = config
+        self.context       = Context(token_limit=config.context)
+        self.tool_handler  = ToolCallHandler()
+        self._turn_count   = 0
+        self.gateway       = None  # set by Lane after construction
 
-        if version_override is not None:
-            self._session_version = version_override
-            logger.info("[%s] starting at version override v%d", session_key, version_override)
-        else:
-            self._session_version = self._load_latest_version()
-            self._restore_history()
+        # Tree refactor: open DB and restore cursor
+        self._db, self._tail_node_id = self._init_db()
+        self.context.set_db(self._db)
+        self.context.set_tail(self._tail_node_id)
+        self.context.set_cursor_callback(self._on_context_tail_advance)
 
         self._models: dict[str, LLM] = {
             name: _build_llm(mc)
@@ -99,6 +105,77 @@ class AgentLoop:
 
         self.tool_handler.register_tool(self.tool_handler.tools_search, always_on=True)
         self._load_modules()
+
+    # ------------------------------------------------------------------
+    # DB initialisation
+    # ------------------------------------------------------------------
+
+    def _init_db(self) -> tuple[ConversationDB, str]:
+        """
+        Open (or create) agent.db in the workspace. Return (db, tail_node_id).
+
+        The tail_node_id is persisted in a small cursor file alongside the DB
+        so the session resumes where it left off on restart. The cursor file
+        is named after the session_key to allow multiple sessions to share one
+        DB (as they will once Phase 2 bridges are migrated).
+
+        On first start for this session_key, a child of the global root is
+        created as the session's initial node and becomes the cursor.
+        """
+        workspace = Path(self.config.workspace.path).expanduser().resolve()
+        workspace.mkdir(parents=True, exist_ok=True)
+        db_path = workspace / "agent.db"
+
+        db = ConversationDB(db_path)
+
+        # Cursor file: workspace/cursors/<safe_key>
+        cursors_dir = workspace / "cursors"
+        cursors_dir.mkdir(parents=True, exist_ok=True)
+        safe_key    = str(self.session_key).replace(":", "_")
+        cursor_file = cursors_dir / safe_key
+
+        if cursor_file.exists():
+            node_id = cursor_file.read_text(encoding="utf-8").strip()
+            # Verify the node still exists in the DB
+            if db.get_node(node_id) is not None:
+                logger.info("[%s] resumed from cursor %s", self.session_key, node_id)
+                return db, node_id
+            else:
+                logger.warning(
+                    "[%s] cursor %s not found in DB — creating fresh node",
+                    self.session_key, node_id,
+                )
+
+        # Fresh start: attach to global root
+        root   = db.get_root()
+        node   = db.add_node(parent_id=root.id, role="system", content=f"session:{self.session_key}")
+        cursor_file.write_text(node.id, encoding="utf-8")
+        logger.info("[%s] created session node %s", self.session_key, node.id)
+        return db, node.id
+
+    def _save_cursor(self) -> None:
+        """Persist the current tail_node_id to the cursor file."""
+        if self._tail_node_id is None:
+            return
+        workspace   = Path(self.config.workspace.path).expanduser().resolve()
+        cursors_dir = workspace / "cursors"
+        cursors_dir.mkdir(parents=True, exist_ok=True)
+        safe_key    = str(self.session_key).replace(":", "_")
+        cursor_file = cursors_dir / safe_key
+        try:
+            cursor_file.write_text(self._tail_node_id, encoding="utf-8")
+        except Exception as exc:
+            logger.warning("[%s] failed to save cursor: %s", self.session_key, exc)
+
+    def _on_context_tail_advance(self) -> None:
+        """
+        Called by Context.add() each time the tail node advances.
+        Keeps _tail_node_id and the on-disk cursor file in sync immediately,
+        so a second AgentLoop for the same session always resumes from the
+        latest node even if run() never completed.
+        """
+        self._tail_node_id = self.context.tail_node_id
+        self._save_cursor()
 
     # ------------------------------------------------------------------
     # Public model accessor (for modules)
@@ -160,11 +237,11 @@ class AgentLoop:
         logger.debug("[%s] turn %d (synthetic=%s)", self.session_key, self._turn_count, msg is None)
 
         if msg is not None:
-            trace_id   = msg.trace_id
-            msg_id     = msg.message_id
+            trace_id = msg.trace_id
+            msg_id   = msg.message_id
         else:
-            trace_id   = str(uuid.uuid4())
-            msg_id     = "synthetic"
+            trace_id = str(uuid.uuid4())
+            msg_id   = "synthetic"
 
         ev = dict(
             session_key=self.session_key,
@@ -290,7 +367,7 @@ class AgentLoop:
             if error:
                 logger.error("[%s] LLM error (all models exhausted): %s", self.session_key, error)
                 yield AgentError(message=f"[LLM error: {error}]", **ev)
-                await self._flush_history()
+                self._save_cursor()
                 return
 
             response_text = "".join(text_chunks)
@@ -321,8 +398,11 @@ class AgentLoop:
             logger.warning("[%s] hit max_tool_cycles (%d)", self.session_key, max_cycles)
             final_text = final_text or "[Tool cycle limit reached.]"
 
+        # Sync cursor so the DB tail_node_id is persisted for next restart
+        self._tail_node_id = self.context.tail_node_id
+        self._save_cursor()
+
         yield AgentTextFinal(text=final_text if not streaming_active else "", **ev)
-        await self._flush_history()
 
     # ------------------------------------------------------------------
     # Tool execution
@@ -346,92 +426,14 @@ class AgentLoop:
     # ------------------------------------------------------------------
 
     def reset(self) -> None:
+        """
+        Clear in-memory context. Does NOT touch agent.db — the tree is
+        permanent. The cursor stays at the current tail; the agent will
+        continue to see prior history when it next assembles context.
+
+        To start a genuinely fresh branch, advance the cursor to a new
+        child node (that is Phase 2 bridge work).
+        """
         self.context.clear()
         self._turn_count = 0
-        safe_key     = str(self.session_key).replace(":", "_")
-        sessions_dir = Path("sessions") / safe_key
-        sessions_dir.mkdir(parents=True, exist_ok=True)
-        path = sessions_dir / f"{self._session_version}.json"
-        try:
-            data = {
-                "session_key": str(self.session_key),
-                "version":     self._session_version,
-                "turn":        0,
-                "saved_at":    time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "dialogue":    [],
-            }
-            path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-            logger.info("[%s] reset session v%d on disk", self.session_key, self._session_version)
-        except Exception as exc:
-            logger.warning("[%s] failed to write reset session JSON: %s", self.session_key, exc)
-
-    def next_session(self) -> None:
-        self.context.clear()
-        self._turn_count      = 0
-        self._session_version += 1
-        logger.info("[%s] new session v%d", self.session_key, self._session_version)
-
-    def _load_latest_version(self) -> int:
-        safe_key     = str(self.session_key).replace(":", "_")
-        sessions_dir = Path("sessions") / safe_key
-        if not sessions_dir.exists():
-            return 1
-        existing = [int(p.stem) for p in sessions_dir.glob("*.json") if p.stem.isdigit()]
-        return max(existing, default=1)
-
-    def _restore_history(self) -> None:
-        safe_key = str(self.session_key).replace(":", "_")
-        path     = Path("sessions") / safe_key / f"{self._session_version}.json"
-        if not path.exists():
-            return
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            self._turn_count = data.get("turn", 0)
-            for raw in data.get("dialogue", []):
-                raw_content = raw.get("content", "")
-                entry = HistoryEntry(
-                    role=raw["role"],
-                    content=raw_content if isinstance(raw_content, (str, list)) else str(raw_content),
-                    id=raw.get("id", ""),
-                    index=raw.get("index", 0),
-                    tool_calls=raw.get("tool_calls") or [],
-                    tool_call_id=raw.get("tool_call_id"),
-                    author_id=raw.get("author_id"),
-                )
-                self.context.dialogue.append(entry)
-            logger.info(
-                "[%s] restored %d entries from v%d",
-                self.session_key, len(self.context.dialogue), self._session_version,
-            )
-        except Exception as exc:
-            logger.warning("[%s] _restore_history failed: %s", self.session_key, exc)
-
-    async def _flush_history(self) -> None:
-        safe_key     = str(self.session_key).replace(":", "_")
-        sessions_dir = Path("sessions") / safe_key
-        sessions_dir.mkdir(parents=True, exist_ok=True)
-        path = sessions_dir / f"{self._session_version}.json"
-        dialogue_raw = [
-            {
-                "id":           e.id,
-                "role":         e.role,
-                "content":      e.content,
-                "tool_calls":   e.tool_calls,
-                "tool_call_id": e.tool_call_id,
-                "index":        e.index,
-                "author_id":    e.author_id,
-            }
-            for e in self.context.dialogue
-        ]
-        data = {
-            "session_key": str(self.session_key),
-            "version":     self._session_version,
-            "turn":        self._turn_count,
-            "saved_at":    time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "dialogue":    dialogue_raw,
-        }
-        try:
-            path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-            logger.debug("[%s] flushed v%d -> %s", self.session_key, self._session_version, path)
-        except Exception as exc:
-            logger.warning("[%s] _flush_history failed: %s", self.session_key, exc)
+        logger.info("[%s] reset (in-memory only — tree intact)", self.session_key)

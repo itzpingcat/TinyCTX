@@ -387,9 +387,6 @@ class TestAgentIntakeWithAttachments:
                 )
         agent._models["primary"] = llm_mock
 
-        async def _noop_flush():
-            pass
-        agent._flush_history = _noop_flush
         return agent
 
     @pytest.mark.asyncio
@@ -466,10 +463,10 @@ class TestAgentIntakeWithAttachments:
 
 class TestAgentFlushRestoreListContent:
     @pytest.mark.asyncio
-    async def test_list_content_survives_flush_restore(self, tmp_path):
+    async def test_list_content_survives_db_roundtrip(self, tmp_path):
         """
-        Simulate what flush+restore does with list content:
-        the JSON round-trip must preserve the list, not convert it to a string.
+        List content written to the DB must round-trip back as a list,
+        not as a raw JSON string. (Replaces the old _flush_history test.)
         """
         from agent import AgentLoop
 
@@ -490,57 +487,54 @@ class TestAgentFlushRestoreListContent:
                 )
         agent._models["primary"] = llm_mock
 
-        # Manually plant a list-content user entry and flush it
+        # Write a list-content user entry directly via context (goes to DB)
         blocks = [{"type": "text", "text": "user msg"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}]
         agent.context.add(HistoryEntry.user(blocks))
-        await agent._flush_history()
 
-        # Verify the session file preserves the list
-        safe_key = str(agent.session_key).replace(":", "_")
-        session_file = next((Path("sessions") / safe_key).glob("*.json"), None)
-        assert session_file is not None
-        data = json.loads(session_file.read_text())
-        saved_content = data["dialogue"][0]["content"]
-        assert isinstance(saved_content, list)
-        assert saved_content[0]["type"] == "text"
+        # Re-load from DB via assemble() and check the round-trip
+        messages = agent.context.assemble()
+        user_msgs = [m for m in messages if m["role"] == "user"]
+        assert len(user_msgs) == 1
+        assert isinstance(user_msgs[0]["content"], list)
+        assert user_msgs[0]["content"][0]["type"] == "text"
 
     @pytest.mark.asyncio
     async def test_restore_history_preserves_list_content(self, tmp_path):
-        """_restore_history must set content as list, not coerce it to str."""
+        """
+        History loaded from the DB at agent startup must restore list content
+        as a list, not coerce it to a string. (Replaces the old _restore_history test.)
+        """
         from agent import AgentLoop
+        from db import ConversationDB
+        import json as _json
 
         cfg = _make_full_config(tmp_path)
         cfg.workspace.path.mkdir(parents=True, exist_ok=True)
 
         blocks = [{"type": "text", "text": "hello"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}]
-
-        # Write a session file manually with list content
         sk = SessionKey.dm("restore-test")
-        safe_key = str(sk).replace(":", "_")
-        sessions_dir = Path("sessions") / safe_key
-        sessions_dir.mkdir(parents=True, exist_ok=True)
-        session_data = {
-            "session_key": str(sk),
-            "version": 1,
-            "turn": 1,
-            "saved_at": "2025-01-01T00:00:00Z",
-            "dialogue": [
-                {"id": "e1", "role": "user", "content": blocks, "tool_calls": [], "tool_call_id": None, "index": 0}
-            ],
-        }
-        (sessions_dir / "1.json").write_text(json.dumps(session_data))
 
         async def _noop_stream(messages, tools=None):
             yield TextDelta(text="ok")
-            return
 
         llm_mock = MagicMock()
         llm_mock.stream = _noop_stream
 
+        # First agent: write a list-content entry to the DB
         with patch("agent.MODULES_DIR", Path("/nonexistent")):
             with patch("agent._build_llm", return_value=llm_mock):
-                agent = AgentLoop(session_key=sk, config=cfg)
+                agent1 = AgentLoop(session_key=sk, config=cfg)
+        agent1._models["primary"] = llm_mock
+        agent1.context.add(HistoryEntry.user(blocks))
+        tail_after_write = agent1._tail_node_id
 
-        assert len(agent.context.dialogue) == 1
-        assert isinstance(agent.context.dialogue[0].content, list)
-        assert agent.context.dialogue[0].content[0]["type"] == "text"
+        # Second agent: same session key + same DB — should restore from cursor
+        with patch("agent.MODULES_DIR", Path("/nonexistent")):
+            with patch("agent._build_llm", return_value=llm_mock):
+                agent2 = AgentLoop(session_key=sk, config=cfg)
+
+        messages = agent2.context.assemble()
+        user_msgs = [m for m in messages if m["role"] == "user"]
+        assert len(user_msgs) == 1
+        assert isinstance(user_msgs[0]["content"], list)
+        assert user_msgs[0]["content"][0]["type"] == "text"

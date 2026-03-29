@@ -56,7 +56,7 @@ class CLITheme:
 
     def t(self, key: str) -> str:
         defaults = {
-            "name": "TinyCTX", "tagline": "AI Agent Framework",
+            "name": "TinyCTX", "tagline": "Agent Framework",
             "user_label": "you", "agent_label": "agent", "bye_message": "Bye.",
         }
         return self.text.get(key) or defaults.get(key, "")

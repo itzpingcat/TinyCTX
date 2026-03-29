@@ -283,7 +283,7 @@ def register(agent) -> None:
                 import datetime
                 date_str = datetime.date.today().strftime("%d-%m-%Y")
                 msg = nudge_message.format(date=date_str)
-                ctx.dialogue.append(HistoryEntry.user(msg))
+                ctx.add(HistoryEntry.user(msg))
                 ctx.state["memory_nudge_tokens_at_last"] = tokens_now
                 logger.info(
                     "[memory] nudge injected (delta %d/%d tokens since last nudge)",

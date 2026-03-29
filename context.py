@@ -1,22 +1,29 @@
 """
 context.py — Conversation history types and context assembly pipeline.
-Imports only from contracts.py and stdlib. Never imports from gateway or agent.
+Imports only from contracts.py, db.py, and stdlib. Never imports from gateway or agent.
 
 The Context class owns:
-  - HistoryEntry list (the raw dialogue)
+  - Dialogue history (backed by ConversationDB when _db + _tail_node_id are set)
   - Prompt provider registry (SOUL.md, AGENTS.md, memory results, etc.)
   - Four-stage hook pipeline (filter, transform, compress, post-process)
   - assemble() — produces a list[dict] ready to send to the LLM API
 
+Tree refactor (Phase 1)
+-----------------------
+When a ConversationDB is injected via set_db() and a tail node is set via
+set_tail(), assemble() loads history by walking the ancestor chain from the
+DB instead of reading self.dialogue. Writes via add() write immediately to
+the DB and advance _tail_node_id.
+
+When _db is None (old code path, tests), behaviour is unchanged — self.dialogue
+is the source of truth and no DB writes happen. This makes the refactor
+incrementally testable.
+
 Dialogue mutation:
-  - add(entry)                  — append a new entry
+  - add(entry)                  — append a new entry (writes to DB if wired)
   - edit(entry_id, new_content) — replace content in-place; no cascade
   - delete(entry_id)            — smart-delete: removes entry + dependents
-                                  (tool calls cascade to their results and
-                                   vice versa); re-indexes after removal
   - strip_tool_calls(entry_id)  — remove tool_calls from an assistant entry
-                                  and drop its tool results, preserving the
-                                  assistant's text content
   - clear()                     — wipe entire dialogue
 
 Modules (compression, dedup, RAG, etc.) are registered externally at startup.
@@ -80,11 +87,9 @@ class HistoryEntry:
       str        — plain text (the common case)
       list[dict] — OpenAI-compat content block list, used when the user
                    message includes image or file attachments.
-                   Blocks follow the format:
-                     {"type": "text", "text": "..."}
-                     {"type": "image_url", "image_url": {"url": "data:..."}}
-                   Only user-role entries ever carry a list; assistant / tool
-                   / system entries always use plain strings.
+
+    parent_id is the DB node_id of this entry's parent. None for entries
+    that predate the tree refactor or were created without a DB wired.
     """
     role:         str
     content:      str | list     # str for most roles; list[dict] for user+attachments
@@ -93,6 +98,7 @@ class HistoryEntry:
     tool_calls:   list[dict]     = field(default_factory=list)
     tool_call_id: str | None     = None
     author_id:    str | None     = None  # set for group chat user turns; None for DM / assistant / tool / system
+    parent_id:    str | None     = None  # tree refactor: DB node_id of parent node
 
     @staticmethod
     def user(content: str | list, author_id: str | None = None) -> HistoryEntry:
@@ -145,14 +151,13 @@ class Context:
     must be awaited by the caller (AgentLoop) via run_async_hooks() before
     calling assemble(). This keeps assemble() synchronous and simple.
 
-    Usage:
-        ctx = Context()
-        ctx.register_prompt("soul", lambda c: soul_md_contents)
-        ctx.register_hook(HOOK_FILTER_TURN, my_trim_fn)
-        ctx.register_hook(HOOK_PRE_ASSEMBLE_ASYNC, my_async_fn)
-        ctx.add(HistoryEntry.user("hello"))
-        await ctx.run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC)
-        messages = ctx.assemble()
+    Tree refactor:
+      Call set_db(db) and set_tail(node_id) to switch Context into DB-backed
+      mode. In this mode:
+        - add() writes each entry to the DB immediately and advances _tail_node_id
+        - assemble() loads history by walking DB ancestors from _tail_node_id
+        - self.dialogue is kept in sync for hooks/modules that iterate it
+      Without a DB wired, old in-memory behaviour is preserved.
     """
 
     def __init__(self, token_limit: int = 16384) -> None:
@@ -169,6 +174,43 @@ class Context:
         self.state: dict[str, Any] = {}
 
         self.token_limit = token_limit
+
+        # Tree refactor: optional DB backing
+        self._db = None            # ConversationDB | None
+        self._tail_node_id: str | None = None
+        self._on_tail_advance = None  # optional callback; see set_cursor_callback()
+
+    # ------------------------------------------------------------------
+    # Tree refactor wiring
+    # ------------------------------------------------------------------
+
+    def set_db(self, db) -> None:
+        """
+        Wire a ConversationDB into this Context. Once set, add() writes to
+        the DB and assemble() reads from it. Call set_tail() after this.
+        """
+        self._db = db
+
+    def set_tail(self, node_id: str) -> None:
+        """
+        Point this Context at a branch tail. assemble() will walk ancestors
+        from this node. add() will attach new nodes as children of this node
+        and advance it.
+        """
+        self._tail_node_id = node_id
+
+    def set_cursor_callback(self, fn) -> None:
+        """
+        Register a zero-argument callable that is invoked every time add()
+        advances the tail. Used by AgentLoop to keep its cursor file in sync
+        with in-memory state even when run() is not called (e.g. direct
+        context mutations in tests or background tasks).
+        """
+        self._on_tail_advance = fn
+
+    @property
+    def tail_node_id(self) -> str | None:
+        return self._tail_node_id
 
     # ------------------------------------------------------------------
     # Hook registration
@@ -225,6 +267,40 @@ class Context:
     # ------------------------------------------------------------------
 
     def add(self, entry: HistoryEntry) -> HistoryEntry:
+        """
+        Append a new entry. If a DB is wired, writes to the DB immediately
+        and advances _tail_node_id. The entry's parent_id is set to the
+        current tail so the node lands on the correct branch.
+        """
+        if self._db is not None and self._tail_node_id is not None:
+            # Serialise content: list → JSON string for DB storage.
+            content_str = (
+                json.dumps(entry.content, ensure_ascii=False)
+                if isinstance(entry.content, list)
+                else entry.content
+            )
+            tool_calls_str = (
+                json.dumps(entry.tool_calls, ensure_ascii=False)
+                if entry.tool_calls
+                else None
+            )
+            node = self._db.add_node(
+                parent_id=self._tail_node_id,
+                role=entry.role,
+                content=content_str,
+                tool_calls=tool_calls_str,
+                tool_call_id=entry.tool_call_id,
+                author_id=entry.author_id,
+            )
+            entry.id        = node.id
+            entry.parent_id = node.parent_id
+            self._tail_node_id = node.id
+            if self._on_tail_advance is not None:
+                try:
+                    self._on_tail_advance()
+                except Exception:
+                    pass  # cursor persistence failures must never interrupt add()
+
         entry.index = len(self.dialogue)
         self.dialogue.append(entry)
         return entry
@@ -232,39 +308,39 @@ class Context:
     def clear(self) -> None:
         self.dialogue.clear()
         self.state.clear()
+        # _tail_node_id is intentionally NOT reset here — clear() is a
+        # user-initiated wipe of in-memory state. The tree in agent.db is
+        # never mutated by clear(). The caller (bridge reset logic) is
+        # responsible for moving the cursor if needed.
 
     def edit(self, entry_id: str, new_content: str) -> bool:
         """
         Replace the content of a dialogue entry in-place.
         Returns True if the entry was found and updated, False otherwise.
-        Does not cascade — editing an assistant turn's content does not
-        touch its tool_calls or the downstream tool results.
+        Writes through to DB if wired.
         """
         for entry in self.dialogue:
             if entry.id == entry_id:
                 entry.content = new_content
+                if self._db is not None:
+                    self._db.update_node_content(entry_id, new_content)
                 return True
         return False
 
     def delete(self, entry_id: str) -> list[str]:
         """
         Remove an entry and all entries that depend on it, then re-index.
-
-        Dependency rules (mirrors the token-budget trimming in assemble()):
-          - Assistant turn with tool_calls  → also delete every tool-result
-            entry whose tool_call_id is in that call set.
-          - Tool-result entry               → also delete the assistant turn
-            that owns the call, plus all *other* tool results belonging to
-            that same assistant turn (a partial tool block is invalid).
-          - User / plain assistant turn     → no dependents.
-
         Returns the list of entry ids that were actually removed.
+        Deletes from DB if wired.
         """
         ids_to_remove = self._dependents(entry_id)
         if not ids_to_remove:
             return []
         self.dialogue = [e for e in self.dialogue if e.id not in ids_to_remove]
         self._reindex()
+        if self._db is not None:
+            for nid in ids_to_remove:
+                self._db.delete_node(nid)
         return list(ids_to_remove)
 
     def _dependents(self, entry_id: str) -> set[str]:
@@ -272,7 +348,6 @@ class Context:
         Return the set of entry ids that must be removed together with
         entry_id (including entry_id itself). Empty set = entry not found.
         """
-        # Build lookup maps once
         by_id: dict[str, HistoryEntry] = {e.id: e for e in self.dialogue}
         if entry_id not in by_id:
             return set()
@@ -281,19 +356,16 @@ class Context:
         group: set[str] = {entry_id}
 
         if target.role == ROLE_ASSISTANT and target.tool_calls:
-            # Delete all tool results that belong to this assistant turn
             call_ids = {tc["id"] for tc in target.tool_calls}
             for e in self.dialogue:
                 if e.role == ROLE_TOOL and e.tool_call_id in call_ids:
                     group.add(e.id)
 
         elif target.role == ROLE_TOOL and target.tool_call_id:
-            # Find the assistant turn that owns this call
             for e in self.dialogue:
                 if e.role == ROLE_ASSISTANT and e.tool_calls:
                     call_ids = {tc["id"] for tc in e.tool_calls}
                     if target.tool_call_id in call_ids:
-                        # Delete the whole assistant turn + all its tool results
                         group.add(e.id)
                         for r in self.dialogue:
                             if r.role == ROLE_TOOL and r.tool_call_id in call_ids:
@@ -306,14 +378,7 @@ class Context:
         """
         Remove the tool_calls field from an assistant entry and delete all
         downstream tool-result entries, while preserving the assistant's
-        text content.
-
-        Use this instead of delete() when the assistant turn has meaningful
-        text content that should survive context trimming — mirroring the
-        behaviour of the token-budget trimmer in assemble().
-
-        Returns the list of tool-result entry ids that were removed.
-        If the entry has no tool_calls, or is not found, returns [].
+        text content. Returns the list of tool-result entry ids removed.
         """
         target = next((e for e in self.dialogue if e.id == entry_id), None)
         if target is None or target.role != ROLE_ASSISTANT or not target.tool_calls:
@@ -327,6 +392,8 @@ class Context:
         for e in self.dialogue:
             if e.role == ROLE_TOOL and e.tool_call_id in call_ids:
                 removed.append(e.id)
+                if self._db is not None:
+                    self._db.delete_node(e.id)
             else:
                 kept.append(e)
         self.dialogue = kept
@@ -337,6 +404,49 @@ class Context:
         """Reassign .index on every entry to match its current position."""
         for i, entry in enumerate(self.dialogue):
             entry.index = i
+
+    # ------------------------------------------------------------------
+    # DB-backed history loading
+    # ------------------------------------------------------------------
+
+    def _load_from_db(self) -> list[HistoryEntry]:
+        """
+        Walk the ancestor chain from _tail_node_id and convert DB nodes to
+        HistoryEntry objects. Returns an empty list if no DB is wired.
+        """
+        if self._db is None or self._tail_node_id is None:
+            return []
+
+        nodes = self._db.get_ancestors(self._tail_node_id)
+        entries: list[HistoryEntry] = []
+        for i, node in enumerate(nodes):
+            # Deserialise content: JSON → list if it was stored as list.
+            content: str | list = node.content
+            if node.role == ROLE_USER and content.startswith("["):
+                try:
+                    content = json.loads(content)
+                except (json.JSONDecodeError, ValueError):
+                    pass  # leave as string
+
+            tool_calls: list[dict] = []
+            if node.tool_calls:
+                try:
+                    tool_calls = json.loads(node.tool_calls)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
+            entry = HistoryEntry(
+                role=node.role,
+                content=content,
+                id=node.id,
+                index=i,
+                tool_calls=tool_calls,
+                tool_call_id=node.tool_call_id,
+                author_id=node.author_id,
+                parent_id=node.parent_id,
+            )
+            entries.append(entry)
+        return entries
 
     # ------------------------------------------------------------------
     # Token counting
@@ -363,13 +473,24 @@ class Context:
         Run the sync pipeline and return API-ready messages.
         Async hooks must have been awaited via run_async_hooks() beforehand.
 
+        When a DB is wired (_db + _tail_node_id set), history is loaded from
+        the DB ancestor walk. Otherwise self.dialogue is used directly.
+
         Stage order (sync):
           1. pre_assemble   — hooks may mutate self.dialogue or warm caches
           2. filter_turn    — drop turns
           3. transform_turn — replace/summarise turns
           4. post_assemble  — reshape final message list
         """
-        n = len(self.dialogue)
+        # Load from DB if wired; otherwise use in-memory dialogue.
+        if self._db is not None and self._tail_node_id is not None:
+            source = self._load_from_db()
+            # Keep self.dialogue in sync so hooks that iterate it see current state.
+            self.dialogue = source
+        else:
+            source = self.dialogue
+
+        n = len(source)
 
         # 1. pre_assemble (sync)
         for _, _, fn in self._hooks[HOOK_PRE_ASSEMBLE]:
@@ -398,7 +519,7 @@ class Context:
                 messages.append({"role": slot.role, "content": content})
 
         # 2 & 3. filter + transform per dialogue entry
-        for entry in self.dialogue:
+        for entry in source:
             age = n - 1 - entry.index
 
             drop = False
@@ -423,8 +544,6 @@ class Context:
                 messages = result
 
         # Merge adjacent same-role non-tool messages.
-        # Only merge when both sides have plain-string content — never merge
-        # content-block lists (they may contain images that must stay distinct).
         merged: list[dict] = []
         for m in messages:
             prev = merged[-1] if merged else None
@@ -442,8 +561,7 @@ class Context:
             else:
                 merged.append(dict(m))
 
-        # Token budget enforcement — drop oldest non-system messages first.
-        # Tool call + result pairs are dropped together to keep API validity.
+        # Token budget enforcement
         self.state["tokens_used"] = self._count_tokens(merged, tools)
 
         while self.state["tokens_used"] > self.token_limit:
@@ -454,22 +572,15 @@ class Context:
             if drop_idx is None:
                 break
 
-            # Drop the entry and any tool results that depend on it.
-            # If the assistant turn has text content AND tool calls, preserve
-            # the text — strip only the tool_calls field and the downstream
-            # tool results. If there is no text content, drop the whole turn.
             if merged[drop_idx].get("tool_calls"):
                 call_ids = {tc["id"] for tc in merged[drop_idx]["tool_calls"]}
                 if merged[drop_idx].get("content", "").strip():
-                    # Keep the turn but remove the tool_calls field so the
-                    # assistant text survives in context.
                     merged[drop_idx] = {
                         k: v for k, v in merged[drop_idx].items()
                         if k != "tool_calls"
                     }
                 else:
                     merged.pop(drop_idx)
-                # Either way, drop the orphaned tool results.
                 i = drop_idx
                 while (
                     i < len(merged)

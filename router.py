@@ -102,7 +102,7 @@ class Lane:
                 self.queue.task_done()
 
     def reset(self) -> None:
-        self.loop.reset()
+        self.loop.reset()  # clears in-memory context; tree in agent.db is preserved
 
     async def stop(self) -> None:
         if self._worker and not self._worker.done():
@@ -400,16 +400,13 @@ class Router:
         return False
 
     def next_session(self, key: SessionKey) -> None:
-        lane = self._session_router._lanes.get(key)
-        if lane:
-            lane.loop.next_session()
-        else:
-            safe_key     = str(key).replace(":", "_")
-            sessions_dir = Path("sessions") / safe_key
-            existing     = [
-                int(p.stem) for p in sessions_dir.glob("*.json") if p.stem.isdigit()
-            ] if sessions_dir.exists() else []
-            self._session_router._version_overrides[key] = max(existing, default=1) + 1
+        """
+        Phase 1 stub: next_session is superseded by branch cursor advancement
+        in the tree refactor. For now this is a no-op — the old session JSON
+        versioning mechanism is removed and Phase 2 will implement proper
+        branch forking via ConversationDB.spawn_branch().
+        """
+        logger.info("next_session(%s) — no-op in Phase 1 tree refactor", key)
 
     async def shutdown(self) -> None:
         await self._session_router.close_all()

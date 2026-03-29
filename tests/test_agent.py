@@ -6,13 +6,18 @@ Tests for AgentLoop — the 6-stage execution loop.
 The LLM is fully stubbed via async generator functions so no network calls
 are made. Modules are not loaded (MODULES_DIR is patched to a non-existent
 path). Each make_agent() call gets a completely fresh AgentLoop with its own
-unique session key, so tests never bleed into each other.
+unique session key so tests never bleed into each other.
+
+Phase 1 tree-refactor notes:
+  - _flush_history, _restore_history, _load_latest_version, next_session
+    are gone. Session-file persistence tests have been removed.
+  - reset() only clears in-memory state; it no longer writes to disk.
+  - Tests that validated those behaviours now live in test_tree_refactor.py.
 
 Run with:
     python -m pytest tests/
 """
 import asyncio
-import json
 import time
 import pytest
 from pathlib import Path
@@ -40,7 +45,9 @@ def _make_config(tmp_path):
     cfg.llm.fallback_on.http_codes = [429, 500]
     cfg.context = 4096
     cfg.max_tool_cycles = 5
-    cfg.memory.workspace_path = str(tmp_path)
+    cfg.workspace.path = str(tmp_path)
+    cfg.attachments = MagicMock()
+    cfg.get_model_config = MagicMock(return_value=MagicMock(vision=False))
     return cfg
 
 
@@ -57,7 +64,7 @@ def _make_msg(text="hello", session_key=None):
 
 
 async def _collect(agent, msg):
-    """Run the agent and collect all reply chunks (partials + final)."""
+    """Run the agent and collect all reply events."""
     chunks = []
     async for chunk in agent.run(msg):
         chunks.append(chunk)
@@ -65,17 +72,10 @@ async def _collect(agent, msg):
 
 
 def _full_text(chunks):
-    """
-    Reassemble the full reply text from a list of agent events.
-    AgentTextChunk events are streaming tokens; AgentTextFinal closes the
-    stream (text may be empty sentinel or full text on non-streaming path);
-    AgentError carries an error message.
-    """
-    return "".join(c.text if hasattr(c, 'text') else c.message for c in chunks)
+    return "".join(c.text if hasattr(c, "text") else c.message for c in chunks)
 
 
 def _text_stream(*texts):
-    """Return an async generator that yields TextDeltas then stops."""
     async def _gen(messages, tools=None):
         for t in texts:
             yield TextDelta(text=t)
@@ -83,14 +83,13 @@ def _text_stream(*texts):
 
 
 def _error_stream(message):
-    """Return an async generator that yields a single LLMError."""
     async def _gen(messages, tools=None):
         yield LLMError(message=message)
     return _gen
 
 
 # ---------------------------------------------------------------------------
-# Fixture: AgentLoop with LLM and modules patched
+# Fixture
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
@@ -98,22 +97,16 @@ def make_agent(tmp_path):
     """
     Factory fixture — call make_agent(stream_fn) to get a fresh AgentLoop.
 
-    Every call gets a unique session key (test-user-1, test-user-2, ...) so
-    _restore_history never picks up state from a prior call, and context
-    never bleeds between tests.
-
-    Session files are written to tmp_path/sessions/ so persistence tests
-    can find them reliably without touching the real workspace.
+    Each call gets a unique session key so DB state never bleeds between tests.
+    The workspace is tmp_path so agent.db and cursor files land there.
     """
     counter = {"n": 0}
 
     def _factory(stream_fn=None, fallback_stream_fn=None, fallback_names=None):
         from agent import AgentLoop
 
-        # Unique key per call — prevents _restore_history cross-contamination
         counter["n"] += 1
         unique_key = SessionKey.dm(f"test-user-{counter['n']}")
-
         cfg = _make_config(tmp_path)
 
         if fallback_names:
@@ -126,50 +119,15 @@ def make_agent(tmp_path):
         fallback_llm = MagicMock()
         fallback_llm.stream = fallback_stream_fn or _text_stream("fallback reply")
 
-        # Patch MODULES_DIR so no real modules are loaded, and _build_llm so
-        # no real API clients are constructed during __init__.
         with patch("agent.MODULES_DIR", Path("/nonexistent")):
             with patch("agent._build_llm", return_value=primary_llm):
                 agent = AgentLoop(session_key=unique_key, config=cfg)
 
-        # Wire controlled stubs into the model pool after construction.
         agent._models["primary"] = primary_llm
         if fallback_names:
             for name in fallback_names:
                 agent._models[name] = fallback_llm
 
-        # Redirect session file writes to tmp_path so persistence tests work.
-        # The real _flush_history resolves paths from Path("sessions/") relative
-        # to the CWD (the repo root during pytest), not tmp_path.
-        async def _patched_flush():
-            safe_key = str(agent.session_key).replace(":", "_")
-            sessions_dir = tmp_path / "sessions" / safe_key
-            sessions_dir.mkdir(parents=True, exist_ok=True)
-            path = sessions_dir / f"{agent._session_version}.json"
-            dialogue_raw = [
-                {
-                    "id":           e.id,
-                    "role":         e.role,
-                    "content":      e.content,
-                    "tool_calls":   e.tool_calls,
-                    "tool_call_id": e.tool_call_id,
-                    "index":        e.index,
-                }
-                for e in agent.context.dialogue
-            ]
-            data = {
-                "session_key": str(agent.session_key),
-                "version":     agent._session_version,
-                "turn":        agent._turn_count,
-                "saved_at":    time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "dialogue":    dialogue_raw,
-            }
-            path.write_text(
-                json.dumps(data, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
-
-        agent._flush_history = _patched_flush
         return agent
 
     return _factory
@@ -313,11 +271,10 @@ class TestToolExecution:
 
         tool_results = [e for e in agent.context.dialogue if e.role == "tool"]
         assert len(tool_results) == 1
-        assert tool_results[0].content  # has some error message
+        assert tool_results[0].content  # some error message
 
     @pytest.mark.asyncio
     async def test_max_tool_cycles_respected(self, make_agent):
-        """Agent must stop after max_tool_cycles even if LLM keeps calling tools."""
         always_tool_count = {"n": 0}
 
         async def always_tool(messages, tools=None):
@@ -368,7 +325,6 @@ class TestLLMErrors:
 
     @pytest.mark.asyncio
     async def test_no_fallback_on_non_matching_code(self, make_agent):
-        """A 404 error should NOT trigger fallback when only 429/500 are configured."""
         agent = make_agent(
             stream_fn=_error_stream("HTTP 404: not found"),
             fallback_stream_fn=_text_stream("should not see this"),
@@ -383,7 +339,6 @@ class TestLLMErrors:
 
     @pytest.mark.asyncio
     async def test_any_error_fallback(self, make_agent):
-        """any_error=True should fall back on any LLMError regardless of code."""
         agent = make_agent(
             stream_fn=_error_stream("Connection failed: timeout"),
             fallback_stream_fn=_text_stream("fallback worked"),
@@ -396,7 +351,7 @@ class TestLLMErrors:
 
 
 # ---------------------------------------------------------------------------
-# Reset
+# Reset (in-memory only after tree refactor)
 # ---------------------------------------------------------------------------
 
 class TestReset:
@@ -419,54 +374,14 @@ class TestReset:
         assert agent._turn_count == 0
 
     @pytest.mark.asyncio
-    async def test_reset_preserves_version(self, make_agent):
-        """reset() clears context but keeps the same session version.
-        Use next_session() to advance the version."""
+    async def test_reset_does_not_delete_db_nodes(self, make_agent, tmp_path):
+        """reset() is in-memory only — the tree in agent.db must survive."""
+        from db import ConversationDB
         agent = make_agent(_text_stream("ok"))
-        v_before = agent._session_version
+        await _collect(agent, _make_msg("hi"))
+        tail_before = agent._tail_node_id
+
         agent.reset()
-        assert agent._session_version == v_before
 
-
-# ---------------------------------------------------------------------------
-# History persistence
-# ---------------------------------------------------------------------------
-
-class TestHistoryPersistence:
-    @pytest.mark.asyncio
-    async def test_flush_writes_session_file(self, make_agent, tmp_path):
-        agent = make_agent(_text_stream("ok"))
-        await _collect(agent, _make_msg("hi"))
-
-        safe_key = str(agent.session_key).replace(":", "_")
-        session_dir = tmp_path / "sessions" / safe_key
-        files = list(session_dir.glob("*.json")) if session_dir.exists() else []
-        assert len(files) >= 1
-
-    @pytest.mark.asyncio
-    async def test_flushed_file_contains_dialogue(self, make_agent, tmp_path):
-        agent = make_agent(_text_stream("my reply"))
-        await _collect(agent, _make_msg("my question"))
-
-        safe_key = str(agent.session_key).replace(":", "_")
-        session_dir = tmp_path / "sessions" / safe_key
-        files = list(session_dir.glob("*.json"))
-        assert files
-
-        data = json.loads(files[0].read_text())
-        contents = [e["content"] for e in data["dialogue"]]
-        assert any("my question" in c for c in contents)
-        assert any("my reply" in c for c in contents)
-
-    @pytest.mark.asyncio
-    async def test_version_increments_after_next_session(self, make_agent, tmp_path):
-        """next_session() is what bumps the version; reset() does not."""
-        agent = make_agent(_text_stream("ok"))
-        await _collect(agent, _make_msg("hi"))
-        v1 = agent._session_version
-
-        agent.next_session()
-        await _collect(agent, _make_msg("hi again"))
-        v2 = agent._session_version
-
-        assert v2 == v1 + 1
+        db = ConversationDB(tmp_path / "agent.db")
+        assert db.get_node(tail_before) is not None
