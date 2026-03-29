@@ -4,62 +4,46 @@ gateway/__main__.py — HTTP/SSE API gateway.
 All endpoints require:  Authorization: Bearer <api_key>
 /v1/health is always public.
 
+Session model (Phase 2 tree refactor)
+--------------------------------------
+session_id is a human-readable string supplied by the API caller (e.g. "main",
+"user-123"). It maps to a node_id (UUID) in agent.db via
+workspace/cursors/gateway.json. On first use the gateway creates a child node
+off the global DB root and persists the mapping. Subsequent calls reuse the
+same node_id, which is passed as tail_node_id into InboundMessage.
+
 Endpoints:
 
   POST   /v1/sessions/{session_id}/message
-    body: { "text": "...", "stream": true, "session_type": "dm"|"group",
+    body: { "text": "...", "stream": true,
             "attachments": [{"name", "data_b64", "mime_type"}] }
-    SSE or JSON response.
+    SSE stream or JSON response.
 
   PUT    /v1/sessions/{session_id}/generation
     Queue a generation cycle with no new user message.
-    The caller is responsible for any history mutations before calling this
-    (e.g. DELETE the last assistant entry to implement regenerate).
-    query: ?session_type=dm|group  (default: dm)
     body: { "stream": true }  (optional, default true)
     SSE stream identical to /message, or JSON { "text": "..." }.
     Returns 429 if lane queue is full.
 
   DELETE /v1/sessions/{session_id}/generation
-    Abort the current in-flight generation for this session.
-    No-op (204) if no generation is running or session doesn't exist.
-    query: ?session_type=dm|group  (default: dm)
+    Abort the current in-flight generation. No-op (204) if nothing is running.
     -> 204
 
   GET    /v1/sessions
-    List all sessions — active in-memory lanes AND on-disk session directories.
-    query: ?session_type=dm|group  (default: all)
-    -> [{ "id", "session_type", "turns", "queue_depth", "queue_max",
-          "is_active", "versions": [int, ...] }, ...]
-
-  GET    /v1/sessions/{session_id}/versions
-    List version numbers available on disk for a session.
-    query: ?session_type=dm|group  (default: dm)
-    -> { "id": "...", "versions": [1, 2, 3], "active_version": N }
+    List all sessions (active in-memory lanes + gateway cursor map).
+    -> [{ "id", "node_id", "turns", "queue_depth", "queue_max", "is_active" }, ...]
 
   DELETE /v1/sessions/{session_id}
-    Reset and evict session (clears dialogue, wipes current version JSON).
+    Reset the lane in-memory (clears context). Tree in agent.db is preserved.
     -> 204
-
-  PATCH  /v1/sessions/{session_id}/rename
-    body: { "new_id": "..." }
-    -> { "old_id": "...", "new_id": "..." }
-
-  GET    /v1/sessions/{session_id}/history
-    query: ?session_type=dm|group&version=N  (version defaults to active)
-    -> [{ "id", "role", "content", "tool_calls", "tool_call_id", "index", "author_id" }, ...]
-
-  PATCH  /v1/sessions/{session_id}/history/{entry_id}
-    body: { "content": "..." }
-    -> { "updated": true }
-
-  DELETE /v1/sessions/{session_id}/history/{entry_id}
-    Deletes exactly that entry (plus dependents per context cascade rules).
-    -> { "removed": ["id", ...] }
 
   POST   /v1/sessions/{session_id}/reset
-    Alias for DELETE /v1/sessions/{session_id} — backwards compat.
+    Alias for DELETE — backwards compat.
     -> 204
+
+  GET    /v1/sessions/{session_id}/history
+    Return the ancestor chain for this session's node_id as history entries.
+    -> [{ "id", "role", "content", "tool_calls", "tool_call_id", "author_id", "created_at" }, ...]
 
   GET    /v1/workspace/files/{path}
     -> { "path": "...", "content": "..." }
@@ -69,7 +53,7 @@ Endpoints:
     -> { "path": "...", "written": true }
 
   GET    /v1/health
-    -> { "status": "ok", "uptime_s": N, "sessions": { "<key>": {...} } }
+    -> { "status": "ok", "uptime_s": N, "lanes": { "<node_id>": {...} } }
 """
 from __future__ import annotations
 
@@ -84,8 +68,8 @@ from aiohttp import web
 
 from config import GatewayConfig
 from contracts import (
-    Platform, ContentType, content_type_for, ChatType,
-    SessionKey, UserIdentity, InboundMessage, Attachment,
+    Platform, ContentType, content_type_for,
+    UserIdentity, InboundMessage, Attachment,
     AgentTextChunk, AgentTextFinal, AgentToolCall, AgentToolResult, AgentError,
 )
 
@@ -95,25 +79,50 @@ _API_AUTHOR = UserIdentity(platform=Platform.API, user_id="api-client", username
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Cursor map — session_id (str) <-> node_id (UUID str)
+# Persisted at workspace/cursors/gateway.json
 # ---------------------------------------------------------------------------
 
-def _session_key(session_id: str, session_type: str) -> SessionKey:
-    if session_type == "group":
-        return SessionKey.group(Platform.API, session_id)
-    return SessionKey.dm(session_id)
+def _load_cursor_map(cursors_dir: Path) -> dict[str, str]:
+    path = cursors_dir / "gateway.json"
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            logger.warning("gateway: corrupt cursor map — starting fresh")
+    return {}
 
 
-def _safe_key_str(sk: SessionKey) -> str:
-    return str(sk).replace(":", "_")
+def _save_cursor_map(cursors_dir: Path, mapping: dict[str, str]) -> None:
+    path = cursors_dir / "gateway.json"
+    path.write_text(json.dumps(mapping, indent=2), encoding="utf-8")
 
 
-def _versions_on_disk(sk: SessionKey, sessions_root: Path) -> list[int]:
-    d = sessions_root / _safe_key_str(sk)
-    if not d.exists():
-        return []
-    return sorted(int(p.stem) for p in d.glob("*.json") if p.stem.isdigit())
+def _resolve_node_id(session_id: str, app: web.Application) -> str:
+    """
+    Return the node_id for session_id, creating a new child node off the
+    global DB root on first use and persisting the mapping.
+    """
+    mapping     = app["cursor_map"]
+    cursors_dir = app["cursors_dir"]
 
+    if session_id in mapping:
+        return mapping[session_id]
+
+    # First use — create a child node off root and persist.
+    from db import ConversationDB
+    db   = ConversationDB(app["workspace"] / "agent.db")
+    root = db.get_root()
+    node = db.add_node(parent_id=root.id, role="system", content=f"session:gateway:{session_id}")
+    mapping[session_id] = node.id
+    _save_cursor_map(cursors_dir, mapping)
+    logger.info("gateway: created cursor for session '%s' -> %s", session_id, node.id)
+    return node.id
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _resolve_workspace_path(workspace_root: Path, rel: str) -> Path | None:
     try:
@@ -141,19 +150,19 @@ def _auth_middleware(api_key: str):
     return middleware
 
 
-def _lane_for(router, key: SessionKey):
-    return router._session_router._lanes.get(key)
+def _lane_for(router, node_id: str):
+    """Return the Lane for node_id, or None."""
+    return router._lane_router._lanes.get(node_id)
 
 
-def _lane_summary(sk: SessionKey, lane, versions: list[int]) -> dict:
+def _lane_summary(session_id: str, node_id: str, lane) -> dict:
     return {
-        "id":           sk.conversation_id,
-        "session_type": "group" if sk.chat_type == ChatType.GROUP else "dm",
-        "turns":        lane.loop._turn_count,
-        "queue_depth":  lane.queue.qsize(),
-        "queue_max":    lane.queue.maxsize,
-        "is_active":    True,
-        "versions":     versions,
+        "id":          session_id,
+        "node_id":     node_id,
+        "turns":       lane.loop._turn_count,
+        "queue_depth": lane.queue.qsize(),
+        "queue_max":   lane.queue.maxsize,
+        "is_active":   True,
     }
 
 
@@ -161,9 +170,9 @@ def _lane_summary(sk: SessionKey, lane, versions: list[int]) -> dict:
 # SSE streaming shared helper
 # ---------------------------------------------------------------------------
 
-async def _stream_generation(request: web.Request, router, sk: SessionKey) -> web.StreamResponse:
+async def _stream_generation(request: web.Request, router, node_id: str) -> web.StreamResponse:
     """
-    Register a per-session SSE handler, wait for generation to complete,
+    Register a per-cursor SSE handler, wait for generation to complete,
     and stream events back to the HTTP client.
     """
     response = web.StreamResponse(headers={
@@ -173,7 +182,7 @@ async def _stream_generation(request: web.Request, router, sk: SessionKey) -> we
     })
     await response.prepare(request)
 
-    done_event      = asyncio.Event()
+    done_event       = asyncio.Event()
     streamed_chunks: list[str] = []
 
     async def _sse(event) -> None:
@@ -200,21 +209,21 @@ async def _stream_generation(request: web.Request, router, sk: SessionKey) -> we
         except Exception:
             done_event.set()
 
-    router.register_session_handler(sk, _sse)
+    router.register_cursor_handler(node_id, _sse)
     try:
         await done_event.wait()
         await response.write(b'data: {"type": "done"}\n\n')
     finally:
-        router.unregister_session_handler(sk)
+        router.unregister_cursor_handler(node_id)
 
     await response.write_eof()
     return response
 
 
-async def _collect_generation(router, sk: SessionKey) -> str:
+async def _collect_generation(router, node_id: str) -> str:
     """Non-streaming: collect full text from a generation."""
-    parts:     list[str] = []
-    done_event           = asyncio.Event()
+    parts:      list[str] = []
+    done_event            = asyncio.Event()
 
     async def _collect(event) -> None:
         if isinstance(event, AgentTextChunk):
@@ -227,13 +236,13 @@ async def _collect_generation(router, sk: SessionKey) -> str:
             parts.append(event.message)
             done_event.set()
 
-    router.register_session_handler(sk, _collect)
+    router.register_cursor_handler(node_id, _collect)
     try:
         await asyncio.wait_for(done_event.wait(), timeout=120)
     except asyncio.TimeoutError:
         pass
     finally:
-        router.unregister_session_handler(sk)
+        router.unregister_cursor_handler(node_id)
     return "".join(parts)
 
 
@@ -244,6 +253,7 @@ async def _collect_generation(router, sk: SessionKey) -> str:
 async def handle_message(request: web.Request) -> web.StreamResponse:
     router     = request.app["router"]
     session_id = request.match_info["session_id"]
+    node_id    = _resolve_node_id(session_id, request.app)
 
     try:
         body = await request.json()
@@ -251,9 +261,8 @@ async def handle_message(request: web.Request) -> web.StreamResponse:
         raise web.HTTPBadRequest(content_type="application/json",
                                  body=json.dumps({"error": "invalid JSON"}))
 
-    text         = body.get("text", "").strip()
-    do_stream    = bool(body.get("stream", True))
-    session_type = body.get("session_type", "dm")
+    text      = body.get("text", "").strip()
+    do_stream = bool(body.get("stream", True))
 
     if not text and not body.get("attachments"):
         raise web.HTTPBadRequest(content_type="application/json",
@@ -267,15 +276,19 @@ async def handle_message(request: web.Request) -> web.StreamResponse:
             try:
                 data = base64.b64decode(item["data_b64"])
             except Exception:
-                raise web.HTTPBadRequest(content_type="application/json",
-                                         body=json.dumps({"error": f"invalid base64 in '{item.get('name', '?')}'"}))
-            parsed.append(Attachment(filename=item.get("name", "file"), data=data,
-                                     mime_type=item.get("mime_type", "application/octet-stream")))
+                raise web.HTTPBadRequest(
+                    content_type="application/json",
+                    body=json.dumps({"error": f"invalid base64 in '{item.get('name', '?')}'"}),
+                )
+            parsed.append(Attachment(
+                filename=item.get("name", "file"),
+                data=data,
+                mime_type=item.get("mime_type", "application/octet-stream"),
+            ))
         attachments = tuple(parsed)
 
-    sk = _session_key(session_id, session_type)
     msg = InboundMessage(
-        session_key=sk,
+        tail_node_id=node_id,
         author=_API_AUTHOR,
         content_type=content_type_for(text, bool(attachments)),
         text=text,
@@ -284,18 +297,15 @@ async def handle_message(request: web.Request) -> web.StreamResponse:
         attachments=attachments,
     )
 
+    accepted = await router.push(msg)
+    if not accepted:
+        raise web.HTTPTooManyRequests(content_type="application/json",
+                                      body=json.dumps({"error": "session queue full"}))
+
     if do_stream:
-        accepted = await router.push(msg)
-        if not accepted:
-            raise web.HTTPTooManyRequests(content_type="application/json",
-                                          body=json.dumps({"error": "session queue full"}))
-        return await _stream_generation(request, router, sk)
+        return await _stream_generation(request, router, node_id)
     else:
-        accepted = await router.push(msg)
-        if not accepted:
-            raise web.HTTPTooManyRequests(content_type="application/json",
-                                          body=json.dumps({"error": "session queue full"}))
-        text_out = await _collect_generation(router, sk)
+        text_out = await _collect_generation(router, node_id)
         return web.Response(content_type="application/json", body=json.dumps({"text": text_out}))
 
 
@@ -306,31 +316,29 @@ async def handle_message(request: web.Request) -> web.StreamResponse:
 async def handle_generation_put(request: web.Request) -> web.Response:
     """
     Queue a generation cycle against the current context, with no new user
-    message. Use after mutating history (e.g. DELETE last assistant entry)
-    to trigger a fresh response.
+    message. Use to trigger a fresh response without adding a user turn.
     """
     router     = request.app["router"]
     session_id = request.match_info["session_id"]
+    node_id    = _resolve_node_id(session_id, request.app)
 
     body = {}
     try:
         body = await request.json()
     except Exception:
-        pass  # body is optional for this endpoint
+        pass  # body is optional
 
-    session_type = request.rel_url.query.get("session_type", "dm")
-    do_stream    = bool(body.get("stream", True))
-    sk           = _session_key(session_id, session_type)
+    do_stream = bool(body.get("stream", True))
 
-    accepted = await router.push_synthetic(sk)
+    accepted = await router.push_synthetic(node_id)
     if not accepted:
         raise web.HTTPTooManyRequests(content_type="application/json",
                                       body=json.dumps({"error": "session queue full"}))
 
     if do_stream:
-        return await _stream_generation(request, router, sk)
+        return await _stream_generation(request, router, node_id)
     else:
-        text_out = await _collect_generation(router, sk)
+        text_out = await _collect_generation(router, node_id)
         return web.Response(content_type="application/json", body=json.dumps({"text": text_out}))
 
 
@@ -340,11 +348,10 @@ async def handle_generation_put(request: web.Request) -> web.Response:
 
 async def handle_generation_delete(request: web.Request) -> web.Response:
     """Abort the current in-flight generation. No-op if nothing is running."""
-    router       = request.app["router"]
-    session_id   = request.match_info["session_id"]
-    session_type = request.rel_url.query.get("session_type", "dm")
-    sk           = _session_key(session_id, session_type)
-    router.abort_generation(sk)  # no-op if lane doesn't exist
+    router     = request.app["router"]
+    session_id = request.match_info["session_id"]
+    node_id    = _resolve_node_id(session_id, request.app)
+    router.abort_generation(node_id)
     return web.Response(status=204)
 
 
@@ -353,230 +360,92 @@ async def handle_generation_delete(request: web.Request) -> web.Response:
 # ---------------------------------------------------------------------------
 
 async def handle_sessions_list(request: web.Request) -> web.Response:
-    router        = request.app["router"]
-    sessions_root = request.app["sessions_root"]
-    session_type  = request.rel_url.query.get("session_type", None)
+    router  = request.app["router"]
+    mapping = request.app["cursor_map"]  # session_id -> node_id
 
-    results: dict[str, dict] = {}
+    results: list[dict] = []
 
-    # 1. Active in-memory lanes
-    for sk, lane in router._session_router._lanes.items():
-        if session_type == "dm"    and sk.chat_type != ChatType.DM:    continue
-        if session_type == "group" and sk.chat_type != ChatType.GROUP: continue
-        versions = _versions_on_disk(sk, sessions_root)
-        results[sk.conversation_id] = _lane_summary(sk, lane, versions)
+    # Start from the known gateway cursor map — every named session appears here.
+    for session_id, node_id in sorted(mapping.items()):
+        lane = _lane_for(router, node_id)
+        if lane is not None:
+            results.append(_lane_summary(session_id, node_id, lane))
+        else:
+            results.append({
+                "id":          session_id,
+                "node_id":     node_id,
+                "turns":       None,
+                "queue_depth": 0,
+                "queue_max":   0,
+                "is_active":   False,
+            })
 
-    # 2. On-disk session directories not currently in memory
-    if sessions_root.exists():
-        for entry in sessions_root.iterdir():
-            if not entry.is_dir():
-                continue
-            # Directory name format: "dm_<id>" or "group_api_<id>"
-            name = entry.name
-            if name.startswith("dm_"):
-                sid  = name[3:]
-                stype = "dm"
-                sk   = SessionKey.dm(sid)
-            elif name.startswith("group_api_"):
-                sid  = name[10:]
-                stype = "group"
-                sk   = SessionKey.group(Platform.API, sid)
-            else:
-                continue
+    # Also surface any active lanes not in the cursor map (e.g. other bridges).
+    reverse = {v: k for k, v in mapping.items()}
+    for node_id in router.active_lanes:
+        if node_id in reverse:
+            continue  # already listed above
+        lane = _lane_for(router, node_id)
+        if lane:
+            results.append({
+                "id":          node_id,   # no human name — use node_id as id
+                "node_id":     node_id,
+                "turns":       lane.loop._turn_count,
+                "queue_depth": lane.queue.qsize(),
+                "queue_max":   lane.queue.maxsize,
+                "is_active":   True,
+            })
 
-            if session_type == "dm"    and stype != "dm":    continue
-            if session_type == "group" and stype != "group": continue
-
-            if sid in results:
-                continue  # already covered by active lane
-
-            versions = _versions_on_disk(sk, sessions_root)
-            if not versions:
-                continue
-
-            results[sid] = {
-                "id":           sid,
-                "session_type": stype,
-                "turns":        None,   # unknown — not in memory
-                "queue_depth":  0,
-                "queue_max":    0,
-                "is_active":    False,
-                "versions":     versions,
-            }
-
-    out = sorted(results.values(), key=lambda x: x["id"])
-    return web.Response(content_type="application/json", body=json.dumps(out))
+    return web.Response(content_type="application/json", body=json.dumps(results))
 
 
 # ---------------------------------------------------------------------------
-# Version list (GET /v1/sessions/{id}/versions)
-# ---------------------------------------------------------------------------
-
-async def handle_session_versions(request: web.Request) -> web.Response:
-    sessions_root = request.app["sessions_root"]
-    session_id    = request.match_info["session_id"]
-    session_type  = request.rel_url.query.get("session_type", "dm")
-    sk            = _session_key(session_id, session_type)
-
-    versions = _versions_on_disk(sk, sessions_root)
-    lane     = _lane_for(request.app["router"], sk)
-    active_v = lane.loop._session_version if lane else (max(versions) if versions else None)
-
-    return web.Response(
-        content_type="application/json",
-        body=json.dumps({"id": session_id, "versions": versions, "active_version": active_v}),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Session delete / rename
+# Session reset / delete
 # ---------------------------------------------------------------------------
 
 async def handle_session_delete(request: web.Request) -> web.Response:
-    router       = request.app["router"]
-    session_id   = request.match_info["session_id"]
-    session_type = request.rel_url.query.get("session_type", "dm")
-    sk           = _session_key(session_id, session_type)
-    router.reset_session(sk)
+    """Reset the lane's in-memory context. Tree in agent.db is preserved."""
+    router     = request.app["router"]
+    session_id = request.match_info["session_id"]
+    node_id    = _resolve_node_id(session_id, request.app)
+    router.reset_lane(node_id)
     return web.Response(status=204)
-
-
-async def handle_session_rename(request: web.Request) -> web.Response:
-    router       = request.app["router"]
-    session_id   = request.match_info["session_id"]
-    session_type = request.rel_url.query.get("session_type", "dm")
-    sk_old       = _session_key(session_id, session_type)
-
-    try:
-        body = await request.json()
-    except Exception:
-        raise web.HTTPBadRequest(content_type="application/json",
-                                 body=json.dumps({"error": "invalid JSON"}))
-
-    new_id = (body.get("new_id") or "").strip()
-    if not new_id:
-        raise web.HTTPBadRequest(content_type="application/json",
-                                 body=json.dumps({"error": "new_id required"}))
-    if new_id == session_id:
-        return web.Response(content_type="application/json",
-                            body=json.dumps({"old_id": session_id, "new_id": new_id}))
-
-    sk_new = _session_key(new_id, session_type)
-
-    if hasattr(router, "rename_session"):
-        router.rename_session(sk_old, sk_new)
-    else:
-        logger.warning("Router lacks rename_session — falling back to reset")
-        router.reset_session(sk_old)
-
-    return web.Response(content_type="application/json",
-                        body=json.dumps({"old_id": session_id, "new_id": new_id}))
-
-
-# ---------------------------------------------------------------------------
-# History
-# ---------------------------------------------------------------------------
-
-async def handle_history_get(request: web.Request) -> web.Response:
-    router       = request.app["router"]
-    session_id   = request.match_info["session_id"]
-    session_type = request.rel_url.query.get("session_type", "dm")
-    version_q    = request.rel_url.query.get("version")
-    sk           = _session_key(session_id, session_type)
-
-    lane = _lane_for(router, sk)
-
-    # If a specific version is requested and it differs from the active one,
-    # read directly from disk.
-    if version_q is not None:
-        try:
-            version = int(version_q)
-        except ValueError:
-            raise web.HTTPBadRequest(content_type="application/json",
-                                     body=json.dumps({"error": "version must be an integer"}))
-        active_version = lane.loop._session_version if lane else None
-        if active_version != version or lane is None:
-            sessions_root = request.app["sessions_root"]
-            path = sessions_root / _safe_key_str(sk) / f"{version}.json"
-            if not path.exists():
-                raise web.HTTPNotFound(content_type="application/json",
-                                       body=json.dumps({"error": "version not found"}))
-            data = json.loads(path.read_text(encoding="utf-8"))
-            return web.Response(content_type="application/json",
-                                body=json.dumps(data.get("dialogue", [])))
-
-    if lane is None:
-        return web.Response(content_type="application/json", body=json.dumps([]))
-
-    entries = [
-        {
-            "id":           e.id,
-            "role":         e.role,
-            "content":      e.content,
-            "tool_calls":   e.tool_calls,
-            "tool_call_id": e.tool_call_id,
-            "index":        e.index,
-            "author_id":    e.author_id,
-        }
-        for e in list(lane.loop.context.dialogue)
-    ]
-    return web.Response(content_type="application/json", body=json.dumps(entries))
-
-
-async def handle_history_patch(request: web.Request) -> web.Response:
-    router       = request.app["router"]
-    session_id   = request.match_info["session_id"]
-    entry_id     = request.match_info["entry_id"]
-    session_type = request.rel_url.query.get("session_type", "dm")
-    sk           = _session_key(session_id, session_type)
-
-    try:
-        body = await request.json()
-    except Exception:
-        raise web.HTTPBadRequest(content_type="application/json",
-                                 body=json.dumps({"error": "invalid JSON"}))
-    content = body.get("content")
-    if content is None:
-        raise web.HTTPBadRequest(content_type="application/json",
-                                 body=json.dumps({"error": "content required"}))
-
-    lane = _lane_for(router, sk)
-    if lane is None:
-        raise web.HTTPNotFound(content_type="application/json",
-                               body=json.dumps({"error": "session not found"}))
-    if not lane.loop.context.edit(entry_id, content):
-        raise web.HTTPNotFound(content_type="application/json",
-                               body=json.dumps({"error": "entry not found"}))
-
-    return web.Response(content_type="application/json", body=json.dumps({"updated": True}))
-
-
-async def handle_history_delete(request: web.Request) -> web.Response:
-    router       = request.app["router"]
-    session_id   = request.match_info["session_id"]
-    entry_id     = request.match_info["entry_id"]
-    session_type = request.rel_url.query.get("session_type", "dm")
-    sk           = _session_key(session_id, session_type)
-
-    lane = _lane_for(router, sk)
-    if lane is None:
-        raise web.HTTPNotFound(content_type="application/json",
-                               body=json.dumps({"error": "session not found"}))
-    removed = lane.loop.context.delete(entry_id)
-    if not removed:
-        raise web.HTTPNotFound(content_type="application/json",
-                               body=json.dumps({"error": "entry not found"}))
-
-    return web.Response(content_type="application/json", body=json.dumps({"removed": removed}))
 
 
 async def handle_session_reset(request: web.Request) -> web.Response:
-    router       = request.app["router"]
-    session_id   = request.match_info["session_id"]
-    session_type = request.rel_url.query.get("session_type", "dm")
-    sk           = _session_key(session_id, session_type)
-    router.reset_session(sk)
-    return web.Response(status=204)
+    """Alias for DELETE — backwards compat."""
+    return await handle_session_delete(request)
+
+
+# ---------------------------------------------------------------------------
+# History (GET /v1/sessions/{id}/history)
+# ---------------------------------------------------------------------------
+
+async def handle_history_get(request: web.Request) -> web.Response:
+    """
+    Return the ancestor chain for this session's node_id.
+    Reads directly from agent.db — no lane needs to be active.
+    """
+    session_id = request.match_info["session_id"]
+    node_id    = _resolve_node_id(session_id, request.app)
+
+    from db import ConversationDB
+    db      = ConversationDB(request.app["workspace"] / "agent.db")
+    nodes   = db.get_ancestors(node_id)  # root -> current tail order
+    entries = [
+        {
+            "id":           n.id,
+            "role":         n.role,
+            "content":      n.content,
+            "tool_calls":   n.tool_calls,
+            "tool_call_id": n.tool_call_id,
+            "author_id":    n.author_id,
+            "created_at":   n.created_at,
+        }
+        for n in nodes
+        if n.role != "system"  # skip session-marker nodes
+    ]
+    return web.Response(content_type="application/json", body=json.dumps(entries))
 
 
 # ---------------------------------------------------------------------------
@@ -633,34 +502,23 @@ async def handle_workspace_put(request: web.Request) -> web.Response:
 async def handle_health(request: web.Request) -> web.Response:
     router  = request.app["router"]
     uptime  = time.time() - request.app["start_time"]
+    mapping = request.app["cursor_map"]
+    reverse = {v: k for k, v in mapping.items()}  # node_id -> session_id
+
     payload = {
         "status":   "ok",
         "uptime_s": round(uptime, 1),
-        "sessions": {
-            str(sk): {
-                "id":          sk.conversation_id,
+        "lanes": {
+            node_id: {
+                "session_id":  reverse.get(node_id, node_id),
                 "turns":       lane.loop._turn_count,
                 "queue_depth": lane.queue.qsize(),
                 "queue_max":   lane.queue.maxsize,
             }
-            for sk, lane in router._session_router._lanes.items()
+            for node_id, lane in router._lane_router._lanes.items()
         },
     }
     return web.Response(content_type="application/json", body=json.dumps(payload))
-
-
-# ---------------------------------------------------------------------------
-# Session next
-# ---------------------------------------------------------------------------
-
-async def handle_session_next(request: web.Request) -> web.Response:
-    """POST /v1/sessions/{session_id}/next — archive current version, start a fresh one."""
-    router       = request.app["router"]
-    session_id   = request.match_info["session_id"]
-    session_type = request.rel_url.query.get("session_type", "dm")
-    sk           = _session_key(session_id, session_type)
-    router.next_session(sk)
-    return web.Response(status=204)
 
 
 # ---------------------------------------------------------------------------
@@ -668,20 +526,20 @@ async def handle_session_next(request: web.Request) -> web.Response:
 # ---------------------------------------------------------------------------
 
 def _make_app(router, cfg: GatewayConfig) -> web.Application:
-    workspace     = Path(router._config.workspace.path).expanduser().resolve()
-    sessions_root = Path("sessions").resolve()
+    workspace   = Path(router._config.workspace.path).expanduser().resolve()
+    cursors_dir = workspace / "cursors"
+    cursors_dir.mkdir(parents=True, exist_ok=True)
 
     app = web.Application(middlewares=[_auth_middleware(cfg.api_key)])
-    app["router"]        = router
-    app["workspace"]     = workspace
-    app["sessions_root"] = sessions_root
-    app["start_time"]    = time.time()
+    app["router"]      = router
+    app["workspace"]   = workspace
+    app["cursors_dir"] = cursors_dir
+    app["cursor_map"]  = _load_cursor_map(cursors_dir)  # mutable dict, saved on write
+    app["start_time"]  = time.time()
 
     # Session management
     app.router.add_get(   "/v1/sessions",                                  handle_sessions_list)
     app.router.add_delete("/v1/sessions/{session_id}",                     handle_session_delete)
-    app.router.add_patch( "/v1/sessions/{session_id}/rename",              handle_session_rename)
-    app.router.add_get(   "/v1/sessions/{session_id}/versions",            handle_session_versions)
 
     # Generation
     app.router.add_post(  "/v1/sessions/{session_id}/message",             handle_message)
@@ -690,12 +548,9 @@ def _make_app(router, cfg: GatewayConfig) -> web.Application:
 
     # Session lifecycle
     app.router.add_post(  "/v1/sessions/{session_id}/reset",               handle_session_reset)
-    app.router.add_post(  "/v1/sessions/{session_id}/next",                handle_session_next)
 
     # History
     app.router.add_get(   "/v1/sessions/{session_id}/history",             handle_history_get)
-    app.router.add_patch( "/v1/sessions/{session_id}/history/{entry_id}",  handle_history_patch)
-    app.router.add_delete("/v1/sessions/{session_id}/history/{entry_id}",  handle_history_delete)
 
     # Workspace
     app.router.add_get(   "/v1/workspace/files/{path:.+}",                 handle_workspace_get)
