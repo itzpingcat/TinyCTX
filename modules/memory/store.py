@@ -484,6 +484,14 @@ class MemoryStore:
     # Housekeeping
     # ------------------------------------------------------------------
 
+    def total_chunks_text_tokens(self) -> int:
+        """
+        Return a fast token estimate for ALL chunks in the store.
+        Used to skip search entirely when everything already fits in context.
+        """
+        row = self._conn.execute("SELECT COALESCE(SUM(LENGTH(text)), 0) FROM chunks").fetchone()
+        return (row[0] or 0) // 4
+
     def remove_deleted_files(self, current_paths: set[str]) -> list[str]:
         """Delete index rows for files no longer on disk. Returns removed paths."""
         removed = [p for p in self.known_paths() if p not in current_paths]

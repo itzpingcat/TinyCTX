@@ -236,6 +236,15 @@ def register(agent) -> None:
     # ------------------------------------------------------------------
 
     async def _pre_assemble_async(ctx) -> None:
+        # Optimization 1: Only search on user-message turns, not tool-call cycles.
+        # The last entry in dialogue is the trigger: if it's a tool result (or
+        # assistant turn), we're mid-tool-loop — reuse the cached results instead.
+        if ctx.dialogue:
+            last_role = ctx.dialogue[-1].role
+            if last_role in ("tool", "assistant"):
+                # Preserve whatever was found on the first (user) cycle.
+                return
+
         await indexer.sync()
 
         query = ""
@@ -247,6 +256,29 @@ def register(agent) -> None:
         if not query.strip():
             ctx.state["memory_search_results"] = []
             return
+
+        # Optimization 2: If the total text of all stored chunks fits within
+        # the memory budget already, skip the embedding round-trip entirely —
+        # auto_inject will just return everything via _format_results anyway.
+        if budget_tokens > 0:
+            total_tokens = store.total_chunks_text_tokens()
+            if total_tokens <= budget_tokens:
+                # Fetch all chunks cheaply via BM25 with a broad wildcard,
+                # but only if there's anything stored at all.
+                if total_tokens > 0:
+                    results = store.hybrid_search(
+                        query, None, top_k=999, bm25_weight=1.0,
+                        decay_halflife_days=decay_halflife_days,
+                        decay_weight=decay_weight,
+                    )
+                    ctx.state["memory_search_results"] = results
+                    logger.debug(
+                        "[memory] all chunks fit in budget (%d tokens) — skipped embeddings, returned %d chunk(s)",
+                        total_tokens, len(results),
+                    )
+                else:
+                    ctx.state["memory_search_results"] = []
+                return
 
         query_vector = None
         if embedder is not None:
