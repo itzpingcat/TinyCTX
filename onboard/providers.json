@@ -1,0 +1,23 @@
+{
+  "Ollama": "http://localhost:11434/v1",
+  "LMStudio": "http://localhost:1234/v1",
+  "OpenAI": "https://api.openai.com/v1",
+  "XAI": "https://api.x.ai/v1",
+  "Groq": "https://api.groq.com/openai/v1",
+  "Mistral": "https://api.mistral.ai/v1",
+  "Together": "https://api.together.xyz/v1",
+  "Deepseek": "https://api.deepseek.com/v1",
+  "MoonshotAI": "https://api.moonshot.ai/v1",
+  "ZAI": "https://api.z.ai/api/paas/v4",
+  "ZhipuAI": "https://open.bigmodel.cn/api/paas/v4",
+  "Openrouter": "https://openrouter.ai/api/v1",
+  "Fireworks": "https://api.fireworks.ai/inference/v1",
+  "Perplexity": "https://api.perplexity.ai",
+  "Cerebras": "https://api.cerebras.ai/v1",
+  "DeepInfra": "https://api.deepinfra.com/v1/openai",
+  "Novita": "https://api.novita.ai/v3/openai",
+  "Hyperbolic": "https://api.hyperbolic.xyz/v1",
+  "LLMAPI": "https://api.llmapi.ai/v1",
+  "302ai": "https://api.302.ai/v1",
+  "AIHubMix": "https://api.aihubmix.com/v1"
+}
