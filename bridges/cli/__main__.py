@@ -78,14 +78,19 @@ class CLIBridge:
         self._current_content = ""
         self._live: Live | None = None
         self._cursor: str | None = None  # node_id for this CLI session
+        self._label_printed = False
+
+    def _start_reply(self):
+        if not self._label_printed:
+            t = self._theme.t
+            c = self._theme.c
+            self._console.print(f"{t('agent_label')}:", style=c('agent_label'))
+            self._label_printed = True  # Lock it so it never prints again this turn
 
     def _get_live_render(self, content: str, is_thinking: bool = False) -> Group:
         """Helper to create a renderable group for the Live display."""
         c = self._theme.c
-        t = self._theme.t
-        
-        parts = [Text(f"{t('agent_label')}:", style=c('agent_label'))]
-        
+        parts = []
         if is_thinking and not content:
             parts.append(Text(" ⠋ thinking...", style=c('thinking')))
         
@@ -114,36 +119,58 @@ class CLIBridge:
 
     async def handle_event(self, event) -> None:
         c = self._theme.c
-        t = self._theme.t
 
         if isinstance(event, AgentThinkingChunk):
+            self._start_reply()
             self._ensure_live(is_thinking=True)
-            self._live.update(self._get_live_render(self._current_content, is_thinking=True))
+            # Only update if live is actually active
+            if self._live:
+                self._live.update(self._get_live_render(self._current_content, is_thinking=True))
 
         elif isinstance(event, AgentTextChunk):
+            self._start_reply()
             self._current_content += event.text
             self._ensure_live()
-            self._live.update(self._get_live_render(self._current_content))
-
-        elif isinstance(event, AgentTextFinal):
-            # Finalize the current stream
-            final_text = (self._current_content + (event.text or "")).strip()
-            self._current_content = final_text
-            
             if self._live:
                 self._live.update(self._get_live_render(self._current_content))
+
+        elif isinstance(event, AgentToolCall):
+            # IMPORTANT: Remove 'thinking' from the UI BEFORE stopping
+            if self._live:
+                self._live.update(self._get_live_render(self._current_content, is_thinking=False))
+            self._stop_live()
+            
+            args_str = ", ".join(f"{k}={v!r}" for k, v in event.args.items())
+            self._console.print(f"  [{c('tool_call')}]⟶  {event.tool_name}({args_str})[/{c('tool_call')}]")
+
+        elif isinstance(event, AgentToolResult):
+            # Just print the result; don't restart Live here
+            status_color = c("tool_error") if event.is_error else c("tool_ok")
+            icon = "✗" if event.is_error else "✓"
+            preview = event.output[:100].replace("\n", " ") + ("..." if len(event.output) > 100 else "")
+            self._console.print(f"  [{status_color}]{icon}  {event.tool_name}:[/{status_color}] ", end="")
+            self._console.print(preview, markup=False, style="bright_black")
+
+        elif isinstance(event, AgentTextFinal):
+            final_text = (self._current_content + (event.text or "")).strip()
+            # If we were streaming, update one last time then stop
+            if self._live:
+                self._live.update(self._get_live_render(final_text))
             
             self._stop_live()
             self._console.print() # Final spacer
             
-            # Reset state for next turn
+            # RESET EVERYTHING
             self._current_content = ""
+            self._label_printed = False 
             self._reply_done.set()
 
         elif isinstance(event, AgentToolCall):
             # 1. Stop streaming so the tool call prints below the text
+            if self._live:
+                self._live.update(self._get_live_render(self._current_content, is_thinking=False))
             self._stop_live()
-            
+            self._current_content = ""
             args_str = ", ".join(f"{k}={v!r}" for k, v in event.args.items())
             self._console.print(f"  [{c('tool_call')}]⟶  {event.tool_name}({args_str})[/{c('tool_call')}]")
 
