@@ -165,25 +165,6 @@ class CLIBridge:
             self._label_printed = False 
             self._reply_done.set()
 
-        elif isinstance(event, AgentToolCall):
-            # 1. Stop streaming so the tool call prints below the text
-            if self._live:
-                self._live.update(self._get_live_render(self._current_content, is_thinking=False))
-            self._stop_live()
-            self._current_content = ""
-            args_str = ", ".join(f"{k}={v!r}" for k, v in event.args.items())
-            self._console.print(f"  [{c('tool_call')}]⟶  {event.tool_name}({args_str})[/{c('tool_call')}]")
-
-        elif isinstance(event, AgentToolResult):
-            # 2. Results also print outside the live context
-            self._stop_live()
-            
-            status_color = c("tool_error") if event.is_error else c("tool_ok")
-            icon = "✗" if event.is_error else "✓"
-            preview = event.output[:100].replace("\n", " ") + ("..." if len(event.output) > 100 else "")
-            self._console.print(f"  [{status_color}]{icon}  {event.tool_name}:[/{status_color}] ", end="")
-            self._console.print(preview, markup=False, style="bright_black")
-
         elif isinstance(event, AgentError):
             self._stop_live()
             self._console.print(f"\n[{c('error')}]error: {event.message}[/{c('error')}]\n")
