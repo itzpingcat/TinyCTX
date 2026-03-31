@@ -1,9 +1,16 @@
 """
 modules/heartbeat/__main__.py
 
-Runs periodic agent turns on a configurable interval.
-Each tick injects a synthetic InboundMessage directly into AgentLoop.run(),
-bypassing the gateway (no platform routing needed).
+Runs periodic agent turns on a configurable interval, isolated on their own
+DB branch — never polluting the user's conversation thread.
+
+Branch strategy (configured via "branch_from"):
+  "root"    — branch off the global DB root, fully independent of the user session
+  "session" — branch off the current tail of the agent's own session at the time
+              heartbeat starts (inherits history up to that point, then diverges)
+
+This mirrors how cron jobs work: a session-init node is created once and stored
+as the cursor. All subsequent heartbeat turns append to that same branch.
 
 Reply handling:
   - "HEARTBEAT_OK" at start or end → silently dropped
@@ -11,7 +18,7 @@ Reply handling:
   - Any other reply → printed as a heartbeat alert, then the agent is
     re-prompted: "Continue the task, or reply HEARTBEAT_OK when done."
   - This continuation loop runs up to max_continuations times before giving up.
-  - Errors are logged and the background task continues normally.
+  - Errors are logged; the background task continues normally.
 
 HEARTBEAT.md in the workspace is read by the agent via the normal filesystem
 tools — this module doesn't inject it directly, the prompt tells the agent to.
@@ -28,6 +35,7 @@ import asyncio
 import logging
 import time
 from datetime import datetime, time as dtime
+from pathlib import Path
 
 from contracts import (
     InboundMessage, ContentType,
@@ -36,16 +44,62 @@ from contracts import (
 
 logger = logging.getLogger(__name__)
 
-# Sentinel identity used for all heartbeat messages.
 _HEARTBEAT_USER_ID = "heartbeat-system"
 _HEARTBEAT_AUTHOR  = UserIdentity(
-    platform=Platform.CLI,
+    platform=Platform.CRON,
     user_id=_HEARTBEAT_USER_ID,
     username="heartbeat",
 )
 _TOKEN = "HEARTBEAT_OK"
 
 
+# ---------------------------------------------------------------------------
+# Cursor bootstrap
+# ---------------------------------------------------------------------------
+
+def _get_or_create_cursor(agent, branch_from: str) -> str:
+    """
+    Return the node_id for the heartbeat branch cursor.
+
+    branch_from == "root":    child of the global DB root (fully isolated)
+    branch_from == "session": child of the agent's current tail at startup
+                               (inherits history up to this point, then diverges)
+
+    The node is created once; the node_id is stored on the agent instance so
+    subsequent calls just return the cached value.
+    """
+    attr = "_heartbeat_cursor_node_id"
+    if getattr(agent, attr, None):
+        return getattr(agent, attr)
+
+    from db import ConversationDB
+    workspace = Path(agent.config.workspace.path).expanduser().resolve()
+    db        = ConversationDB(workspace / "agent.db")
+
+    if branch_from == "session":
+        # Branch off the live session tail — the heartbeat "knows" what the
+        # user has discussed so far, but its turns won't appear in their thread.
+        parent_id = agent._tail_node_id
+    else:
+        # Branch off the global root — fully isolated, no user history.
+        parent_id = db.get_root().id
+
+    node = db.add_node(
+        parent_id=parent_id,
+        role="system",
+        content="session:heartbeat",
+    )
+    setattr(agent, attr, node.id)
+    logger.info(
+        "[heartbeat] created branch cursor %s (branch_from=%s, parent=%s)",
+        node.id, branch_from, parent_id,
+    )
+    return node.id
+
+
+# ---------------------------------------------------------------------------
+# Module entry point
+# ---------------------------------------------------------------------------
 
 def register(agent) -> None:
     try:
@@ -64,23 +118,28 @@ def register(agent) -> None:
     ack_max             = int(cfg.get("ack_max_chars", 300))
     max_continuations   = int(cfg.get("max_continuations", 5))
     active_hours        = cfg.get("active_hours", None)
+    branch_from         = cfg.get("branch_from", "root")   # "root" | "session"
     interval_secs       = every_minutes * 60
+
+    # Bootstrap the branch cursor now (while the agent's tail_node_id is
+    # fresh and before any user turns advance it further).
+    cursor_node_id = _get_or_create_cursor(agent, branch_from)
 
     task = asyncio.get_event_loop().create_task(
         _heartbeat_loop(
-            agent, interval_secs,
+            agent, cursor_node_id, interval_secs,
             prompt, continuation_prompt,
             ack_max, max_continuations,
             active_hours,
         ),
-        name=f"heartbeat:{agent.tail_node_id}",
+        name=f"heartbeat:{cursor_node_id}",
     )
 
     _patch_reset(agent, task)
 
     logger.info(
-        "[heartbeat] started — every %dm, cursor=%s, active_hours=%s",
-        every_minutes, agent.tail_node_id, active_hours,
+        "[heartbeat] started — every %dm, cursor=%s, branch_from=%s, active_hours=%s",
+        every_minutes, cursor_node_id, branch_from, active_hours,
     )
 
 
@@ -90,6 +149,7 @@ def register(agent) -> None:
 
 async def _heartbeat_loop(
     agent,
+    cursor_node_id: str,
     interval_secs: int,
     prompt: str,
     continuation_prompt: str,
@@ -104,7 +164,8 @@ async def _heartbeat_loop(
         try:
             if _in_active_window(active_hours):
                 await _tick(
-                    agent, prompt, continuation_prompt,
+                    agent, cursor_node_id,
+                    prompt, continuation_prompt,
                     ack_max, max_continuations,
                 )
             else:
@@ -118,38 +179,37 @@ async def _heartbeat_loop(
 
 
 # ---------------------------------------------------------------------------
-# Single tick — initial turn + continuation loop
+# Single tick — push through gateway, collect reply, continuation loop
 # ---------------------------------------------------------------------------
 
 async def _tick(
     agent,
+    cursor_node_id: str,
     prompt: str,
     continuation_prompt: str,
     ack_max: int,
     max_continuations: int,
 ) -> None:
-    """
-    Run the initial heartbeat turn. If the agent doesn't reply HEARTBEAT_OK,
-    re-prompt it to continue or acknowledge, up to max_continuations times.
-    """
-    logger.debug("[heartbeat] tick start")
+    logger.debug("[heartbeat] tick start (cursor=%s)", cursor_node_id)
 
-    # Initial turn
-    reply = await _run_turn(agent, prompt)
+    reply, new_cursor = await _run_turn(agent, cursor_node_id, prompt)
+    if new_cursor:
+        cursor_node_id = new_cursor
+
     is_ok, alert = _parse_reply(reply, ack_max)
-
     if is_ok:
         logger.debug("[heartbeat] OK on initial turn")
         return
 
-    # Agent has work to do — enter continuation loop
     _emit_alert(alert)
 
     for turn in range(1, max_continuations + 1):
         logger.debug("[heartbeat] continuation turn %d/%d", turn, max_continuations)
-        reply = await _run_turn(agent, continuation_prompt)
-        is_ok, alert = _parse_reply(reply, ack_max)
+        reply, new_cursor = await _run_turn(agent, cursor_node_id, continuation_prompt)
+        if new_cursor:
+            cursor_node_id = new_cursor
 
+        is_ok, alert = _parse_reply(reply, ack_max)
         if is_ok:
             logger.debug("[heartbeat] OK after %d continuation turn(s)", turn)
             return
@@ -162,52 +222,82 @@ async def _tick(
     )
 
 
-async def _run_turn(agent, text: str) -> str:
-    """Inject a synthetic message directly into the agent and collect the full reply."""
+async def _run_turn(agent, cursor_node_id: str, text: str) -> tuple[str, str | None]:
+    """
+    Push a heartbeat message through the gateway on the heartbeat branch.
+
+    Returns (reply_text, updated_cursor_node_id | None).
+    The cursor advances as the AgentLoop writes new DB nodes; we read the
+    new tail off the lane after the turn completes so the next tick resumes
+    from the correct leaf.
+    """
     from contracts import AgentTextChunk, AgentTextFinal, AgentError
 
-    # The heartbeat runs on the same agent instance, so we use its current
-    # tail_node_id as the cursor — no separate session needed.
+    gateway = getattr(agent, "gateway", None)
+    if gateway is None:
+        logger.error("[heartbeat] agent.gateway not set — cannot run tick")
+        return "", None
+
     msg = InboundMessage(
-        tail_node_id=agent.tail_node_id,
+        tail_node_id=cursor_node_id,
         author=_HEARTBEAT_AUTHOR,
         content_type=ContentType.TEXT,
         text=text,
         message_id=f"heartbeat-{int(time.time_ns())}",
         timestamp=time.time(),
     )
-    parts: list[str] = []
-    async for chunk in agent.run(msg):
-        if isinstance(chunk, AgentTextChunk):
-            parts.append(chunk.text)
-        elif isinstance(chunk, AgentTextFinal):
-            if chunk.text:
-                parts.append(chunk.text)
-            break
-        elif isinstance(chunk, AgentError):
-            logger.warning("[heartbeat] agent error during turn: %s", chunk.message)
-            break
-        # AgentThinkingChunk, AgentToolCall, AgentToolResult — skip
-    return "".join(parts).strip()
 
+    parts: list[str]  = []
+    reply_event       = asyncio.Event()
+
+    async def _collect(event) -> None:
+        if isinstance(event, AgentTextChunk):
+            parts.append(event.text)
+        elif isinstance(event, AgentTextFinal):
+            if event.text:
+                parts.append(event.text)
+            reply_event.set()
+        elif isinstance(event, AgentError):
+            parts.append(event.message)
+            reply_event.set()
+
+    gateway.register_cursor_handler(cursor_node_id, _collect)
+    try:
+        await gateway.push(msg)
+        await asyncio.wait_for(reply_event.wait(), timeout=120)
+    except asyncio.TimeoutError:
+        logger.error("[heartbeat] turn timed out after 120s")
+    finally:
+        gateway.unregister_cursor_handler(cursor_node_id)
+
+    # Advance cursor to the lane's current tail so the next turn continues
+    # from the correct leaf rather than re-sending to the old node.
+    new_cursor: str | None = None
+    lane = gateway._lane_router._lanes.get(cursor_node_id)
+    if lane and lane.loop._tail_node_id != cursor_node_id:
+        new_cursor = lane.loop._tail_node_id
+        # Cache the updated cursor on the agent so _get_or_create_cursor
+        # returns the right value if re-called (e.g. after reset).
+        setattr(agent, "_heartbeat_cursor_node_id", new_cursor)
+
+    return "".join(parts).strip(), new_cursor
+
+
+# ---------------------------------------------------------------------------
+# Reply parsing
+# ---------------------------------------------------------------------------
 
 def _parse_reply(reply: str, ack_max: int) -> tuple[bool, str]:
     """
-    Returns (is_ok, alert_text).
-
-    Strips HEARTBEAT_OK from the start or end of the reply.
-    is_ok=True when the remainder is ≤ ack_max chars (nothing meaningful to surface).
-    is_ok=False when there's real content to deliver as an alert.
+    Strip HEARTBEAT_OK from the start or end of the reply.
+    is_ok=True when the remainder is ≤ ack_max chars.
     """
     text = reply
-
     if text.startswith(_TOKEN):
         text = text[len(_TOKEN):].lstrip(" \n\r")
     elif text.endswith(_TOKEN):
         text = text[: -len(_TOKEN)].rstrip(" \n\r")
-
-    is_ok = len(text) <= ack_max
-    return is_ok, text
+    return len(text) <= ack_max, text
 
 
 def _emit_alert(text: str) -> None:
@@ -216,7 +306,7 @@ def _emit_alert(text: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Active hours check
+# Active hours
 # ---------------------------------------------------------------------------
 
 def _parse_hhmm(s: str) -> dtime:
@@ -225,28 +315,20 @@ def _parse_hhmm(s: str) -> dtime:
 
 
 def _in_active_window(active_hours: dict | None) -> bool:
-    """Return True if we should run this tick."""
     if not active_hours:
         return True
-
     try:
         start = _parse_hhmm(active_hours["start"])
         end_  = _parse_hhmm(active_hours["end"])
     except (KeyError, ValueError):
         logger.warning("[heartbeat] invalid active_hours config — running anyway")
         return True
-
-    # Zero-width window: always outside.
     if start == end_:
         return False
-
     now = datetime.now().time().replace(second=0, microsecond=0)
-
-    # Handle midnight-spanning windows (e.g. 22:00 → 02:00)
     if start < end_:
         return start <= now < end_
-    else:
-        return now >= start or now < end_
+    return now >= start or now < end_
 
 
 # ---------------------------------------------------------------------------

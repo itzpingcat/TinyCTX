@@ -67,7 +67,7 @@ Sessions are represented as tree branches in `agent.db` (SQLite). Each bridge ho
 - Matrix: `workspace/cursors/matrix.json` (by room_id)
 - Gateway: `workspace/cursors/gateway.json` (by session_id → node_id)
 - Cron: `cursor_node_id` field per job in `CRON.json`
-- Heartbeat: `workspace/cursors/heartbeat`
+- Heartbeat: `_heartbeat_cursor_node_id` attribute on the agent instance; node created once in `agent.db` as a child of root (or the session tail, if `branch_from: "session"`), then reused for all subsequent ticks
 
 **Group chat sender attribution:**
 
@@ -440,7 +440,7 @@ Token-budget trimming in `assemble()` follows the same rules: assistant turns wi
 | `filesystem` | Tools: `shell`, `view`, `write_file`, `str_replace` — all always-on. Sandboxed to workspace. Shell execution split into `shell.py` (platform detection, blacklist, subprocess dispatch). On Linux/macOS runs via `bash -c`; on Windows via `powershell -NonInteractive`. Blacklist (`blacklist.txt`, glob patterns, case-insensitive) enforced on both platforms — covers bulk destruction, RCE, privilege escalation, persistence, system path writes, and more. Blocked commands return an error string. Blacklist loaded at `register()` time; restart to reload. |
 | `web` | Tools: `web_search` (DuckDuckGo) and `navigate` are always-on. `http_request`, `click`, `type_text`, `extract_text`, `extract_html`, `screenshot`, `wait_for`, `manage_browser` (Playwright) are deferred. |
 | `cron` | Scheduled agent turns. Jobs in `workspace/CRON.json`. Schedule kinds: `every`, `at`, `cron` (requires `croniter`). Tool: `cron_list`. Each job holds its own `cursor_node_id` (child of global root, created on first run). `reset_after_run: true` rewinds the cursor to the job's root node rather than wiping the DB. |
-| `heartbeat` | Periodic timer turns. Agent replies `HEARTBEAT_OK` if nothing needs attention; otherwise triggers a continuation loop. Configurable active hours. Cursor stored at `workspace/cursors/heartbeat`; created as a child of global root on first run. |
+| `heartbeat` | Periodic timer turns on an isolated DB branch — never pollutes the user's conversation thread. On `register()`, creates a session-init node in `agent.db` and stores its `node_id` as `agent._heartbeat_cursor_node_id`. All ticks push through the gateway (own `Lane` + `AgentLoop`); the cursor advances after each turn and is cached for the next. `branch_from: "root"` (default) — fully isolated; `branch_from: "session"` — branches off the user session tail at startup. Agent replies `HEARTBEAT_OK` if nothing needs attention; otherwise triggers a continuation loop (up to `max_continuations`). Configurable active hours. |
 | `ctx_tools` | Context pipeline hooks: deduplicates repeated identical tool calls, strips `<think>` CoT blocks from old turns, truncates/trims large tool outputs. |
 | `skills` | agentskills.io standard. Scans configured dirs + `~/.agents/skills/` for `SKILL.md` files, injects a compact index as system prompt, tool: `use_skill(name)` (always-on). |
 | `mcp` | stdio MCP server client. Connects at startup, discovers tools, registers them as `mcp__<server>__<tool>`. All tools deferred by default; configure per-tool visibility under `mcp.servers.<n>.tools:`. Requires `pip install mcp`. |
