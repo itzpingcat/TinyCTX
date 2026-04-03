@@ -227,29 +227,54 @@ class TestNoopHandler:
 # ---------------------------------------------------------------------------
 
 class TestCronRunnerRegistersHandler:
-    def test_start_registers_noop_platform_handler(self, tmp_path):
+    def test_lazy_registers_noop_platform_handler_on_first_job_run(self, tmp_path):
         """
-        Fix verification: _CronRunner.start() must call
-        gateway.register_platform_handler('cron', _noop_reply_handler)
-        so that router._dispatch_event never hits the 'no handler' branch.
+        Fix verification: the noop handler must be registered before any job
+        events are dispatched.  Because agent.gateway is None during start()
+        (Lane.__post_init__ sets it after AgentLoop.__init__ returns), the
+        registration must happen lazily inside _run_job().
         """
-        agent = MagicMock()
-        agent.config.workspace.path = str(tmp_path)
-        gateway = MagicMock()
-        agent.gateway = gateway
+        agent, gateway = _make_agent_and_gateway(tmp_path)
+
+        # Confirm the slot starts empty.
+        assert gateway._platform_handlers.get(_CRON_PLATFORM) is None
 
         runner = _CronRunner(agent, tmp_path / "CRON.json")
+        # start() must NOT register when gateway is available (it can't be).
         runner.start()
+        # Still empty — registration is deferred.
+        assert gateway._platform_handlers.get(_CRON_PLATFORM) is None
 
-        gateway.register_platform_handler.assert_called_once_with(
-            _CRON_PLATFORM, _noop_reply_handler
-        )
+    @pytest.mark.asyncio
+    async def test_noop_registered_before_first_job_events(self, tmp_path):
+        """
+        After the first _run_job() call the noop slot must be filled so that
+        any stray events that arrive after unregister_cursor_handler don't
+        produce 'no handler for platform cron' errors.
+        """
+        agent, gateway = _make_agent_and_gateway(tmp_path)
+        gateway._platform_handlers = {}  # start clean
+        job = _make_job()
+
+        async def _fake_push(msg):
+            from contracts import AgentTextFinal
+            handler = gateway.register_cursor_handler.call_args[0][1]
+            ev = MagicMock(spec=AgentTextFinal)
+            ev.text = "done"
+            await handler(ev)
+
+        gateway.push = _fake_push
+
+        runner = _CronRunner(agent, tmp_path / "CRON.json")
+        await runner._run_job(job)
+
+        assert gateway._platform_handlers.get(_CRON_PLATFORM) is _noop_reply_handler
 
     def test_start_without_gateway_does_not_crash(self, tmp_path):
-        """If agent.gateway is not yet set, start() must not raise."""
+        """start() must not raise even when gateway isn't set yet (normal case)."""
         agent = MagicMock()
         agent.config.workspace.path = str(tmp_path)
-        del agent.gateway  # simulate gateway not yet attached
+        del agent.gateway
 
         runner = _CronRunner(agent, tmp_path / "CRON.json")
         runner.start()  # should not raise

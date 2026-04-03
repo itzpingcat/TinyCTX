@@ -384,12 +384,9 @@ class _CronRunner:
         self._recompute_next_runs()
         self._save()
         self._arm()
-        # Register the sentinel platform handler so router._dispatch_event never
-        # hits the "no handler for platform 'cron'" branch for stray events that
-        # arrive after a cursor handler has been unregistered.
-        gateway = getattr(self._agent, 'gateway', None)
-        if gateway is not None:
-            gateway.register_platform_handler(_CRON_PLATFORM, _noop_reply_handler)
+        # Note: we'd like to register the noop platform handler here, but
+        # agent.gateway is set by Lane.__post_init__ *after* register() returns,
+        # so it's None at this point. Registration is done lazily in _run_job().
         logger.info("[cron] started with %d job(s)", len(self._jobs))
 
     def stop(self) -> None:
@@ -491,6 +488,13 @@ class _CronRunner:
                 job.state.last_status = "error"
                 job.state.last_error  = "agent.gateway not available"
                 return
+
+            # Lazily register the noop platform handler the first time a job
+            # runs. Can't do this in start() because agent.gateway is set by
+            # Lane.__post_init__ after AgentLoop.__init__ (and _load_modules /
+            # register) has already returned, so it's None at that point.
+            if not gateway._platform_handlers.get(_CRON_PLATFORM):
+                gateway.register_platform_handler(_CRON_PLATFORM, _noop_reply_handler)
 
             node_id = self._get_or_create_job_cursor(job, gateway)
 
