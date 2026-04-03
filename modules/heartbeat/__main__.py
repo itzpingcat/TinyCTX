@@ -130,6 +130,10 @@ def register(agent) -> None:
     # fresh and before any user turns advance it further).
     lane_node_id, tail_node_id = _get_or_create_cursor(agent, branch_from)
 
+    # Note: we'd like to stash agent on gateway here for /debug heartbeat, but
+    # agent.gateway is set by Lane.__post_init__ *after* register() returns, so
+    # it's None at this point.  The stash is done lazily in _run_turn() instead.
+
     task = asyncio.get_event_loop().create_task(
         _heartbeat_loop(
             agent, lane_node_id, tail_node_id, interval_secs,
@@ -254,6 +258,12 @@ async def _run_turn(
         logger.error("[heartbeat] agent.gateway not set — cannot run tick")
         return "", tail_node_id
 
+    # Lazily stash the agent ref on the gateway the first time a turn runs.
+    # We can't do this in register() because lane.gateway is set by Lane.__post_init__
+    # after AgentLoop.__init__ (and thus _load_modules / register) has returned.
+    if not hasattr(gateway, "_heartbeat_agent"):
+        gateway._heartbeat_agent = agent
+
     msg = InboundMessage(
         tail_node_id=tail_node_id,
         author=_HEARTBEAT_AUTHOR,
@@ -283,6 +293,7 @@ async def _run_turn(
         await gateway.push(msg)
         await asyncio.wait_for(reply_event.wait(), timeout=120)
     except asyncio.TimeoutError:
+        gateway.abort_generation(lane_node_id)
         logger.error("[heartbeat] turn timed out after 120s")
     finally:
         gateway.unregister_cursor_handler(lane_node_id)

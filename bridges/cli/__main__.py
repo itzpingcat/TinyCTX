@@ -202,7 +202,7 @@ class CLIBridge:
         banner_text.append(pyfiglet.figlet_format(self._theme.t("name"), font="slant"), style=self._theme.c("banner"))
         banner_text.append(f"  {self._theme.t('tagline')}", style=self._theme.c("tagline"))
         self._console.print(Panel(banner_text, border_style=self._theme.c("border"), padding=(0, 2)))
-        self._console.print(f"[{self._theme.c('border')}]  type a message · /reset · exit[/{self._theme.c('border')}]\n")
+        self._console.print(f"[{self._theme.c('border')}]  type a message · /reset · /debug heartbeat · exit[/{self._theme.c('border')}]\n")
 
         c = self._theme.c
         t = self._theme.t
@@ -221,7 +221,10 @@ class CLIBridge:
                     break
 
                 if text.startswith("/"):
-                    if text.lower() == "/reset":
+                    if text.lower() == "/debug heartbeat":
+                        await _debug_heartbeat(self._gateway, self._console, c)
+                        continue
+                    elif text.lower() == "/reset":
                         # Start a brand new session branch off root.
                         from db import ConversationDB
                         workspace   = Path(self._gateway._config.workspace.path).expanduser().resolve()
@@ -255,6 +258,79 @@ class CLIBridge:
                 break
 
         self._console.print(f"[{c('reset')}]{t('bye_message')}[/{c('reset')}]")
+
+
+# --- Debug commands ---
+
+async def _debug_heartbeat(gateway, console: Console, c) -> None:
+    """
+    /debug heartbeat — immediately fire one heartbeat tick so you can verify
+    the module is wired correctly without waiting for the real interval.
+
+    Looks for a running heartbeat task on the event loop by name
+    ("heartbeat:<node_id>") and calls _tick() directly on the same lane/tail
+    the live task uses, so the test exercises the real code path.
+    """
+    from modules.heartbeat.__main__ import _tick, _parse_reply
+
+    # Find the heartbeat task and extract its lane/tail state from the agent.
+    # The task name is "heartbeat:<lane_node_id>" — see register() in heartbeat.
+    hb_task = next(
+        (t for t in asyncio.all_tasks() if t.get_name().startswith("heartbeat:")),
+        None,
+    )
+
+    # heartbeat.register() stashes the AgentLoop ref directly on the gateway.
+    agent = getattr(gateway, "_heartbeat_agent", None)
+
+    if agent is None:
+        # Fallback: scan live lanes (works after first message if stash missed).
+        for lane in gateway._lane_router._lanes.values():
+            loop = getattr(lane, "loop", None)
+            if loop is None and hasattr(lane, "_lane"):
+                loop = getattr(lane._lane, "loop", None)
+            if loop is not None and getattr(loop, "_heartbeat_lane_node_id", None):
+                agent = loop
+                break
+
+    if agent is None:
+        console.print(f"[{c('error')}]  ✗  heartbeat: could not find agent instance[/{c('error')}]")
+        console.print(f"[{c('tool_call')}]     (is the heartbeat module registered?)[/{c('tool_call')}]")
+        return
+
+    lane_node_id = getattr(agent, "_heartbeat_lane_node_id", None)
+    tail_node_id = getattr(agent, "_heartbeat_cursor_node_id", None)
+
+    if not lane_node_id:
+        console.print(f"[{c('error')}]  ✗  heartbeat: no cursor found — has the module run at least once?[/{c('error')}]")
+        if hb_task:
+            console.print(f"[{c('tool_call')}]     task exists ({hb_task.get_name()}) but hasn't ticked yet[/{c('tool_call')}]")
+        return
+
+    try:
+        from modules.heartbeat import EXTENSION_META
+        cfg: dict = EXTENSION_META.get("default_config", {})
+    except ImportError:
+        cfg = {}
+
+    prompt              = cfg.get("prompt", "If nothing needs attention, reply HEARTBEAT_OK.")
+    continuation_prompt = cfg.get("continuation_prompt", "Continue the task, or reply HEARTBEAT_OK when you are done.")
+    ack_max             = int(cfg.get("ack_max_chars", 300))
+    max_continuations   = int(cfg.get("max_continuations", 5))
+
+    console.print(f"[{c('tool_call')}]  ⏱  firing heartbeat tick (lane={lane_node_id[:8]}…)[/{c('tool_call')}]")
+
+    try:
+        new_tail = await _tick(
+            agent, lane_node_id, tail_node_id,
+            prompt, continuation_prompt,
+            ack_max, max_continuations,
+        )
+        # Update the persisted tail so the real task picks up from the right node.
+        setattr(agent, "_heartbeat_cursor_node_id", new_tail)
+        console.print(f"[{c('tool_ok')}]  ✓  heartbeat tick complete[/{c('tool_ok')}]")
+    except Exception as exc:
+        console.print(f"[{c('error')}]  ✗  heartbeat tick raised: {exc}[/{c('error')}]")
 
 
 # CLI user identity

@@ -384,6 +384,12 @@ class _CronRunner:
         self._recompute_next_runs()
         self._save()
         self._arm()
+        # Register the sentinel platform handler so router._dispatch_event never
+        # hits the "no handler for platform 'cron'" branch for stray events that
+        # arrive after a cursor handler has been unregistered.
+        gateway = getattr(self._agent, 'gateway', None)
+        if gateway is not None:
+            gateway.register_platform_handler(_CRON_PLATFORM, _noop_reply_handler)
         logger.info("[cron] started with %d job(s)", len(self._jobs))
 
     def stop(self) -> None:
@@ -518,6 +524,12 @@ class _CronRunner:
             try:
                 await gateway.push(msg)
                 await asyncio.wait_for(reply_event.wait(), timeout=120)
+            except asyncio.TimeoutError:
+                # Abort the lane before unregistering the cursor handler so the
+                # AgentLoop stops emitting events.  Re-raise so the outer
+                # except block records the timeout status.
+                gateway.abort_generation(node_id)
+                raise
             finally:
                 gateway.unregister_cursor_handler(node_id)
 
