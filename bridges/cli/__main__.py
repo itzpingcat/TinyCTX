@@ -140,7 +140,10 @@ class CLIBridge:
                 self._live.update(self._get_live_render(self._current_content, is_thinking=False))
             self._stop_live()
             self._current_content = ""
-            args_str = ", ".join(f"{k}={v!r}" for k, v in event.args.items())
+            def _truncate(v, max_chars=80) -> str:
+                r = repr(v)
+                return r[:max_chars] + "..." if len(r) > max_chars else r
+            args_str = ", ".join(f"{k}={_truncate(v)}" for k, v in event.args.items())
             self._console.print(f"  [{c('tool_call')}]⟶  {event.tool_name}({args_str})[/{c('tool_call')}]")
 
         elif isinstance(event, AgentToolResult):
@@ -220,8 +223,20 @@ class CLIBridge:
 
                 if text.startswith("/"):
                     if text.lower() == "/reset":
+                        # Start a brand new session branch off root.
+                        from db import ConversationDB
+                        workspace   = Path(self._gateway._config.workspace.path).expanduser().resolve()
+                        db          = ConversationDB(workspace / "agent.db")
+                        root        = db.get_root()
+                        node        = db.add_node(parent_id=root.id, role="system", content="session:cli")
+                        cursor_file = workspace / "cursors" / "cli"
+                        cursor_file.write_text(node.id, encoding="utf-8")
+                        self._cursor = node.id
                         self._gateway.reset_lane(self._cursor)
-                        self._console.print(f"[{c('reset')}]  ↺  context cleared[/{c('reset')}]")
+                        self._console.print(f"[{c('reset')}]  ↺  new session started[/{c('reset')}]")
+                    elif text.lower() == "/resume":
+                        # Already on the latest session — just confirm.
+                        self._console.print(f"[{c('reset')}]  ↩  resuming from last session[/{c('reset')}]")
                     continue
 
                 msg = InboundMessage(
@@ -235,6 +250,7 @@ class CLIBridge:
                 self._reply_done.clear()
                 await self._gateway.push(msg)
                 await self._reply_done.wait()
+                _persist_cli_cursor(self._gateway, self._cursor)
 
             except (KeyboardInterrupt, EOFError):
                 break
@@ -251,6 +267,7 @@ def _load_cli_cursor(gateway) -> str:
     """
     Load (or create) the persistent CLI cursor from workspace/cursors/cli.
     On first run, attaches to the DB global root and persists the new node_id.
+    On subsequent runs, resumes from the last known tail node.
     """
     from db import ConversationDB
     workspace   = Path(gateway._config.workspace.path).expanduser().resolve()
@@ -270,6 +287,30 @@ def _load_cli_cursor(gateway) -> str:
     node    = db.add_node(parent_id=root.id, role="system", content="session:cli")
     cursor_file.write_text(node.id, encoding="utf-8")
     return node.id
+
+
+def _persist_cli_cursor(gateway, anchor_node_id: str) -> None:
+    """
+    After each turn, read the live tail from the active lane and persist it
+    to the cursor file so the next session resumes from the right place.
+    """
+    try:
+        lanes = gateway._lane_router._lanes
+        # The lane may be keyed by the anchor or by the current tail.
+        lane = lanes.get(anchor_node_id)
+        if lane is None:
+            # Search all lanes for one whose original node_id matches.
+            lane = next((l for l in lanes.values() if l.node_id == anchor_node_id), None)
+        if lane is None:
+            return
+        tail = lane.loop._tail_node_id
+        if not tail:
+            return
+        workspace   = Path(gateway._config.workspace.path).expanduser().resolve()
+        cursor_file = workspace / "cursors" / "cli"
+        cursor_file.write_text(tail, encoding="utf-8")
+    except Exception:
+        pass  # cursor persistence must never crash the bridge
 
 
 
