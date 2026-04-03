@@ -30,6 +30,29 @@ Config (in config.yaml under bridges.discord.options):
   max_reply_length: Discord message length cap before chunking. Default: 1900
   typing_indicator: Show "Bot is typing..." while the agent thinks. Default: true
 
+Thread branching:
+  When a Discord thread is created inside a tracked channel, the bot creates a
+  new DB branch forked off the channel turn that spawned the thread. The channel
+  and thread then evolve independently — both can be active simultaneously. The
+  thread agent sees the full channel history up to the fork point, plus whatever
+  has happened inside the thread since then.
+
+  Cursor persistence:
+  All cursors (DMs, channels, threads) are persisted to
+  workspace/cursors/discord.json so sessions survive bot restarts. The file maps
+  cursor_key strings to DB node UUIDs:
+    "dm:<user_id>"        → node_id
+    "group:<channel_id>"  → node_id  (advances with each turn)
+    "thread:<thread_id>"  → node_id  (advances with each turn)
+
+  Message → node mapping for fork points:
+  When a channel trigger message is processed, the DB node ID of the resulting
+  user turn is recorded in workspace/cursors/discord_msg_nodes.json keyed by
+  Discord message ID. When a thread is created from that message, its cursor
+  is initialised to that node ID — branching the tree exactly at that turn.
+  If the origin message isn't mapped (e.g. predates the bot), the thread falls
+  back to the channel's current tail.
+
 Token setup:
   export DISCORD_BOT_TOKEN=your-bot-token-here
 
@@ -44,11 +67,13 @@ Finding your Discord user ID:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import discord
@@ -117,6 +142,83 @@ async def _humanize_mentions(text: str, client: discord.Client) -> str:
         last = m.end()
     parts.append(text[last:])
     return "".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Cursor store — persists all Discord cursors across restarts
+# ---------------------------------------------------------------------------
+
+class CursorStore:
+    """
+    Persists two JSON files under workspace/cursors/:
+
+    discord.json          — cursor_key -> node_id
+                            Keys: "dm:<uid>", "group:<cid>", "thread:<tid>"
+
+    discord_msg_nodes.json — discord_message_id -> db_node_id
+                            Records which DB node a channel trigger message
+                            produced, so thread forks can branch accurately.
+                            Capped at MAX_MSG_NODES entries (LRU-style trim).
+    """
+
+    MAX_MSG_NODES = 2000
+
+    def __init__(self, cursors_dir: Path) -> None:
+        self._dir           = cursors_dir
+        self._cursor_file   = cursors_dir / "discord.json"
+        self._msg_node_file = cursors_dir / "discord_msg_nodes.json"
+        self._cursors:   dict[str, str] = self._load(self._cursor_file)
+        self._msg_nodes: dict[str, str] = self._load(self._msg_node_file)
+
+    # ------------------------------------------------------------------
+    # Cursor map (cursor_key -> node_id)
+    # ------------------------------------------------------------------
+
+    def get(self, cursor_key: str) -> str | None:
+        return self._cursors.get(cursor_key)
+
+    def set(self, cursor_key: str, node_id: str) -> None:
+        self._cursors[cursor_key] = node_id
+        self._save(self._cursor_file, self._cursors)
+
+    def all_cursors(self) -> dict[str, str]:
+        return dict(self._cursors)
+
+    # ------------------------------------------------------------------
+    # Message → node map (discord_message_id -> db_node_id)
+    # ------------------------------------------------------------------
+
+    def get_msg_node(self, discord_message_id: str) -> str | None:
+        return self._msg_nodes.get(discord_message_id)
+
+    def set_msg_node(self, discord_message_id: str, node_id: str) -> None:
+        self._msg_nodes[discord_message_id] = node_id
+        # Trim to cap if needed (remove oldest entries)
+        if len(self._msg_nodes) > self.MAX_MSG_NODES:
+            overflow = len(self._msg_nodes) - self.MAX_MSG_NODES
+            for key in list(self._msg_nodes.keys())[:overflow]:
+                del self._msg_nodes[key]
+        self._save(self._msg_node_file, self._msg_nodes)
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _load(path: Path) -> dict:
+        if path.exists():
+            try:
+                return json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                logger.warning("CursorStore: corrupt file %s — starting fresh", path)
+        return {}
+
+    @staticmethod
+    def _save(path: Path, data: dict) -> None:
+        try:
+            path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except Exception:
+            logger.exception("CursorStore: failed to save %s", path)
 
 
 # ---------------------------------------------------------------------------
@@ -226,43 +328,139 @@ class _ReplyAccumulator:
 
 
 # ---------------------------------------------------------------------------
+# DB helpers
+# ---------------------------------------------------------------------------
+
+def _open_db(router):
+    from db import ConversationDB
+    workspace = Path(router._config.workspace.path).expanduser().resolve()
+    return ConversationDB(workspace / "agent.db")
+
+
+def _make_session_node(db, cursor_key: str) -> str:
+    """Create a new session-anchor node off the global root and return its id."""
+    root = db.get_root()
+    node = db.add_node(parent_id=root.id, role="system", content=f"session:{cursor_key}")
+    return node.id
+
+
+# ---------------------------------------------------------------------------
 # Bridge
 # ---------------------------------------------------------------------------
 
 class DiscordBridge:
     def __init__(self, router: "Router", options: dict) -> None:
         self._router = router
-        self._opts = {**DEFAULTS, **options}
-        self._max_len: int = int(self._opts["max_reply_length"])
-        self._typing: bool = bool(self._opts["typing_indicator"])
+        self._opts   = {**DEFAULTS, **options}
+
+        self._max_len:          int   = int(self._opts["max_reply_length"])
+        self._typing:           bool  = bool(self._opts["typing_indicator"])
         self._typing_on_thinking: bool = bool(self._opts["typing_on_thinking"])
-        self._typing_on_tools: bool = bool(self._opts["typing_on_tools"])
-        self._typing_on_reply: bool = bool(self._opts["typing_on_reply"])
-        self._prefix: str = str(self._opts["command_prefix"])
-        self._prefix_required: bool = bool(self._opts["prefix_required"])
-        self._reset_command: str = str(self._opts["reset_command"])
-        self._dm_enabled: bool = bool(self._opts["dm_enabled"])
-        self._guild_ids: set[int] = {int(g) for g in self._opts["guild_ids"]}
+        self._typing_on_tools:  bool  = bool(self._opts["typing_on_tools"])
+        self._typing_on_reply:  bool  = bool(self._opts["typing_on_reply"])
+        self._prefix:           str   = str(self._opts["command_prefix"])
+        self._prefix_required:  bool  = bool(self._opts["prefix_required"])
+        self._reset_command:    str   = str(self._opts["reset_command"])
+        self._dm_enabled:       bool  = bool(self._opts["dm_enabled"])
+        self._guild_ids:        set[int] = {int(g) for g in self._opts["guild_ids"]}
         self._buffer_timeout_s: float = float(self._opts["buffer_timeout_s"])
 
-        raw_allowed: list = self._opts["allowed_users"]
-        self._allowed_users: set[int] = {int(u) for u in raw_allowed}
+        self._allowed_users: set[int] = {int(u) for u in self._opts["allowed_users"]}
+        self._admin_users:   set[int] = {int(u) for u in self._opts["admin_users"]}
 
-        raw_admin: list = self._opts["admin_users"]
-        self._admin_users: set[int] = {int(u) for u in raw_admin}
+        # In-flight state (not persisted)
+        self._accumulators:  dict[str, _ReplyAccumulator] = {}
+        self._typing_active: dict[str, asyncio.Event]     = {}
+        self._group_buffers: dict[str, GroupBuffer]       = {}
 
-        self._accumulators: dict[str, _ReplyAccumulator] = {}
-        self._typing_active: dict[str, asyncio.Event] = {}
-        self._group_buffers: dict[str, GroupBuffer] = {}
-        self._cursors: dict[str, str] = {}
+        # Persisted cursor store
+        workspace   = Path(router._config.workspace.path).expanduser().resolve()
+        cursors_dir = workspace / "cursors"
+        cursors_dir.mkdir(parents=True, exist_ok=True)
+        self._store = CursorStore(cursors_dir)
 
         intents = discord.Intents.default()
         intents.message_content = True
-        intents.members = True
+        intents.members         = True
         self._client = discord.Client(intents=intents)
 
         self._client.event(self._on_ready)
         self._client.event(self._on_message)
+
+    # ------------------------------------------------------------------
+    # Cursor management
+    # ------------------------------------------------------------------
+
+    def _get_cursor(self, cursor_key: str) -> str | None:
+        return self._store.get(cursor_key)
+
+    def _get_or_create_cursor(self, cursor_key: str) -> str:
+        node_id = self._store.get(cursor_key)
+        if node_id:
+            return node_id
+        db      = _open_db(self._router)
+        node_id = _make_session_node(db, cursor_key)
+        self._store.set(cursor_key, node_id)
+        logger.info("Discord: created cursor %s -> %s", cursor_key, node_id)
+        return node_id
+
+    def _get_or_create_thread_cursor(self, thread_id: str, channel_id: str) -> str:
+        """
+        Return the cursor node_id for a thread, creating it if necessary.
+
+        Fork logic:
+          1. If the thread already has a persisted cursor, use it.
+          2. Look up the Discord message that spawned the thread
+             (thread.id == starter message id in Discord) in our msg->node map.
+             If found, fork off that specific user-turn node — the thread
+             inherits full channel history up to that moment.
+          3. Fall back to the channel's current tail if no mapping exists.
+          4. Fall back to a fresh root-anchored session if the channel has
+             no cursor at all (e.g. bot never saw that channel).
+        """
+        cursor_key = f"thread:{thread_id}"
+        node_id    = self._store.get(cursor_key)
+        if node_id:
+            return node_id
+
+        # Try to fork from the specific message that created the thread.
+        # In Discord, thread.id == id of the starter message.
+        parent_node_id = self._store.get_msg_node(thread_id)
+
+        if parent_node_id is None:
+            # Fall back to wherever the channel currently is.
+            parent_node_id = self._store.get(f"group:{channel_id}")
+
+        if parent_node_id is None:
+            # No channel context at all — create a fresh branch.
+            db         = _open_db(self._router)
+            node_id    = _make_session_node(db, cursor_key)
+            logger.info(
+                "Discord: thread %s has no known parent — created fresh branch %s",
+                thread_id, node_id,
+            )
+        else:
+            # Fork: the thread's initial cursor IS the parent node.
+            # The first add() in this thread will create a child of parent_node_id.
+            node_id = parent_node_id
+            logger.info(
+                "Discord: thread %s forked from node %s", thread_id, parent_node_id
+            )
+
+        self._store.set(cursor_key, node_id)
+        return node_id
+
+    def _advance_cursor(self, cursor_key: str, router_node_id: str) -> None:
+        """
+        After a turn completes, read the lane's current tail and persist it.
+        router_node_id is the node_id the lane was opened with (may differ from
+        tail after the turn writes new nodes).
+        """
+        lane = self._router._lane_router._lanes.get(router_node_id)
+        if lane:
+            new_id = lane.loop._tail_node_id
+            if new_id and new_id != self._store.get(cursor_key):
+                self._store.set(cursor_key, new_id)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -311,7 +509,7 @@ class DiscordBridge:
 
     async def handle_event(self, event) -> None:
         node_id = event.tail_node_id
-        acc = self._accumulators.get(node_id)
+        acc     = self._accumulators.get(node_id)
         if acc is None:
             logger.debug("Discord: received event for unknown cursor %s", node_id)
             return
@@ -371,19 +569,23 @@ class DiscordBridge:
             )
             return
 
-        is_dm = isinstance(message.channel, discord.DMChannel)
+        # ── Thread message ────────────────────────────────────────────
+        if isinstance(message.channel, discord.Thread):
+            await self._handle_thread_message(message)
+            return
 
-        if is_dm:
+        # ── DM ────────────────────────────────────────────────────────
+        if isinstance(message.channel, discord.DMChannel):
             if not self._dm_enabled:
                 return
-            text = message.content.strip()
+            text        = message.content.strip()
             attachments = await self._fetch_attachments(message)
             if not text and not attachments:
                 return
 
-            cursor_key  = f"dm:{message.author.id}"
-            node_id     = self._get_or_create_cursor(cursor_key)
-            author      = UserIdentity(
+            cursor_key = f"dm:{message.author.id}"
+            node_id    = self._get_or_create_cursor(cursor_key)
+            author     = UserIdentity(
                 platform=Platform.DISCORD,
                 user_id=str(message.author.id),
                 username=message.author.display_name,
@@ -404,18 +606,19 @@ class DiscordBridge:
             )
             return
 
+        # ── Group channel ─────────────────────────────────────────────
         if self._guild_ids and message.guild and message.guild.id not in self._guild_ids:
             return
 
-        channel_id  = str(message.channel.id)
-        cursor_key  = f"group:{channel_id}"
-        buf         = self._get_or_create_buffer(channel_id)
-        raw_text    = message.content.strip()
+        channel_id = str(message.channel.id)
+        cursor_key = f"group:{channel_id}"
+        buf        = self._get_or_create_buffer(channel_id)
+        raw_text   = message.content.strip()
 
         if raw_text == self._reset_command:
             if self._is_admin(message.author.id):
                 buf.clear()
-                node_id = self._cursors.get(cursor_key)
+                node_id = self._get_cursor(cursor_key)
                 if node_id:
                     self._router.reset_lane(node_id)
                 await message.channel.send("✅ Session reset.")
@@ -427,11 +630,8 @@ class DiscordBridge:
                 await message.channel.send("⛔ Only admins can reset the session.")
             return
 
-        mentioned = (
-            self._client.user is not None
-            and self._client.user in message.mentions
-        )
-        prefixed = raw_text.startswith(self._prefix)
+        mentioned  = self._client.user is not None and self._client.user in message.mentions
+        prefixed   = raw_text.startswith(self._prefix)
         is_trigger = mentioned or prefixed
 
         if self._prefix_required and not is_trigger:
@@ -454,9 +654,9 @@ class DiscordBridge:
             )
             return
 
-        stripped = self._strip_trigger(raw_text)
+        stripped          = self._strip_trigger(raw_text)
         humanized_trigger = await _humanize_mentions(stripped, self._client)
-        attachments = await self._fetch_attachments(message)
+        attachments       = await self._fetch_attachments(message)
 
         await self._flush_group_buffer(
             buf, channel_id, cursor_key, message.channel,
@@ -468,20 +668,46 @@ class DiscordBridge:
         )
 
     # ------------------------------------------------------------------
-    # Group flush
+    # Thread message handler
     # ------------------------------------------------------------------
 
-    def _get_or_create_cursor(self, cursor_key: str) -> str:
-        if cursor_key in self._cursors:
-            return self._cursors[cursor_key]
-        from db import ConversationDB
-        from pathlib import Path
-        workspace   = Path(self._router._config.workspace.path).expanduser().resolve()
-        db          = ConversationDB(workspace / "agent.db")
-        root        = db.get_root()
-        node        = db.add_node(parent_id=root.id, role="system", content=f"session:{cursor_key}")
-        self._cursors[cursor_key] = node.id
-        return node.id
+    async def _handle_thread_message(self, message: discord.Message) -> None:
+        thread     = message.channel  # discord.Thread
+        thread_id  = str(thread.id)
+        channel_id = str(thread.parent_id) if thread.parent_id else ""
+        cursor_key = f"thread:{thread_id}"
+
+        # In threads, respond to every message (no trigger gating).
+        # Threads are already opt-in — you have to come here intentionally.
+        text        = message.content.strip()
+        attachments = await self._fetch_attachments(message)
+        if not text and not attachments:
+            return
+
+        node_id = self._get_or_create_thread_cursor(thread_id, channel_id)
+        author  = UserIdentity(
+            platform=Platform.DISCORD,
+            user_id=str(message.author.id),
+            username=message.author.display_name,
+        )
+        msg = InboundMessage(
+            tail_node_id=node_id,
+            author=author,
+            content_type=content_type_for(text, bool(attachments)),
+            text=text,
+            message_id=str(message.id),
+            timestamp=time.time(),
+            attachments=attachments,
+        )
+        acc = _ReplyAccumulator(message.channel, self._max_len)
+        self._accumulators[node_id] = acc
+        asyncio.create_task(
+            self._handle_turn(msg, message.channel, node_id, acc, cursor_key)
+        )
+
+    # ------------------------------------------------------------------
+    # Group channel flush
+    # ------------------------------------------------------------------
 
     async def _flush_group_buffer(
         self,
@@ -504,17 +730,17 @@ class DiscordBridge:
             return
 
         combined_text = _format_buffer(lines)
-        node_id = self._get_or_create_cursor(cursor_key)
+        node_id       = self._get_or_create_cursor(cursor_key)
 
         if trigger_user_id:
-            author_uid = trigger_user_id
+            author_uid  = trigger_user_id
             author_name = trigger_display_name or trigger_user_id
-            msg_id = trigger_message_id or str(time.time_ns())
+            msg_id      = trigger_message_id or str(time.time_ns())
         else:
-            first = lines[0] if lines else None
-            author_uid = first.user_id if first else "unknown"
+            first       = lines[0] if lines else None
+            author_uid  = first.user_id if first else "unknown"
             author_name = first.display_name if first else "unknown"
-            msg_id = str(time.time_ns())
+            msg_id      = str(time.time_ns())
 
         author = UserIdentity(
             platform=Platform.DISCORD,
@@ -534,7 +760,10 @@ class DiscordBridge:
         acc = _ReplyAccumulator(channel, self._max_len)
         self._accumulators[node_id] = acc
         asyncio.create_task(
-            self._handle_turn(msg, channel, node_id, acc, cursor_key)
+            self._handle_turn(
+                msg, channel, node_id, acc, cursor_key,
+                record_msg_node=trigger_message_id,
+            )
         )
 
     # ------------------------------------------------------------------
@@ -567,9 +796,18 @@ class DiscordBridge:
         node_id: str,
         acc: _ReplyAccumulator,
         cursor_key: str | None = None,
+        record_msg_node: str | None = None,
     ) -> None:
+        """
+        Execute one agent turn.
+
+        record_msg_node: if set, this is the Discord message ID of the trigger
+        message. After the user turn is written to the DB but before the agent
+        replies, we snapshot the lane's tail (= the user turn node) and store
+        it in the msg->node map so future threads can fork from it precisely.
+        """
         done_event = asyncio.Event()
-        typing_ev = asyncio.Event()
+        typing_ev  = asyncio.Event()
         self._typing_active[node_id] = typing_ev
 
         try:
@@ -577,6 +815,20 @@ class DiscordBridge:
             if not accepted:
                 await channel.send("⏳ I'm busy — please try again in a moment.")
                 return
+
+            # Capture the user-turn node ID immediately after push.
+            # At this point the lane has ingested the user message and written
+            # its DB node, but hasn't replied yet — so tail == user turn node.
+            if record_msg_node:
+                lane = self._router._lane_router._lanes.get(node_id)
+                if lane:
+                    user_turn_node_id = lane.loop._tail_node_id
+                    if user_turn_node_id:
+                        self._store.set_msg_node(record_msg_node, user_turn_node_id)
+                        logger.debug(
+                            "Discord: mapped message %s -> node %s",
+                            record_msg_node, user_turn_node_id,
+                        )
 
             if self._typing:
                 keepalive = asyncio.create_task(
@@ -591,12 +843,10 @@ class DiscordBridge:
             else:
                 await acc.wait_and_send()
 
+            # Persist the advanced cursor after the full turn completes.
             if cursor_key:
-                lane = self._router._lane_router._lanes.get(node_id)
-                if lane:
-                    new_id = lane.loop._tail_node_id
-                    if new_id and new_id != node_id:
-                        self._cursors[cursor_key] = new_id
+                self._advance_cursor(cursor_key, node_id)
+
         except Exception:
             logger.exception("Discord: error handling turn for cursor %s", node_id)
         finally:
@@ -610,7 +860,7 @@ class DiscordBridge:
 
     async def run(self) -> None:
         token_env = str(self._opts["token_env"])
-        token = os.environ.get(token_env, "")
+        token     = os.environ.get(token_env, "")
         if not token:
             raise RuntimeError(
                 f"Discord bridge: env var '{token_env}' is not set. "
