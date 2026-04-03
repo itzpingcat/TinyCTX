@@ -60,7 +60,7 @@ from typing import AsyncIterator, Callable, Awaitable
 from contracts import (
     InboundMessage, AgentEvent,
     AgentThinkingChunk, AgentTextChunk, AgentTextFinal, AgentToolCall, AgentToolResult, AgentError,
-    ToolCall, ToolResult,
+    ToolCall, ToolResult, IMAGE_BLOCK_PREFIX,
 )
 from context import Context, HistoryEntry, HOOK_PRE_ASSEMBLE_ASYNC
 from config import Config, ModelConfig
@@ -414,10 +414,21 @@ class AgentLoop:
                 yield AgentToolCall(call_id=tc.call_id, tool_name=tc.tool_name, args=tc.args, **ev)
                 result = await self._execute_tool(tc)
                 self.context.add(HistoryEntry.tool_result(result))
+                # For image results, inject a follow-up user message with the image_url
+                # block.  OpenAI-compat servers don't support list content in tool result
+                # messages, so a synthetic user turn is a shitty but ok workaround.
+                if result.is_image:
+                    image_content = [
+                        {"type": "text",      "text": "Here is the image from the tool result:"},
+                        {"type": "image_url", "image_url": {"url": f"data:{result.image_mime};base64,{result.image_b64}"}},
+                    ]
+                    self.context.add(HistoryEntry.user(image_content))
+                # For bridge display, show a tidy label instead of raw base64.
+                display_output = f"[image: {result.image_mime}]" if result.is_image else result.output
                 yield AgentToolResult(
                     call_id=result.call_id,
                     tool_name=result.tool_name,
-                    output=result.output,
+                    output=display_output,
                     is_error=result.is_error,
                     **ev,
                 )
@@ -474,11 +485,44 @@ class AgentLoop:
             "id": call.call_id,
         }
         result = await self.tool_handler.execute_tool_call(proxy)
+        raw_output = str(result.get("result", result.get("error", "[no output]")))
+        is_error    = not result.get("success", False)
+
+        # --- vision unwrap ---
+        # If view() returned an IMAGE_BLOCK sentinel and the primary model
+        # supports vision, stash the image data in the ToolResult so the
+        # caller (run()) can inject a follow-up user message containing the
+        # image_url block.  OpenAI-compat servers don't support list content
+        # in tool result messages, so we use a separate user turn instead.
+        if not is_error and raw_output.startswith(IMAGE_BLOCK_PREFIX):
+            payload = raw_output[len(IMAGE_BLOCK_PREFIX):]  # "mime;base64data"
+            sep = payload.index(";")
+            mime    = payload[:sep]
+            b64data = payload[sep + 1:]
+
+            primary_cfg = self.config.get_model_config(self.config.llm.primary)
+            if primary_cfg.vision:
+                return ToolResult(
+                    call_id=call.call_id,
+                    tool_name=call.tool_name,
+                    output=f"[image/{mime} — see attached image below]",
+                    is_error=False,
+                    is_image=True,
+                    image_mime=mime,
+                    image_b64=b64data,
+                )
+            else:
+                # Model doesn't support vision — return a friendly stub.
+                raw_output = (
+                    f"[Image file detected ({mime}) but the current model does not "
+                    "support vision. Use a vision-capable model to inspect this file.]"
+                )
+
         return ToolResult(
             call_id=call.call_id,
             tool_name=call.tool_name,
-            output=str(result.get("result", result.get("error", "[no output]"))),
-            is_error=not result.get("success", False),
+            output=raw_output,
+            is_error=is_error,
         )
 
     # ------------------------------------------------------------------

@@ -274,6 +274,8 @@ class Context:
         """
         if self._db is not None and self._tail_node_id is not None:
             # Serialise content: list → JSON string for DB storage.
+            # This applies to user messages with attachments AND tool results
+            # with image blocks (both use list[dict] content).
             content_str = (
                 json.dumps(entry.content, ensure_ascii=False)
                 if isinstance(entry.content, list)
@@ -421,10 +423,13 @@ class Context:
         entries: list[HistoryEntry] = []
         for i, node in enumerate(nodes):
             # Deserialise content: JSON → list if it was stored as list.
+            # Only user messages store list content (attachments).
             content: str | list = node.content
             if node.role == ROLE_USER and content.startswith("["):
                 try:
-                    content = json.loads(content)
+                    parsed = json.loads(content)
+                    if isinstance(parsed, list):
+                        content = parsed
                 except (json.JSONDecodeError, ValueError):
                     pass  # leave as string
 
@@ -599,7 +604,7 @@ class Context:
         if entry.role == ROLE_TOOL:
             return {
                 "role":         ROLE_TOOL,
-                "content":      entry.content,
+                "content":      entry.content,  # str or list[dict] for image blocks
                 "tool_call_id": entry.tool_call_id,
             }
         if entry.role == ROLE_ASSISTANT:

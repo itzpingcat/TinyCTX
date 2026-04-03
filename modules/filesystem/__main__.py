@@ -10,12 +10,40 @@ blacklist enforcement, and subprocess dispatch.
 """
 from __future__ import annotations
 
+import base64
 import logging
+import mimetypes
 from pathlib import Path
 
+from contracts import IMAGE_BLOCK_PREFIX
 from modules.filesystem.shell import load_blacklist, run_command
 
 logger = logging.getLogger(__name__)
+
+# Image MIME types we can pass to a vision model as an image_url block.
+_VISION_MIMES: frozenset[str] = frozenset({
+    "image/jpeg", "image/png", "image/gif", "image/webp",
+})
+
+# Extension fallback map for cases where mimetypes guesses wrong.
+_EXT_TO_MIME: dict[str, str] = {
+    ".jpg":  "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png":  "image/png",
+    ".gif":  "image/gif",
+    ".webp": "image/webp",
+}
+
+
+def _image_mime(path: Path) -> str | None:
+    """Return the vision-compatible MIME type for a file, or None if not an image."""
+    ext = path.suffix.lower()
+    if ext in _EXT_TO_MIME:
+        return _EXT_TO_MIME[ext]
+    mime, _ = mimetypes.guess_type(str(path))
+    if mime and mime in _VISION_MIMES:
+        return mime
+    return None
 
 
 def register(agent) -> None:
@@ -42,7 +70,11 @@ def register(agent) -> None:
         return run_command(command, cwd=workspace, timeout=shell_timeout, blacklist=blacklist)
 
     def view(path: str, view_range: list = None) -> str:
-        """Read a file with line numbers, or list a directory.
+        """Read a file with line numbers, list a directory, or display an image.
+
+        For image files (jpg, png, gif, webp) the raw image bytes are returned
+        as a vision content block so the model can see the image directly.
+        For all other binary files an error is returned.
 
         Args:
             path: File or directory path.
@@ -56,6 +88,19 @@ def register(agent) -> None:
             if not entries:
                 return f"[empty directory: {p}]"
             return f"[{p}]\n" + "\n".join(f"  {e.name}{'/' if e.is_dir() else ''}" for e in entries)
+
+        # --- image handling ---
+        mime = _image_mime(p)
+        if mime:
+            try:
+                raw = p.read_bytes()
+            except OSError as exc:
+                return f"[error: could not read {p}: {exc}]"
+            b64 = base64.b64encode(raw).decode()
+            # Return a sentinel that agent._execute_tool knows how to unwrap.
+            return f"{IMAGE_BLOCK_PREFIX}{mime};{b64}"
+
+        # --- text handling ---
         try:
             text = p.read_text(encoding="utf-8")
         except UnicodeDecodeError:
@@ -67,20 +112,19 @@ def register(agent) -> None:
                 # If the agent sent a string like "1,20", convert it to a list [1, 20]
                 if isinstance(view_range, str):
                     parts = []
-                    
                     for chunk in view_range.split(','):
                         chunk = chunk.strip()
-                        
-                        # Handle range like "1-20"
                         if '-' in chunk:
                             start, end = chunk.split('-', 1)
                             parts.extend([start.strip(), end.strip()])
                         else:
-                            parts.append(chunk)                    
+                            parts.append(chunk)
                     view_range = parts
+                start = int(view_range[0]) - 1
+                end   = int(view_range[1]) if int(view_range[1]) != -1 else total
+                lines = lines[start:end]
             except (ValueError, IndexError):
                 return "[error: view_range must be [start, end] or 'start,end' integers]"
-
 
         return f"[{p} | {total} lines]\n" + "\n".join(
             f"{i:>6}\t{l}" for i, l in enumerate(lines, 1)
@@ -135,7 +179,7 @@ def register(agent) -> None:
         p.write_text(original.replace(old_str, new_str, 1), encoding="utf-8")
         return f"[replaced 1 occurrence in {p}]"
 
-    agent.tool_handler.register_tool(shell,      always_on=True)
-    agent.tool_handler.register_tool(view,       always_on=True)
-    agent.tool_handler.register_tool(write_file, always_on=True)
+    agent.tool_handler.register_tool(shell,       always_on=True)
+    agent.tool_handler.register_tool(view,        always_on=True)
+    agent.tool_handler.register_tool(write_file,  always_on=True)
     agent.tool_handler.register_tool(str_replace, always_on=True)

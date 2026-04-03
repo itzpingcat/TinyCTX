@@ -250,8 +250,22 @@ def register(agent) -> None:
         query = ""
         for entry in reversed(ctx.dialogue):
             if entry.role == "user":
-                query = entry.content
-                break
+                content = entry.content
+                # content may be a list[dict] when the user message contains
+                # image blocks (e.g. the synthetic vision injection). Extract
+                # only text parts for the search query.
+                if isinstance(content, list):
+                    query = " ".join(
+                        part.get("text", "")
+                        for part in content
+                        if isinstance(part, dict) and part.get("type") == "text"
+                    ).strip()
+                else:
+                    query = content
+                # Skip the synthetic image-injection turn (no useful text)
+                # and keep looking for the real user message.
+                if query.strip():
+                    break
 
         if not query.strip():
             ctx.state["memory_search_results"] = []

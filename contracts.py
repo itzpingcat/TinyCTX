@@ -217,6 +217,16 @@ AgentEvent = Union[AgentThinkingChunk, AgentTextChunk, AgentTextFinal, AgentTool
 
 
 # ---------------------------------------------------------------------------
+# Sentinel values
+# ---------------------------------------------------------------------------
+
+# Returned by the filesystem view() tool when an image file is read.
+# Format: IMAGE_BLOCK_PREFIX + "<mime>;<base64data>"
+# agent._execute_tool detects this and builds a vision content block.
+IMAGE_BLOCK_PREFIX = "IMAGE_BLOCK:"
+
+
+# ---------------------------------------------------------------------------
 # Tool call / result envelopes
 # ---------------------------------------------------------------------------
 
@@ -237,3 +247,6 @@ class ToolResult:
     tool_name: str
     output:    str
     is_error:  bool = False
+    is_image:  bool = False  # True when image_mime + image_b64 are populated
+    image_mime: str | None = None  # e.g. "image/jpeg"
+    image_b64:  str | None = None  # raw base64, no data URI prefix
