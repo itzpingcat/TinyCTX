@@ -31,6 +31,9 @@ def register(agent) -> None:
 
     cfg: dict = {**defaults, **overrides}
 
+    max_concurrent = max(1, int(cfg.get("max_concurrent", 4)))
+    completed_ttl_seconds = max(0.0, float(cfg.get("completed_ttl_seconds", 900.0)))
+
     async def spawn_agent(prompt: str) -> str:
         """
         Spawn a detached subagent on a child branch for bounded parallel work.
@@ -43,7 +46,12 @@ def register(agent) -> None:
             return json.dumps(
                 {"status": "error", "error": "spawn_agent requires a non-empty prompt."}
             )
-        payload = await spawn_subagent(agent, prompt)
+        payload = await spawn_subagent(
+            agent,
+            prompt,
+            max_concurrent=max_concurrent,
+            completed_ttl_seconds=completed_ttl_seconds,
+        )
         return json.dumps(payload, ensure_ascii=False)
 
     async def wait_agent(task_id: str, timeout_seconds: float = 60.0) -> str:
@@ -58,7 +66,11 @@ def register(agent) -> None:
             return json.dumps(
                 {"status": "error", "error": "timeout_seconds must be greater than or equal to 0."}
             )
-        payload = await wait_for_subagent(task_id, timeout_seconds=timeout_seconds)
+        payload = await wait_for_subagent(
+            agent,
+            task_id,
+            timeout_seconds=timeout_seconds,
+        )
         return json.dumps(payload, ensure_ascii=False)
 
     agent.tool_handler.register_tool(spawn_agent, always_on=True)

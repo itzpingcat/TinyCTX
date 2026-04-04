@@ -7,5 +7,7 @@ EXTENSION_META = {
     ),
     "default_config": {
         "prompt_priority": 13,
+        "max_concurrent": 4,
+        "completed_ttl_seconds": 900.0,
     },
 }

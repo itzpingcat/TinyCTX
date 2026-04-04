@@ -48,7 +48,7 @@ class _MockAgent:
         self.is_subagent = is_subagent
 
 
-def _make_config(tmp_path):
+def _make_config(tmp_path, *, extra: dict | None = None):
     cfg = MagicMock()
     primary_mc = MagicMock()
     primary_mc.is_embedding = False
@@ -62,7 +62,7 @@ def _make_config(tmp_path):
     cfg.max_tool_cycles = 5
     cfg.workspace.path = str(tmp_path)
     cfg.attachments = MagicMock()
-    cfg.extra = {}
+    cfg.extra = extra or {}
     cfg.get_model_config = MagicMock(return_value=MagicMock(vision=False, supports_vision=False))
     return cfg
 
@@ -191,3 +191,91 @@ async def test_wait_agent_can_poll_running_task(tmp_path: Path):
     assert "still running" in polled["message"].lower()
     assert completed["status"] == "completed"
     assert completed["result"] == "slow completion"
+
+
+@pytest.mark.asyncio
+async def test_wait_agent_is_scoped_to_own_agent_registry(tmp_path: Path):
+    from agent import AgentLoop
+
+    cfg = _make_config(tmp_path)
+    first_node_id = _make_cursor(tmp_path)
+    second_node_id = _make_cursor(tmp_path)
+    llm = MagicMock()
+    llm.stream = _text_stream("session scoped")
+
+    with patch("agent.MODULES_DIR", Path("/nonexistent")):
+        with patch("agent._build_llm", return_value=llm):
+            first_agent = AgentLoop(tail_node_id=first_node_id, config=cfg)
+            second_agent = AgentLoop(tail_node_id=second_node_id, config=cfg)
+            subagents_module.register(first_agent)
+            subagents_module.register(second_agent)
+            first_spawn = first_agent.tool_handler.tools["spawn_agent"]["function"]
+            first_wait = first_agent.tool_handler.tools["wait_agent"]["function"]
+            second_wait = second_agent.tool_handler.tools["wait_agent"]["function"]
+
+            spawned = json.loads(await first_spawn("Scoped task."))
+            missing = json.loads(await second_wait(spawned["task_id"], timeout_seconds=0.0))
+            completed = json.loads(await first_wait(spawned["task_id"], timeout_seconds=1.0))
+
+    assert missing["status"] == "missing"
+    assert completed["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_spawn_agent_enforces_max_concurrent_limit(tmp_path: Path):
+    from agent import AgentLoop
+
+    cfg = _make_config(
+        tmp_path,
+        extra={"subagents": {"max_concurrent": 1}},
+    )
+    node_id = _make_cursor(tmp_path)
+
+    async def slow_stream(messages, tools=None):
+        await asyncio.sleep(0.05)
+        yield TextDelta(text="slow completion")
+
+    llm = MagicMock()
+    llm.stream = slow_stream
+
+    with patch("agent.MODULES_DIR", Path("/nonexistent")):
+        with patch("agent._build_llm", return_value=llm):
+            agent = AgentLoop(tail_node_id=node_id, config=cfg)
+            subagents_module.register(agent)
+            spawn_agent = agent.tool_handler.tools["spawn_agent"]["function"]
+            wait_agent = agent.tool_handler.tools["wait_agent"]["function"]
+
+            first = json.loads(await spawn_agent("First task."))
+            second = json.loads(await spawn_agent("Second task."))
+            await wait_agent(first["task_id"], timeout_seconds=1.0)
+
+    assert first["status"] == "running"
+    assert second["status"] == "error"
+    assert "Too many subagents" in second["error"]
+
+
+@pytest.mark.asyncio
+async def test_spawn_agent_prunes_completed_tasks_before_new_spawn(tmp_path: Path):
+    from agent import AgentLoop
+
+    cfg = _make_config(
+        tmp_path,
+        extra={"subagents": {"completed_ttl_seconds": 0}},
+    )
+    node_id = _make_cursor(tmp_path)
+    llm = MagicMock()
+    llm.stream = _text_stream("done")
+
+    with patch("agent.MODULES_DIR", Path("/nonexistent")):
+        with patch("agent._build_llm", return_value=llm):
+            agent = AgentLoop(tail_node_id=node_id, config=cfg)
+            subagents_module.register(agent)
+            spawn_agent = agent.tool_handler.tools["spawn_agent"]["function"]
+            wait_agent = agent.tool_handler.tools["wait_agent"]["function"]
+
+            first = json.loads(await spawn_agent("First task."))
+            await wait_agent(first["task_id"], timeout_seconds=1.0)
+            second = json.loads(await spawn_agent("Second task."))
+
+    assert second["status"] == "running"
+    assert second["pruned_completed_tasks"] == 1

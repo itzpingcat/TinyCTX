@@ -4,6 +4,7 @@ import asyncio
 import logging
 import time
 import uuid
+import weakref
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -12,7 +13,7 @@ from contracts import AgentError, AgentTextChunk, AgentTextFinal
 logger = logging.getLogger(__name__)
 
 _SUBAGENT_BRANCH_PREFIX = "session:subagent:"
-_TASKS: dict[str, "SubagentTask"] = {}
+_AGENTS: "weakref.WeakSet[object]" = weakref.WeakSet()
 
 
 @dataclass
@@ -51,8 +52,63 @@ def _snapshot(handle: SubagentTask) -> dict[str, Any]:
     return payload
 
 
-async def spawn_subagent(agent, prompt: str) -> dict[str, Any]:
+def _task_registry(agent) -> dict[str, SubagentTask]:
+    _AGENTS.add(agent)
+    registry = getattr(agent, "_subagent_tasks", None)
+    if registry is None:
+        registry = {}
+        setattr(agent, "_subagent_tasks", registry)
+    return registry
+
+
+def _prune_completed_tasks(agent, completed_ttl_seconds: float, *, now: float | None = None) -> int:
+    registry = _task_registry(agent)
+    if completed_ttl_seconds <= 0:
+        stale_ids = [
+            task_id
+            for task_id, handle in registry.items()
+            if handle.completed_at is not None
+        ]
+    else:
+        now = time.time() if now is None else now
+        stale_ids = [
+            task_id
+            for task_id, handle in registry.items()
+            if handle.completed_at is not None and (now - handle.completed_at) >= completed_ttl_seconds
+        ]
+    for task_id in stale_ids:
+        registry.pop(task_id, None)
+    return len(stale_ids)
+
+
+def _running_task_count(agent) -> int:
+    registry = _task_registry(agent)
+    return sum(
+        1
+        for handle in registry.values()
+        if handle.task is not None and not handle.task.done()
+    )
+
+
+async def spawn_subagent(
+    agent,
+    prompt: str,
+    *,
+    max_concurrent: int = 4,
+    completed_ttl_seconds: float = 900.0,
+) -> dict[str, Any]:
     """Create a detached child branch and start a background AgentLoop on it."""
+    pruned = _prune_completed_tasks(agent, completed_ttl_seconds)
+    running = _running_task_count(agent)
+    if running >= max_concurrent:
+        return {
+            "status": "error",
+            "error": (
+                f"Too many subagents are already running ({running}/{max_concurrent}). "
+                "Wait for one to finish before spawning another."
+            ),
+        }
+
     task_id = str(uuid.uuid4())
     parent_tail_node_id = agent._tail_node_id
 
@@ -78,16 +134,18 @@ async def spawn_subagent(agent, prompt: str) -> dict[str, Any]:
         _run_subagent(handle, agent.config),
         name=f"tinyctx-subagent-{task_id[:8]}",
     )
-    _TASKS[task_id] = handle
+    _task_registry(agent)[task_id] = handle
 
     payload = _snapshot(handle)
+    if pruned:
+        payload["pruned_completed_tasks"] = pruned
     payload["message"] = "Subagent started. Use wait_agent(task_id=...) to retrieve the result."
     return payload
 
 
-async def wait_for_subagent(task_id: str, timeout_seconds: float = 60.0) -> dict[str, Any]:
+async def wait_for_subagent(agent, task_id: str, timeout_seconds: float = 60.0) -> dict[str, Any]:
     """Wait for a spawned subagent to finish, or return its current status."""
-    handle = _TASKS.get(task_id)
+    handle = _task_registry(agent).get(task_id)
     if handle is None:
         return {
             "task_id": task_id,
@@ -109,10 +167,14 @@ async def wait_for_subagent(task_id: str, timeout_seconds: float = 60.0) -> dict
 
 def reset_subagent_tasks() -> None:
     """Best-effort test helper to clear the in-process task registry."""
-    for handle in list(_TASKS.values()):
-        if handle.task is not None and not handle.task.done():
-            handle.task.cancel()
-    _TASKS.clear()
+    for agent in list(_AGENTS):
+        registry = getattr(agent, "_subagent_tasks", None)
+        if not registry:
+            continue
+        for handle in list(registry.values()):
+            if handle.task is not None and not handle.task.done():
+                handle.task.cancel()
+        registry.clear()
 
 
 async def _run_subagent(handle: SubagentTask, config) -> None:
