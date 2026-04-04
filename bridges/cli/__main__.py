@@ -24,7 +24,14 @@ from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import TextArea
 from rich.text import Text
 
-from config import resolve_log_level, update_bridge_options, update_config_values
+from config import (
+    load as load_config,
+    resolve_log_level,
+    set_primary_model,
+    update_bridge_options,
+    update_config_values,
+    update_model_profile,
+)
 from contracts import (
     AgentError,
     AgentTextChunk,
@@ -58,6 +65,62 @@ _CLI_OPTION_DEFAULTS = {
 }
 _LOG_LEVEL_CHOICES = ("inherit", "warning", "info", "debug", "error")
 _ROUND_TRIP_CHOICES = (10, 20, 30, 40, 60)
+_PROVIDER_PRESETS = {
+    "openai": {
+        "label": "OpenAI",
+        "profile": "openai",
+        "updates": {
+            "base_url": "https://api.openai.com/v1",
+            "model": "gpt-4o-mini",
+            "api_key_env": "OPENAI_API_KEY",
+        },
+    },
+    "openrouter": {
+        "label": "OpenRouter",
+        "profile": "openrouter",
+        "updates": {
+            "base_url": "https://openrouter.ai/api/v1",
+            "model": "openai/gpt-4o-mini",
+            "api_key_env": "OPENROUTER_API_KEY",
+        },
+    },
+    "ollama": {
+        "label": "Ollama",
+        "profile": "ollama",
+        "updates": {
+            "base_url": "http://localhost:11434/v1",
+            "model": "llama3.1",
+            "api_key_env": "N/A",
+        },
+    },
+    "lmstudio": {
+        "label": "LM Studio",
+        "profile": "lmstudio",
+        "updates": {
+            "base_url": "http://localhost:1234/v1",
+            "model": "local-model",
+            "api_key_env": "N/A",
+        },
+    },
+    "llamacpp": {
+        "label": "llama.cpp",
+        "profile": "llamacpp",
+        "updates": {
+            "base_url": "http://localhost:8080/v1",
+            "model": "local-model",
+            "api_key_env": "N/A",
+        },
+    },
+    "custom": {
+        "label": "Custom",
+        "profile": "custom",
+        "updates": {
+            "base_url": "http://localhost:8080/v1",
+            "model": "your-model",
+            "api_key_env": "N/A",
+        },
+    },
+}
 
 
 class _DimToolLineProcessor(Processor):
@@ -160,6 +223,42 @@ class CLIBridge:
         config = getattr(self._gateway, "_config", None)
         return int(getattr(config, "max_tool_cycles", 20) or 20)
 
+    def _profile_names(self) -> list[str]:
+        config = getattr(self._gateway, "_config", None)
+        models = getattr(config, "models", {}) or {}
+        return list(models.keys())
+
+    def _current_primary_profile(self) -> str:
+        config = getattr(self._gateway, "_config", None)
+        llm = getattr(config, "llm", None)
+        primary = getattr(llm, "primary", "")
+        return str(primary or "")
+
+    def _model_profile(self, profile_name: str):
+        config = getattr(self._gateway, "_config", None)
+        models = getattr(config, "models", {}) or {}
+        return models.get(profile_name)
+
+    def _provider_label_for_profile(self, profile_name: str) -> str:
+        profile = self._model_profile(profile_name)
+        if profile is None:
+            return "unknown"
+        base_url = getattr(profile, "base_url", "") or ""
+        for preset in _PROVIDER_PRESETS.values():
+            if preset["updates"]["base_url"] == base_url:
+                return preset["label"]
+        return "custom"
+
+    def _profile_menu_name(self) -> str | None:
+        if not self._settings_open():
+            return None
+        menu_id = self._settings_path[-1]
+        if menu_id.startswith("provider_profile:"):
+            return menu_id.split(":", 1)[1]
+        if menu_id.startswith("provider_preset:"):
+            return menu_id.split(":", 1)[1]
+        return None
+
     def _config_source_path(self) -> Path:
         config = getattr(self._gateway, "_config", None)
         path = getattr(config, "_source_path", None)
@@ -167,15 +266,104 @@ class CLIBridge:
             return Path("config.yaml").resolve()
         return Path(path).resolve()
 
+    def _reload_runtime_config(self) -> None:
+        fresh = load_config(str(self._config_source_path()))
+        config = getattr(self._gateway, "_config", None)
+        if config is None:
+            setattr(self._gateway, "_config", fresh)
+            return
+        for attr in (
+            "models",
+            "llm",
+            "router",
+            "bridges",
+            "gateway",
+            "workspace",
+            "logging",
+            "max_tool_cycles",
+            "context",
+            "attachments",
+            "extra",
+        ):
+            setattr(config, attr, getattr(fresh, attr))
+        setattr(config, "_source_path", getattr(fresh, "_source_path", self._config_source_path()))
+        cli_bridge = config.bridges.get("cli")
+        if cli_bridge is not None:
+            self._options.update(cli_bridge.options)
+
     def _settings_menu(self) -> tuple[str, list[dict]]:
         menu_id = self._settings_path[-1] if self._settings_path else "root"
         if menu_id == "root":
             return "Settings", [
+                {"label": "Providers", "kind": "submenu", "target": "providers"},
                 {"label": "Appearance", "kind": "submenu", "target": "appearance"},
                 {"label": "Behavior", "kind": "submenu", "target": "behavior"},
                 {"label": "Session", "kind": "submenu", "target": "session"},
                 {"label": "Close settings", "kind": "action", "action": "close_settings"},
             ]
+        if menu_id == "providers":
+            current_primary = self._current_primary_profile()
+            return "Providers", [
+                {
+                    "label": "Manage active profile",
+                    "kind": "submenu",
+                    "target": f"provider_profile:{current_primary}",
+                },
+                {"label": "Add preset profile", "kind": "submenu", "target": "providers_add"},
+                {"label": "Set primary profile", "kind": "submenu", "target": "providers_primary"},
+                {"label": "Back", "kind": "action", "action": "back"},
+            ]
+        if menu_id == "providers_add":
+            items = []
+            for preset_key, preset in _PROVIDER_PRESETS.items():
+                items.append({
+                    "label": preset["label"],
+                    "kind": "create_preset_profile",
+                    "preset_key": preset_key,
+                    "profile_name": preset["profile"],
+                })
+            items.append({"label": "Back", "kind": "action", "action": "back"})
+            return "Add Preset Profile", items
+        if menu_id == "providers_primary":
+            items = []
+            current_primary = self._current_primary_profile()
+            for profile_name in self._profile_names():
+                items.append({
+                    "label": profile_name,
+                    "kind": "set_primary_profile",
+                    "profile_name": profile_name,
+                    "selected": profile_name == current_primary,
+                })
+            items.append({"label": "Back", "kind": "action", "action": "back"})
+            return "Set Primary Profile", items
+        if menu_id.startswith("provider_profile:"):
+            profile_name = menu_id.split(":", 1)[1]
+            return f"Profile: {profile_name}", [
+                {
+                    "label": "Apply preset",
+                    "kind": "submenu",
+                    "target": f"provider_preset:{profile_name}",
+                },
+                {
+                    "label": "Make primary",
+                    "kind": "set_primary_profile",
+                    "profile_name": profile_name,
+                    "selected": profile_name == self._current_primary_profile(),
+                },
+                {"label": "Back", "kind": "action", "action": "back"},
+            ]
+        if menu_id.startswith("provider_preset:"):
+            profile_name = menu_id.split(":", 1)[1]
+            items = []
+            for preset_key, preset in _PROVIDER_PRESETS.items():
+                items.append({
+                    "label": preset["label"],
+                    "kind": "apply_preset_profile",
+                    "preset_key": preset_key,
+                    "profile_name": profile_name,
+                })
+            items.append({"label": "Back", "kind": "action", "action": "back"})
+            return f"Preset for {profile_name}", items
         if menu_id == "appearance":
             return "Appearance", [
                 {
@@ -340,6 +528,35 @@ class CLIBridge:
         if self._application is not None:
             self._application.invalidate()
 
+    def _apply_provider_preset(
+        self,
+        profile_name: str,
+        preset_key: str,
+        *,
+        set_primary: bool = False,
+        notice: str | None = None,
+    ) -> None:
+        preset = _PROVIDER_PRESETS[preset_key]
+        update_model_profile(
+            profile_name,
+            dict(preset["updates"]),
+            path=self._config_source_path(),
+            set_primary=set_primary if set_primary else None,
+        )
+        self._reload_runtime_config()
+        self._settings_notice = notice or f"saved {preset['label']} preset to {profile_name}"
+        self._refresh_output(self._resolve_runtime_log_level())
+        if self._application is not None:
+            self._application.invalidate()
+
+    def _apply_primary_profile(self, profile_name: str) -> None:
+        set_primary_model(profile_name, path=self._config_source_path())
+        self._reload_runtime_config()
+        self._settings_notice = f"primary profile set to {profile_name}"
+        self._refresh_output(self._resolve_runtime_log_level())
+        if self._application is not None:
+            self._application.invalidate()
+
     def _apply_cli_option(self, key: str, value, *, notice: str | None = None) -> None:
         self._options[key] = value
         self._persist_cli_option(key, value)
@@ -365,6 +582,12 @@ class CLIBridge:
         if action == "resume_session":
             self._close_settings()
             self._send_task = asyncio.create_task(self._handle_command("/resume"))
+
+    def _return_to_provider_profile(self, profile_name: str) -> None:
+        self._settings_path = ["root", "providers", f"provider_profile:{profile_name}"]
+        self._settings_selected = [0, 0, 0]
+        if self._application is not None:
+            self._application.invalidate()
 
     def _activate_settings_selection(self) -> None:
         if not self._settings_open():
@@ -405,6 +628,27 @@ class CLIBridge:
             if self._settings_path and self._settings_path[-1] == "round_trips":
                 self._back_settings()
                 return
+        elif kind == "set_primary_profile":
+            self._apply_primary_profile(item["profile_name"])
+            if self._settings_path and self._settings_path[-1] == "providers_primary":
+                self._back_settings()
+                return
+        elif kind == "create_preset_profile":
+            self._apply_provider_preset(
+                item["profile_name"],
+                item["preset_key"],
+                notice=f"created profile {item['profile_name']}",
+            )
+            self._return_to_provider_profile(item["profile_name"])
+            return
+        elif kind == "apply_preset_profile":
+            self._apply_provider_preset(
+                item["profile_name"],
+                item["preset_key"],
+                notice=f"applied {item['label']} to {item['profile_name']}",
+            )
+            self._return_to_provider_profile(item["profile_name"])
+            return
         elif kind == "action":
             self._invoke_settings_action(item["action"])
             return
@@ -417,11 +661,45 @@ class CLIBridge:
         rows = self._application.output.get_size().rows
         return max(6, rows - 4)
 
+    def _settings_context_lines(self) -> list[str]:
+        if not self._settings_open():
+            return []
+        menu_id = self._settings_path[-1]
+        if menu_id == "providers":
+            current_primary = self._current_primary_profile()
+            profile = self._model_profile(current_primary)
+            if profile is None:
+                return []
+            return [
+                f"active profile {current_primary}",
+                f"provider {self._provider_label_for_profile(current_primary)}",
+                f"base url {getattr(profile, 'base_url', '')}",
+            ]
+        profile_name = self._profile_menu_name()
+        if profile_name:
+            profile = self._model_profile(profile_name)
+            if profile is None:
+                return [f"profile {profile_name}"]
+            return [
+                f"profile {profile_name}",
+                f"provider {self._provider_label_for_profile(profile_name)}",
+                f"model {getattr(profile, 'model', '')}",
+                f"base url {getattr(profile, 'base_url', '')}",
+                f"api key env {getattr(profile, 'api_key_env', '')}",
+            ]
+        return []
+
     def _settings_item_line(self, item: dict, *, selected: bool, width: int) -> str:
         prefix = "› " if selected else "  "
         label = item["label"]
         suffix = ""
         if item["kind"] == "submenu":
+            if item.get("target") == "providers":
+                suffix = self._current_primary_profile()
+                line = f"{prefix}{label}"
+                available = max(1, width - len(prefix) - len(suffix) - 1)
+                line = prefix + self._fit(label, available)
+                return self._fit(f"{line}{' ' * max(1, width - len(line) - len(suffix))}{suffix}", width)
             if item.get("target") == "log_level":
                 suffix = self._string_option("log_level", "warning")
                 line = f"{prefix}{label}"
@@ -439,6 +717,10 @@ class CLIBridge:
             suffix = "on" if self._bool_option(item["option"], bool(item.get("default", False))) else "off"
         elif item["kind"] in {"set", "set_config"} and item.get("selected"):
             suffix = "current"
+        elif item["kind"] == "set_primary_profile":
+            suffix = "current" if item.get("selected") else self._provider_label_for_profile(item["profile_name"])
+        elif item["kind"] in {"create_preset_profile", "apply_preset_profile"}:
+            suffix = item["profile_name"]
         line = f"{prefix}{label}"
         if not suffix:
             return self._fit(line, width)
@@ -451,7 +733,8 @@ class CLIBridge:
         title, items = self._settings_menu()
         selected = self._settings_selected_index()
         body_height = self._settings_body_height()
-        reserved = 5 + (1 if self._settings_notice else 0)
+        context_lines = self._settings_context_lines()
+        reserved = 5 + len(context_lines) + (1 if self._settings_notice else 0)
         visible_count = max(3, body_height - reserved)
         start = max(0, min(selected - visible_count // 2, max(0, len(items) - visible_count)))
         end = min(len(items), start + visible_count)
@@ -462,6 +745,8 @@ class CLIBridge:
             ("class:menu.header", self._fit(title, width)),
             ("", "\n"),
         ]
+        for line in context_lines:
+            fragments.extend([("class:menu.dim", self._fit(line, width)), ("", "\n")])
         if start > 0:
             fragments.extend([("class:menu.dim", self._fit("  ...", width)), ("", "\n")])
         for idx in range(start, end):

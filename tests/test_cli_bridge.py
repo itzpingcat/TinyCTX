@@ -172,7 +172,7 @@ def test_settings_navigation_enters_submenu_and_applies_choice(tmp_path):
     cfg = _make_config(tmp_path)
     bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
     bridge._open_settings()
-    bridge._move_settings(1)
+    bridge._move_settings(2)
     bridge._activate_settings_selection()
     assert bridge._settings_path[-1] == "behavior"
     bridge._move_settings(1)
@@ -208,7 +208,7 @@ bridges:
     setattr(cfg, "_source_path", cfg_path)
     bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
     bridge._open_settings()
-    bridge._move_settings(1)
+    bridge._move_settings(2)
     bridge._activate_settings_selection()
     assert bridge._settings_path[-1] == "behavior"
     bridge._activate_settings_selection()
@@ -252,6 +252,7 @@ def test_settings_root_contains_session_submenu(tmp_path):
     bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
     bridge._open_settings()
     lines = "".join(fragment[1] for fragment in bridge._settings_fragments())
+    assert "Providers" in lines
     assert "Appearance" in lines
     assert "Behavior" in lines
     assert "Session" in lines
@@ -266,3 +267,86 @@ def test_settings_behavior_menu_shows_round_trips_value(tmp_path):
     lines = "".join(fragment[1] for fragment in bridge._settings_fragments())
     assert "Agent round trips" in lines
     assert "20" in lines
+
+
+def test_settings_providers_menu_shows_active_profile_context(tmp_path):
+    cfg = _make_config(tmp_path)
+    bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
+    bridge._settings_path = ["root", "providers"]
+    bridge._settings_selected = [0, 0]
+    lines = "".join(fragment[1] for fragment in bridge._settings_fragments())
+    assert "active profile main" in lines
+    assert "Manage active profile" in lines
+
+
+def test_settings_can_create_provider_preset_profile(tmp_path):
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(
+        """
+models:
+  main:
+    base_url: http://localhost:8080/v1
+    model: llama3
+    api_key_env: N/A
+llm:
+  primary: main
+bridges:
+  cli:
+    enabled: true
+    options: {}
+""".strip(),
+        encoding="utf-8",
+    )
+    cfg = _make_config(tmp_path)
+    cfg.models["ollama"] = ModelConfig(
+        base_url="http://localhost:11434/v1",
+        model="llama3.1",
+        api_key_env="N/A",
+    )
+    setattr(cfg, "_source_path", cfg_path)
+    bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
+    bridge._settings_path = ["root", "providers", "providers_add"]
+    bridge._settings_selected = [0, 0, 0]
+    bridge._activate_settings_selection()
+    raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    assert raw["models"]["openai"]["base_url"] == "https://api.openai.com/v1"
+    assert cfg.models["openai"].base_url == "https://api.openai.com/v1"
+    assert bridge._settings_path[-1] == "provider_profile:openai"
+
+
+def test_settings_can_set_primary_profile_from_provider_menu(tmp_path):
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(
+        """
+models:
+  main:
+    base_url: http://localhost:8080/v1
+    model: llama3
+    api_key_env: N/A
+  ollama:
+    base_url: http://localhost:11434/v1
+    model: llama3.1
+    api_key_env: N/A
+llm:
+  primary: main
+bridges:
+  cli:
+    enabled: true
+    options: {}
+""".strip(),
+        encoding="utf-8",
+    )
+    cfg = _make_config(tmp_path)
+    cfg.models["ollama"] = ModelConfig(
+        base_url="http://localhost:11434/v1",
+        model="llama3.1",
+        api_key_env="N/A",
+    )
+    setattr(cfg, "_source_path", cfg_path)
+    bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
+    bridge._settings_path = ["root", "providers", "providers_primary"]
+    bridge._settings_selected = [0, 0, 1]
+    bridge._activate_settings_selection()
+    raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    assert raw["llm"]["primary"] == "ollama"
+    assert cfg.llm.primary == "ollama"
