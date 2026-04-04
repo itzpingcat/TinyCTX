@@ -19,6 +19,7 @@ from rich.panel import Panel
 from rich.text import Text
 from rich.live import Live
 
+from config import resolve_log_level
 from contracts import (
     Platform, ContentType,
     UserIdentity, InboundMessage,
@@ -68,9 +69,10 @@ class CLITheme:
 class CLIBridge:
     def __init__(self, gateway, options: dict | None = None) -> None:
         self._gateway = gateway
+        self._options = dict(options or {})
         self._theme = CLITheme(
-            colors=options.get("customcolors") or {} if options else {},
-            text=options.get("customtext") or {} if options else {}
+            colors=self._options.get("customcolors") or {},
+            text=self._options.get("customtext") or {}
         )
         self._console = Console(highlight=False)
         self._reply_done = asyncio.Event()
@@ -79,6 +81,78 @@ class CLIBridge:
         self._live: Live | None = None
         self._cursor: str | None = None  # node_id for this CLI session
         self._label_printed = False
+
+    def _resolve_runtime_log_level(self) -> int:
+        config = getattr(self._gateway, "_config", None)
+        configured = getattr(getattr(config, "logging", None), "level", "WARNING")
+        raw = self._options.get("log_level")
+        if isinstance(raw, str) and raw.lower() == "inherit":
+            raw = configured
+        elif raw is None:
+            raw = "WARNING"
+        return resolve_log_level(raw, default=logging.WARNING)
+
+    def _compact_path(self, path: Path) -> str:
+        try:
+            return str(path).replace(str(Path.home()), "~", 1)
+        except Exception:
+            return str(path)
+
+    def _startup_summary(self, log_level: int) -> Text:
+        config = getattr(self._gateway, "_config", None)
+        summary = Text(style=self._theme.c("border"))
+        if config is None:
+            summary.append("interactive session ready")
+            return summary
+
+        workspace = Path(config.workspace.path).expanduser().resolve()
+        try:
+            primary_model = config.get_model_config(config.llm.primary).model
+        except Exception:
+            primary_model = config.llm.primary
+
+        memory_cfg = (config.extra.get("memory") or {}) if hasattr(config, "extra") else {}
+        embedder = memory_cfg.get("embedding_model") or "bm25"
+
+        heartbeat_cfg = (config.extra.get("heartbeat") or {}) if hasattr(config, "extra") else {}
+        heartbeat_every = int(heartbeat_cfg.get("every_minutes", 30) or 0)
+        heartbeat_text = f"{heartbeat_every}m" if heartbeat_every > 0 else "off"
+
+        mcp_cfg = (config.extra.get("mcp") or {}) if hasattr(config, "extra") else {}
+        mcp_servers = mcp_cfg.get("servers") or {}
+        if isinstance(mcp_servers, dict) and mcp_servers:
+            mcp_text = str(len(mcp_servers))
+        else:
+            mcp_text = "off"
+
+        segments = [
+            ("workspace", self._compact_path(workspace)),
+            ("model", primary_model),
+            ("memory", str(embedder)),
+            ("heartbeat", heartbeat_text),
+            ("mcp", mcp_text),
+            ("logs", f"{logging.getLevelName(log_level).lower()}+"),
+        ]
+        for idx, (label, value) in enumerate(segments):
+            if idx:
+                summary.append(" · ")
+            summary.append(f"{label} ", style=self._theme.c("tagline"))
+            summary.append(value, style=self._theme.c("banner"))
+        return summary
+
+    def _banner_renderable(self) -> Text:
+        name = self._theme.t("name")
+        font = str(self._options.get("banner_font") or "slant")
+        width = max(40, min(self._console.size.width - 8, 160))
+        try:
+            banner = pyfiglet.figlet_format(name, font=font, width=width)
+        except Exception:
+            banner = pyfiglet.figlet_format(name, font="slant", width=width)
+
+        banner_text = Text()
+        banner_text.append(banner, style=self._theme.c("banner"))
+        banner_text.append(f"  {self._theme.t('tagline')}", style=self._theme.c("tagline"))
+        return banner_text
 
     def _start_reply(self):
         if not self._label_printed:
@@ -179,11 +253,7 @@ class CLIBridge:
     async def run(self) -> None:
         # Route all logging through Rich so log lines don't interleave with
         # the input() prompt or Live panels (fixes heartbeat log bleed).
-        config = getattr(self._gateway, "_config", None)
-        log_level = logging.WARNING
-        if config and hasattr(config, "logging"):
-            level_str = getattr(config.logging, "level", "WARNING")
-            log_level = getattr(logging, level_str.upper(), logging.WARNING)
+        log_level = self._resolve_runtime_log_level()
 
         logging.basicConfig(
             level=log_level,
@@ -198,10 +268,8 @@ class CLIBridge:
         self._gateway.register_platform_handler(Platform.CLI.value, self.handle_event)
         self._cursor = _load_cli_cursor(self._gateway)
 
-        banner_text = Text()
-        banner_text.append(pyfiglet.figlet_format(self._theme.t("name"), font="slant"), style=self._theme.c("banner"))
-        banner_text.append(f"  {self._theme.t('tagline')}", style=self._theme.c("tagline"))
-        self._console.print(Panel(banner_text, border_style=self._theme.c("border"), padding=(0, 2)))
+        self._console.print(Panel(self._banner_renderable(), border_style=self._theme.c("border"), padding=(0, 2)))
+        self._console.print(self._startup_summary(log_level))
         self._console.print(f"[{self._theme.c('border')}]  type a message · /reset · /debug heartbeat · exit[/{self._theme.c('border')}]\n")
 
         c = self._theme.c

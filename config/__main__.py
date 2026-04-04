@@ -207,6 +207,17 @@ class Config:
         return cfg
 
 
+def resolve_log_level(level: str | int | None, *, default: int = logging.WARNING) -> int:
+    """Best-effort log-level resolver for bridge/runtime overrides."""
+    if isinstance(level, int):
+        return level
+    if not level:
+        return default
+    if isinstance(level, str):
+        return getattr(logging, level.upper(), default)
+    return default
+
+
 def _parse_fallback_on(raw: dict) -> FallbackOnConfig:
     return FallbackOnConfig(
         any_error=bool(raw.get("any_error", False)),
@@ -372,11 +383,12 @@ def load(path="config.yaml") -> Config:
     )
 
 
-def apply_logging(cfg: LoggingConfig) -> None:
+def apply_logging(cfg: LoggingConfig, *, level_override: str | int | None = None) -> None:
     import structlog
+    resolved_level = resolve_log_level(level_override or cfg.level, default=logging.INFO)
 
     logging.basicConfig(
-        level=getattr(logging, cfg.level),
+        level=resolved_level,
         format="%(message)s",
         datefmt="%H:%M:%S",
     )

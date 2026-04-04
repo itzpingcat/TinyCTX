@@ -91,10 +91,15 @@ gateway:
 bridges:
   # --------------------------------------------------------------------------
   # CLI bridge — interactive terminal session.
-  # No extra options needed.
+  # quiet_startup hides startup/runtime INFO chatter in the terminal.
+  # log_level defaults to WARNING for the CLI; set to inherit or INFO if you
+  # want to see module/server logs live while chatting.
   # --------------------------------------------------------------------------
   cli:
     enabled: true
+    options:
+      quiet_startup: true
+      log_level: WARNING
 
   # --------------------------------------------------------------------------
   # Discord bridge
