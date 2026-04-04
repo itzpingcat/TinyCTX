@@ -178,6 +178,7 @@ async def _heartbeat_loop(
                     prompt, continuation_prompt,
                     ack_max, max_continuations,
                 )
+                setattr(agent, "_heartbeat_cursor_node_id", tail_node_id)
             else:
                 logger.debug("[heartbeat] outside active hours — skipping tick")
         except asyncio.CancelledError:
@@ -265,7 +266,7 @@ async def _run_turn(
         gateway._heartbeat_agent = agent
 
     msg = InboundMessage(
-        tail_node_id=lane_node_id,
+        tail_node_id=tail_node_id,
         author=_HEARTBEAT_AUTHOR,
         content_type=ContentType.TEXT,
         text=text,
