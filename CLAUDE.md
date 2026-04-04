@@ -343,6 +343,7 @@ Modules must not import from `router.py`, `gateway/`, or any bridge.
 - **Vision models** use `vision: true` in `models:`. Non-vision models receive a reference note instead of image blocks.
 - **Tool functions can be sync or async.** `ToolCallHandler.execute_tool_call` handles both.
 - **Context hooks run in priority order** (lower = first). `priority=0` for early hooks (dedup, memory), `priority=10+` for later (trim).
+- **Token budget telemetry:** agent logs at INFO when context hits 80% of `context:` limit, WARNING at 95%. These are signals to implement/trigger the compaction module.
 - **LLM retries:** `ai.LLM` retries `ClientConnectionError` up to 3× with exponential backoff (1–8s). Other errors (`LLMError`) pass through immediately.
 - **Queue backpressure:** Lane queues are bounded (32 by default, change `LANE_QUEUE_MAX` in `router.py`). Full queues return `False` from `router.push()` — gateway surfaces this as 429.
 - **Graceful shutdown:** SIGTERM/SIGINT drain in-flight turns before exit.
@@ -491,7 +492,7 @@ The memory module has two layers:
 | `skills/` | Skill folders following agentskills.io convention, each containing `SKILL.md`. |
 
 
-## IMPORTANT SHIT
+## IMPORTANT SHIT AND STANDARDS
 
 NO CONTEXT COMPACTION SHIT
 NO ADDING FEATURES DIRECTLY TO AGENT.PY, ONLY MODULES

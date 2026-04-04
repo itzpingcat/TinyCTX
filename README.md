@@ -4,7 +4,7 @@ A lightweight agentic assistant framework. Connect it to your LLM, configure a b
 
 ## Highlights
 
-- Fullscreen terminal UI with persistent session restore, slash commands, paste refs, and copy helpers
+- Terminal UI with persistent session restore, slash commands, paste refs, and copy helpers
 - Direct web browsing via `web_search`, `browse_url`, and `navigate`
 - Branch-backed conversation history with automatic compaction when context pressure gets high
 - Static + searchable memory with BM25 or embeddings, plus background memory consolidation
