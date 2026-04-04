@@ -17,6 +17,7 @@ from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.document import Document
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.keys import Keys
 from prompt_toolkit.layout import HSplit, Layout, Window
 from prompt_toolkit.layout.containers import ConditionalContainer
 from prompt_toolkit.layout.controls import FormattedTextControl
@@ -59,6 +60,8 @@ _TINYCTX_BANNER = (
     "   ╚═╝   ╚═╝╚═╝  ╚═══╝   ╚═╝    ╚═════╝   ╚═╝   ╚═╝  ╚═╝",
 )
 _DIMMED_LINE_PREFIXES = ("tool ", "ok ", "err ", "thinking…")
+_PASTED_TEXT_THRESHOLD = 120
+_PASTED_TEXT_REF = re.compile(r"\[Pasted text #(\d+)(?: \+\d+ lines)?\]")
 _CLI_OPTION_DEFAULTS = {
     "compact_tools": True,
     "dim_tools": True,
@@ -240,6 +243,8 @@ class CLIBridge:
         self._settings_path: list[str] = []
         self._settings_selected: list[int] = []
         self._settings_notice = ""
+        self._pasted_texts: dict[int, str] = {}
+        self._next_paste_id = 1
 
     def _resolve_runtime_log_level(self) -> int:
         config = getattr(self._gateway, "_config", None)
@@ -941,6 +946,82 @@ class CLIBridge:
         rendered.extend(f"  {line}" for line in lines[1:])
         return "\n".join(rendered)
 
+    def _content_to_text(self, content) -> str:
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            parts: list[str] = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text = str(block.get("text", "")).strip()
+                    if text:
+                        parts.append(text)
+            if parts:
+                return "\n".join(parts)
+            return "[non-text content]"
+        return str(content).strip()
+
+    def _looks_like_error_output(self, output: str) -> bool:
+        lowered = (output or "").lstrip().lower()
+        return lowered.startswith("[error") or lowered.startswith("error:") or lowered.startswith("[blocked")
+
+    def _paste_ref(self, paste_id: int, text: str) -> str:
+        line_count = text.count("\n")
+        if line_count <= 0:
+            return f"[Pasted text #{paste_id}]"
+        return f"[Pasted text #{paste_id} +{line_count} lines]"
+
+    def _insert_input_text(self, text: str) -> None:
+        if self._input_area is None:
+            return
+        buffer = self._input_area.buffer
+        document = buffer.document
+        cursor = document.cursor_position
+        new_text = document.text[:cursor] + text + document.text[cursor:]
+        buffer.document = Document(text=new_text, cursor_position=cursor + len(text))
+
+    def _handle_paste(self, text: str) -> None:
+        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+        if not normalized:
+            return
+        if "\n" not in normalized and len(normalized) <= _PASTED_TEXT_THRESHOLD:
+            self._insert_input_text(normalized)
+            return
+
+        paste_id = self._next_paste_id
+        self._next_paste_id += 1
+        self._pasted_texts[paste_id] = normalized
+        self._insert_input_text(self._paste_ref(paste_id, normalized))
+
+    def _expand_pasted_text_refs(self, text: str, pasted_texts: dict[int, str] | None = None) -> str:
+        refs = pasted_texts if pasted_texts is not None else self._pasted_texts
+        if not refs:
+            return text
+
+        def _replace(match: re.Match[str]) -> str:
+            paste_id = int(match.group(1))
+            return refs.get(paste_id, match.group(0))
+
+        return _PASTED_TEXT_REF.sub(_replace, text)
+
+    def _read_clipboard_text(self) -> str:
+        try:
+            import subprocess
+
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", "Get-Clipboard -Raw"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                encoding="utf-8",
+                errors="replace",
+            )
+            if result.returncode == 0:
+                return result.stdout
+        except Exception:
+            pass
+        return ""
+
     def _summarize_value(self, value, max_chars: int = 84) -> str:
         if value is None:
             return ""
@@ -999,6 +1080,62 @@ class CLIBridge:
         block = text.strip()
         if block:
             self._transcript_blocks.append(block)
+
+    def _restore_transcript_from_cursor(self) -> int:
+        if not self._cursor:
+            return 0
+
+        from context import Context, ROLE_ASSISTANT, ROLE_TOOL, ROLE_USER
+        from db import ConversationDB
+
+        workspace = Path(self._gateway._config.workspace.path).expanduser().resolve()
+        db = ConversationDB(workspace / "agent.db")
+        try:
+            ctx = Context(token_limit=int(getattr(self._gateway._config, "context", 16384) or 16384))
+            ctx.set_db(db)
+            ctx.set_tail(self._cursor)
+            entries = ctx._load_from_db()
+        finally:
+            db.close()
+
+        blocks: list[str] = []
+        tool_names: dict[str, str] = {}
+        for entry in entries:
+            if entry.role == ROLE_USER:
+                text = self._content_to_text(entry.content)
+                if text:
+                    blocks.append(self._render_user_block(text))
+                continue
+
+            if entry.role == ROLE_ASSISTANT:
+                text = self._content_to_text(entry.content)
+                if text:
+                    blocks.append(text)
+                for tool_call in entry.tool_calls:
+                    tool_name = str(tool_call.get("name") or "tool")
+                    arguments = tool_call.get("arguments")
+                    if not isinstance(arguments, dict):
+                        arguments = {}
+                    call_id = tool_call.get("id")
+                    if isinstance(call_id, str) and call_id:
+                        tool_names[call_id] = tool_name
+                    blocks.append(self._tool_call_line(tool_name, arguments))
+                continue
+
+            if entry.role == ROLE_TOOL:
+                output = self._content_to_text(entry.content)
+                tool_name = tool_names.get(entry.tool_call_id or "", "tool")
+                if output:
+                    blocks.append(
+                        self._tool_result_line(
+                            tool_name,
+                            output,
+                            self._looks_like_error_output(output),
+                        )
+                    )
+
+        self._transcript_blocks = blocks
+        return len(blocks)
 
     def _append_log_record(self, levelno: int, message: str) -> None:
         text = message.strip()
@@ -1205,27 +1342,29 @@ class CLIBridge:
         self._append_block(f"unknown command: {text}")
         self._refresh_output(self._resolve_runtime_log_level())
 
-    async def _submit_text(self, text: str) -> None:
-        text = text.strip()
-        if not text:
+    async def _submit_text(self, text: str, *, pasted_texts: dict[int, str] | None = None) -> None:
+        display_text = text.strip()
+        if not display_text:
             return
-        if text.lower() in {"exit", "quit"}:
+        if display_text.lower() in {"exit", "quit"}:
             if self._application is not None:
                 self._application.exit(result=None)
             return
-        if text.startswith("/"):
-            await self._handle_command(text)
+        if display_text.startswith("/"):
+            await self._handle_command(display_text)
             return
 
+        expanded_text = self._expand_pasted_text_refs(display_text, pasted_texts)
+
         self._set_status("waiting for response")
-        self._append_block(self._render_user_block(text))
+        self._append_block(self._render_user_block(display_text))
         self._refresh_output(self._resolve_runtime_log_level())
 
         msg = InboundMessage(
             tail_node_id=self._cursor,
             author=CLI_USER,
             content_type=ContentType.TEXT,
-            text=text,
+            text=expanded_text,
             message_id=str(time.time_ns()),
             timestamp=time.time(),
         )
@@ -1240,8 +1379,11 @@ class CLIBridge:
         if self._send_task is not None and not self._send_task.done():
             return
         text = self._input_area.text
+        pasted_texts = dict(self._pasted_texts)
         self._input_area.buffer.reset()
-        self._send_task = asyncio.create_task(self._submit_text(text))
+        self._pasted_texts.clear()
+        self._next_paste_id = 1
+        self._send_task = asyncio.create_task(self._submit_text(text, pasted_texts=pasted_texts))
 
     def _complete_input(self) -> None:
         if self._input_area is None:
@@ -1329,6 +1471,15 @@ class CLIBridge:
         def _settings_enter(_event) -> None:
             self._activate_settings_selection()
 
+        @key_bindings.add(Keys.BracketedPaste, filter=~showing_settings, eager=True)
+        def _paste(event) -> None:
+            self._handle_paste(event.data)
+
+        @key_bindings.add("c-v", filter=~showing_settings, eager=True)
+        @key_bindings.add("s-insert", filter=~showing_settings, eager=True)
+        def _paste_clipboard(_event) -> None:
+            self._handle_paste(self._read_clipboard_text())
+
         @key_bindings.add("tab", filter=~showing_settings, eager=True)
         def _complete(_event) -> None:
             self._complete_input()
@@ -1414,6 +1565,7 @@ class CLIBridge:
         log_level = self._resolve_runtime_log_level()
         self._gateway.register_platform_handler(Platform.CLI.value, self.handle_event)
         self._cursor = _load_cli_cursor(self._gateway)
+        self._restore_transcript_from_cursor()
         self._application = self._build_application()
         self._loop = asyncio.get_running_loop()
         self._refresh_output(log_level)

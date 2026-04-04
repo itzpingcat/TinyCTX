@@ -1,0 +1,14 @@
+[
+  {
+    "content": "Reduce memory vector search RAM usage by reranking a smaller candidate set instead of loading all embeddings on every query.",
+    "status": "pending"
+  },
+  {
+    "content": "Add an explicit pre-budget trim for compaction summary requests so the summarizer input cannot exceed model context limits.",
+    "status": "pending"
+  },
+  {
+    "content": "Replace the memory all-fits top_k=999 path with a real full-store retrieval path that does not silently depend on BM25 query matches.",
+    "status": "pending"
+  }
+]

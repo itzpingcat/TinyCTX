@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from types import SimpleNamespace
 from pathlib import Path
@@ -22,6 +23,7 @@ from config import (
     ModelConfig,
     WorkspaceConfig,
 )
+from db import ConversationDB
 from main import _startup_log_level
 
 
@@ -407,3 +409,105 @@ def test_cli_capture_root_logs_routes_warnings_to_transcript(tmp_path):
     assert all("hidden info" not in block for block in bridge._transcript_blocks)
     assert root.handlers == previous_handlers
     assert root.level == previous_level
+
+
+def test_large_paste_collapses_to_reference_and_expands_for_submit(tmp_path):
+    cfg = _make_config(tmp_path)
+    bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
+    with patch("bridges.cli.__main__.Application", return_value=SimpleNamespace()):
+        bridge._build_application()
+    assert bridge._input_area is not None
+
+    pasted = "line one\nline two\nline three"
+    bridge._handle_paste(pasted)
+
+    assert bridge._input_area.text == "[Pasted text #1 +2 lines]"
+    assert bridge._expand_pasted_text_refs(bridge._input_area.text) == pasted
+
+
+def test_short_paste_stays_inline(tmp_path):
+    cfg = _make_config(tmp_path)
+    bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
+    with patch("bridges.cli.__main__.Application", return_value=SimpleNamespace()):
+        bridge._build_application()
+
+    bridge._handle_paste("hello")
+    assert bridge._input_area is not None
+    assert bridge._input_area.text == "hello"
+
+
+def test_submit_text_renders_placeholder_but_sends_expanded_paste(tmp_path):
+    cfg = _make_config(tmp_path)
+
+    pushed = {}
+
+    async def _push(msg):
+        pushed["text"] = msg.text
+        bridge._reply_done.set()
+
+    gateway = SimpleNamespace(_config=cfg, push=_push)
+    bridge = CLIBridge(gateway, options={})
+    bridge._cursor = "cursor-1"
+
+    asyncio.run(
+        bridge._submit_text(
+            "[Pasted text #1 +1 lines]",
+            pasted_texts={1: "alpha\nbeta"},
+        )
+    )
+
+    assert pushed["text"] == "alpha\nbeta"
+    assert bridge._transcript_blocks[-1] == "› [Pasted text #1 +1 lines]"
+
+
+def test_cli_restores_transcript_from_saved_cursor(tmp_path):
+    cfg = _make_config(tmp_path)
+    gateway = SimpleNamespace(_config=cfg)
+    bridge = CLIBridge(gateway, options={})
+
+    db = ConversationDB(tmp_path / "agent.db")
+    root = db.get_root()
+    session = db.add_node(parent_id=root.id, role="system", content="session:cli")
+    user = db.add_node(parent_id=session.id, role="user", content="hello")
+    assistant = db.add_node(parent_id=user.id, role="assistant", content="hi there")
+    bridge._cursor = assistant.id
+    db.close()
+
+    restored = bridge._restore_transcript_from_cursor()
+
+    assert restored == 2
+    assert bridge._transcript_blocks == ["› hello", "hi there"]
+
+
+def test_cli_restores_tool_history_from_saved_cursor(tmp_path):
+    cfg = _make_config(tmp_path)
+    gateway = SimpleNamespace(_config=cfg)
+    bridge = CLIBridge(gateway, options={})
+
+    db = ConversationDB(tmp_path / "agent.db")
+    root = db.get_root()
+    session = db.add_node(parent_id=root.id, role="system", content="session:cli")
+    user = db.add_node(parent_id=session.id, role="user", content="check cwd")
+    assistant = db.add_node(
+        parent_id=user.id,
+        role="assistant",
+        content="",
+        tool_calls=json.dumps([
+            {"id": "call-1", "name": "shell", "arguments": {"command": "pwd"}}
+        ]),
+    )
+    tool = db.add_node(
+        parent_id=assistant.id,
+        role="tool",
+        content="C:\\repo",
+        tool_call_id="call-1",
+    )
+    bridge._cursor = tool.id
+    db.close()
+
+    restored = bridge._restore_transcript_from_cursor()
+
+    assert restored == 3
+    assert bridge._transcript_blocks[0] == "› check cwd"
+    assert bridge._transcript_blocks[1] == "tool shell pwd"
+    assert bridge._transcript_blocks[2] == "ok shell C:\\repo"
