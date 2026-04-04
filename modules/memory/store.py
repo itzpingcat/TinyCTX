@@ -517,4 +517,5 @@ class MemoryStore:
         tokens = [t for t in query.split() if t]
         if not tokens:
             return ""
-        return " OR ".join(f'"{t}"' for t in tokens)
+        escaped = [t.replace('"', '""') for t in tokens]
+        return " OR ".join(f'"{token}"' for token in escaped)

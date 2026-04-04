@@ -260,6 +260,15 @@ class TestMemoryStore:
         assert len(results) == 1
         assert "fox" in results[0][2]
 
+    def test_bm25_search_escapes_quotes_in_query(self, tmp_path):
+        store = MemoryStore(tmp_path / "cache.db")
+        store.upsert_file("/f.md", "h", "m", 0.0)
+        store.insert_chunks("/f.md", ['hello "world" entry'], None)
+        store.commit()
+        results = store.bm25_search('hello "world', 5)
+        assert len(results) == 1
+        assert 'hello "world" entry' == results[0][2]
+
     def test_bm25_empty_query_returns_nothing(self, tmp_path):
         store = MemoryStore(tmp_path / "cache.db")
         assert store.bm25_search("", 5) == []
