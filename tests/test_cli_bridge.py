@@ -461,6 +461,38 @@ def test_submit_text_renders_placeholder_but_sends_expanded_paste(tmp_path):
     assert bridge._transcript_blocks[-1] == "› [Pasted text #1, 10 chars]"
 
 
+def test_copy_primary_text_prefers_selected_output(tmp_path):
+    cfg = _make_config(tmp_path)
+    bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
+    with patch("bridges.cli.__main__.Application", return_value=SimpleNamespace()):
+        bridge._build_application()
+
+    assert bridge._output_area is not None
+    bridge._output_area.buffer.selection_state = object()
+    with patch.object(bridge._output_area.buffer, "copy_selection", return_value=SimpleNamespace(text="picked output")):
+        with patch.object(bridge, "_write_clipboard_text", return_value=True) as copy_mock:
+            assert bridge._copy_primary_text() is True
+
+    copy_mock.assert_called_once_with("picked output")
+
+
+def test_copy_primary_text_falls_back_to_full_transcript(tmp_path):
+    cfg = _make_config(tmp_path)
+    bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
+    with patch("bridges.cli.__main__.Application", return_value=SimpleNamespace()):
+        bridge._build_application()
+
+    bridge._transcript_blocks = ["line one", "line two"]
+    bridge._refresh_output(logging.WARNING)
+
+    with patch.object(bridge, "_write_clipboard_text", return_value=True) as copy_mock:
+        assert bridge._copy_primary_text() is True
+
+    copied_text = copy_mock.call_args[0][0]
+    assert "line one" in copied_text
+    assert "line two" in copied_text
+
+
 def test_cli_restores_transcript_from_saved_cursor(tmp_path):
     cfg = _make_config(tmp_path)
     gateway = SimpleNamespace(_config=cfg)

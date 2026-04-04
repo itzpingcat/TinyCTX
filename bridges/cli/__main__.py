@@ -1016,6 +1016,38 @@ class CLIBridge:
             pass
         return ""
 
+    def _write_clipboard_text(self, text: str) -> bool:
+        if not text:
+            return False
+        try:
+            import subprocess
+
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", "Set-Clipboard -Value ([Console]::In.ReadToEnd())"],
+                input=text,
+                capture_output=True,
+                text=True,
+                timeout=2,
+                encoding="utf-8",
+                errors="replace",
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    def _copy_primary_text(self) -> bool:
+        if self._output_area is not None and self._output_area.buffer.selection_state is not None:
+            data = self._output_area.buffer.copy_selection()
+            return self._write_clipboard_text(data.text)
+        if self._input_area is not None and self._input_area.buffer.selection_state is not None:
+            data = self._input_area.buffer.copy_selection()
+            return self._write_clipboard_text(data.text)
+        if self._has_transcript() and self._output_area is not None and self._output_area.text:
+            return self._write_clipboard_text(self._output_area.text)
+        if self._input_area is not None and self._input_area.text:
+            return self._write_clipboard_text(self._input_area.text)
+        return False
+
     def _summarize_value(self, value, max_chars: int = 84) -> str:
         if value is None:
             return ""
@@ -1324,6 +1356,8 @@ class CLIBridge:
             self._append_block(
                 "shortcuts\n"
                 "  Enter        send message\n"
+                "  Ctrl+C       copy selected text or the transcript\n"
+                "  Ctrl+Q       exit TinyCTX\n"
                 "  /reset       start a new session\n"
                 "  /resume      keep using the saved session\n"
                 "  /settings    open CLI settings\n"
@@ -1500,6 +1534,12 @@ class CLIBridge:
             self._back_settings()
 
         @key_bindings.add("c-c", eager=True)
+        @key_bindings.add("c-insert", eager=True)
+        def _copy_or_exit(event) -> None:
+            if not self._copy_primary_text():
+                event.app.exit(result=None)
+
+        @key_bindings.add("c-q", eager=True)
         def _exit(event) -> None:
             event.app.exit(result=None)
 
