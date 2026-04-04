@@ -356,15 +356,13 @@ def register(agent) -> None:
             db = getattr(agent, "_db", None) or getattr(agent.context, "_db", None)
             ctx_tail = agent.context.tail_node_id
             if db is not None and ctx_tail is not None:
-                # DB-backed path: spawn a background branch off the current tail.
-                # The live conversation is untouched; the background loop writes
-                # its own nodes into the branch.
                 opening = db.add_node(
                     parent_id=tail_node_id,
                     role="user",
                     content=msg,
                 )
-                agent.queue_background_branch(opening.id)
+                from agent import _run_background
+                asyncio.create_task(_run_background(opening.id, config))
             else:
                 # No-DB (legacy/test) path: inject the nudge inline so the agent
                 # sees it on the next assemble().
@@ -475,11 +473,15 @@ def register(agent) -> None:
             msg      = nudge_message.format(date=date_str)
 
             opening = db.add_node(parent_id=tail, role="user", content=msg)
-            agent.queue_background_branch(opening.id)
+
+            # Fire directly — queue_background_branch() only drains inside
+            # AgentLoop.run(), which never runs for a slash command handler.
+            from agent import _run_background
+            asyncio.create_task(_run_background(opening.id, agent.config))
 
             if console:
-                console.print(f"[{c('tool_ok')}]  ✓  memory consolidation queued (branch off tail={tail[:8]}…)[/{c('tool_ok')}]")
-            logger.info("[memory] /memory consolidate — branch queued off tail=%s", tail)
+                console.print(f"[{c('tool_ok')}]  ✓  memory consolidation started (branch off tail={tail[:8]}…)[/{c('tool_ok')}]")
+            logger.info("[memory] /memory consolidate — branch fired off tail=%s", tail)
 
         registry.register(
             "memory", "consolidate", _cmd_consolidate,

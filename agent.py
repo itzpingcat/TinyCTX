@@ -68,6 +68,7 @@ from config import Config, ModelConfig
 from ai import LLM, TextDelta, ThinkingDelta, ToolCallAssembled, LLMError
 from utils.tool_handler import ToolCallHandler
 from utils.attachments import build_content_blocks
+from utils.commands import CommandRegistry
 from db import ConversationDB
 
 logger = logging.getLogger(__name__)
@@ -128,6 +129,7 @@ class AgentLoop:
             image_tokens_per_block=primary_mc.tokens_per_image if primary_mc else 280,
         )
         self.tool_handler  = ToolCallHandler()
+        self.commands      = CommandRegistry()  # replaced by Lane with the shared router registry
         self._turn_count   = 0
         self.gateway       = None  # set by Lane after construction
 
@@ -139,10 +141,7 @@ class AgentLoop:
         self.context.set_cursor_callback(self._on_context_tail_advance)
 
         # Background hooks: called after AgentTextFinal with (tail_node_id, config).
-        # Each hook is responsible for spawning its own detached task if needed.
         self._background_hooks: list[Callable[[str, Config], Awaitable[None]]] = []
-
-        self._pending_background_branches: list[str] = []
 
         self._models: dict[str, LLM] = {
             name: _build_llm(mc)
@@ -151,7 +150,13 @@ class AgentLoop:
         }
 
         self.tool_handler.register_tool(self.tool_handler.tools_search, always_on=True)
-        self._load_modules()
+        # NOTE: _load_modules() is NOT called here. Lane.__post_init__ wires
+        # self.commands = router.commands first, then calls load_modules() so
+        # modules register their commands into the shared registry.
+        # Exception: subagent loops (background branches) have no Lane and
+        # don't need commands — they load modules immediately.
+        if is_subagent:
+            self.load_modules()
 
     # ------------------------------------------------------------------
     # DB
@@ -191,28 +196,7 @@ class AgentLoop:
     def register_background_hook(
         self, fn: Callable[[str, Config], Awaitable[None]]
     ) -> None:
-        """
-        Register an async hook to be called after each interactive turn
-        completes (after AgentTextFinal is yielded).
-
-        fn(tail_node_id: str, config: Config) -> Awaitable[None]
-
-        The hook receives the tail node_id at the moment the turn finished
-        and the agent's config. It is responsible for spawning its own
-        detached asyncio.create_task() if it needs to run in the background
-        without blocking. Hooks are called sequentially in registration order;
-        exceptions are caught and logged.
-
-        Typical usage (memory module):
-            def register(agent):
-                async def _memory_hook(tail_node_id, config):
-                    opening = agent._db.add_node(
-                        parent_id=tail_node_id, role="user",
-                        content="Consolidate memory from this conversation.",
-                    )
-                    asyncio.create_task(_run_background(opening.id, config))
-                agent.register_background_hook(_memory_hook)
-        """
+        """Register an async hook called after each turn with (tail_node_id, config)."""
         self._background_hooks.append(fn)
 
     async def _fire_background_hooks(self, tail_node_id: str) -> None:
@@ -227,7 +211,7 @@ class AgentLoop:
     # Module loader
     # ------------------------------------------------------------------
 
-    def _load_modules(self) -> None:
+    def load_modules(self) -> None:
         if not MODULES_DIR.exists():
             return
         for entry in sorted(MODULES_DIR.iterdir()):
@@ -450,18 +434,13 @@ class AgentLoop:
 
         yield AgentTextFinal(text=final_text if not streaming_active else "", **ev)
 
-        # Phase 3: fire any background branches registered this turn.
-        for branch_node_id in self._pending_background_branches:
-            asyncio.ensure_future(self._run_background(branch_node_id))
-        self._pending_background_branches.clear()
-
-        # Phase 3: fire background hooks after the turn completes.
-        # Skipped for synthetic turns — they are already background work.
+        # Fire background hooks after the turn completes.
+        # Skipped for synthetic turns — they are themselves background work.
         if not is_synthetic and self._background_hooks:
             await self._fire_background_hooks(self._tail_node_id)
 
     # ------------------------------------------------------------------
-    # Background branch runner (Phase 3)
+    # Background branch runner
     # ------------------------------------------------------------------
 
     async def _run_background(self, tail_node_id: str) -> None:
@@ -481,10 +460,13 @@ class AgentLoop:
 
     def queue_background_branch(self, tail_node_id: str) -> None:
         """
-        Schedule a background branch to be fired after the current turn yields
-        AgentTextFinal. Called by modules (e.g. memory) during a hook.
+        Deprecated — call asyncio.create_task(_run_background(node_id, config)) directly.
+        Kept temporarily so old call sites fail loudly rather than silently.
         """
-        self._pending_background_branches.append(tail_node_id)
+        raise RuntimeError(
+            "queue_background_branch() is removed. "
+            "Use asyncio.create_task(_run_background(node_id, agent.config)) directly."
+        )
 
     # ------------------------------------------------------------------
     # Tool execution

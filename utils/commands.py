@@ -72,6 +72,9 @@ class CommandRegistry:
         """
         namespace = namespace.lower().strip()
         sub       = sub.lower().strip()
+        # Replace any existing entry with the same (namespace, sub) so that
+        # open_lane() calls after /reset don't accumulate duplicates.
+        self._entries = [e for e in self._entries if not (e.namespace == namespace and e.sub == sub)]
         self._entries.append(_Entry(namespace=namespace, sub=sub, handler=handler, help=help))
         logger.debug(
             "[commands] registered /%s%s",

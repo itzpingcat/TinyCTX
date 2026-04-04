@@ -254,6 +254,10 @@ class CLIBridge:
         self._gateway.register_platform_handler(Platform.CLI.value, self.handle_event)
         self._cursor = _load_cli_cursor(self._gateway)
 
+        # Eagerly open the lane so modules load and register their commands
+        # into router.commands before the user types anything.
+        self._gateway.open_lane(self._cursor, Platform.CLI.value)
+
         banner_text = Text()
         banner_text.append(pyfiglet.figlet_format(self._theme.t("name"), font="slant"), style=self._theme.c("banner"))
         banner_text.append(f"  {self._theme.t('tagline')}", style=self._theme.c("tagline"))
@@ -290,6 +294,8 @@ class CLIBridge:
                         cursor_file.write_text(node.id, encoding="utf-8")
                         self._cursor = node.id
                         self._gateway.reset_lane(self._cursor)
+                        # Eagerly open the new lane so commands remain available.
+                        self._gateway.open_lane(self._cursor, Platform.CLI.value)
                         self._console.print(f"[{c('reset')}]  ↺  new session started[/{c('reset')}]")
                         continue
 
