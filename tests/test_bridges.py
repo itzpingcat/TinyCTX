@@ -74,10 +74,14 @@ def _stub_discord():
     class TextChannel:
         pass
 
+    class Thread:
+        pass
+
     discord.Intents     = Intents
     discord.Client      = Client
     discord.DMChannel   = DMChannel
     discord.TextChannel = TextChannel
+    discord.Thread      = Thread
     discord.abc         = types.ModuleType("discord.abc")
 
     class Messageable:
@@ -191,6 +195,7 @@ from bridges.matrix.__main__ import MatrixBridge, _ReplyAccumulator as MatrixAcc
 def _make_router(workspace="/tmp/tinyctx_test"):
     router = MagicMock()
     router.config.workspace.path = workspace
+    router._config.workspace.path = workspace
     router.config.bridges = {}
     router.push = AsyncMock(return_value=True)
     router.register_platform_handler = MagicMock()
@@ -208,6 +213,7 @@ def _node_id():
 def _make_agent_event(cls, node_id, **kwargs):
     return cls(
         tail_node_id=node_id,
+        lane_node_id=node_id,
         trace_id=_trace_id(),
         reply_to_message_id="msg-1",
         **kwargs,
@@ -287,9 +293,9 @@ class TestDiscordMessageFiltering:
         b = DiscordBridge(router, opts)
         b._router = router
         # Pre-seed a cursor so _get_or_create_cursor doesn't hit the DB
-        b._cursors["dm:42"] = _node_id()
-        b._cursors["dm:111"] = _node_id()
-        b._cursors["dm:99999"] = _node_id()
+        b._store.set("dm:42", _node_id())
+        b._store.set("dm:111", _node_id())
+        b._store.set("dm:99999", _node_id())
         return b, router
 
     def _make_discord_message(self, author_id: int, content: str, is_dm: bool = True):
@@ -327,7 +333,7 @@ class TestDiscordMessageFiltering:
     @pytest.mark.asyncio
     async def test_open_allowlist_accepts_anyone(self):
         b, router = self._bridge(allowed=[])
-        b._cursors["dm:99999"] = _node_id()
+        b._store.set("dm:99999", _node_id())
         msg = self._make_discord_message(author_id=99999, content="hello")
         await b._on_message(msg)
         await asyncio.sleep(0)
@@ -343,7 +349,7 @@ class TestDiscordMessageFiltering:
     @pytest.mark.asyncio
     async def test_empty_text_not_pushed(self):
         b, router = self._bridge(allowed=[])
-        b._cursors["dm:42"] = _node_id()
+        b._store.set("dm:42", _node_id())
         msg = self._make_discord_message(author_id=42, content="   ")
         await b._on_message(msg)
         router.push.assert_not_called()
@@ -363,8 +369,8 @@ class TestDiscordMessageRouting:
     def _bridge(self):
         b = DiscordBridge(_make_router(), {})
         # Pre-seed cursors so no DB access needed
-        b._cursors["dm:42"] = str(uuid.uuid4())
-        b._cursors["dm:77"] = str(uuid.uuid4())
+        b._store.set("dm:42", str(uuid.uuid4()))
+        b._store.set("dm:77", str(uuid.uuid4()))
         return b
 
     def _make_discord_dm_message(self, author_id: int):

@@ -163,9 +163,15 @@ class InboundMessage:
 @dataclass(frozen=True, kw_only=True)
 class _AgentEventBase:
     tail_node_id:        str   # current cursor — advances as new DB nodes are written
-    lane_node_id:        str   # original lane key — stable for the lifetime of the lane
+    lane_node_id:        str | None = None   # original lane key — stable for the lifetime of the lane
     trace_id:            str
     reply_to_message_id: str
+
+    def __post_init__(self) -> None:
+        # Back-compat for tests and older helper code that still constructs
+        # events with only tail_node_id.
+        if self.lane_node_id is None:
+            object.__setattr__(self, "lane_node_id", self.tail_node_id)
 
 
 @dataclass(frozen=True)

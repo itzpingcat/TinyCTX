@@ -438,6 +438,7 @@ class Context:
             return []
 
         nodes = self._db.get_ancestors(self._tail_node_id)
+
         entries: list[HistoryEntry] = []
         for i, node in enumerate(nodes):
             # Deserialise content: JSON → list if it was stored as list.
@@ -605,9 +606,12 @@ class Context:
                 merged.append(dict(m))
 
         # Token budget enforcement
-        self.state["tokens_used"] = self._count_tokens(merged, tools)
+        self.state["tokens_used_pre_trim"] = self._count_tokens(merged, tools)
+        self.state["tokens_used"] = self.state["tokens_used_pre_trim"]
+        self.state["budget_trimmed"] = False
 
         while self.state["tokens_used"] > self.token_limit:
+            self.state["budget_trimmed"] = True
             drop_idx = next(
                 (i for i, m in enumerate(merged) if m["role"] != ROLE_SYSTEM),
                 None,

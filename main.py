@@ -19,7 +19,7 @@ import importlib
 import logging
 from pathlib import Path
 
-from config import load as load_config, apply_logging
+from config import load as load_config, apply_logging, resolve_log_level
 from router import Router
 
 logger = logging.getLogger(__name__)
@@ -28,9 +28,17 @@ BRIDGES_DIR = Path("bridges")
 GATEWAY_MOD = "gateway.__main__"
 
 
+def _startup_log_level(cfg) -> int:
+    level = resolve_log_level(cfg.logging.level, default=logging.INFO)
+    cli_cfg = cfg.bridges.get("cli")
+    if cli_cfg and cli_cfg.enabled and bool(cli_cfg.options.get("quiet_startup", True)):
+        return max(level, logging.WARNING)
+    return level
+
+
 async def main() -> None:
     cfg = load_config()
-    apply_logging(cfg.logging)
+    apply_logging(cfg.logging, level_override=_startup_log_level(cfg))
 
     gw = Router(config=cfg)
 

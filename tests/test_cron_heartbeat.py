@@ -227,12 +227,10 @@ class TestNoopHandler:
 # ---------------------------------------------------------------------------
 
 class TestCronRunnerRegistersHandler:
-    def test_lazy_registers_noop_platform_handler_on_first_job_run(self, tmp_path):
+    def test_start_registers_noop_platform_handler_when_gateway_exists(self, tmp_path):
         """
-        Fix verification: the noop handler must be registered before any job
-        events are dispatched.  Because agent.gateway is None during start()
-        (Lane.__post_init__ sets it after AgentLoop.__init__ returns), the
-        registration must happen lazily inside _run_job().
+        If agent.gateway already exists when start() runs, the cron platform
+        sentinel should be registered immediately.
         """
         agent, gateway = _make_agent_and_gateway(tmp_path)
 
@@ -240,10 +238,8 @@ class TestCronRunnerRegistersHandler:
         assert gateway._platform_handlers.get(_CRON_PLATFORM) is None
 
         runner = _CronRunner(agent, tmp_path / "CRON.json")
-        # start() must NOT register when gateway is available (it can't be).
         runner.start()
-        # Still empty — registration is deferred.
-        assert gateway._platform_handlers.get(_CRON_PLATFORM) is None
+        assert gateway._platform_handlers.get(_CRON_PLATFORM) is _noop_reply_handler
 
     @pytest.mark.asyncio
     async def test_noop_registered_before_first_job_events(self, tmp_path):
@@ -297,6 +293,7 @@ def _make_agent_and_gateway(tmp_path):
     gateway.unregister_cursor_handler = MagicMock()
     gateway.abort_generation = MagicMock()
     gateway.reset_lane = MagicMock()
+    gateway._platform_handlers = {}
     gateway._lane_router = MagicMock()
     gateway._lane_router._lanes = {}
     return agent, gateway

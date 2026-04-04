@@ -296,6 +296,57 @@ class TestContextDBBacked:
         messages = ctx.assemble()
         assert any(m["content"] == "in-memory message" for m in messages if m["role"] == "user")
 
+    def test_compact_replaces_active_db_history_with_summary_and_tail(self, ctx_db):
+        ctx, db, _ = ctx_db
+        old_user = ctx.add(HistoryEntry.user("old user"))
+        old_asst = ctx.add(HistoryEntry.assistant("old reply"))
+        keep_user = ctx.add(HistoryEntry.user("recent user"))
+        keep_asst = ctx.add(HistoryEntry.assistant("recent reply"))
+
+        active = ctx.compact(
+            "Compact summary:\n- old user\n- old reply",
+            preserved_tail=[keep_user, keep_asst],
+            metadata={"entries_summarized": 2},
+        )
+
+        assert [e.role for e in active] == ["user", "user", "assistant"]
+        assert active[0].content.startswith("Compact summary:")
+        assert active[1].content == "recent user"
+        assert active[2].content == "recent reply"
+
+        ancestors = db.get_ancestors(ctx.tail_node_id)
+        assert any(
+            node.role == "system" and node.content.startswith("__tinyctx_compact_boundary__:")
+            for node in ancestors
+        )
+
+        ctx.dialogue.clear()
+        messages = ctx.assemble()
+        rendered = [(m["role"], m["content"]) for m in messages]
+        assert rendered == [
+            ("user", "Compact summary:\n- old user\n- old reply\n\nrecent user"),
+            ("assistant", "recent reply"),
+        ]
+
+    def test_compact_rewrites_in_memory_dialogue(self):
+        ctx = Context()
+        keep_asst = HistoryEntry.assistant("recent reply")
+        ctx.add(HistoryEntry.user("old user"))
+        ctx.add(HistoryEntry.assistant("old reply"))
+
+        active = ctx.compact(
+            "Compact summary:\n- old user\n- old reply",
+            preserved_tail=[HistoryEntry.user("recent user"), keep_asst],
+        )
+
+        assert [e.role for e in active] == ["user", "user", "assistant"]
+        assert active[0].content.startswith("Compact summary:")
+        messages = ctx.assemble()
+        assert [(m["role"], m["content"]) for m in messages] == [
+            ("user", "Compact summary:\n- old user\n- old reply\n\nrecent user"),
+            ("assistant", "recent reply"),
+        ]
+
 
 # ===========================================================================
 # AgentLoop DB integration tests

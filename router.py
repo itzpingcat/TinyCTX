@@ -23,6 +23,13 @@ Synthetic turns
 ---------------
 Router.push_synthetic(node_id) enqueues None to the lane. The drain worker
 calls loop.run(None) which skips Stage 1 (no user intake).
+
+Command registry
+----------------
+Router.commands is a CommandRegistry. Modules register slash commands at
+register() time via agent.commands (agent.commands is the same object).
+Bridges call router.commands.dispatch(text, context) before pushing to the
+router; dispatch() returns True if handled so the bridge can skip push().
 """
 
 from __future__ import annotations
@@ -39,6 +46,7 @@ from contracts import (
 )
 from agent import AgentLoop
 from config import Config
+from utils.commands import CommandRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +75,13 @@ class Lane:
             config=self.config,
         )
         self.loop.gateway = self.router
+        # Expose the shared command registry to the agent loop so modules can
+        # register commands at register() time via agent.commands.
+        self.loop.commands = self.router.commands
+        # Load modules NOW — after commands is wired — so modules that call
+        # agent.commands.register() see the shared router registry, not the
+        # throwaway CommandRegistry created in AgentLoop.__init__.
+        self.loop.load_modules()
 
     def start(self) -> None:
         if self._worker is None or self._worker.done():
@@ -253,7 +268,7 @@ class GroupLane:
 
 
 # ---------------------------------------------------------------------------
-# _SessionRouter
+# _LaneRouter
 # ---------------------------------------------------------------------------
 
 class _LaneRouter:
@@ -262,6 +277,20 @@ class _LaneRouter:
         self._event_handler = event_handler
         self._router        = router
         self._lanes: dict[str, "Lane | GroupLane"] = {}  # node_id → lane
+
+    def ensure_lane(self, node_id: str) -> "Lane":
+        """Return the lane for node_id, creating it if needed. No work enqueued."""
+        if node_id not in self._lanes:
+            lane = Lane(
+                node_id=node_id,
+                config=self._config,
+                event_handler=self._event_handler,
+                router=self._router,
+            )
+            lane.start()
+            self._lanes[node_id] = lane
+            logger.info("Opened lane %s (eager)", node_id)
+        return self._lanes[node_id]  # type: ignore[return-value]
 
     async def route(self, msg: InboundMessage) -> bool:
         lane = self._get_or_create(msg.tail_node_id, msg)
@@ -323,6 +352,8 @@ class Router:
         self._platform_handlers: dict[str, EventHandler] = {}
         self._cursor_handlers:   dict[str, EventHandler] = {}  # node_id → handler
         self._node_platforms:    dict[str, str]           = {}  # node_id → platform value
+        # Shared command registry — modules register commands, bridges dispatch.
+        self.commands            = CommandRegistry()
         self._lane_router        = _LaneRouter(
             config=config,
             event_handler=self._dispatch_event,
@@ -351,6 +382,18 @@ class Router:
     async def push_synthetic(self, node_id: str) -> bool:
         """Queue a generation with no new user message (run(None))."""
         return await self._lane_router.enqueue_synthetic(node_id)
+
+    def open_lane(self, node_id: str, platform: str) -> None:
+        """
+        Eagerly open a lane for node_id without enqueuing any work.
+
+        Creates the Lane (which triggers load_modules() and populates the
+        shared command registry) and registers the platform so events from
+        the lane can be dispatched. Safe to call multiple times — a no-op
+        if the lane already exists.
+        """
+        self._node_platforms[node_id] = platform
+        self._lane_router.ensure_lane(node_id)
 
     async def _dispatch_event(self, event: AgentEvent) -> None:
         # Use lane_node_id (stable original cursor) for dispatch, not tail_node_id

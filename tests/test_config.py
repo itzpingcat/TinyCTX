@@ -243,6 +243,7 @@ class TestLoadHappyPath:
         cfg = load(str(p))
         assert "main" in cfg.models
         assert cfg.llm.primary == "main"
+        assert getattr(cfg, "_source_path") == p.resolve()
 
     def test_models_parsed(self, tmp_path):
         p = _write_config(tmp_path, _minimal())
@@ -377,7 +378,7 @@ class TestLoadHappyPath:
         p = _write_config(tmp_path, _minimal())
         cfg = load(str(p))
         assert cfg.context == 16384
-        assert cfg.max_tool_cycles == 10
+        assert cfg.max_tool_cycles == 20
         assert cfg.gateway.enabled is False
         assert cfg.logging.level == "INFO"
 
@@ -473,3 +474,4 @@ class TestLoadErrors:
         p = _write_config(tmp_path, _minimal("logging:\n  level: CHATTY"))
         with pytest.raises(ValueError, match="Invalid log level"):
             load(str(p))
+

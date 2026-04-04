@@ -91,10 +91,15 @@ gateway:
 bridges:
   # --------------------------------------------------------------------------
   # CLI bridge — interactive terminal session.
-  # No extra options needed.
+  # quiet_startup hides startup/runtime INFO chatter in the terminal.
+  # log_level defaults to WARNING for the CLI; set to inherit or INFO if you
+  # want to see module/server logs live while chatting.
   # --------------------------------------------------------------------------
   cli:
     enabled: true
+    options:
+      quiet_startup: true
+      log_level: WARNING
 
   # --------------------------------------------------------------------------
   # Discord bridge
@@ -271,7 +276,7 @@ memory_search:
 # web:  (consumed by modules/web)
 #
 # Per-tool visibility — defaults:
-#   web_search, navigate:  always_on
+#   web_search, browse_url, navigate:  always_on
 #   all other tools:       deferred
 #
 # Override individual tools:
@@ -279,6 +284,7 @@ memory_search:
 # web:
 #   tools:
 #     web_search:    always_on
+#     browse_url:    always_on
 #     navigate:      always_on
 #     http_request:  deferred
 #     screenshot:    disabled

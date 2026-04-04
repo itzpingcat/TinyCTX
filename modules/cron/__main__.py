@@ -383,10 +383,8 @@ class _CronRunner:
         self._reload_if_changed()
         self._recompute_next_runs()
         self._save()
+        self._ensure_noop_platform_handler()
         self._arm()
-        # Note: we'd like to register the noop platform handler here, but
-        # agent.gateway is set by Lane.__post_init__ *after* register() returns,
-        # so it's None at this point. Registration is done lazily in _run_job().
         logger.info("[cron] started with %d job(s)", len(self._jobs))
 
     def stop(self) -> None:
@@ -442,6 +440,24 @@ class _CronRunner:
 
         self._timer_task = asyncio.get_event_loop().create_task(_tick())
 
+    def _ensure_noop_platform_handler(self) -> None:
+        gateway = getattr(self._agent, "gateway", None)
+        if gateway is None:
+            return
+
+        handlers = getattr(gateway, "_platform_handlers", None)
+        if not isinstance(handlers, dict):
+            return
+
+        if handlers.get(_CRON_PLATFORM) is None:
+            handlers[_CRON_PLATFORM] = _noop_reply_handler
+            register = getattr(gateway, "register_platform_handler", None)
+            if callable(register):
+                try:
+                    register(_CRON_PLATFORM, _noop_reply_handler)
+                except Exception:
+                    pass
+
     async def _on_timer(self) -> None:
         self._reload_if_changed()
         now = _now_ms()
@@ -489,12 +505,10 @@ class _CronRunner:
                 job.state.last_error  = "agent.gateway not available"
                 return
 
-            # Lazily register the noop platform handler the first time a job
-            # runs. Can't do this in start() because agent.gateway is set by
-            # Lane.__post_init__ after AgentLoop.__init__ (and _load_modules /
-            # register) has already returned, so it's None at that point.
-            if not gateway._platform_handlers.get(_CRON_PLATFORM):
-                gateway.register_platform_handler(_CRON_PLATFORM, _noop_reply_handler)
+            # Normal app startup sets agent.gateway after module registration,
+            # so keep a lazy path here even though start() also registers when
+            # the gateway is already available.
+            self._ensure_noop_platform_handler()
 
             node_id = self._get_or_create_job_cursor(job, gateway)
 
@@ -539,7 +553,23 @@ class _CronRunner:
 
             reply_text = "".join(parts).strip()
             if reply_text:
-                print(f"\n[CRON: {job.name}]\n{reply_text}\n")
+                logger.info("[cron] job '%s' reply:\n%s", job.name, reply_text)
+
+            # Advance the job cursor to the lane's latest tail so the next run
+            # continues from the updated branch head.
+            lane_router = getattr(gateway, "_lane_router", None)
+            lanes = getattr(lane_router, "_lanes", None)
+            if isinstance(lanes, dict):
+                lane = lanes.get(node_id)
+                loop_owner = lane
+                if getattr(loop_owner, "loop", None) is None:
+                    nested_lane = getattr(loop_owner, "_lane", None)
+                    if nested_lane is not None:
+                        loop_owner = nested_lane
+                loop = getattr(loop_owner, "loop", None)
+                tail = getattr(loop, "_tail_node_id", None)
+                if tail:
+                    job.cursor_node_id = tail
 
             job.state.last_status = "ok"
             job.state.last_error  = None

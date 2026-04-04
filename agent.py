@@ -53,6 +53,7 @@ import asyncio
 import importlib
 import json
 import logging
+import re
 import uuid
 from pathlib import Path
 from typing import AsyncIterator, Callable, Awaitable
@@ -67,11 +68,19 @@ from config import Config, ModelConfig
 from ai import LLM, TextDelta, ThinkingDelta, ToolCallAssembled, LLMError
 from utils.tool_handler import ToolCallHandler
 from utils.attachments import build_content_blocks
+from utils.commands import CommandRegistry
 from db import ConversationDB
 
 logger = logging.getLogger(__name__)
 
 MODULES_DIR = Path("modules")
+_EXIT_ERROR_RE = re.compile(r"(^|\n)\[exit \d+\](?=\n|$)")
+
+def _looks_like_failed_tool_output(output: str) -> bool:
+    lowered = (output or "").lstrip().lower()
+    if lowered.startswith("[error") or lowered.startswith("[blocked") or lowered.startswith("error:"):
+        return True
+    return bool(_EXIT_ERROR_RE.search(output or ""))
 
 
 def _build_llm(cfg: ModelConfig) -> LLM:
@@ -101,7 +110,7 @@ async def _run_background(tail_node_id: str, config: Config) -> None:
         asyncio.create_task(_run_background(opening.id, agent.config))
     """
     try:
-        loop = AgentLoop(tail_node_id=tail_node_id, config=config)
+        loop = AgentLoop(tail_node_id=tail_node_id, config=config, is_subagent=True)
         async for _ in loop.run(msg=None):
             pass  # events discarded
     except Exception:
@@ -109,16 +118,18 @@ async def _run_background(tail_node_id: str, config: Config) -> None:
 
 
 class AgentLoop:
-    def __init__(self, tail_node_id: str, config: Config) -> None:
+    def __init__(self, tail_node_id: str, config: Config, *, is_subagent: bool = False) -> None:
         self.tail_node_id  = tail_node_id  # cursor — the DB node this agent runs from
         self.lane_node_id  = tail_node_id  # original lane key — never changes
         self.config        = config
+        self.is_subagent   = is_subagent
         primary_mc         = config.models.get(config.llm.primary)
         self.context       = Context(
             token_limit=config.context,
             image_tokens_per_block=primary_mc.tokens_per_image if primary_mc else 280,
         )
         self.tool_handler  = ToolCallHandler()
+        self.commands      = CommandRegistry()  # replaced by Lane with the shared router registry
         self._turn_count   = 0
         self.gateway       = None  # set by Lane after construction
 
@@ -130,10 +141,7 @@ class AgentLoop:
         self.context.set_cursor_callback(self._on_context_tail_advance)
 
         # Background hooks: called after AgentTextFinal with (tail_node_id, config).
-        # Each hook is responsible for spawning its own detached task if needed.
         self._background_hooks: list[Callable[[str, Config], Awaitable[None]]] = []
-
-        self._pending_background_branches: list[str] = []
 
         self._models: dict[str, LLM] = {
             name: _build_llm(mc)
@@ -142,7 +150,13 @@ class AgentLoop:
         }
 
         self.tool_handler.register_tool(self.tool_handler.tools_search, always_on=True)
-        self._load_modules()
+        # NOTE: _load_modules() is NOT called here. Lane.__post_init__ wires
+        # self.commands = router.commands first, then calls load_modules() so
+        # modules register their commands into the shared registry.
+        # Exception: subagent loops (background branches) have no Lane and
+        # don't need commands — they load modules immediately.
+        if is_subagent:
+            self.load_modules()
 
     # ------------------------------------------------------------------
     # DB
@@ -182,28 +196,7 @@ class AgentLoop:
     def register_background_hook(
         self, fn: Callable[[str, Config], Awaitable[None]]
     ) -> None:
-        """
-        Register an async hook to be called after each interactive turn
-        completes (after AgentTextFinal is yielded).
-
-        fn(tail_node_id: str, config: Config) -> Awaitable[None]
-
-        The hook receives the tail node_id at the moment the turn finished
-        and the agent's config. It is responsible for spawning its own
-        detached asyncio.create_task() if it needs to run in the background
-        without blocking. Hooks are called sequentially in registration order;
-        exceptions are caught and logged.
-
-        Typical usage (memory module):
-            def register(agent):
-                async def _memory_hook(tail_node_id, config):
-                    opening = agent._db.add_node(
-                        parent_id=tail_node_id, role="user",
-                        content="Consolidate memory from this conversation.",
-                    )
-                    asyncio.create_task(_run_background(opening.id, config))
-                agent.register_background_hook(_memory_hook)
-        """
+        """Register an async hook called after each turn with (tail_node_id, config)."""
         self._background_hooks.append(fn)
 
     async def _fire_background_hooks(self, tail_node_id: str) -> None:
@@ -218,7 +211,7 @@ class AgentLoop:
     # Module loader
     # ------------------------------------------------------------------
 
-    def _load_modules(self) -> None:
+    def load_modules(self) -> None:
         if not MODULES_DIR.exists():
             return
         for entry in sorted(MODULES_DIR.iterdir()):
@@ -302,7 +295,6 @@ class AgentLoop:
         streaming_active = False
 
         for cycle in range(max_cycles):
-
             # Abort check between cycles
             if abort_event and abort_event.is_set():
                 logger.info("[%s] aborted before cycle %d", self._tail_node_id, cycle)
@@ -315,18 +307,14 @@ class AgentLoop:
             messages = self.context.assemble(tools=tools)
 
             # Token budget telemetry
-            tokens_used = self.context.state.get("tokens_used", 0)
+            tokens_used = int(self.context.state.get("tokens_used_pre_trim", 0) or 0)
+            active_tokens = int(self.context.state.get("tokens_used", 0) or 0)
             token_limit = self.config.context
             token_pct   = tokens_used / token_limit if token_limit else 0
-            if token_pct >= 0.95:
-                logger.warning(
-                    "[cursor=%s] context at %.0f%% of token budget (%d/%d) — consider compaction",
-                    self._tail_node_id, token_pct * 100, tokens_used, token_limit,
-                )
-            elif token_pct >= 0.80:
+            if token_pct >= 0.80:
                 logger.info(
-                    "[cursor=%s] context at %.0f%% of token budget (%d/%d)",
-                    self._tail_node_id, token_pct * 100, tokens_used, token_limit,
+                    "[cursor=%s] context at %.0f%% of token budget (%d/%d, active=%d)",
+                    self._tail_node_id, token_pct * 100, tokens_used, token_limit, active_tokens,
                 )
 
             # Stage 3: Inference — walk primary → fallback chain
@@ -446,18 +434,13 @@ class AgentLoop:
 
         yield AgentTextFinal(text=final_text if not streaming_active else "", **ev)
 
-        # Phase 3: fire any background branches registered this turn.
-        for branch_node_id in self._pending_background_branches:
-            asyncio.ensure_future(self._run_background(branch_node_id))
-        self._pending_background_branches.clear()
-
-        # Phase 3: fire background hooks after the turn completes.
-        # Skipped for synthetic turns — they are already background work.
+        # Fire background hooks after the turn completes.
+        # Skipped for synthetic turns — they are themselves background work.
         if not is_synthetic and self._background_hooks:
             await self._fire_background_hooks(self._tail_node_id)
 
     # ------------------------------------------------------------------
-    # Background branch runner (Phase 3)
+    # Background branch runner
     # ------------------------------------------------------------------
 
     async def _run_background(self, tail_node_id: str) -> None:
@@ -468,7 +451,7 @@ class AgentLoop:
         """
         logger.debug("[background] starting branch tail=%s", tail_node_id)
         try:
-            loop = AgentLoop(tail_node_id=tail_node_id, config=self.config)
+            loop = AgentLoop(tail_node_id=tail_node_id, config=self.config, is_subagent=True)
             async for _ in loop.run(msg=None):
                 pass  # discard events
             logger.debug("[background] branch complete tail=%s", tail_node_id)
@@ -477,23 +460,31 @@ class AgentLoop:
 
     def queue_background_branch(self, tail_node_id: str) -> None:
         """
-        Schedule a background branch to be fired after the current turn yields
-        AgentTextFinal. Called by modules (e.g. memory) during a hook.
+        Deprecated — call asyncio.create_task(_run_background(node_id, config)) directly.
+        Kept temporarily so old call sites fail loudly rather than silently.
         """
-        self._pending_background_branches.append(tail_node_id)
+        raise RuntimeError(
+            "queue_background_branch() is removed. "
+            "Use asyncio.create_task(_run_background(node_id, agent.config)) directly."
+        )
 
     # ------------------------------------------------------------------
     # Tool execution
     # ------------------------------------------------------------------
 
-    async def _execute_tool(self, call: ToolCall) -> ToolResult:
+    async def _execute_tool(
+        self,
+        call: ToolCall
+    ) -> ToolResult:
+        cache_key = None
+
         proxy = {
             "function": {"name": call.tool_name, "arguments": call.args},
             "id": call.call_id,
         }
         result = await self.tool_handler.execute_tool_call(proxy)
         raw_output = str(result.get("result", result.get("error", "[no output]")))
-        is_error    = not result.get("success", False)
+        is_error    = (not result.get("success", False)) or _looks_like_failed_tool_output(raw_output)
 
         # --- vision unwrap ---
         # If view() returned an IMAGE_BLOCK sentinel and the primary model
@@ -509,7 +500,7 @@ class AgentLoop:
 
             primary_cfg = self.config.get_model_config(self.config.llm.primary)
             if primary_cfg.supports_vision:
-                return ToolResult(
+                tool_result = ToolResult(
                     call_id=call.call_id,
                     tool_name=call.tool_name,
                     output=f"[image/{mime} — see attached image below]",
@@ -518,6 +509,7 @@ class AgentLoop:
                     image_mime=mime,
                     image_b64=b64data,
                 )
+                return tool_result
             else:
                 # Model doesn't support vision — return a friendly stub.
                 raw_output = (
@@ -525,12 +517,13 @@ class AgentLoop:
                     "support vision. Use a vision-capable model to inspect this file.]"
                 )
 
-        return ToolResult(
+        tool_result = ToolResult(
             call_id=call.call_id,
             tool_name=call.tool_name,
             output=raw_output,
             is_error=is_error,
         )
+        return tool_result
 
     # ------------------------------------------------------------------
     # Lifecycle

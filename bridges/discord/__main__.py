@@ -583,6 +583,22 @@ class DiscordBridge:
             if not text and not attachments:
                 return
 
+            # Slash commands in DMs also go through the module registry.
+            if text.startswith("/"):
+                dm_cursor_key = f"dm:{message.author.id}"
+                dm_node_id    = self._get_or_create_cursor(dm_cursor_key)
+                ctx = {
+                    "channel": message.channel,
+                    "message": message,
+                    "guild":   None,
+                    "bridge":  self,
+                    "router":  self._router,
+                    "cursor":  dm_node_id,
+                }
+                handled = await self._router.commands.dispatch(text, ctx)
+                if handled:
+                    return
+
             cursor_key = f"dm:{message.author.id}"
             node_id    = self._get_or_create_cursor(cursor_key)
             author     = UserIdentity(
@@ -629,6 +645,21 @@ class DiscordBridge:
             else:
                 await message.channel.send("⛔ Only admins can reset the session.")
             return
+
+        # ── Slash commands (module registry) ─────────────────────────
+        if raw_text.startswith("/"):
+            node_id = self._get_or_create_cursor(cursor_key)
+            ctx = {
+                "channel":  message.channel,
+                "message":  message,
+                "guild":    message.guild,
+                "bridge":   self,
+                "router":   self._router,
+                "cursor":   node_id,
+            }
+            handled = await self._router.commands.dispatch(raw_text, ctx)
+            if handled:
+                return
 
         mentioned  = self._client.user is not None and self._client.user in message.mentions
         prefixed   = raw_text.startswith(self._prefix)
@@ -685,6 +716,20 @@ class DiscordBridge:
             return
 
         node_id = self._get_or_create_thread_cursor(thread_id, channel_id)
+
+        # Slash commands in threads also go through the module registry.
+        if text.startswith("/"):
+            ctx = {
+                "channel": message.channel,
+                "message": message,
+                "guild":   message.guild,
+                "bridge":  self,
+                "router":  self._router,
+                "cursor":  node_id,
+            }
+            handled = await self._router.commands.dispatch(text, ctx)
+            if handled:
+                return
         author  = UserIdentity(
             platform=Platform.DISCORD,
             user_id=str(message.author.id),
