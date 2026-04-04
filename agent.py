@@ -75,39 +75,6 @@ logger = logging.getLogger(__name__)
 MODULES_DIR = Path("modules")
 _EXIT_ERROR_RE = re.compile(r"(^|\n)\[exit \d+\](?=\n|$)")
 
-
-def _tool_cache_key(call: ToolCall) -> str:
-    return call.tool_name + "::" + json.dumps(call.args, sort_keys=True, ensure_ascii=False)
-
-
-def _summarize_cached_tool_call(call: ToolCall, *, max_chars: int = 160) -> str:
-    if not call.args:
-        return f"{call.tool_name}()"
-    parts = [
-        f"{key}={json.dumps(value, ensure_ascii=False)}"
-        for key, value in sorted(call.args.items())
-    ]
-    summary = f"{call.tool_name}(" + ", ".join(parts) + ")"
-    summary = summary.replace("\n", " ")
-    if len(summary) > max_chars:
-        return summary[: max_chars - 1] + "…"
-    return summary
-
-
-def _cached_tool_result_notice(call: ToolCall, *, is_error: bool) -> str:
-    if is_error:
-        return (
-            "[error: cached exact same tool call reused earlier error from this turn: "
-            + _summarize_cached_tool_call(call)
-            + " — refer to the previous tool result instead of calling it again]"
-        )
-    return (
-        "[cached exact same tool call reused earlier result from this turn: "
-        + _summarize_cached_tool_call(call)
-        + " — refer to the previous tool result instead of calling it again]"
-    )
-
-
 def _looks_like_failed_tool_output(output: str) -> bool:
     lowered = (output or "").lstrip().lower()
     if lowered.startswith("[error") or lowered.startswith("[blocked") or lowered.startswith("error:"):
@@ -342,7 +309,6 @@ class AgentLoop:
         max_cycles       = self.config.max_tool_cycles
         final_text       = ""
         streaming_active = False
-        tool_result_cache: dict[str, ToolResult] = {}
 
         for cycle in range(max_cycles):
             # Abort check between cycles
@@ -457,7 +423,7 @@ class AgentLoop:
             logger.debug("[%s] cycle %d — %d tool call(s)", self._tail_node_id, cycle, len(tool_calls))
             for tc in tool_calls:
                 yield AgentToolCall(call_id=tc.call_id, tool_name=tc.tool_name, args=tc.args, **ev)
-                result = await self._execute_tool(tc, tool_result_cache=tool_result_cache)
+                result = await self._execute_tool(tc)
                 self.context.add(HistoryEntry.tool_result(result))
                 # For image results, inject a follow-up user message with the image_url
                 # block.  OpenAI-compat servers don't support list content in tool result
@@ -526,26 +492,9 @@ class AgentLoop:
 
     async def _execute_tool(
         self,
-        call: ToolCall,
-        *,
-        tool_result_cache: dict[str, ToolResult] | None = None,
+        call: ToolCall
     ) -> ToolResult:
         cache_key = None
-        if tool_result_cache is not None:
-            cache_key = _tool_cache_key(call)
-            cached = tool_result_cache.get(cache_key)
-            if cached is not None:
-                logger.info(
-                    "[cursor=%s] reusing cached tool result for %s",
-                    self._tail_node_id, call.tool_name,
-                )
-                return ToolResult(
-                    call_id=call.call_id,
-                    tool_name=call.tool_name,
-                    output=_cached_tool_result_notice(call, is_error=cached.is_error),
-                    is_error=cached.is_error,
-                    is_image=False,
-                )
 
         proxy = {
             "function": {"name": call.tool_name, "arguments": call.args},
@@ -578,8 +527,6 @@ class AgentLoop:
                     image_mime=mime,
                     image_b64=b64data,
                 )
-                if cache_key is not None and tool_result_cache is not None:
-                    tool_result_cache[cache_key] = tool_result
                 return tool_result
             else:
                 # Model doesn't support vision — return a friendly stub.
@@ -594,8 +541,6 @@ class AgentLoop:
             output=raw_output,
             is_error=is_error,
         )
-        if cache_key is not None and tool_result_cache is not None:
-            tool_result_cache[cache_key] = tool_result
         return tool_result
 
     # ------------------------------------------------------------------
