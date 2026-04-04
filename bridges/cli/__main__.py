@@ -11,7 +11,18 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import sys
 import pyfiglet
+
+if sys.platform == "win32":
+    import ctypes
+    # Enable ANSI/VT processing on stdout before Rich Console is constructed.
+    # Without this, Live's cursor-up escape sequences are printed literally
+    # instead of executed, causing each update() to append a new copy of the
+    # rendered content rather than overwriting the previous one.
+    kernel32 = ctypes.windll.kernel32
+    kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
+
 from rich.console import Console, Group
 from rich.logging import RichHandler
 from rich.markdown import Markdown
