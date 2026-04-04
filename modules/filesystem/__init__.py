@@ -1,9 +1,9 @@
 EXTENSION_META = {
     "name":    "filesystem",
-    "version": "2.0",
+    "version": "3.0",
     "description": (
-        "Core filesystem tools modelled after Claude's own tool suite: "
-        "bash, view, create_file, str_replace. "
+        "Core filesystem tools: shell, view, write_file, str_replace, grep, glob_search. "
+        "grep wraps ripgrep (with Python fallback). glob_search finds files by pattern. "
         "view automatically converts files via registered handlers (pdf, images, etc)."
     ),
     "default_config": {
