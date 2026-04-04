@@ -40,10 +40,23 @@ class _MockToolHandler:
         self.tools[func.__name__] = func
 
 
+class _MockContext:
+    def __init__(self):
+        self.prompts: dict = {}
+
+    def register_prompt(self, pid, provider, *, role="system", priority=0):
+        self.prompts[pid] = {
+            "provider": provider,
+            "role": role,
+            "priority": priority,
+        }
+
+
 class _MockAgent:
     def __init__(self, ws_path: str):
         self.config = _MockConfig(ws_path)
         self.tool_handler = _MockToolHandler()
+        self.context = _MockContext()
 
 
 @pytest.fixture
@@ -81,6 +94,21 @@ def tools(workspace):
     agent = _MockAgent(str(workspace))
     register(agent)
     return agent.tool_handler.tools
+
+
+@pytest.fixture
+def filesystem_agent(workspace):
+    """Register the filesystem module and return the mock agent."""
+    import sys
+    project_root = str(Path(__file__).resolve().parent.parent)
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+
+    from modules.filesystem.__main__ import register
+
+    agent = _MockAgent(str(workspace))
+    register(agent)
+    return agent
 
 
 # ===================================================================
@@ -229,6 +257,17 @@ class TestGlobSearch:
         lines = [l for l in result.strip().splitlines() if not l.startswith("[")]
         # hello.py should be first (newest)
         assert lines[0] == "hello.py"
+
+
+class TestFilesystemPrompt:
+    def test_prompt_includes_workspace_and_source_root(self, filesystem_agent, workspace):
+        prompt_info = filesystem_agent.context.prompts["filesystem_tools"]
+        prompt = prompt_info["provider"](None)
+
+        assert str(workspace) in prompt
+        assert str(Path.cwd().resolve()) in prompt
+        assert "Do not waste tool calls rediscovering the repo path" in prompt
+        assert "Prefer view(), grep(), and glob_search()" in prompt
 
 
 # ===================================================================

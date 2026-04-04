@@ -85,15 +85,34 @@ _EXT_TO_MIME: dict[str, str] = {
 }
 
 
-def _filesystem_prompt(_ctx) -> str:
-    return (
-        "<filesystem>\n"
-        "- The shell() tool runs PowerShell on Windows and bash on Linux/macOS.\n"
-        "- On Windows, prefer PowerShell-native commands such as Get-ChildItem, Get-Content, Get-Location, and Select-String.\n"
-        "- Avoid Unix-only flags like `ls -la` on Windows.\n"
-        "- Prefer view(), grep(), and glob_search() for file inspection when they are sufficient.\n"
-        "</filesystem>"
-    )
+def _filesystem_prompt(workspace: Path, source_root: Path):
+    workspace_str = str(workspace)
+    source_root_str = str(source_root)
+
+    lines = [
+        "<filesystem>",
+        f"- Persistent workspace root: {workspace_str}",
+        "- The shell() tool runs PowerShell on Windows and bash on Linux/macOS.",
+        f"- shell() starts in the workspace root above, not necessarily in the source checkout.",
+    ]
+
+    if source_root_str != workspace_str:
+        lines.extend([
+            f"- Current launch/source directory: {source_root_str}",
+            "- If the user asks about TinyCTX's own code, the repo, or 'your code', start from the source directory above.",
+            "- Do not waste tool calls rediscovering the repo path with shell listings when it is already provided here.",
+            "- Prefer view(), grep(), and glob_search() against that path for code inspection; they accept absolute paths.",
+        ])
+    else:
+        lines.append("- The workspace root above is also the current launch/source directory.")
+
+    lines.extend([
+        "- On Windows, prefer PowerShell-native commands such as Get-ChildItem, Get-Content, Get-Location, and Select-String.",
+        "- Avoid Unix-only flags like `ls -la` on Windows.",
+        "- Prefer view(), grep(), and glob_search() for file inspection when they are sufficient.",
+        "</filesystem>",
+    ])
+    return "\n".join(lines)
 
 
 def _image_mime(path: Path) -> str | None:
@@ -109,6 +128,7 @@ def _image_mime(path: Path) -> str | None:
 
 def register(agent) -> None:
     workspace = Path(agent.config.workspace.path).expanduser().resolve()
+    source_root = Path.cwd().resolve()
     workspace.mkdir(parents=True, exist_ok=True)
 
     shell_timeout: int = getattr(agent.config, 'shell_timeout', 60)
@@ -116,7 +136,7 @@ def register(agent) -> None:
     if hasattr(agent, "context"):
         agent.context.register_prompt(
             "filesystem_tools",
-            _filesystem_prompt,
+            lambda _ctx: _filesystem_prompt(workspace, source_root),
             role="system",
             priority=11,
         )
