@@ -95,14 +95,14 @@ class MemoryIndexer:
             self._store.commit()
 
         # Index dirty files
-        dirty: list[Path] = []
+        dirty: list[tuple[Path, str, str]] = []
         for path_str in sorted(disk_paths):
             path = Path(path_str)
             try:
                 content      = path.read_text(encoding="utf-8")
                 content_hash = _md5(content)
                 if self._store.is_dirty(path_str, content_hash, self._embedding_model):
-                    dirty.append(path)
+                    dirty.append((path, content, content_hash))
             except Exception as exc:
                 logger.warning("[memory/indexer] could not read %s: %s", path, exc)
 
@@ -111,18 +111,11 @@ class MemoryIndexer:
             return
 
         logger.info("[memory/indexer] indexing %d dirty file(s)", len(dirty))
-        for path in dirty:
-            await self._index_file(path)
+        for path, content, content_hash in dirty:
+            await self._index_file(path, content, content_hash)
 
-    async def _index_file(self, path: Path) -> None:
+    async def _index_file(self, path: Path, content: str, content_hash: str) -> None:
         path_str = str(path.resolve())
-        try:
-            content = path.read_text(encoding="utf-8")
-        except Exception as exc:
-            logger.warning("[memory/indexer] failed to read %s: %s", path, exc)
-            return
-
-        content_hash = _md5(content)
         mtime        = path.stat().st_mtime
         chunks       = self._strategy.chunk(content)
 

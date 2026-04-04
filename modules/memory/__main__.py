@@ -337,15 +337,13 @@ def register(agent) -> None:
         token_limit = agent.config.context
         nudge_delta = int(nudge_threshold * token_limit)
 
-        # Import _run_background here to avoid a circular import at module
-        # load time (agent imports memory, memory would import agent).
-        from agent import _run_background
-
         async def _consolidation_hook(tail_node_id: str, config) -> None:
             tokens_now      = agent.context.state.get("tokens_used", 0)
             tokens_at_nudge = agent.context.state.get("memory_nudge_tokens_at_last", 0)
+            current_limit   = int(getattr(config, "context", 0) or 0)
+            current_delta   = int(nudge_threshold * current_limit) if current_limit > 0 else nudge_delta
 
-            if tokens_now - tokens_at_nudge < nudge_delta:
+            if tokens_now - tokens_at_nudge < current_delta:
                 return
 
             import datetime
@@ -376,7 +374,7 @@ def register(agent) -> None:
             logger.info(
                 "[memory] background consolidation spawned off tail=%s "
                 "(delta %d/%d tokens since last nudge)",
-                tail_node_id, tokens_now - tokens_at_nudge, nudge_delta,
+                tail_node_id, tokens_now - tokens_at_nudge, current_delta,
             )
 
         agent.register_background_hook(_consolidation_hook)
