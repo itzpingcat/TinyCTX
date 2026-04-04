@@ -20,6 +20,8 @@ import yaml
 
 from config import (
     load,
+    update_config_values,
+    update_bridge_options,
     Config,
     ModelConfig,
     BridgeConfig,
@@ -243,6 +245,7 @@ class TestLoadHappyPath:
         cfg = load(str(p))
         assert "main" in cfg.models
         assert cfg.llm.primary == "main"
+        assert getattr(cfg, "_source_path") == p.resolve()
 
     def test_models_parsed(self, tmp_path):
         p = _write_config(tmp_path, _minimal())
@@ -377,7 +380,7 @@ class TestLoadHappyPath:
         p = _write_config(tmp_path, _minimal())
         cfg = load(str(p))
         assert cfg.context == 16384
-        assert cfg.max_tool_cycles == 10
+        assert cfg.max_tool_cycles == 20
         assert cfg.gateway.enabled is False
         assert cfg.logging.level == "INFO"
 
@@ -473,3 +476,39 @@ class TestLoadErrors:
         p = _write_config(tmp_path, _minimal("logging:\n  level: CHATTY"))
         with pytest.raises(ValueError, match="Invalid log level"):
             load(str(p))
+
+
+class TestUpdateBridgeOptions:
+    def test_updates_nested_bridge_options(self, tmp_path):
+        p = _write_config(tmp_path, _minimal("""
+            bridges:
+              cli:
+                enabled: true
+                options:
+                  quiet_startup: true
+        """))
+        update_bridge_options("cli", {"compact_tools": False}, path=p, enabled=True)
+        raw = yaml.safe_load(p.read_text(encoding="utf-8"))
+        assert raw["bridges"]["cli"]["enabled"] is True
+        assert raw["bridges"]["cli"]["options"]["quiet_startup"] is True
+        assert raw["bridges"]["cli"]["options"]["compact_tools"] is False
+
+    def test_migrates_flat_bridge_keys_to_options(self, tmp_path):
+        p = _write_config(tmp_path, _minimal("""
+            bridges:
+              cli:
+                enabled: true
+                quiet_startup: false
+        """))
+        update_bridge_options("cli", {"word_wrap": True}, path=p)
+        raw = yaml.safe_load(p.read_text(encoding="utf-8"))
+        assert raw["bridges"]["cli"]["options"]["quiet_startup"] is False
+        assert raw["bridges"]["cli"]["options"]["word_wrap"] is True
+
+
+class TestUpdateConfigValues:
+    def test_updates_top_level_values(self, tmp_path):
+        p = _write_config(tmp_path, _minimal("max_tool_cycles: 20"))
+        update_config_values({"max_tool_cycles": 30}, path=p)
+        raw = yaml.safe_load(p.read_text(encoding="utf-8"))
+        assert raw["max_tool_cycles"] == 30

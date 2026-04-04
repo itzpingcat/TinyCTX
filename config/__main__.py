@@ -168,7 +168,7 @@ class Config:
     gateway:         GatewayConfig           = field(default_factory=GatewayConfig)
     workspace:       WorkspaceConfig         = field(default_factory=WorkspaceConfig)
     logging:         LoggingConfig           = field(default_factory=LoggingConfig)
-    max_tool_cycles: int                     = 10
+    max_tool_cycles: int                     = 20
     context:         int                     = 16384
     attachments:     AttachmentConfig        = field(default_factory=AttachmentConfig)
     # Catch-all for unknown top-level keys (e.g. mcp:, custom module config, etc.)
@@ -365,7 +365,7 @@ def load(path="config.yaml") -> Config:
     # ------------------------------------------------------------------ extra
     extra = {k: v for k, v in raw.items() if k not in _KNOWN_KEYS}
 
-    return Config(
+    cfg = Config(
         models=models,
         llm=llm,
         router=RouterConfig(
@@ -376,11 +376,70 @@ def load(path="config.yaml") -> Config:
         gateway=gateway,
         workspace=workspace,
         logging=LoggingConfig(level=log_raw.get("level", "INFO")),
-        max_tool_cycles=int(raw.get("max_tool_cycles", 10)),
+        max_tool_cycles=int(raw.get("max_tool_cycles", 20)),
         context=int(raw.get("context", 16384)),
         attachments=attachments,
         extra=extra,
     )
+    setattr(cfg, "_source_path", p.resolve())
+    return cfg
+
+
+def update_config_values(
+    updates: dict,
+    *,
+    path: str | Path = "config.yaml",
+) -> Path:
+    """Persist top-level config values back into config.yaml."""
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Config file not found: {p.resolve()}")
+
+    with p.open(encoding="utf-8") as f:
+        raw = yaml.safe_load(f) or {}
+
+    raw.update(updates)
+
+    with p.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(raw, f, sort_keys=False)
+
+    return p.resolve()
+
+
+def update_bridge_options(
+    bridge_name: str,
+    updates: dict,
+    *,
+    path: str | Path = "config.yaml",
+    enabled: bool | None = None,
+) -> Path:
+    """
+    Persist bridge option updates back into config.yaml using the canonical
+    nested bridges.<name>.options shape.
+    """
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Config file not found: {p.resolve()}")
+
+    with p.open(encoding="utf-8") as f:
+        raw = yaml.safe_load(f) or {}
+
+    bridges = raw.setdefault("bridges", {})
+    bridge = bridges.setdefault(bridge_name, {})
+    current_enabled = bool(bridge.get("enabled", False))
+    options = bridge.get("options")
+    if not isinstance(options, dict):
+        options = {k: v for k, v in bridge.items() if k not in {"enabled", "options"}}
+
+    options.update(updates)
+    bridge.clear()
+    bridge["enabled"] = current_enabled if enabled is None else bool(enabled)
+    bridge["options"] = options
+
+    with p.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(raw, f, sort_keys=False)
+
+    return p.resolve()
 
 
 def apply_logging(cfg: LoggingConfig, *, level_override: str | int | None = None) -> None:
