@@ -60,8 +60,7 @@ _TINYCTX_BANNER = (
     "   ╚═╝   ╚═╝╚═╝  ╚═══╝   ╚═╝    ╚═════╝   ╚═╝   ╚═╝  ╚═╝",
 )
 _DIMMED_LINE_PREFIXES = ("tool ", "ok ", "err ", "thinking…")
-_PASTED_TEXT_THRESHOLD = 120
-_PASTED_TEXT_REF = re.compile(r"\[Pasted text #(\d+)(?: \+\d+ lines)?\]")
+_PASTED_TEXT_REF = re.compile(r"\[Pasted text #(\d+)(?:[^\]]*)\]")
 _CLI_OPTION_DEFAULTS = {
     "compact_tools": True,
     "dim_tools": True,
@@ -966,10 +965,8 @@ class CLIBridge:
         return lowered.startswith("[error") or lowered.startswith("error:") or lowered.startswith("[blocked")
 
     def _paste_ref(self, paste_id: int, text: str) -> str:
-        line_count = text.count("\n")
-        if line_count <= 0:
-            return f"[Pasted text #{paste_id}]"
-        return f"[Pasted text #{paste_id} +{line_count} lines]"
+        char_count = len(text)
+        return f"[Pasted text #{paste_id}, {char_count} chars]"
 
     def _insert_input_text(self, text: str) -> None:
         if self._input_area is None:
@@ -983,9 +980,6 @@ class CLIBridge:
     def _handle_paste(self, text: str) -> None:
         normalized = text.replace("\r\n", "\n").replace("\r", "\n")
         if not normalized:
-            return
-        if "\n" not in normalized and len(normalized) <= _PASTED_TEXT_THRESHOLD:
-            self._insert_input_text(normalized)
             return
 
         paste_id = self._next_paste_id

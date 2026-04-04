@@ -421,11 +421,11 @@ def test_large_paste_collapses_to_reference_and_expands_for_submit(tmp_path):
     pasted = "line one\nline two\nline three"
     bridge._handle_paste(pasted)
 
-    assert bridge._input_area.text == "[Pasted text #1 +2 lines]"
+    assert bridge._input_area.text == "[Pasted text #1, 28 chars]"
     assert bridge._expand_pasted_text_refs(bridge._input_area.text) == pasted
 
 
-def test_short_paste_stays_inline(tmp_path):
+def test_short_paste_also_uses_reference(tmp_path):
     cfg = _make_config(tmp_path)
     bridge = CLIBridge(SimpleNamespace(_config=cfg), options={})
     with patch("bridges.cli.__main__.Application", return_value=SimpleNamespace()):
@@ -433,7 +433,8 @@ def test_short_paste_stays_inline(tmp_path):
 
     bridge._handle_paste("hello")
     assert bridge._input_area is not None
-    assert bridge._input_area.text == "hello"
+    assert bridge._input_area.text == "[Pasted text #1, 5 chars]"
+    assert bridge._expand_pasted_text_refs(bridge._input_area.text) == "hello"
 
 
 def test_submit_text_renders_placeholder_but_sends_expanded_paste(tmp_path):
@@ -451,13 +452,13 @@ def test_submit_text_renders_placeholder_but_sends_expanded_paste(tmp_path):
 
     asyncio.run(
         bridge._submit_text(
-            "[Pasted text #1 +1 lines]",
+            "[Pasted text #1, 10 chars]",
             pasted_texts={1: "alpha\nbeta"},
         )
     )
 
     assert pushed["text"] == "alpha\nbeta"
-    assert bridge._transcript_blocks[-1] == "› [Pasted text #1 +1 lines]"
+    assert bridge._transcript_blocks[-1] == "› [Pasted text #1, 10 chars]"
 
 
 def test_cli_restores_transcript_from_saved_cursor(tmp_path):
