@@ -72,9 +72,11 @@ EXTENSION_META = {
         "nudge_threshold": 0.80,
         # The nudge message injected as a user turn at the end of the context.
         "nudge_message": (
+            "<context_sentinel>"
             "Your context window is getting full. "
             "Please write any important information, decisions, or ongoing tasks "
             "to memory/session-{date}.md or MEMORY.md before continuing."
+            "</context_sentinel>"
         ),
     },
 }
