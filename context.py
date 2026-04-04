@@ -33,6 +33,7 @@ Context itself never loads modules — that is main.py's concern.
 from __future__ import annotations
 
 import json
+import tiktoken
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -476,32 +477,56 @@ class Context:
     # Token counting
     # ------------------------------------------------------------------
 
-    def _count_tokens(self, messages: list[dict], tools: list[dict] | None = None) -> int:
-        tool_chars  = len(json.dumps(tools)) if tools else 0
-        img_cost    = self._image_tokens_per_block or 0  # 0 for non-vision models
-        image_chars = img_cost * 4  # ×4 because the sum is divided by 4
+    # Lazy-loaded tiktoken encoder. o200k_base is a close enough tokenizer
+    # for most open-weight models served via llama.cpp (Llama, Mistral, Gemma,
+    # DeepSeek, Qwen, etc.). It won't be exact for every model but is far more
+    # accurate than the old chars//4 heuristic.
+    _tiktoken_enc: "tiktoken.Encoding | None" = None
 
-        def _content_len(c) -> int:
+    @classmethod
+    def _get_encoder(cls) -> "tiktoken.Encoding":
+        if cls._tiktoken_enc is None:
+            try:
+                cls._tiktoken_enc = tiktoken.get_encoding("o200k_base")
+            except Exception:
+                cls._tiktoken_enc = None  # fall back to heuristic on failure
+        return cls._tiktoken_enc
+
+    def _count_tokens(self, messages: list[dict], tools: list[dict] | None = None) -> int:
+        img_cost = self._image_tokens_per_block or 0  # 0 for non-vision models
+        enc      = self._get_encoder()
+
+        def _tokenize(text: str) -> int:
+            if enc is None:
+                return len(text) // 4
+            return len(enc.encode(text, disallowed_special=()))
+
+        def _content_tokens(c) -> int:
             if isinstance(c, list):
                 total = 0
                 for b in c:
-                    # image_url blocks carry raw base64 — counting those bytes as
-                    # characters wildly inflates the estimate and causes the
-                    # budget-trimmer to evict all prior conversation history.
-                    # Charge a flat per-image cost matching the model's actual
-                    # vision-encoder overhead (image_tokens_per_block in config.yaml).
+                    # image_url blocks carry raw base64 — tokenizing those bytes
+                    # would wildly inflate the count. Charge the flat per-image
+                    # cost from ModelConfig.tokens_per_image instead.
                     if isinstance(b, dict) and b.get("type") == "image_url":
-                        total += image_chars
+                        total += img_cost
                     else:
-                        total += len(json.dumps(b))
+                        total += _tokenize(json.dumps(b))
                 return total
-            return len(str(c or ""))
+            return _tokenize(str(c or ""))
 
-        return (sum(
-            _content_len(m.get("content", "")) +
-            len(json.dumps(m.get("tool_calls", [])))
+        tool_tokens = _tokenize(json.dumps(tools)) if tools else 0
+
+        raw = sum(
+            _content_tokens(m.get("content", "")) +
+            _tokenize(json.dumps(m.get("tool_calls", [])))
             for m in messages
-        ) + tool_chars) // 4
+        ) + tool_tokens
+
+        # 1.05x fudge factor: tiktoken uses cl100k_base which won't match the
+        # model's actual tokenizer exactly. A 5% overhead means the trimmer
+        # fires slightly early rather than slightly late.
+        return int(raw * 1.05)
 
     # ------------------------------------------------------------------
     # Assembly (sync)
