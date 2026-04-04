@@ -23,6 +23,13 @@ Synthetic turns
 ---------------
 Router.push_synthetic(node_id) enqueues None to the lane. The drain worker
 calls loop.run(None) which skips Stage 1 (no user intake).
+
+Command registry
+----------------
+Router.commands is a CommandRegistry. Modules register slash commands at
+register() time via agent.commands (agent.commands is the same object).
+Bridges call router.commands.dispatch(text, context) before pushing to the
+router; dispatch() returns True if handled so the bridge can skip push().
 """
 
 from __future__ import annotations
@@ -39,6 +46,7 @@ from contracts import (
 )
 from agent import AgentLoop
 from config import Config
+from utils.commands import CommandRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +75,9 @@ class Lane:
             config=self.config,
         )
         self.loop.gateway = self.router
+        # Expose the shared command registry to the agent loop so modules can
+        # register commands at register() time via agent.commands.
+        self.loop.commands = self.router.commands
 
     def start(self) -> None:
         if self._worker is None or self._worker.done():
@@ -253,7 +264,7 @@ class GroupLane:
 
 
 # ---------------------------------------------------------------------------
-# _SessionRouter
+# _LaneRouter
 # ---------------------------------------------------------------------------
 
 class _LaneRouter:
@@ -323,6 +334,8 @@ class Router:
         self._platform_handlers: dict[str, EventHandler] = {}
         self._cursor_handlers:   dict[str, EventHandler] = {}  # node_id → handler
         self._node_platforms:    dict[str, str]           = {}  # node_id → platform value
+        # Shared command registry — modules register commands, bridges dispatch.
+        self.commands            = CommandRegistry()
         self._lane_router        = _LaneRouter(
             config=config,
             event_handler=self._dispatch_event,

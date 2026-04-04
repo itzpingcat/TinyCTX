@@ -1,6 +1,10 @@
 """
 bridges/cli/__main__.py — Robust Interactive CLI bridge using Rich.
 prompt_toolkit removed — no more patch_stdout fighting with Rich Live.
+
+Slash commands are dispatched via router.commands (CommandRegistry).
+Built-in bridge commands (/reset, /resume, /copy, /paste, /help) are
+handled here before the registry is consulted.
 """
 from __future__ import annotations
 
@@ -16,10 +20,6 @@ import pyfiglet
 
 if sys.platform == "win32":
     import ctypes
-    # Enable ANSI/VT processing on stdout before Rich Console is constructed.
-    # Without this, Live's cursor-up escape sequences are printed literally
-    # instead of executed, causing each update() to append a new copy of the
-    # rendered content rather than overwriting the previous one.
     kernel32 = ctypes.windll.kernel32
     kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
 
@@ -39,8 +39,6 @@ from contracts import (
 logger = logging.getLogger(__name__)
 
 # --- Code block label injection ---
-# Rich's Markdown renderer syntax-highlights fenced blocks but drops the language label.
-# We prepend an italic label above each tagged block so the user can see the language.
 
 _FENCED_CODE = re.compile(r'^```[ \t]*(\w+)[ \t]*\n(.*?)\n```[ \t]*$', re.DOTALL | re.MULTILINE)
 
@@ -129,29 +127,23 @@ class CLIBridge:
             t = self._theme.t
             c = self._theme.c
             self._console.print(f"{t('agent_label')}:", style=c('agent_label'))
-            self._label_printed = True  # Lock it so it never prints again this turn
+            self._label_printed = True
 
     def _get_live_render(self, content: str, is_thinking: bool = False) -> Group:
-        """Helper to create a renderable group for the Live display."""
         c = self._theme.c
         parts = []
         if is_thinking and not content:
             parts.append(Text(" ⠋ thinking...", style=c('thinking')))
-        
         if content:
-            # Preprocess and render the markdown accumulated so far
             parts.append(Markdown(_preprocess(content)))
-            
         return Group(*parts)
 
     def _stop_live(self):
-        """Helper to safely stop and clear the live reference."""
         if self._live:
             self._live.stop()
             self._live = None
 
     def _ensure_live(self, is_thinking: bool = False):
-        """Helper to ensure the live display is running."""
         if not self._live:
             self._live = Live(
                 self._get_live_render(self._current_content, is_thinking),
@@ -167,7 +159,6 @@ class CLIBridge:
         if isinstance(event, AgentThinkingChunk):
             self._start_reply()
             self._ensure_live(is_thinking=True)
-            # Only update if live is actually active
             if self._live:
                 self._live.update(self._get_live_render(self._current_content, is_thinking=True))
 
@@ -179,7 +170,6 @@ class CLIBridge:
                 self._live.update(self._get_live_render(self._current_content))
 
         elif isinstance(event, AgentToolCall):
-            # IMPORTANT: Remove 'thinking' from the UI BEFORE stopping
             if self._live:
                 self._live.update(self._get_live_render(self._current_content, is_thinking=False))
             self._stop_live()
@@ -200,17 +190,13 @@ class CLIBridge:
 
         elif isinstance(event, AgentTextFinal):
             final_text = (event.text or self._current_content).strip()
-            # If we were streaming, update one last time then stop
             if self._live:
                 self._live.update(self._get_live_render(final_text))
-            
             self._stop_live()
-            
-            # RESET EVERYTHING
             if final_text:
                 self._last_reply = final_text
             self._current_content = ""
-            self._label_printed = False 
+            self._label_printed = False
             self._reply_done.set()
 
         elif isinstance(event, AgentError):
@@ -222,9 +208,35 @@ class CLIBridge:
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, lambda: input(prompt_str))
 
+    def _build_command_context(self) -> dict:
+        """Build the context dict passed to module command handlers."""
+        return {
+            "console":  self._console,
+            "theme_c":  self._theme.c,
+            "gateway":  self._gateway,
+            "cursor":   self._cursor,
+        }
+
+    async def _handle_help(self) -> None:
+        """Print all registered commands plus built-in bridge commands."""
+        c = self._theme.c
+        rows = [
+            ("/reset",   "Start a new session branch"),
+            ("/resume",  "Confirm resume from last session"),
+            ("/copy",    "Copy last agent reply to clipboard"),
+            ("/paste",   "Submit clipboard contents as next message"),
+            ("/help",    "Show this help"),
+        ]
+        # Append module-registered commands.
+        registry = getattr(self._gateway, "commands", None)
+        if registry is not None:
+            rows.extend(registry.list_commands())
+        rows.sort(key=lambda r: r[0])
+        self._console.print(f"[{c('border')}]available commands:[/{c('border')}]")
+        for cmd, help_text in rows:
+            self._console.print(f"  [{c('tool_call')}]{cmd}[/{c('tool_call')}]  {help_text}")
+
     async def run(self) -> None:
-        # Route all logging through Rich so log lines don't interleave with
-        # the input() prompt or Live panels (fixes heartbeat log bleed).
         config = getattr(self._gateway, "_config", None)
         log_level = logging.WARNING
         if config and hasattr(config, "logging"):
@@ -238,8 +250,6 @@ class CLIBridge:
             handlers=[RichHandler(console=self._console, rich_tracebacks=True, markup=False)],
             force=True,
         )
-        # markdown-it-py logs every parser rule at DEBUG; silence it regardless
-        # of the configured log level — it's never useful in the CLI output.
         logging.getLogger("markdown_it").setLevel(logging.WARNING)
         self._gateway.register_platform_handler(Platform.CLI.value, self.handle_event)
         self._cursor = _load_cli_cursor(self._gateway)
@@ -248,7 +258,7 @@ class CLIBridge:
         banner_text.append(pyfiglet.figlet_format(self._theme.t("name"), font="slant"), style=self._theme.c("banner"))
         banner_text.append(f"  {self._theme.t('tagline')}", style=self._theme.c("tagline"))
         self._console.print(Panel(banner_text, border_style=self._theme.c("border"), padding=(0, 2)))
-        self._console.print(f"[{self._theme.c('border')}]  type a message · /reset · /debug heartbeat · /copy · exit[/{self._theme.c('border')}]\n")
+        self._console.print(f"[{self._theme.c('border')}]  type a message · /reset · /help · exit[/{self._theme.c('border')}]\n")
 
         c = self._theme.c
         t = self._theme.t
@@ -267,11 +277,10 @@ class CLIBridge:
                     break
 
                 if text.startswith("/"):
-                    if text.lower() == "/debug heartbeat":
-                        await _debug_heartbeat(self._gateway, self._console, c)
-                        continue
-                    elif text.lower() == "/reset":
-                        # Start a brand new session branch off root.
+                    # Built-in bridge commands (not module-registered).
+                    lower = text.lower()
+
+                    if lower == "/reset":
                         from db import ConversationDB
                         workspace   = Path(self._gateway._config.workspace.path).expanduser().resolve()
                         db          = ConversationDB(workspace / "agent.db")
@@ -283,20 +292,20 @@ class CLIBridge:
                         self._gateway.reset_lane(self._cursor)
                         self._console.print(f"[{c('reset')}]  ↺  new session started[/{c('reset')}]")
                         continue
-                    elif text.lower() == "/resume":
-                        # Already on the latest session — just confirm.
+
+                    if lower == "/resume":
                         self._console.print(f"[{c('reset')}]  ↩  resuming from last session[/{c('reset')}]")
                         continue
-                    elif text.lower().startswith("/copy"):
-                        # /copy — write the last agent reply to the clipboard.
+
+                    if lower.startswith("/copy"):
                         copied = self._write_clipboard_text(self._last_reply)
                         if copied:
                             self._console.print(f"[{c('tool_ok')}]  ✓  copied last reply to clipboard[/{c('tool_ok')}]")
                         else:
                             self._console.print(f"[{c('tool_error')}]  ✗  nothing to copy[/{c('tool_error')}]")
                         continue
-                    elif text.lower().startswith("/paste"):
-                        # /paste — read from clipboard and submit as the next message.
+
+                    if lower.startswith("/paste"):
                         pasted = self._read_clipboard_text().strip()
                         if not pasted:
                             self._console.print(f"[{c('tool_error')}]  ✗  clipboard is empty[/{c('tool_error')}]")
@@ -304,7 +313,22 @@ class CLIBridge:
                         self._console.print(f"[{c('tool_call')}]  (pasting {len(pasted)} chars from clipboard)[/{c('tool_call')}]")
                         text = pasted
                         # Falls through to the InboundMessage send below.
+
+                    elif lower in {"/help", "/?"}:
+                        await self._handle_help()
+                        continue
+
                     else:
+                        # Delegate to the module command registry.
+                        registry = getattr(self._gateway, "commands", None)
+                        if registry is not None:
+                            handled = await registry.dispatch(text, self._build_command_context())
+                            if handled:
+                                continue
+                        # Unrecognised slash command — suggest /help.
+                        self._console.print(
+                            f"[{c('error')}]  unknown command: {text}  (try /help)[/{c('error')}]"
+                        )
                         continue
 
                 msg = InboundMessage(
@@ -326,90 +350,12 @@ class CLIBridge:
         self._console.print(f"[{c('reset')}]{t('bye_message')}[/{c('reset')}]")
 
 
-# --- Debug commands ---
-
-async def _debug_heartbeat(gateway, console: Console, c) -> None:
-    """
-    /debug heartbeat — immediately fire one heartbeat tick so you can verify
-    the module is wired correctly without waiting for the real interval.
-
-    Looks for a running heartbeat task on the event loop by name
-    ("heartbeat:<node_id>") and calls _tick() directly on the same lane/tail
-    the live task uses, so the test exercises the real code path.
-    """
-    from modules.heartbeat.__main__ import _tick, _parse_reply
-
-    # Find the heartbeat task and extract its lane/tail state from the agent.
-    # The task name is "heartbeat:<lane_node_id>" — see register() in heartbeat.
-    hb_task = next(
-        (t for t in asyncio.all_tasks() if t.get_name().startswith("heartbeat:")),
-        None,
-    )
-
-    # heartbeat.register() stashes the AgentLoop ref directly on the gateway.
-    agent = getattr(gateway, "_heartbeat_agent", None)
-
-    if agent is None:
-        # Fallback: scan live lanes (works after first message if stash missed).
-        for lane in gateway._lane_router._lanes.values():
-            loop = getattr(lane, "loop", None)
-            if loop is None and hasattr(lane, "_lane"):
-                loop = getattr(lane._lane, "loop", None)
-            if loop is not None and getattr(loop, "_heartbeat_lane_node_id", None):
-                agent = loop
-                break
-
-    if agent is None:
-        console.print(f"[{c('error')}]  ✗  heartbeat: could not find agent instance[/{c('error')}]")
-        console.print(f"[{c('tool_call')}]     (is the heartbeat module registered?)[/{c('tool_call')}]")
-        return
-
-    lane_node_id = getattr(agent, "_heartbeat_lane_node_id", None)
-    tail_node_id = getattr(agent, "_heartbeat_cursor_node_id", None)
-
-    if not lane_node_id:
-        console.print(f"[{c('error')}]  ✗  heartbeat: no cursor found — has the module run at least once?[/{c('error')}]")
-        if hb_task:
-            console.print(f"[{c('tool_call')}]     task exists ({hb_task.get_name()}) but hasn't ticked yet[/{c('tool_call')}]")
-        return
-
-    try:
-        from modules.heartbeat import EXTENSION_META
-        cfg: dict = EXTENSION_META.get("default_config", {})
-    except ImportError:
-        cfg = {}
-
-    prompt              = cfg.get("prompt", "If nothing needs attention, reply HEARTBEAT_OK.")
-    continuation_prompt = cfg.get("continuation_prompt", "Continue the task, or reply HEARTBEAT_OK when you are done.")
-    ack_max             = int(cfg.get("ack_max_chars", 300))
-    max_continuations   = int(cfg.get("max_continuations", 5))
-
-    console.print(f"[{c('tool_call')}]  ⏱  firing heartbeat tick (lane={lane_node_id[:8]}…)[/{c('tool_call')}]")
-
-    try:
-        new_tail = await _tick(
-            agent, lane_node_id, tail_node_id,
-            prompt, continuation_prompt,
-            ack_max, max_continuations,
-        )
-        # Update the persisted tail so the real task picks up from the right node.
-        setattr(agent, "_heartbeat_cursor_node_id", new_tail)
-        console.print(f"[{c('tool_ok')}]  ✓  heartbeat tick complete[/{c('tool_ok')}]")
-    except Exception as exc:
-        console.print(f"[{c('error')}]  ✗  heartbeat tick raised: {exc}[/{c('error')}]")
-
-
 # CLI user identity
 CLI_USER_ID = "cli-owner"
 CLI_USER = UserIdentity(platform=Platform.CLI, user_id=CLI_USER_ID, username="you")
 
 
 def _load_cli_cursor(gateway) -> str:
-    """
-    Load (or create) the persistent CLI cursor from workspace/cursors/cli.
-    On first run, attaches to the DB global root and persists the new node_id.
-    On subsequent runs, resumes from the last known tail node.
-    """
     from db import ConversationDB
     workspace   = Path(gateway._config.workspace.path).expanduser().resolve()
     workspace.mkdir(parents=True, exist_ok=True)
@@ -431,16 +377,10 @@ def _load_cli_cursor(gateway) -> str:
 
 
 def _persist_cli_cursor(gateway, anchor_node_id: str) -> None:
-    """
-    After each turn, read the live tail from the active lane and persist it
-    to the cursor file so the next session resumes from the right place.
-    """
     try:
         lanes = gateway._lane_router._lanes
-        # The lane may be keyed by the anchor or by the current tail.
         lane = lanes.get(anchor_node_id)
         if lane is None:
-            # Search all lanes for one whose original node_id matches.
             lane = next((l for l in lanes.values() if l.node_id == anchor_node_id), None)
         if lane is None:
             return
@@ -452,7 +392,6 @@ def _persist_cli_cursor(gateway, anchor_node_id: str) -> None:
         cursor_file.write_text(tail, encoding="utf-8")
     except Exception:
         pass  # cursor persistence must never crash the bridge
-
 
 
 # --- Loader entry point ---

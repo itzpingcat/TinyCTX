@@ -349,6 +349,20 @@ class MatrixBridge:
             cursor_key  = f"dm:{event.sender}"
             node_id     = self._get_or_create_cursor(cursor_key)
 
+            # Slash commands in DMs go through the module registry.
+            if body.startswith("/"):
+                ctx = {
+                    "room":    room,
+                    "event":   event,
+                    "bridge":  self,
+                    "router":  self._router,
+                    "cursor":  node_id,
+                    "send":    self._send,
+                }
+                handled = await self._router.commands.dispatch(body, ctx)
+                if handled:
+                    return
+
             author = UserIdentity(
                 platform=Platform.MATRIX,
                 user_id=event.sender,
@@ -389,6 +403,21 @@ class MatrixBridge:
             else:
                 await self._send(room.room_id, "⛔ Only admins can reset the session.")
             return
+
+        # Slash commands (module registry) — dispatched before trigger gating.
+        if body.startswith("/"):
+            node_id = self._get_or_create_cursor(cursor_key)
+            ctx = {
+                "room":   room,
+                "event":  event,
+                "bridge": self,
+                "router": self._router,
+                "cursor": node_id,
+                "send":   self._send,
+            }
+            handled = await self._router.commands.dispatch(body, ctx)
+            if handled:
+                return
 
         # Humanize HTML mention markup (Matrix-specific formatting only).
         # Trigger detection and stripping are handled by GroupLane via GroupPolicy.

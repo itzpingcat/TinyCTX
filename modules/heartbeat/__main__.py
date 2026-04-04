@@ -9,9 +9,6 @@ Branch strategy (configured via "branch_from"):
   "session" — branch off the current tail of the agent's own session at the time
               heartbeat starts (inherits history up to that point, then diverges)
 
-This mirrors how cron jobs work: a session-init node is created once and stored
-as the cursor. All subsequent heartbeat turns append to that same branch.
-
 Reply handling:
   - "HEARTBEAT_OK" at start or end → silently dropped
     (if remaining content is ≤ ack_max_chars).
@@ -26,6 +23,9 @@ tools — this module doesn't inject it directly, the prompt tells the agent to.
 Active hours: if configured, ticks outside the window are skipped.
 The task still sleeps its normal interval; it just does nothing on waking
 outside the allowed window.
+
+Slash command:
+  /heartbeat run  — fire one tick immediately (replaces /debug heartbeat)
 
 Convention: register(agent) — no imports from gateway or bridges.
 """
@@ -60,16 +60,7 @@ _TOKEN = "HEARTBEAT_OK"
 def _get_or_create_cursor(agent, branch_from: str) -> tuple[str, str]:
     """
     Return (lane_node_id, tail_node_id) for the heartbeat branch.
-
-    lane_node_id — the stable original branch root; never changes; used as
-                   the lane dict key and cursor-handler registration key,
-                   because router._dispatch_event always dispatches using
-                   event.lane_node_id (the immutable lane origin).
-    tail_node_id — the advancing DB tail; passed in InboundMessage so turns
-                   append to the correct leaf node.
-
-    The lane node is created once; both ids are stored on the agent instance
-    so subsequent calls just return the cached values.
+    Both ids are stored on the agent instance so subsequent calls return cached values.
     """
     attr_lane = "_heartbeat_lane_node_id"
     attr_tail = "_heartbeat_cursor_node_id"
@@ -81,11 +72,8 @@ def _get_or_create_cursor(agent, branch_from: str) -> tuple[str, str]:
     db        = ConversationDB(workspace / "agent.db")
 
     if branch_from == "session":
-        # Branch off the live session tail — the heartbeat "knows" what the
-        # user has discussed so far, but its turns won't appear in their thread.
         parent_id = agent._tail_node_id
     else:
-        # Branch off the global root — fully isolated, no user history.
         parent_id = db.get_root().id
 
     node = db.add_node(
@@ -114,25 +102,61 @@ def register(agent) -> None:
         cfg = {}
 
     every_minutes = int(cfg.get("every_minutes", 30))
-    if every_minutes <= 0:
-        logger.info("[heartbeat] disabled (every_minutes=0)")
-        return
 
     prompt              = cfg.get("prompt", "If nothing needs attention, reply HEARTBEAT_OK.")
     continuation_prompt = cfg.get("continuation_prompt", "Continue the task, or reply HEARTBEAT_OK when you are done.")
     ack_max             = int(cfg.get("ack_max_chars", 300))
     max_continuations   = int(cfg.get("max_continuations", 5))
     active_hours        = cfg.get("active_hours", None)
-    branch_from         = cfg.get("branch_from", "root")   # "root" | "session"
+    branch_from         = cfg.get("branch_from", "root")
     interval_secs       = every_minutes * 60
 
-    # Bootstrap the branch cursor now (while the agent's tail_node_id is
-    # fresh and before any user turns advance it further).
+    # Bootstrap the branch cursor while agent's tail_node_id is fresh.
     lane_node_id, tail_node_id = _get_or_create_cursor(agent, branch_from)
 
-    # Note: we'd like to stash agent on gateway here for /debug heartbeat, but
-    # agent.gateway is set by Lane.__post_init__ *after* register() returns, so
-    # it's None at this point.  The stash is done lazily in _run_turn() instead.
+    # ------------------------------------------------------------------
+    # Register /heartbeat run command via the shared command registry.
+    # agent.commands is set by Lane.__post_init__ from router.commands;
+    # it's always available at register() time because Lane sets it before
+    # calling _load_modules().
+    # ------------------------------------------------------------------
+    registry = getattr(agent, "commands", None)
+    if registry is not None:
+        async def _cmd_run(args: list[str], context: dict) -> None:
+            """Fire one heartbeat tick immediately."""
+            console = context.get("console")
+            c       = context.get("theme_c", lambda k: "")
+
+            current_tail = getattr(agent, "_heartbeat_cursor_node_id", tail_node_id)
+            current_lane = getattr(agent, "_heartbeat_lane_node_id", lane_node_id)
+
+            if console:
+                console.print(f"[{c('tool_call')}]  ⏱  firing heartbeat tick (lane={current_lane[:8]}…)[/{c('tool_call')}]")
+
+            try:
+                new_tail = await _tick(
+                    agent, current_lane, current_tail,
+                    prompt, continuation_prompt,
+                    ack_max, max_continuations,
+                )
+                setattr(agent, "_heartbeat_cursor_node_id", new_tail)
+                if console:
+                    console.print(f"[{c('tool_ok')}]  ✓  heartbeat tick complete[/{c('tool_ok')}]")
+            except Exception as exc:
+                logger.exception("[heartbeat] /heartbeat run raised")
+                if console:
+                    console.print(f"[{c('error')}]  ✗  heartbeat tick raised: {exc}[/{c('error')}]")
+
+        registry.register(
+            "heartbeat", "run", _cmd_run,
+            help="Fire one heartbeat tick immediately",
+        )
+        logger.debug("[heartbeat] registered /heartbeat run command")
+
+    # Start the periodic background loop (skip if disabled).
+    if every_minutes <= 0:
+        logger.info("[heartbeat] periodic ticks disabled (every_minutes=0)")
+        return
 
     task = asyncio.get_event_loop().create_task(
         _heartbeat_loop(
@@ -167,7 +191,6 @@ async def _heartbeat_loop(
     max_continuations: int,
     active_hours: dict | None,
 ) -> None:
-    # Wait one full interval before the first tick so startup isn't noisy.
     await asyncio.sleep(interval_secs)
 
     while True:
@@ -190,7 +213,7 @@ async def _heartbeat_loop(
 
 
 # ---------------------------------------------------------------------------
-# Single tick — push through gateway, collect reply, continuation loop
+# Single tick
 # ---------------------------------------------------------------------------
 
 async def _tick(
@@ -238,20 +261,7 @@ async def _run_turn(
     tail_node_id: str,
     text: str,
 ) -> tuple[str, str]:
-    """
-    Push a heartbeat message through the gateway on the heartbeat branch.
-
-    lane_node_id — stable lane key, used for cursor-handler registration.
-                   router._dispatch_event always dispatches via event.lane_node_id,
-                   which is set to the lane's original node_id and never advances.
-                   Registering the handler under this key ensures events are
-                   delivered correctly even after the tail cursor has moved forward.
-
-    tail_node_id — the current DB leaf; passed as InboundMessage.tail_node_id so
-                   the agent loop appends new nodes to the correct branch position.
-
-    Returns (reply_text, new_tail_node_id).
-    """
+    """Push a heartbeat message through the gateway. Returns (reply_text, tail_node_id)."""
     from contracts import AgentTextChunk, AgentTextFinal, AgentError
 
     gateway = getattr(agent, "gateway", None)
@@ -259,9 +269,6 @@ async def _run_turn(
         logger.error("[heartbeat] agent.gateway not set — cannot run tick")
         return "", tail_node_id
 
-    # Lazily stash the agent ref on the gateway the first time a turn runs.
-    # We can't do this in register() because lane.gateway is set by Lane.__post_init__
-    # after AgentLoop.__init__ (and thus _load_modules / register) has returned.
     if not hasattr(gateway, "_heartbeat_agent"):
         gateway._heartbeat_agent = agent
 
@@ -288,7 +295,6 @@ async def _run_turn(
             parts.append(event.message)
             reply_event.set()
 
-    # Register under lane_node_id — the stable key that _dispatch_event uses.
     gateway.register_cursor_handler(lane_node_id, _collect)
     try:
         await gateway.push(msg)
@@ -307,22 +313,17 @@ async def _run_turn(
 # ---------------------------------------------------------------------------
 
 def _parse_reply(reply: str, ack_max: int) -> tuple[bool, str]:
-    """
-    Strip HEARTBEAT_OK from the start or end of the reply.
-    is_ok=True only when the token is present (or the reply is empty) and the
-    remainder is ≤ ack_max chars.
-    """
-    text = reply
+    text    = reply
     matched = False
 
     if text == "":
         return True, ""
 
     if text.startswith(_TOKEN):
-        text = text[len(_TOKEN):].lstrip(" \n\r")
+        text    = text[len(_TOKEN):].lstrip(" \n\r")
         matched = True
     elif text.endswith(_TOKEN):
-        text = text[: -len(_TOKEN)].rstrip(" \n\r")
+        text    = text[: -len(_TOKEN)].rstrip(" \n\r")
         matched = True
     return matched and len(text) <= ack_max, text
 
