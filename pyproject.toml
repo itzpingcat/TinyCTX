@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "tinyctx"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "PyYAML",
+    "aiohttp",
+    "pyfiglet",
+    "rich",
+    "questionary",
+    "requests",
+    "mcp",
+    "numpy",
+    "tiktoken",
+    "structlog",
+    "tenacity",
+    "ddgs",
+    "playwright",
+    "pdfplumber",
+    "python-docx",
+    "sympy",
+    "antlr4-python3-runtime",
+    "croniter",
+    "discord.py",
+    "matrix-nio",
+]
+
+[project.scripts]
+tinyctx = "cmd.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["cmd*", "bridges*", "gateway*", "config*", "onboard*"]

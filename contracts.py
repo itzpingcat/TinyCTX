@@ -256,3 +256,13 @@ class ToolResult:
     is_image:  bool = False  # True when image_mime + image_b64 are populated
     image_mime: str | None = None  # e.g. "image/jpeg"
     image_b64:  str | None = None  # raw base64, no data URI prefix
+
+
+# ---------------------------------------------------------------------------
+# Bridge launch sentinels
+# ---------------------------------------------------------------------------
+
+# Bridges that set MANUAL_LAUNCH = True at module level are skipped by
+# main.py's auto-start loop. They must be launched explicitly (e.g. via
+# `tinyctx launch cli`).
+MANUAL_LAUNCH_ATTR = "MANUAL_LAUNCH"

@@ -1,24 +1,13 @@
-PyYAML
+# Install the package and all its dependencies from pyproject.toml.
+# To install dev/optional extras add them here, e.g.:
+#   .[dev]
+-e .
+
+# Heavy optional bridges — uncomment as needed:
+# discord.py
+# matrix-nio
+# matrix-nio[e2e]   # requires cmake + libolm
+
+# Dev / test tools:
 pytest
 pytest-asyncio
-requests
-aiohttp
-pyyaml
-playwright
-ddgs
-mcp
-numpy
-tiktoken
-structlog
-tenacity
-discord.py
-matrix-nio
-# matrix-nio[e2e] requires cmake + libolm to build python-olm from source.
-# Only uncomment if you have a C build environment and need E2EE support.
-# matrix-nio[e2e]
-pdfplumber
-python-docx
-pyfiglet
-sympy
-antlr4-python3-runtime
-questionary

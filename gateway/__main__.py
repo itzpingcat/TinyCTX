@@ -1,59 +1,40 @@
 """
-gateway/__main__.py — HTTP/SSE API gateway.
+gateway/__main__.py — HTTP/SSE API gateway (lane-based, node_id-keyed).
 
-All endpoints require:  Authorization: Bearer <api_key>
-/v1/health is always public.
+All endpoints except /v1/health require:
+    Authorization: Bearer <api_key>
 
-Session model (Phase 2 tree refactor)
---------------------------------------
-session_id is a human-readable string supplied by the API caller (e.g. "main",
-"user-123"). It maps to a node_id (UUID) in agent.db via
-workspace/cursors/gateway.json. On first use the gateway creates a child node
-off the global DB root and persists the mapping. Subsequent calls reuse the
-same node_id, which is passed as tail_node_id into InboundMessage.
+Endpoints
+---------
+POST   /v1/lane/open       Open (or no-op) a lane; bootstrap cursor if needed.
+POST   /v1/lane/message    Push a user message; returns SSE event stream.
+POST   /v1/lane/branch     Create a new branch node; return its node_id.
+                           Non-destructive — no existing lane is modified.
+DELETE /v1/lane/abort      Abort in-flight generation for a node_id.
+GET    /v1/health          Always public.
 
-Endpoints:
+Kept from old gateway
+---------------------
+GET    /v1/workspace/files/{path}
+PUT    /v1/workspace/files/{path}
 
-  POST   /v1/sessions/{session_id}/message
-    body: { "text": "...", "stream": true,
-            "attachments": [{"name", "data_b64", "mime_type"}] }
-    SSE stream or JSON response.
+SSE event types
+---------------
+  {"type": "thinking_chunk", "text": "..."}
+  {"type": "text_chunk",     "text": "..."}
+  {"type": "text_final",     "text": "..."}
+  {"type": "tool_call",      "tool_name": "...", "call_id": "...", "args": {...}}
+  {"type": "tool_result",    "tool_name": "...", "call_id": "...", "output": "...", "is_error": false}
+  {"type": "error",          "message": "..."}
+  {"type": "done",           "node_id": "<new tail uuid>"}
 
-  PUT    /v1/sessions/{session_id}/generation
-    Queue a generation cycle with no new user message.
-    body: { "stream": true }  (optional, default true)
-    SSE stream identical to /message, or JSON { "text": "..." }.
-    Returns 429 if lane queue is full.
-
-  DELETE /v1/sessions/{session_id}/generation
-    Abort the current in-flight generation. No-op (204) if nothing is running.
-    -> 204
-
-  GET    /v1/sessions
-    List all sessions (active in-memory lanes + gateway cursor map).
-    -> [{ "id", "node_id", "turns", "queue_depth", "queue_max", "is_active" }, ...]
-
-  DELETE /v1/sessions/{session_id}
-    Reset the lane in-memory (clears context). Tree in agent.db is preserved.
-    -> 204
-
-  POST   /v1/sessions/{session_id}/reset
-    Alias for DELETE — backwards compat.
-    -> 204
-
-  GET    /v1/sessions/{session_id}/history
-    Return the ancestor chain for this session's node_id as history entries.
-    -> [{ "id", "role", "content", "tool_calls", "tool_call_id", "author_id", "created_at" }, ...]
-
-  GET    /v1/workspace/files/{path}
-    -> { "path": "...", "content": "..." }
-
-  PUT    /v1/workspace/files/{path}
-    body: { "content": "..." }
-    -> { "path": "...", "written": true }
-
-  GET    /v1/health
-    -> { "status": "ok", "uptime_s": N, "lanes": { "<node_id>": {...} } }
+Fanout table
+------------
+The gateway maintains a per-node_id fanout table so that multiple concurrent
+SSE clients on the same node_id all receive every event. One persistent cursor
+handler is registered with the router per active node_id; it fans events out
+into per-request asyncio.Queue instances. When the last queue for a node_id
+is removed the cursor handler is unregistered.
 """
 from __future__ import annotations
 
@@ -70,54 +51,13 @@ from config import GatewayConfig
 from contracts import (
     Platform, ContentType, content_type_for,
     UserIdentity, InboundMessage, Attachment,
-    AgentTextChunk, AgentTextFinal, AgentToolCall, AgentToolResult, AgentError,
+    AgentThinkingChunk, AgentTextChunk, AgentTextFinal,
+    AgentToolCall, AgentToolResult, AgentError,
 )
 
 logger = logging.getLogger(__name__)
 
 _API_AUTHOR = UserIdentity(platform=Platform.API, user_id="api-client", username="api")
-
-
-# ---------------------------------------------------------------------------
-# Cursor map — session_id (str) <-> node_id (UUID str)
-# Persisted at workspace/cursors/gateway.json
-# ---------------------------------------------------------------------------
-
-def _load_cursor_map(cursors_dir: Path) -> dict[str, str]:
-    path = cursors_dir / "gateway.json"
-    if path.exists():
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            logger.warning("gateway: corrupt cursor map — starting fresh")
-    return {}
-
-
-def _save_cursor_map(cursors_dir: Path, mapping: dict[str, str]) -> None:
-    path = cursors_dir / "gateway.json"
-    path.write_text(json.dumps(mapping, indent=2), encoding="utf-8")
-
-
-def _resolve_node_id(session_id: str, app: web.Application) -> str:
-    """
-    Return the node_id for session_id, creating a new child node off the
-    global DB root on first use and persisting the mapping.
-    """
-    mapping     = app["cursor_map"]
-    cursors_dir = app["cursors_dir"]
-
-    if session_id in mapping:
-        return mapping[session_id]
-
-    # First use — create a child node off root and persist.
-    from db import ConversationDB
-    db   = ConversationDB(app["workspace"] / "agent.db")
-    root = db.get_root()
-    node = db.add_node(parent_id=root.id, role="system", content=f"session:gateway:{session_id}")
-    mapping[session_id] = node.id
-    _save_cursor_map(cursors_dir, mapping)
-    logger.info("gateway: created cursor for session '%s' -> %s", session_id, node.id)
-    return node.id
 
 
 # ---------------------------------------------------------------------------
@@ -150,110 +90,119 @@ def _auth_middleware(api_key: str):
     return middleware
 
 
-def _lane_for(router, node_id: str):
-    """Return the Lane for node_id, or None."""
-    return router._lane_router._lanes.get(node_id)
-
-
-def _lane_summary(session_id: str, node_id: str, lane) -> dict:
-    return {
-        "id":          session_id,
-        "node_id":     node_id,
-        "turns":       lane.loop._turn_count,
-        "queue_depth": lane.queue.qsize(),
-        "queue_max":   lane.queue.maxsize,
-        "is_active":   True,
-    }
+def _event_to_dict(event) -> dict:
+    """Convert an AgentEvent to a JSON-serialisable dict for SSE."""
+    if isinstance(event, AgentThinkingChunk):
+        return {"type": "thinking_chunk", "text": event.text}
+    if isinstance(event, AgentTextChunk):
+        return {"type": "text_chunk", "text": event.text}
+    if isinstance(event, AgentTextFinal):
+        return {"type": "text_final", "text": event.text, "node_id": event.tail_node_id}
+    if isinstance(event, AgentToolCall):
+        return {"type": "tool_call", "tool_name": event.tool_name,
+                "call_id": event.call_id, "args": event.args}
+    if isinstance(event, AgentToolResult):
+        return {"type": "tool_result", "tool_name": event.tool_name,
+                "call_id": event.call_id, "output": event.output,
+                "is_error": event.is_error}
+    if isinstance(event, AgentError):
+        return {"type": "error", "message": event.message, "node_id": event.tail_node_id}
+    return {}
 
 
 # ---------------------------------------------------------------------------
-# SSE streaming shared helper
+# Fanout table management
 # ---------------------------------------------------------------------------
 
-async def _stream_generation(request: web.Request, router, node_id: str) -> web.StreamResponse:
-    """
-    Register a per-cursor SSE handler, wait for generation to complete,
-    and stream events back to the HTTP client.
-    """
-    response = web.StreamResponse(headers={
-        "Content-Type":      "text/event-stream",
-        "Cache-Control":     "no-cache",
-        "X-Accel-Buffering": "no",
-    })
-    await response.prepare(request)
+def _ensure_fanout(node_id: str, app: web.Application) -> None:
+    """Register a persistent cursor handler for node_id if not already present."""
+    fanout: dict[str, set[asyncio.Queue]] = app["fanout"]
+    router = app["router"]
 
-    done_event       = asyncio.Event()
-    streamed_chunks: list[str] = []
+    if node_id in fanout:
+        return  # handler already registered
 
-    async def _sse(event) -> None:
-        if isinstance(event, AgentTextChunk):
-            data = {"type": "text_chunk", "text": event.text}
-            streamed_chunks.append(event.text)
-        elif isinstance(event, AgentTextFinal):
-            data = {"type": "text_final", "text": event.text or "".join(streamed_chunks)}
-            done_event.set()
-        elif isinstance(event, AgentToolCall):
-            data = {"type": "tool_call", "call_id": event.call_id,
-                    "name": event.tool_name, "args": event.args}
-        elif isinstance(event, AgentToolResult):
-            data = {"type": "tool_result", "call_id": event.call_id,
-                    "name": event.tool_name, "output": event.output,
-                    "is_error": event.is_error}
-        elif isinstance(event, AgentError):
-            data = {"type": "error", "message": event.message}
-            done_event.set()
-        else:
+    fanout[node_id] = set()
+
+    async def _handler(event) -> None:
+        payload = _event_to_dict(event)
+        if not payload:
             return
-        try:
-            await response.write(f"data: {json.dumps(data)}\n\n".encode())
-        except Exception:
-            done_event.set()
+        is_terminal = isinstance(event, (AgentTextFinal, AgentError))
+        for q in list(fanout.get(node_id, [])):
+            await q.put(("event", payload))
+            if is_terminal:
+                await q.put(("done", event.tail_node_id))
 
-    router.register_cursor_handler(node_id, _sse)
-    try:
-        await done_event.wait()
-        await response.write(b'data: {"type": "done"}\n\n')
-    finally:
+    router.register_cursor_handler(node_id, _handler)
+    logger.debug("gateway: registered fanout handler for node_id=%s", node_id)
+
+
+def _add_subscriber(node_id: str, app: web.Application) -> asyncio.Queue:
+    q: asyncio.Queue = asyncio.Queue()
+    app["fanout"][node_id].add(q)
+    return q
+
+
+def _remove_subscriber(node_id: str, q: asyncio.Queue, app: web.Application) -> None:
+    fanout: dict[str, set[asyncio.Queue]] = app["fanout"]
+    router = app["router"]
+    fanout.get(node_id, set()).discard(q)
+    if not fanout.get(node_id):
         router.unregister_cursor_handler(node_id)
+        fanout.pop(node_id, None)
+        logger.debug("gateway: unregistered fanout handler for node_id=%s", node_id)
 
-    await response.write_eof()
-    return response
 
+# ---------------------------------------------------------------------------
+# POST /v1/lane/open
+# ---------------------------------------------------------------------------
 
-async def _collect_generation(router, node_id: str) -> str:
-    """Non-streaming: collect full text from a generation."""
-    parts:      list[str] = []
-    done_event            = asyncio.Event()
+async def handle_lane_open(request: web.Request) -> web.Response:
+    """
+    Open (or no-op) a lane for node_id. If node_id is null/absent or
+    unknown, create a fresh branch off DB root and return its id.
+    """
+    router    = request.app["router"]
+    workspace = request.app["workspace"]
 
-    async def _collect(event) -> None:
-        if isinstance(event, AgentTextChunk):
-            parts.append(event.text)
-        elif isinstance(event, AgentTextFinal):
-            if event.text:
-                parts.append(event.text)
-            done_event.set()
-        elif isinstance(event, AgentError):
-            parts.append(event.message)
-            done_event.set()
-
-    router.register_cursor_handler(node_id, _collect)
+    body = {}
     try:
-        await asyncio.wait_for(done_event.wait(), timeout=120)
-    except asyncio.TimeoutError:
+        body = await request.json()
+    except Exception:
         pass
-    finally:
-        router.unregister_cursor_handler(node_id)
-    return "".join(parts)
+
+    node_id = (body.get("node_id") or "").strip() or None
+
+    from db import ConversationDB
+    db = ConversationDB(workspace / "agent.db")
+
+    if node_id and db.get_node(node_id) is not None:
+        router.open_lane(node_id, Platform.API.value)
+        logger.debug("gateway: opened existing lane node_id=%s", node_id)
+    else:
+        root = db.get_root()
+        node = db.add_node(parent_id=root.id, role="system", content="session:api")
+        node_id = node.id
+        router.open_lane(node_id, Platform.API.value)
+        logger.info("gateway: created new lane node_id=%s", node_id)
+
+    return web.Response(
+        content_type="application/json",
+        body=json.dumps({"node_id": node_id}),
+    )
 
 
 # ---------------------------------------------------------------------------
-# Message handler (POST /v1/sessions/{id}/message)
+# POST /v1/lane/message
 # ---------------------------------------------------------------------------
 
-async def handle_message(request: web.Request) -> web.StreamResponse:
-    router     = request.app["router"]
-    session_id = request.match_info["session_id"]
-    node_id    = _resolve_node_id(session_id, request.app)
+async def handle_lane_message(request: web.Request) -> web.StreamResponse:
+    """
+    Push a user message for node_id and stream the reply via SSE.
+    The final SSE event is {"type": "done", "node_id": "<new tail>"}.
+    """
+    router    = request.app["router"]
 
     try:
         body = await request.json()
@@ -261,9 +210,12 @@ async def handle_message(request: web.Request) -> web.StreamResponse:
         raise web.HTTPBadRequest(content_type="application/json",
                                  body=json.dumps({"error": "invalid JSON"}))
 
-    text      = body.get("text", "").strip()
-    do_stream = bool(body.get("stream", True))
+    node_id = (body.get("node_id") or "").strip()
+    if not node_id:
+        raise web.HTTPBadRequest(content_type="application/json",
+                                 body=json.dumps({"error": "node_id required"}))
 
+    text = body.get("text", "").strip()
     if not text and not body.get("attachments"):
         raise web.HTTPBadRequest(content_type="application/json",
                                  body=json.dumps({"error": "text or attachments required"}))
@@ -297,155 +249,106 @@ async def handle_message(request: web.Request) -> web.StreamResponse:
         attachments=attachments,
     )
 
+    # Set up fanout before pushing so no events are missed.
+    _ensure_fanout(node_id, request.app)
+    q = _add_subscriber(node_id, request.app)
+
     accepted = await router.push(msg)
     if not accepted:
+        _remove_subscriber(node_id, q, request.app)
         raise web.HTTPTooManyRequests(content_type="application/json",
-                                      body=json.dumps({"error": "session queue full"}))
+                                      body=json.dumps({"error": "lane queue full"}))
 
-    if do_stream:
-        return await _stream_generation(request, router, node_id)
-    else:
-        text_out = await _collect_generation(router, node_id)
-        return web.Response(content_type="application/json", body=json.dumps({"text": text_out}))
+    # Stream SSE response.
+    response = web.StreamResponse(headers={
+        "Content-Type":      "text/event-stream",
+        "Cache-Control":     "no-cache",
+        "X-Accel-Buffering": "no",
+    })
+    await response.prepare(request)
+
+    try:
+        while True:
+            kind, payload = await q.get()
+            if kind == "event":
+                await response.write(f"data: {json.dumps(payload)}\n\n".encode())
+            elif kind == "done":
+                new_tail = payload  # tail node_id from the terminal event
+                await response.write(
+                    f'data: {json.dumps({"type": "done", "node_id": new_tail})}\n\n'.encode()
+                )
+                break
+    except asyncio.CancelledError:
+        pass
+    finally:
+        _remove_subscriber(node_id, q, request.app)
+
+    await response.write_eof()
+    return response
 
 
 # ---------------------------------------------------------------------------
-# Synthetic generation (PUT /v1/sessions/{id}/generation)
+# POST /v1/lane/branch
 # ---------------------------------------------------------------------------
 
-async def handle_generation_put(request: web.Request) -> web.Response:
+async def handle_lane_branch(request: web.Request) -> web.Response:
     """
-    Queue a generation cycle against the current context, with no new user
-    message. Use to trigger a fresh response without adding a user turn.
+    Create a new child node in agent.db and return its node_id.
+    Non-destructive — no existing lane is reset or modified.
+
+    Body: { "parent_node_id": "<uuid or null>" }
+
+    parent_node_id: node to branch from. If null/absent, branches off DB root.
     """
-    router     = request.app["router"]
-    session_id = request.match_info["session_id"]
-    node_id    = _resolve_node_id(session_id, request.app)
+    workspace = request.app["workspace"]
 
     body = {}
     try:
         body = await request.json()
     except Exception:
-        pass  # body is optional
+        pass
 
-    do_stream = bool(body.get("stream", True))
-
-    accepted = await router.push_synthetic(node_id)
-    if not accepted:
-        raise web.HTTPTooManyRequests(content_type="application/json",
-                                      body=json.dumps({"error": "session queue full"}))
-
-    if do_stream:
-        return await _stream_generation(request, router, node_id)
-    else:
-        text_out = await _collect_generation(router, node_id)
-        return web.Response(content_type="application/json", body=json.dumps({"text": text_out}))
-
-
-# ---------------------------------------------------------------------------
-# Abort (DELETE /v1/sessions/{id}/generation)
-# ---------------------------------------------------------------------------
-
-async def handle_generation_delete(request: web.Request) -> web.Response:
-    """Abort the current in-flight generation. No-op if nothing is running."""
-    router     = request.app["router"]
-    session_id = request.match_info["session_id"]
-    node_id    = _resolve_node_id(session_id, request.app)
-    router.abort_generation(node_id)
-    return web.Response(status=204)
-
-
-# ---------------------------------------------------------------------------
-# Session list (GET /v1/sessions)
-# ---------------------------------------------------------------------------
-
-async def handle_sessions_list(request: web.Request) -> web.Response:
-    router  = request.app["router"]
-    mapping = request.app["cursor_map"]  # session_id -> node_id
-
-    results: list[dict] = []
-
-    # Start from the known gateway cursor map — every named session appears here.
-    for session_id, node_id in sorted(mapping.items()):
-        lane = _lane_for(router, node_id)
-        if lane is not None:
-            results.append(_lane_summary(session_id, node_id, lane))
-        else:
-            results.append({
-                "id":          session_id,
-                "node_id":     node_id,
-                "turns":       None,
-                "queue_depth": 0,
-                "queue_max":   0,
-                "is_active":   False,
-            })
-
-    # Also surface any active lanes not in the cursor map (e.g. other bridges).
-    reverse = {v: k for k, v in mapping.items()}
-    for node_id in router.active_lanes:
-        if node_id in reverse:
-            continue  # already listed above
-        lane = _lane_for(router, node_id)
-        if lane:
-            results.append({
-                "id":          node_id,   # no human name — use node_id as id
-                "node_id":     node_id,
-                "turns":       lane.loop._turn_count,
-                "queue_depth": lane.queue.qsize(),
-                "queue_max":   lane.queue.maxsize,
-                "is_active":   True,
-            })
-
-    return web.Response(content_type="application/json", body=json.dumps(results))
-
-
-# ---------------------------------------------------------------------------
-# Session reset / delete
-# ---------------------------------------------------------------------------
-
-async def handle_session_delete(request: web.Request) -> web.Response:
-    """Reset the lane's in-memory context. Tree in agent.db is preserved."""
-    router     = request.app["router"]
-    session_id = request.match_info["session_id"]
-    node_id    = _resolve_node_id(session_id, request.app)
-    router.reset_lane(node_id)
-    return web.Response(status=204)
-
-
-async def handle_session_reset(request: web.Request) -> web.Response:
-    """Alias for DELETE — backwards compat."""
-    return await handle_session_delete(request)
-
-
-# ---------------------------------------------------------------------------
-# History (GET /v1/sessions/{id}/history)
-# ---------------------------------------------------------------------------
-
-async def handle_history_get(request: web.Request) -> web.Response:
-    """
-    Return the ancestor chain for this session's node_id.
-    Reads directly from agent.db — no lane needs to be active.
-    """
-    session_id = request.match_info["session_id"]
-    node_id    = _resolve_node_id(session_id, request.app)
+    parent_node_id = (body.get("parent_node_id") or "").strip() or None
 
     from db import ConversationDB
-    db      = ConversationDB(request.app["workspace"] / "agent.db")
-    nodes   = db.get_ancestors(node_id)  # root -> current tail order
-    entries = [
-        {
-            "id":           n.id,
-            "role":         n.role,
-            "content":      n.content,
-            "tool_calls":   n.tool_calls,
-            "tool_call_id": n.tool_call_id,
-            "author_id":    n.author_id,
-            "created_at":   n.created_at,
-        }
-        for n in nodes
-        if n.role != "system"  # skip session-marker nodes
-    ]
-    return web.Response(content_type="application/json", body=json.dumps(entries))
+    db   = ConversationDB(workspace / "agent.db")
+    root = db.get_root()
+
+    if parent_node_id and db.get_node(parent_node_id) is not None:
+        parent_id = parent_node_id
+    else:
+        parent_id = root.id
+
+    node = db.add_node(parent_id=parent_id, role="system", content="session:branch")
+    logger.info("gateway: branched node_id=%s from parent=%s", node.id, parent_id)
+
+    return web.Response(
+        content_type="application/json",
+        body=json.dumps({"node_id": node.id}),
+    )
+
+
+# ---------------------------------------------------------------------------
+# DELETE /v1/lane/abort
+# ---------------------------------------------------------------------------
+
+async def handle_lane_abort(request: web.Request) -> web.Response:
+    """Abort in-flight generation for node_id. No-op if nothing is running."""
+    router = request.app["router"]
+
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+
+    node_id = (body.get("node_id") or "").strip()
+    if not node_id:
+        raise web.HTTPBadRequest(content_type="application/json",
+                                 body=json.dumps({"error": "node_id required"}))
+
+    router.abort_generation(node_id)
+    return web.Response(status=204)
 
 
 # ---------------------------------------------------------------------------
@@ -467,7 +370,8 @@ async def handle_workspace_get(request: web.Request) -> web.Response:
     except Exception as exc:
         raise web.HTTPInternalServerError(content_type="application/json",
                                           body=json.dumps({"error": str(exc)}))
-    return web.Response(content_type="application/json", body=json.dumps({"path": rel, "content": content}))
+    return web.Response(content_type="application/json",
+                        body=json.dumps({"path": rel, "content": content}))
 
 
 async def handle_workspace_put(request: web.Request) -> web.Response:
@@ -492,7 +396,8 @@ async def handle_workspace_put(request: web.Request) -> web.Response:
     except Exception as exc:
         raise web.HTTPInternalServerError(content_type="application/json",
                                           body=json.dumps({"error": str(exc)}))
-    return web.Response(content_type="application/json", body=json.dumps({"path": rel, "written": True}))
+    return web.Response(content_type="application/json",
+                        body=json.dumps({"path": rel, "written": True}))
 
 
 # ---------------------------------------------------------------------------
@@ -500,25 +405,27 @@ async def handle_workspace_put(request: web.Request) -> web.Response:
 # ---------------------------------------------------------------------------
 
 async def handle_health(request: web.Request) -> web.Response:
-    router  = request.app["router"]
-    uptime  = time.time() - request.app["start_time"]
-    mapping = request.app["cursor_map"]
-    reverse = {v: k for k, v in mapping.items()}  # node_id -> session_id
+    router = request.app["router"]
+    uptime = time.time() - request.app["start_time"]
+    fanout: dict = request.app["fanout"]
 
-    payload = {
-        "status":   "ok",
-        "uptime_s": round(uptime, 1),
-        "lanes": {
-            node_id: {
-                "session_id":  reverse.get(node_id, node_id),
-                "turns":       lane.loop._turn_count,
-                "queue_depth": lane.queue.qsize(),
-                "queue_max":   lane.queue.maxsize,
-            }
-            for node_id, lane in router._lane_router._lanes.items()
-        },
-    }
-    return web.Response(content_type="application/json", body=json.dumps(payload))
+    lanes_summary = {}
+    for node_id, lane in router._lane_router._lanes.items():
+        lanes_summary[node_id] = {
+            "turns":       lane.loop._turn_count,
+            "queue_depth": lane.queue.qsize(),
+            "queue_max":   lane.queue.maxsize,
+            "subscribers": len(fanout.get(node_id, [])),
+        }
+
+    return web.Response(
+        content_type="application/json",
+        body=json.dumps({
+            "status":   "ok",
+            "uptime_s": round(uptime, 1),
+            "lanes":    lanes_summary,
+        }),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -526,38 +433,27 @@ async def handle_health(request: web.Request) -> web.Response:
 # ---------------------------------------------------------------------------
 
 def _make_app(router, cfg: GatewayConfig) -> web.Application:
-    workspace   = Path(router._config.workspace.path).expanduser().resolve()
-    cursors_dir = workspace / "cursors"
-    cursors_dir.mkdir(parents=True, exist_ok=True)
+    workspace = Path(router._config.workspace.path).expanduser().resolve()
+    workspace.mkdir(parents=True, exist_ok=True)
 
     app = web.Application(middlewares=[_auth_middleware(cfg.api_key)])
-    app["router"]      = router
-    app["workspace"]   = workspace
-    app["cursors_dir"] = cursors_dir
-    app["cursor_map"]  = _load_cursor_map(cursors_dir)  # mutable dict, saved on write
-    app["start_time"]  = time.time()
+    app["router"]     = router
+    app["workspace"]  = workspace
+    app["start_time"] = time.time()
+    app["fanout"]     = {}   # node_id -> set[asyncio.Queue]
 
-    # Session management
-    app.router.add_get(   "/v1/sessions",                                  handle_sessions_list)
-    app.router.add_delete("/v1/sessions/{session_id}",                     handle_session_delete)
+    # Lane API
+    app.router.add_post(  "/v1/lane/open",                handle_lane_open)
+    app.router.add_post(  "/v1/lane/message",             handle_lane_message)
+    app.router.add_post(  "/v1/lane/branch",              handle_lane_branch)
+    app.router.add_delete("/v1/lane/abort",               handle_lane_abort)
 
-    # Generation
-    app.router.add_post(  "/v1/sessions/{session_id}/message",             handle_message)
-    app.router.add_put(   "/v1/sessions/{session_id}/generation",          handle_generation_put)
-    app.router.add_delete("/v1/sessions/{session_id}/generation",          handle_generation_delete)
-
-    # Session lifecycle
-    app.router.add_post(  "/v1/sessions/{session_id}/reset",               handle_session_reset)
-
-    # History
-    app.router.add_get(   "/v1/sessions/{session_id}/history",             handle_history_get)
-
-    # Workspace
-    app.router.add_get(   "/v1/workspace/files/{path:.+}",                 handle_workspace_get)
-    app.router.add_put(   "/v1/workspace/files/{path:.+}",                 handle_workspace_put)
+    # Workspace (kept)
+    app.router.add_get(   "/v1/workspace/files/{path:.+}", handle_workspace_get)
+    app.router.add_put(   "/v1/workspace/files/{path:.+}", handle_workspace_put)
 
     # Health (public)
-    app.router.add_get(   "/v1/health",                                    handle_health)
+    app.router.add_get(   "/v1/health",                   handle_health)
 
     return app
 

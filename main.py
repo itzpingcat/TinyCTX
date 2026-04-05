@@ -11,6 +11,9 @@ Startup order:
 The server and bridges are peers — either can trigger shutdown if they exit.
 The server is started before bridges so API clients can connect as soon as
 the process is up, even before bridge tasks are running.
+
+Bridges that set MANUAL_LAUNCH = True at module level are skipped — they
+are launched on demand via `tinyctx launch <bridge>`.
 """
 from __future__ import annotations
 
@@ -20,6 +23,7 @@ import logging
 from pathlib import Path
 
 from config import load as load_config, apply_logging, resolve_log_level
+from contracts import MANUAL_LAUNCH_ATTR
 from router import Router
 
 logger = logging.getLogger(__name__)
@@ -78,6 +82,9 @@ async def main() -> None:
 
             try:
                 mod = importlib.import_module(f"bridges.{name}.__main__")
+                if getattr(mod, MANUAL_LAUNCH_ATTR, False):
+                    logger.debug("Bridge '%s' is manual-launch only — skipping auto-start", name)
+                    continue
                 if not hasattr(mod, "run"):
                     logger.warning("Bridge '%s' has no run() — skipping", name)
                     continue
