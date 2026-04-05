@@ -18,7 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from contracts import (
+from TinyCTX.contracts import (
     ActivationMode,
     ContentType,
     GroupPolicy,
@@ -26,7 +26,7 @@ from contracts import (
     Platform,
     UserIdentity,
 )
-from router import GroupLane, Lane, Router, _gp_strip_trigger, _gp_replace_text
+from TinyCTX.router import GroupLane, Lane, Router, _gp_strip_trigger, _gp_replace_text
 
 
 # ---------------------------------------------------------------------------

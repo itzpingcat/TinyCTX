@@ -15,12 +15,12 @@ import asyncio
 import uuid
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
-from contracts import (
+from TinyCTX.contracts import (
     UserIdentity, InboundMessage,
     AgentTextFinal, AgentError,
     Platform, ContentType,
 )
-from router import Router, Lane, _LaneRouter
+from TinyCTX.router import Router, Lane, _LaneRouter
 
 
 # ---------------------------------------------------------------------------

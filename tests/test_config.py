@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from config import (
+from TinyCTX.config import (
     load,
     Config,
     ModelConfig,

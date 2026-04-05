@@ -7,12 +7,12 @@ Run with:
     pytest tests/
 """
 import pytest
-from context import (
+from TinyCTX.context import (
     Context, HistoryEntry,
     HOOK_PRE_ASSEMBLE, HOOK_FILTER_TURN, HOOK_TRANSFORM_TURN, HOOK_POST_ASSEMBLE,
     ROLE_USER, ROLE_ASSISTANT, ROLE_TOOL, ROLE_SYSTEM,
 )
-from contracts import ToolCall, ToolResult
+from TinyCTX.contracts import ToolCall, ToolResult
 
 
 # ---------------------------------------------------------------------------

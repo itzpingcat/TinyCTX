@@ -9,7 +9,7 @@ Run with:
     pytest tests/
 """
 import pytest
-from contracts import (
+from TinyCTX.contracts import (
     UserIdentity, InboundMessage,
     AgentTextFinal, AgentError,
     ToolCall, ToolResult,

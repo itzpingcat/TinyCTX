@@ -18,9 +18,9 @@ from unittest.mock import patch
 
 import pytest
 
-from contracts import Attachment, AttachmentKind
-from config import ModelConfig, AttachmentConfig
-from utils.attachments import (
+from TinyCTX.contracts import Attachment, AttachmentKind
+from TinyCTX.config import ModelConfig, AttachmentConfig
+from TinyCTX.utils.attachments import (
     classify,
     save_upload,
     build_content_blocks,

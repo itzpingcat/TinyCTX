@@ -59,7 +59,7 @@ def agent(workspace):
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
 
-    from modules.todo.__main__ import register
+    from TinyCTX.modules.todo.__main__ import register
     ag = _MockAgent(str(workspace))
     register(ag)
     return ag
@@ -220,7 +220,7 @@ class TestTodoPrompt:
 class TestTodoPersistence:
     def test_survives_reload(self, workspace):
         """Todo list persists across module re-registrations."""
-        from modules.todo.__main__ import register
+        from TinyCTX.modules.todo.__main__ import register
 
         # First agent writes
         ag1 = _MockAgent(str(workspace))

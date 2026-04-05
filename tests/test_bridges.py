@@ -26,7 +26,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from contracts import (
+from TinyCTX.contracts import (
     AgentError,
     AgentTextChunk,
     AgentTextFinal,
@@ -184,8 +184,8 @@ def _stub_nio():
 _stub_discord()
 _stub_nio()
 
-from bridges.discord.__main__ import DiscordBridge, _ReplyAccumulator as DiscordAccumulator
-from bridges.matrix.__main__ import MatrixBridge, _ReplyAccumulator as MatrixAccumulator
+from TinyCTX.bridges.discord.__main__ import DiscordBridge, _ReplyAccumulator as DiscordAccumulator
+from TinyCTX.bridges.matrix.__main__ import MatrixBridge, _ReplyAccumulator as MatrixAccumulator
 
 
 # ---------------------------------------------------------------------------

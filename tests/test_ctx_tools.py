@@ -9,8 +9,8 @@ Run with:
     pytest tests/
 """
 import pytest
-from context import Context, HistoryEntry, ROLE_TOOL, ROLE_ASSISTANT
-from contracts import ToolCall, ToolResult
+from TinyCTX.context import Context, HistoryEntry, ROLE_TOOL, ROLE_ASSISTANT
+from TinyCTX.contracts import ToolCall, ToolResult
 
 
 def _make_context_with_ctx_tools(config=None):
@@ -21,7 +21,7 @@ def _make_context_with_ctx_tools(config=None):
 
     # We need to call the internal register functions directly since
     # ctx_tools.register() expects an agent object. We replicate the call here.
-    from modules.ctx_tools.__main__ import _register_dedup, _register_cot_strip, _register_trim
+    from TinyCTX.modules.ctx_tools.__main__ import _register_dedup, _register_cot_strip, _register_trim
 
     cfg = config or {
         "same_call_dedup_after": 3,

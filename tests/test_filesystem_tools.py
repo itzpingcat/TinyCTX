@@ -89,7 +89,7 @@ def tools(workspace):
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
 
-    from modules.filesystem.__main__ import register
+    from TinyCTX.modules.filesystem.__main__ import register
 
     agent = _MockAgent(str(workspace))
     register(agent)
@@ -104,7 +104,7 @@ def filesystem_agent(workspace):
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
 
-    from modules.filesystem.__main__ import register
+    from TinyCTX.modules.filesystem.__main__ import register
 
     agent = _MockAgent(str(workspace))
     register(agent)

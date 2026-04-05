@@ -23,14 +23,14 @@ import pytest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from contracts import (
+from TinyCTX.contracts import (
     UserIdentity, InboundMessage,
     AgentTextChunk, AgentTextFinal, AgentError, AgentToolResult,
     Platform, ContentType, ToolCall, ToolResult,
 )
-from context import HistoryEntry
-from ai import TextDelta, ToolCallAssembled, LLMError
-from db import ConversationDB
+from TinyCTX.context import HistoryEntry
+from TinyCTX.ai import TextDelta, ToolCallAssembled, LLMError
+from TinyCTX.db import ConversationDB
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +114,7 @@ def make_agent(tmp_path):
     never bleeds between tests. The workspace is tmp_path.
     """
     def _factory(stream_fn=None, fallback_stream_fn=None, fallback_names=None):
-        from agent import AgentLoop
+        from TinyCTX.agent import AgentLoop
 
         node_id = _make_cursor(tmp_path)
         cfg = _make_config(tmp_path)

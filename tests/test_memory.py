@@ -25,7 +25,7 @@ import pytest
 # chunkers
 # ---------------------------------------------------------------------------
 
-from modules.memory.chunkers import (
+from TinyCTX.modules.memory.chunkers import (
     CharChunker,
     DelimiterChunker,
     MarkdownChunker,
@@ -152,7 +152,7 @@ class TestGetStrategy:
 # store
 # ---------------------------------------------------------------------------
 
-from modules.memory.store import MemoryStore, _cosine_matrix, _vec_to_blob, _blob_to_vec
+from TinyCTX.modules.memory.store import MemoryStore, _cosine_matrix, _vec_to_blob, _blob_to_vec
 
 
 class TestVecSerialization:
@@ -372,9 +372,9 @@ class TestMemoryStore:
 # indexer
 # ---------------------------------------------------------------------------
 
-from modules.memory.indexer import MemoryIndexer
-from modules.memory.chunkers import get_strategy
-from modules.memory.store import MemoryStore
+from TinyCTX.modules.memory.indexer import MemoryIndexer
+from TinyCTX.modules.memory.chunkers import get_strategy
+from TinyCTX.modules.memory.store import MemoryStore
 
 
 class _FakeEmbedder:
@@ -519,7 +519,7 @@ class TestMemoryIndexer:
 # Context nudge
 # ---------------------------------------------------------------------------
 
-from context import Context, HistoryEntry, HOOK_PRE_ASSEMBLE_ASYNC
+from TinyCTX.context import Context, HistoryEntry, HOOK_PRE_ASSEMBLE_ASYNC
 
 
 class _FakeAgentConfig:
@@ -595,7 +595,7 @@ def _make_agent(nudge_threshold=0.8, nudge_message=None):
     cfg   = _FakeAgentConfig(nudge_threshold=nudge_threshold, nudge_message=nudge_message)
     agent = _FakeAgent(cfg)
     # register() wires all hooks including _nudge_hook
-    from modules.memory.__main__ import register
+    from TinyCTX.modules.memory.__main__ import register
     register(agent)
     return agent
 
@@ -606,7 +606,7 @@ def _make_agent(nudge_threshold=0.8, nudge_message=None):
 
 def _make_agent_with_db(tmp_path, nudge_threshold=0.8, nudge_message=None):
     """Like _make_agent() but wires a real ConversationDB into the context."""
-    from db import ConversationDB
+    from TinyCTX.db import ConversationDB
     cfg   = _FakeAgentConfig(nudge_threshold=nudge_threshold, nudge_message=nudge_message)
     agent = _FakeAgent(cfg)
     db    = ConversationDB(tmp_path / "agent.db")
@@ -614,7 +614,7 @@ def _make_agent_with_db(tmp_path, nudge_threshold=0.8, nudge_message=None):
     session_node = db.add_node(parent_id=root.id, role="system", content="session:nudge-test")
     agent.context.set_db(db)
     agent.context.set_tail(session_node.id)
-    from modules.memory.__main__ import register
+    from TinyCTX.modules.memory.__main__ import register
     register(agent)
     return agent, db
 

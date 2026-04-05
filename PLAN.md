@@ -22,7 +22,7 @@ daemon.
 ## Package layout (new files only)
 
 ```
-cmd/                              ← new top-level CLI package
+                              ← new top-level CLI package
   __init__.py
   __main__.py                     ← entry: python -m cmd / tinyctx
   commands/
@@ -64,7 +64,7 @@ The `run(gateway)` entry point (called by main.py's bridge loader) becomes a
 no-op since main.py skips MANUAL_LAUNCH bridges before calling it.
 
 The new `run_detached(gateway_url, api_key, options)` function is the real
-entry point, called by `cmd/commands/launch.py`. It connects to the running
+entry point, called by `commands/launch.py`. It connects to the running
 daemon over HTTP and runs the interactive TUI in the foreground.
 
 All rendering code (`CLITheme`, `CLIBridge`, `handle_event`, Rich Live display,
@@ -420,7 +420,7 @@ async def run(gateway) -> None:
 
 async def run_detached(gateway_url: str, api_key: str,
                        options: dict | None = None) -> None:
-    """Called by cmd/commands/launch.py."""
+    """Called by commands/launch.py."""
     bridge = CLIBridge(None, options=options or {})
     bridge._gateway_url = gateway_url
     bridge._api_key     = api_key
@@ -445,7 +445,7 @@ async def run_detached(gateway_url: str, api_key: str,
 
 ## New files in detail
 
-### `cmd/pid.py`
+### `pid.py`
 
 Manages `~/.tinyctx/daemon.pid` (JSON).
 
@@ -454,7 +454,7 @@ Fields: `pid`, `gateway_url`, `api_key`, `config_path`, `started_at`.
 Functions: `write(...)`, `read() -> dict | None`, `is_alive(pid) -> bool`,
 `clean()`.
 
-### `cmd/commands/start.py`
+### `commands/start.py`
 
 1. Load config → extract gateway host/port/api_key.
 2. Check existing pid: if alive → print URL and exit.
@@ -469,15 +469,15 @@ Functions: `write(...)`, `read() -> dict | None`, `is_alive(pid) -> bool`,
    ```
 7. `--foreground` flag: skip detach.
 
-### `cmd/commands/stop.py`
+### `commands/stop.py`
 
 SIGTERM → poll 5s → SIGKILL → clean pid file.
 
-### `cmd/commands/status.py`
+### `commands/status.py`
 
 Read pid → check alive → `GET /v1/health` → print.
 
-### `cmd/commands/onboard.py`
+### `commands/onboard.py`
 
 ```python
 from onboard.__main__ import main as _onboard_main
@@ -486,14 +486,14 @@ def run(args):
     _onboard_main()
 ```
 
-### `cmd/commands/launch.py`
+### `commands/launch.py`
 
 `tinyctx launch cli`:
 1. Read pid file → get gateway_url, api_key.
 2. Load config for `bridges.cli.options`.
 3. Call `bridges.cli.__main__.run_detached(gateway_url, api_key, options)`.
 
-### `cmd/__main__.py`
+### `__main__.py`
 
 Argparse dispatcher for: `onboard`, `start`, `stop`, `status`, `launch`.
 
@@ -547,13 +547,13 @@ tinyctx = "cmd.__main__:main"
 3. `gateway/__main__.py` — rewrite with 4-endpoint API + fanout table
 4. `bridges/cli/__main__.py` — add `MANUAL_LAUNCH`, rewrite send/receive,
    add `run_detached()`
-5. `cmd/pid.py`
-6. `cmd/commands/start.py`
-7. `cmd/commands/stop.py`
-8. `cmd/commands/status.py`
-9. `cmd/commands/onboard.py`
-10. `cmd/commands/launch.py`
-11. `cmd/__main__.py`
+5. `pid.py`
+6. `commands/start.py`
+7. `commands/stop.py`
+8. `commands/status.py`
+9. `commands/onboard.py`
+10. `commands/launch.py`
+11. `__main__.py`
 12. `pyproject.toml`
 
 Steps 1–4 are the core rewrite. Steps 5–12 are all new files.

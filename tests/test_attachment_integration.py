@@ -22,15 +22,15 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from contracts import (
+from TinyCTX.contracts import (
     Attachment, AttachmentKind,
     InboundMessage, ContentType,
     UserIdentity, Platform,
     content_type_for,
 )
-from config import ModelConfig, AttachmentConfig, Config, LLMRoutingConfig
-from context import Context, HistoryEntry, ROLE_USER, ROLE_ASSISTANT
-from ai import TextDelta
+from TinyCTX.config import ModelConfig, AttachmentConfig, Config, LLMRoutingConfig
+from TinyCTX.context import Context, HistoryEntry, ROLE_USER, ROLE_ASSISTANT
+from TinyCTX.ai import TextDelta
 
 
 # ---------------------------------------------------------------------------
@@ -158,7 +158,7 @@ class TestModelConfigVision:
         assert m.supports_vision is True
 
     def test_vision_parsed_from_yaml(self, tmp_path):
-        from config import load
+        from TinyCTX.config import load
         p = tmp_path / "config.yaml"
         p.write_text(textwrap.dedent("""\
             models:
@@ -174,7 +174,7 @@ class TestModelConfigVision:
         assert cfg.models["smart"].vision is True
 
     def test_vision_false_when_omitted_from_yaml(self, tmp_path):
-        from config import load
+        from TinyCTX.config import load
         p = tmp_path / "config.yaml"
         p.write_text(textwrap.dedent("""\
             models:
@@ -207,7 +207,7 @@ class TestAttachmentConfig:
         assert cfg.uploads_dir == "files"
 
     def test_parsed_from_yaml(self, tmp_path):
-        from config import load
+        from TinyCTX.config import load
         p = tmp_path / "config.yaml"
         p.write_text(textwrap.dedent("""\
             models:
@@ -228,7 +228,7 @@ class TestAttachmentConfig:
         assert cfg.attachments.uploads_dir == "my_uploads"
 
     def test_defaults_applied_when_section_absent(self, tmp_path):
-        from config import load
+        from TinyCTX.config import load
         p = tmp_path / "config.yaml"
         p.write_text(textwrap.dedent("""\
             models:
@@ -349,8 +349,8 @@ class TestCountTokensListContent:
 # ---------------------------------------------------------------------------
 
 def _make_agent(tmp_path, vision=False):
-    from agent import AgentLoop
-    from db import ConversationDB
+    from TinyCTX.agent import AgentLoop
+    from TinyCTX.db import ConversationDB
 
     cfg = _make_full_config(tmp_path, vision=vision)
     cfg.workspace.path.mkdir(parents=True, exist_ok=True)
@@ -448,8 +448,8 @@ class TestAgentIntakeWithAttachments:
 class TestAgentListContentDBRoundtrip:
     @pytest.mark.asyncio
     async def test_list_content_survives_db_roundtrip(self, tmp_path):
-        from agent import AgentLoop
-        from db import ConversationDB
+        from TinyCTX.agent import AgentLoop
+        from TinyCTX.db import ConversationDB
 
         cfg = _make_full_config(tmp_path)
         cfg.workspace.path.mkdir(parents=True, exist_ok=True)
@@ -480,8 +480,8 @@ class TestAgentListContentDBRoundtrip:
 
     @pytest.mark.asyncio
     async def test_restore_history_preserves_list_content(self, tmp_path):
-        from agent import AgentLoop
-        from db import ConversationDB
+        from TinyCTX.agent import AgentLoop
+        from TinyCTX.db import ConversationDB
 
         cfg = _make_full_config(tmp_path)
         cfg.workspace.path.mkdir(parents=True, exist_ok=True)

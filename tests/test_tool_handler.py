@@ -7,8 +7,8 @@ Run with:
     pytest tests/
 """
 import pytest
-from utils.tool_handler import ToolCallHandler
-from utils.bm25 import BM25, _tokenise
+from TinyCTX.utils.tool_handler import ToolCallHandler
+from TinyCTX.utils.bm25 import BM25, _tokenise
 
 
 # ---------------------------------------------------------------------------

@@ -18,7 +18,7 @@ project_root = str(Path(__file__).resolve().parent.parent)
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-from modules.filesystem.shell import (
+from TinyCTX.modules.filesystem.shell import (
     _extract_last_command,
     _interpret_exit_code,
     _normalize_windows_command,

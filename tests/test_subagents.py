@@ -7,10 +7,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from ai import TextDelta
-from db import ConversationDB
-from modules.subagents import __main__ as subagents_module
-from modules.subagents.subagents import reset_subagent_tasks
+from TinyCTX.ai import TextDelta
+from TinyCTX.db import ConversationDB
+from TinyCTX.modules.subagents import __main__ as subagents_module
+from TinyCTX.modules.subagents.subagents import reset_subagent_tasks
 
 
 class _MockConfig:
@@ -116,7 +116,7 @@ def test_register_skips_subagent_agents(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_spawn_agent_and_wait_agent_complete_on_child_branch(tmp_path: Path):
-    from agent import AgentLoop
+    from TinyCTX.agent import AgentLoop
 
     cfg = _make_config(tmp_path)
     node_id = _make_cursor(tmp_path)
@@ -154,7 +154,7 @@ async def test_spawn_agent_and_wait_agent_complete_on_child_branch(tmp_path: Pat
 
 @pytest.mark.asyncio
 async def test_wait_agent_can_poll_running_task(tmp_path: Path):
-    from agent import AgentLoop
+    from TinyCTX.agent import AgentLoop
 
     cfg = _make_config(tmp_path)
     node_id = _make_cursor(tmp_path)
@@ -195,7 +195,7 @@ async def test_wait_agent_can_poll_running_task(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_wait_agent_is_scoped_to_own_agent_registry(tmp_path: Path):
-    from agent import AgentLoop
+    from TinyCTX.agent import AgentLoop
 
     cfg = _make_config(tmp_path)
     first_node_id = _make_cursor(tmp_path)
@@ -223,7 +223,7 @@ async def test_wait_agent_is_scoped_to_own_agent_registry(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_spawn_agent_enforces_max_concurrent_limit(tmp_path: Path):
-    from agent import AgentLoop
+    from TinyCTX.agent import AgentLoop
 
     cfg = _make_config(
         tmp_path,
@@ -256,7 +256,7 @@ async def test_spawn_agent_enforces_max_concurrent_limit(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_spawn_agent_prunes_completed_tasks_before_new_spawn(tmp_path: Path):
-    from agent import AgentLoop
+    from TinyCTX.agent import AgentLoop
 
     cfg = _make_config(
         tmp_path,

@@ -46,7 +46,7 @@ def _make_config(tmp_path: Path):
 # CRON TESTS
 # ===========================================================================
 
-from modules.cron.__main__ import (
+from TinyCTX.modules.cron.__main__ import (
     CronJob, CronSchedule, CronState,
     _compute_next_run, _validate_job,
     _load_store, _save_store,
@@ -253,7 +253,7 @@ class TestCronRunnerRegistersHandler:
         job = _make_job()
 
         async def _fake_push(msg):
-            from contracts import AgentTextFinal
+            from TinyCTX.contracts import AgentTextFinal
             handler = gateway.register_cursor_handler.call_args[0][1]
             ev = MagicMock(spec=AgentTextFinal)
             ev.text = "done"
@@ -318,7 +318,7 @@ class TestRunJob:
         async def _fake_push(msg):
             # Simulate agent emitting AgentTextFinal which sets reply_event
             # We reach into the runner to get the collect handler and call it.
-            from contracts import AgentTextFinal
+            from TinyCTX.contracts import AgentTextFinal
             handler = gateway.register_cursor_handler.call_args[0][1]
             fake_event = MagicMock(spec=AgentTextFinal)
             fake_event.text = "done"
@@ -375,7 +375,7 @@ class TestRunJob:
         new_tail = _node_id()
 
         async def _fake_push(msg):
-            from contracts import AgentTextFinal
+            from TinyCTX.contracts import AgentTextFinal
             handler = gateway.register_cursor_handler.call_args[0][1]
             fake_event = MagicMock(spec=AgentTextFinal)
             fake_event.text = "done"
@@ -418,7 +418,7 @@ class TestRunJob:
         job.state.next_run_at_ms = int(time.time() * 1000) - 1
 
         async def _fake_push(msg):
-            from contracts import AgentTextFinal
+            from TinyCTX.contracts import AgentTextFinal
             handler = gateway.register_cursor_handler.call_args[0][1]
             ev = MagicMock(spec=AgentTextFinal)
             ev.text = "ok"
@@ -440,7 +440,7 @@ class TestRunJob:
         agent, gateway = _make_agent_and_gateway(tmp_path)
 
         # Use a real Router to verify the noop slot is actually wired.
-        from router import Router
+        from TinyCTX.router import Router
         real_gateway = Router(config=_make_config(tmp_path))
         agent.gateway = real_gateway
 
@@ -460,7 +460,7 @@ class TestRunJob:
 # HEARTBEAT TESTS
 # ===========================================================================
 
-from modules.heartbeat.__main__ import (
+from TinyCTX.modules.heartbeat.__main__ import (
     _parse_reply,
     _in_active_window,
     _run_turn,
@@ -563,7 +563,7 @@ class TestRunTurn:
         tail_node_id = _node_id()
 
         async def _fake_push(msg):
-            from contracts import AgentTextFinal
+            from TinyCTX.contracts import AgentTextFinal
             handler = gateway.register_cursor_handler.call_args[0][1]
             ev = MagicMock(spec=AgentTextFinal)
             ev.text = "HEARTBEAT_OK"
@@ -629,7 +629,7 @@ class TestRunTurn:
         gateway._lane_router._lanes = {}
 
         async def _fake_push(msg):
-            from contracts import AgentError
+            from TinyCTX.contracts import AgentError
             handler = gateway.register_cursor_handler.call_args[0][1]
             ev = MagicMock(spec=AgentError)
             ev.message = "LLM error"
@@ -647,7 +647,7 @@ class TestRunTurn:
 class TestHeartbeatRegister:
     @pytest.mark.asyncio
     async def test_reset_cancels_task(self, tmp_path):
-        from modules.heartbeat.__main__ import register, _patch_reset
+        from TinyCTX.modules.heartbeat.__main__ import register, _patch_reset
 
         agent = MagicMock()
         agent.config.workspace.path = str(tmp_path)
@@ -667,7 +667,7 @@ class TestHeartbeatRegister:
 
     @pytest.mark.asyncio
     async def test_reset_skips_cancel_if_task_done(self, tmp_path):
-        from modules.heartbeat.__main__ import _patch_reset
+        from TinyCTX.modules.heartbeat.__main__ import _patch_reset
 
         agent = MagicMock()
         agent.reset = MagicMock()

@@ -10,12 +10,12 @@ import yaml
 
 from prompt_toolkit.document import Document
 
-from bridges.cli.__main__ import (
+from TinyCTX.bridges.cli.__main__ import (
     CLIBridge,
     _DimToolLineProcessor,
     _SlashCommandCompleter,
 )
-from config import (
+from TinyCTX.config import (
     BridgeConfig,
     Config,
     LLMRoutingConfig,
@@ -23,8 +23,8 @@ from config import (
     ModelConfig,
     WorkspaceConfig,
 )
-from db import ConversationDB
-from main import _startup_log_level
+from TinyCTX.db import ConversationDB
+from TinyCTX.main import _startup_log_level
 
 
 def _make_config(

@@ -23,16 +23,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from contracts import (
+from TinyCTX.contracts import (
     ContentType, InboundMessage, Platform, UserIdentity,
     ToolCall, ToolResult,
 )
-from context import (
+from TinyCTX.context import (
     Context, HistoryEntry,
     ROLE_USER, ROLE_ASSISTANT, ROLE_TOOL, ROLE_SYSTEM,
 )
-from db import ConversationDB
-from ai import TextDelta, LLMError
+from TinyCTX.db import ConversationDB
+from TinyCTX.ai import TextDelta, LLMError
 
 
 # ---------------------------------------------------------------------------
@@ -406,7 +406,7 @@ def make_agent(tmp_path):
     counter = {"n": 0}
 
     def _factory(stream_fn=None):
-        from agent import AgentLoop
+        from TinyCTX.agent import AgentLoop
         counter["n"] += 1
         cfg = _make_config(tmp_path)
         session_node_id = _make_session_node(tmp_path, f"session-{counter['n']}")
@@ -452,7 +452,7 @@ class TestAgentLoopDBIntegration:
     @pytest.mark.asyncio
     async def test_cursor_persists_across_restarts(self, tmp_path):
         """A new AgentLoop starting from the same tail_node_id resumes the conversation."""
-        from agent import AgentLoop
+        from TinyCTX.agent import AgentLoop
 
         cfg = _make_config(tmp_path)
         session_nid = _make_session_node(tmp_path, "persistent-session")
@@ -502,7 +502,7 @@ class TestAgentLoopDBIntegration:
     @pytest.mark.asyncio
     async def test_multiple_sessions_share_db_independently(self, tmp_path):
         """Three different session nodes share the same DB but have independent cursors."""
-        from agent import AgentLoop
+        from TinyCTX.agent import AgentLoop
 
         cfg = _make_config(tmp_path)
         agents = []
