@@ -41,23 +41,31 @@ def _startup_log_level(cfg) -> int:
 
 
 async def main() -> None:
+    print("[main] loading config", flush=True)
     cfg = load_config()
     apply_logging(cfg.logging, level_override=_startup_log_level(cfg))
+    print(f"[main] gateway.enabled={cfg.gateway.enabled} bridges={list(cfg.bridges)}", flush=True)
 
+    print("[main] creating router", flush=True)
     gw = Router(config=cfg)
+    print("[main] router created", flush=True)
 
     tasks: list[asyncio.Task] = []
 
     # ------------------------------------------------------------------ gateway
     if cfg.gateway.enabled:
+        print("[main] starting gateway", flush=True)
         if not cfg.gateway.api_key:
             logger.warning("gateway.api_key is empty — gateway is unauthenticated!")
         try:
+            print("[main] importing gateway module", flush=True)
             gateway_mod = importlib.import_module(GATEWAY_MOD)
+            print("[main] gateway module imported", flush=True)
             tasks.append(asyncio.create_task(
                 gateway_mod.run(gw, cfg.gateway),
                 name="gateway",
             ))
+            print("[main] gateway task created", flush=True)
             logger.info(
                 "Started gateway on %s:%d",
                 cfg.gateway.host, cfg.gateway.port,
@@ -66,12 +74,14 @@ async def main() -> None:
             logger.exception("Failed to start gateway")
 
     # ------------------------------------------------------------------ bridges
+    print("[main] scanning bridges", flush=True)
     if BRIDGES_DIR.exists():
         for entry in sorted(BRIDGES_DIR.iterdir()):
             if not entry.is_dir() or not (entry / "__main__.py").exists():
                 continue
 
             name = entry.name
+            print(f"[main] found bridge '{name}'", flush=True)
             bridge_cfg = cfg.bridges.get(name)
             if bridge_cfg is None:
                 logger.debug("Bridge '%s' has no config entry — skipping", name)
@@ -81,7 +91,7 @@ async def main() -> None:
                 continue
 
             try:
-                mod = importlib.import_module(f"bridges.{name}.__main__")
+                mod = importlib.import_module(f"TinyCTX.bridges.{name}.__main__")
                 if getattr(mod, MANUAL_LAUNCH_ATTR, False):
                     logger.debug("Bridge '%s' is manual-launch only — skipping auto-start", name)
                     continue
@@ -93,6 +103,7 @@ async def main() -> None:
             except Exception:
                 logger.exception("Failed to load bridge '%s'", name)
 
+    print(f"[main] {len(tasks)} tasks, entering wait", flush=True)
     if not tasks:
         logger.error("Nothing started — enable at least one bridge or the server in config.yaml.")
         return

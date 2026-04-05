@@ -11,6 +11,8 @@ from __future__ import annotations
 import argparse
 import sys
 
+from pathlib import Path
+
 from TinyCTX.utils import pid as pidfile
 
 
@@ -22,34 +24,51 @@ def run(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     info = pidfile.read()
-    if not info:
-        print("error: TinyCTX is not running. Start it first with `tinyctx start`.",
-              file=sys.stderr)
-        sys.exit(1)
 
-    if not pidfile.is_alive(info["pid"]):
-        print("error: daemon pid is stale. Run `tinyctx start` to restart.",
-              file=sys.stderr)
-        sys.exit(1)
-
-    gateway_url = info["gateway_url"]
-    api_key     = info["api_key"]
-    config_path = info.get("config_path")
-
-    # Load bridge options from config.yaml.
-    options: dict = {}
-    if config_path:
+    # Fall back to reading gateway info directly from config if no pid file.
+    if not info or not pidfile.is_alive(info["pid"]):
+        config_path = str(Path("config.yaml").resolve())
         try:
-            import sys as _sys
-            from pathlib import Path
-            _sys.path.insert(0, str(Path(config_path).parent))
             from TinyCTX.config import load as load_config
             cfg = load_config(config_path)
+            gateway_url = f"http://{cfg.gateway.host}:{cfg.gateway.port}"
+            api_key     = cfg.gateway.api_key or ""
+        except Exception as exc:
+            print(f"error: no running daemon and could not load config: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+        # Verify gateway is actually reachable.
+        import urllib.request
+        try:
+            with urllib.request.urlopen(f"{gateway_url}/v1/health", timeout=2) as r:
+                if r.status != 200:
+                    raise OSError(f"status {r.status}")
+        except Exception as exc:
+            print(f"error: gateway at {gateway_url} is not responding: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+        options: dict = {}
+        try:
             bridge_cfg = cfg.bridges.get("cli")
             if bridge_cfg:
                 options = getattr(bridge_cfg, "options", {}) or {}
         except Exception:
-            pass  # options are optional
+            pass
+    else:
+        gateway_url = info["gateway_url"]
+        api_key     = info["api_key"]
+        config_path = info.get("config_path")
+
+        options: dict = {}
+        if config_path:
+            try:
+                from TinyCTX.config import load as load_config
+                cfg = load_config(config_path)
+                bridge_cfg = cfg.bridges.get("cli")
+                if bridge_cfg:
+                    options = getattr(bridge_cfg, "options", {}) or {}
+            except Exception:
+                pass
 
     import asyncio
     from TinyCTX.bridges.cli.__main__ import run_detached

@@ -69,6 +69,8 @@ def run(args: argparse.Namespace) -> None:
         proc = subprocess.Popen(
             [sys.executable, str(main_py)],
             cwd=str(config_path.parent),
+            stdout=sys.stdout,
+            stderr=sys.stderr,
         )
     else:
         with open(log_file, "a") as lf:
@@ -99,7 +101,11 @@ def run(args: argparse.Namespace) -> None:
     )
 
     if foreground:
-        proc.wait()
+        try:
+            proc.wait()
+        except KeyboardInterrupt:
+            proc.terminate()
+            proc.wait()
         return
 
     # Poll health.
