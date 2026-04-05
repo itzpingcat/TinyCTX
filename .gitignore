@@ -1,14 +1,14 @@
 # secrets / local config
 config.yaml
 config.yaml.bak
-
+.env
 
 # python
 __pycache__/
 .pytest_cache/
 *.pyc
 *.pyo
-.env
+tinyctx.egg-info
 
 # sessions / workspace data
 sessions/
