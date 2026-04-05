@@ -15,10 +15,15 @@ cp example.config.yaml config.yaml
 # Edit config.yaml — set models, llm.primary, api_key_env
 export ANTHROPIC_API_KEY=sk-...
 pip install -r requirements.txt
-python main.py
+pip install -e .           # installs `tinyctx` CLI entry point
+tinyctx onboard            # first-time setup
+tinyctx start              # start daemon
+tinyctx launch cli         # attach CLI
 ```
 
-In the CLI bridge: type `/reset` to clear context, `exit` to quit.
+Or run directly without installing: `python main.py` (daemon only, no CLI).
+
+In the CLI: type `/reset` to clear context, `exit` to quit.
 
 Run tests: `python -m pytest -v`
 
@@ -49,7 +54,7 @@ main.py
 | `contracts.py` | Pure data types. No logic. Everything imports from here, never the reverse. `InboundMessage` carries `author` (`UserIdentity`) for all messages. |
 | `config/` | YAML loader + env var resolution. `WorkspaceConfig` (global workspace path). `ModelConfig` supports `kind: chat` (default) or `kind: embedding`, plus `vision: bool`. `AttachmentConfig` (inline thresholds). |
 | `router.py` | Session routing. One `Lane` (bounded queue maxsize=32 + crash-recovering worker task) per `node_id` (cursor). `router.push()` returns `bool` — `False` means lane queue full. Bridges register platform/session handlers. `router.open_lane(node_id, platform)` eagerly creates a lane and registers its platform without enqueuing any work — used by CLI at startup and after `/reset`. |
-| `gateway/` | HTTP/SSE API gateway. External clients (SillyTavern, custom scripts, etc.) connect here. `run(router, cfg)` called by `main.py`. Accepts `attachments: [{name, data_b64, mime_type}]` on POST /message. |
+| `gateway/` | HTTP/SSE API gateway. External clients connect here. `run(router, cfg)` called by `main.py`. Node-id-based lane API (`/v1/lane/*`). Per-lane SSE fanout via `node_id → set[Queue]` table. |
 | `agent.py` | The 6-stage loop. Owns `Context`, `ToolCallHandler`, and LLM pool. Yields `AgentEvent` stream. Skips embedding models when building LLM pool. Stage 1 calls `build_content_blocks` when `msg.attachments` is non-empty. |
 | `context.py` | Dialogue history + hook pipeline. Sync stages: `pre_assemble`, `filter_turn`, `transform_turn`, `post_assemble`. Async stage: `HOOK_PRE_ASSEMBLE_ASYNC` (awaited by agent before each `assemble()` call). Smart `delete()` / `edit()` / `strip_tool_calls()` for dialogue mutation. `HistoryEntry.content` is `str \| list` — list for user turns with attachments. |
 | `ai.py` | Async OpenAI-compatible clients. `LLM` streams SSE → `TextDelta` / `ToolCallAssembled` / `LLMError`. Retries on `ClientConnectionError` (3 attempts, exp backoff via tenacity). `Embedder` calls `/v1/embeddings`, auto-batches, numpy fast-path. |
@@ -66,7 +71,7 @@ Sessions are represented as tree branches in `agent.db` (SQLite). Each bridge ho
 - CLI: `workspace/cursors/cli`
 - Discord: `workspace/cursors/discord.json` (by channel_id)
 - Matrix: `workspace/cursors/matrix.json` (by room_id)
-- Gateway: `workspace/cursors/gateway.json` (by session_id → node_id)
+- Gateway: clients track their own cursor locally; `workspace/cursors/gateway.json` is no longer used
 - Cron: `cursor_node_id` field per job in `CRON.json`
 - Heartbeat: `_heartbeat_cursor_node_id` attribute on the agent instance; node created once in `agent.db` as a child of root (or the session tail, if `branch_from: "session"`), then reused for all subsequent ticks
 
@@ -214,38 +219,108 @@ Modules access workspace via `agent.config.workspace.path`. There is no `memory.
 
 ---
 
-## Gateway API (OUTDATED)
+## CLI tool
 
-this section is outdated
+TinyCTX ships as an installable CLI. The daemon runs headlessly (gateway + all non-CLI bridges). The CLI bridge attaches on demand as a foreground client.
 
-**SSE event types** (streaming responses):
-```json
-{"type": "text_chunk",  "text": "..."}
-{"type": "tool_call",   "call_id": "...", "name": "...", "args": {...}}
-{"type": "tool_result", "call_id": "...", "name": "...", "output": "...", "is_error": false}
-{"type": "text_final",  "text": "..."}
-{"type": "error",       "message": "..."}
-{"type": "done"}
-```
-Non-streaming responses return `{ "text": "..." }` (120s timeout).
-
-**GET /sessions response:**
-```json
-[{ "id": "main", "node_id": "<uuid>", "turns": 5, "queue_depth": 0, "queue_max": 32, "is_active": true }]
-```
-Includes all sessions in the cursor map (active or not) plus any active lanes from other bridges (shown with `node_id` as `id`).
-
-**GET /history response:** Ancestor chain from `agent.db` (root → current tail), system session-marker nodes filtered out. Reads directly from DB — no active lane required:
-```json
-[{ "id": "<uuid>", "role": "user", "content": "...", "tool_calls": null, "tool_call_id": null, "author_id": null, "created_at": 1234567890.0 }]
+```bash
+tinyctx onboard          # setup wizard
+tinyctx start            # start gateway daemon
+tinyctx stop             # stop daemon
+tinyctx status           # show daemon health
+tinyctx launch cli       # attach interactive CLI to running daemon
 ```
 
-**GET /health response:**
+**`cmd/` package layout:**
+```
+cmd/
+  __init__.py
+  __main__.py              # entry: python -m cmd / tinyctx
+  commands/
+    start.py               # spawn daemon, write pid file, poll health
+    stop.py                # SIGTERM → poll → SIGKILL, clean pid file
+    status.py              # print health from /v1/health
+    onboard.py             # thin wrapper: calls onboard.__main__.main()
+    launch.py              # dispatch `tinyctx launch <target>`
+  pid.py                   # pid file helpers: read/write/check/clean
+```
+
+**Pid file** (`~/.tinyctx/daemon.pid`, JSON): fields `pid`, `gateway_url`, `api_key`, `config_path`, `started_at`.
+
+**`tinyctx start`** — loads config, checks/cleans existing pid, spawns `main.py` detached (logs to `~/.tinyctx/daemon.log`), polls `GET /v1/health` up to 8s. Pass `--foreground` to skip detach.
+
+**`tinyctx launch cli`** — reads pid file for gateway_url + api_key, loads `bridges.cli.options` from config, calls `bridges.cli.__main__.run_detached(gateway_url, api_key, options)`.
+
+**MANUAL_LAUNCH bridges:** Bridges that set `MANUAL_LAUNCH = True` at module level are skipped by `main.py`'s bridge loader (checked via `getattr(mod, "MANUAL_LAUNCH", False)`). `bridges/cli/__main__.py` sets this — the CLI is never auto-started with the daemon.
+
+---
+
+## Gateway API
+
+Four endpoints. All except `/v1/health` require `Authorization: Bearer <api_key>`.
+
+```
+POST   /v1/lane/open       open (or no-op) a lane; bootstrap cursor if needed
+POST   /v1/lane/message    push a message, receive SSE reply
+POST   /v1/lane/branch     create a new branch node, return its node_id
+DELETE /v1/lane/abort      abort in-flight generation for a node_id
+GET    /v1/health          always public
+GET    /v1/workspace/files/{path}   read workspace file
+PUT    /v1/workspace/files/{path}   write workspace file
+```
+
+**`POST /v1/lane/open`** — mirrors `router.open_lane(node_id, "api")` + cursor bootstrap.
 ```json
-{ "status": "ok", "uptime_s": 42.1, "lanes": { "<node_id>": { "session_id": "main", "turns": 5, "queue_depth": 0, "queue_max": 32 } } }
+// request
+{ "node_id": "<uuid or null>" }
+// response
+{ "node_id": "<uuid>" }
+```
+If `node_id` is null/absent or not found in DB, creates a new branch off root.
+
+**`POST /v1/lane/message`** — push a message, returns SSE stream.
+```json
+// request
+{ "node_id": "<uuid>", "text": "hello", "attachments": [{"name": "f.png", "data_b64": "...", "mime_type": "image/png"}] }
+```
+Returns 429 if lane queue full. `text` or `attachments` (or both) required.
+
+**SSE event types:**
+```json
+{"type": "thinking_chunk", "text": "..."}
+{"type": "text_chunk",     "text": "..."}
+{"type": "text_final",     "text": "..."}
+{"type": "tool_call",      "tool_name": "...", "call_id": "...", "args": {...}}
+{"type": "tool_result",    "tool_name": "...", "call_id": "...", "output": "...", "is_error": false}
+{"type": "error",          "message": "..."}
+{"type": "done",           "node_id": "<new tail uuid>"}
+```
+The `done` event carries the new tail `node_id` — clients must update their local cursor to this value.
+
+**`POST /v1/lane/branch`** — creates a child node in `agent.db`. Non-destructive.
+```json
+// request
+{ "parent_node_id": "<uuid or null>" }
+// response
+{ "node_id": "<new uuid>" }
+```
+Null/absent `parent_node_id` branches off root. CLI `/reset` uses `{"parent_node_id": null}`, then follows up with `POST /v1/lane/open` for the new node_id.
+
+**`DELETE /v1/lane/abort`** — calls `router.abort_generation(node_id)`. Returns 204.
+```json
+{ "node_id": "<uuid>" }
+```
+
+**`GET /v1/health`:**
+```json
+{ "status": "ok", "uptime_s": 42.1, "lanes": { "<node_id>": { "turns": 5, "queue_depth": 0, "queue_max": 32 } } }
 ```
 
 **Workspace file paths** are resolved relative to `workspace.path`. Path traversal (`..`) is rejected with 403.
+
+**Per-lane SSE fanout:** The gateway maintains a `node_id → set[asyncio.Queue]` fanout table. One persistent cursor handler per active node_id fans events to all connected SSE streams. Multiple clients on the same node_id all receive all events. Cursor handler lifetime is tied to whether any client is listening.
+
+**Gateway cursor storage:** `workspace/cursors/gateway.json` is no longer created or read. Clients track their own `node_id` cursors locally.
 
 ---
 
