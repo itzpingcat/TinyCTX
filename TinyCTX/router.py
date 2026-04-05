@@ -410,11 +410,11 @@ class Router:
 
         platform = self._node_platforms.get(lane_id)
         if platform is None:
-            logger.error("Cannot determine platform for lane %s — dropping %s", lane_id, event.trace_id)
+            logger.debug("No platform registered for lane %s — event dropped (client likely disconnected)", lane_id)
             return
         handler = self._platform_handlers.get(platform)
         if handler is None:
-            logger.error("No handler for platform '%s' — dropping %s", platform, event.trace_id)
+            logger.debug("No handler for platform '%s' on lane %s — event dropped (client likely disconnected)", platform, lane_id)
             return
         try:
             await handler(event)

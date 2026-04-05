@@ -271,12 +271,19 @@ async def handle_lane_message(request: web.Request) -> web.StreamResponse:
         while True:
             kind, payload = await q.get()
             if kind == "event":
-                await response.write(f"data: {json.dumps(payload)}\n\n".encode())
+                try:
+                    await response.write(f"data: {json.dumps(payload)}\n\n".encode())
+                except (ConnectionResetError, Exception) as exc:
+                    logger.debug("gateway: client disconnected mid-stream for node_id=%s (%s)", node_id, exc)
+                    break
             elif kind == "done":
                 new_tail = payload  # tail node_id from the terminal event
-                await response.write(
-                    f'data: {json.dumps({"type": "done", "node_id": new_tail})}\n\n'.encode()
-                )
+                try:
+                    await response.write(
+                        f'data: {json.dumps({"type": "done", "node_id": new_tail})}\n\n'.encode()
+                    )
+                except Exception:
+                    pass
                 break
     except asyncio.CancelledError:
         pass

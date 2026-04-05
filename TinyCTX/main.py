@@ -37,31 +37,31 @@ def _startup_log_level(cfg) -> int:
 
 
 async def main() -> None:
-    print("[main] loading config", flush=True)
+    logger.debug("loading config")
     cfg = load_config()
     apply_logging(cfg.logging, level_override=_startup_log_level(cfg))
-    print(f"[main] gateway.enabled={cfg.gateway.enabled} bridges={list(cfg.bridges)}", flush=True)
+    logger.debug("gateway.enabled=%s bridges=%s", cfg.gateway.enabled, list(cfg.bridges))
 
-    print("[main] creating router", flush=True)
+    logger.debug("creating router")
     gw = Router(config=cfg)
-    print("[main] router created", flush=True)
+    logger.debug("router created")
 
     tasks: list[asyncio.Task] = []
 
     # ------------------------------------------------------------------ gateway
     if cfg.gateway.enabled:
-        print("[main] starting gateway", flush=True)
+        logger.debug("starting gateway")
         if not cfg.gateway.api_key:
             logger.warning("gateway.api_key is empty — gateway is unauthenticated!")
         try:
-            print("[main] importing gateway module", flush=True)
+            logger.debug("importing gateway module")
             gateway_mod = importlib.import_module(GATEWAY_MOD)
-            print("[main] gateway module imported", flush=True)
+            logger.debug("gateway module imported")
             tasks.append(asyncio.create_task(
                 gateway_mod.run(gw, cfg.gateway),
                 name="gateway",
             ))
-            print("[main] gateway task created", flush=True)
+            logger.debug("gateway task created")
             logger.info(
                 "Started gateway on %s:%d",
                 cfg.gateway.host, cfg.gateway.port,
@@ -70,14 +70,14 @@ async def main() -> None:
             logger.exception("Failed to start gateway")
 
     # ------------------------------------------------------------------ bridges
-    print("[main] scanning bridges", flush=True)
+    logger.debug("scanning bridges")
     if BRIDGES_DIR.exists():
         for entry in sorted(BRIDGES_DIR.iterdir()):
             if not entry.is_dir() or not (entry / "__main__.py").exists():
                 continue
 
             name = entry.name
-            print(f"[main] found bridge '{name}'", flush=True)
+            logger.debug("found bridge '%s'", name)
             bridge_cfg = cfg.bridges.get(name)
             if bridge_cfg is None:
                 logger.debug("Bridge '%s' has no config entry — skipping", name)
@@ -99,7 +99,7 @@ async def main() -> None:
             except Exception:
                 logger.exception("Failed to load bridge '%s'", name)
 
-    print(f"[main] {len(tasks)} tasks, entering wait", flush=True)
+    logger.debug("%d tasks created, entering wait", len(tasks))
     if not tasks:
         logger.error("Nothing started — enable at least one bridge or the server in config.yaml.")
         return
