@@ -9,7 +9,7 @@ import argparse
 import json
 import sys
 
-from TinyCTX.commands import pid as pidfile
+from TinyCTX.utils import pid as pidfile
 
 
 def _health(gateway_url: str, api_key: str) -> dict | None:

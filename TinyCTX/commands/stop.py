@@ -11,7 +11,7 @@ import signal
 import sys
 import time
 
-from TinyCTX.commands import pid as pidfile
+from TinyCTX.utils import pid as pidfile
 
 _DRAIN_TIMEOUT  = 5.0
 _POLL_INTERVAL  = 0.2

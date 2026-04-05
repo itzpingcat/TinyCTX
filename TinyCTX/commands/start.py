@@ -18,7 +18,7 @@ import sys
 import time
 from pathlib import Path
 
-from TinyCTX.commands import pid as pidfile
+from TinyCTX.utils import pid as pidfile
 
 
 _POLL_TIMEOUT  = 8.0   # seconds to wait for daemon to come up

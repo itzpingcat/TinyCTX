@@ -1,5 +1,1 @@
-bridges
-cmd
-config
-gateway
-onboard
+TinyCTX

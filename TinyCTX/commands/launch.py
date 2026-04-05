@@ -11,7 +11,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from TinyCTX.commands import pid as pidfile
+from TinyCTX.utils import pid as pidfile
 
 
 def run(args: argparse.Namespace) -> None:

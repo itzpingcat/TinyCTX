@@ -1,2 +1,2 @@
 [console_scripts]
-tinyctx = cmd.__main__:main
+tinyctx = TinyCTX.__main__:main
