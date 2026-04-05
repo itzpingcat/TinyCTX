@@ -76,7 +76,7 @@ def section(title: str) -> None:
 
 
 def success(msg: str) -> None:
-    c.print(f"[bold green]✓[/] {msg}")
+    c.print(f"[bold green]OK[/] {msg}")
 
 
 def warn(msg: str) -> None:
@@ -86,13 +86,13 @@ def warn(msg: str) -> None:
 # ── data loaders ──────────────────────────────────────────────────────────────
 
 def load_providers() -> dict[str, str]:
-    """Load full providers list (name → base_url)."""
+    """Load full providers list (name -> base_url)."""
     with open(PROVIDERS_FILE) as f:
         return json.load(f)
 
 
 def load_beginner_providers() -> dict[str, dict]:
-    """Load enriched beginner providers list (name → {base_url, key_url, key_steps, suggested_models})."""
+    """Load beginner providers list (name -> {base_url, key_url, key_steps, suggested_models})."""
     with open(BEGINNER_PROVIDERS_FILE) as f:
         return json.load(f)
 
@@ -210,51 +210,70 @@ def health_ping(host: str, port: int, timeout: float = 4.0) -> bool:
 
 def pick_model(base_url: str, api_key_env: str, label: str = "model") -> str:
     """
-    Try to list models from the endpoint. If successful, show arrow-key select.
-    Falls back to free-text entry if the endpoint is unreachable.
-    Floats likely embedding models to the top when label contains 'embed'.
+    Fetch the model list from the provider and let the user pick one.
+    Falls back to a free-text prompt if the list is empty or unreachable.
+    Returns the chosen model string, or "" if the user aborts.
     """
-    c.print(f"  Querying {base_url}/models …", end=" ")
-    model_ids = fetch_models(base_url, api_key_env)
+    c.print(f"  Fetching available {label}s...", end=" ", flush=True)
+    models = fetch_models(base_url, api_key_env)
 
-    if not model_ids:
-        c.print("[yellow]could not reach endpoint[/]")
-        answer = questionary.text(f"Enter {label} name manually", style=QSTYLE).ask()
-        return answer or ""
+    if models:
+        c.print(f"[dim]{len(models)} found[/]")
+        choices = models + ["Enter manually", "<- Back"]
+        choice = questionary.select(
+            f"Select {label}:",
+            choices=choices,
+            style=QSTYLE,
+        ).ask()
 
-    if "embed" in label.lower():
-        hints   = ("embed", "nomic", "mxbai", "e5-", "bge-", "voyage", "gte-", "minilm", "all-")
-        priority = [m for m in model_ids if any(h in m.lower() for h in hints)]
-        rest     = [m for m in model_ids if m not in priority]
-        ordered  = priority + rest
-        c.print(f"[green]{len(model_ids)} models ({len(priority)} likely embedding)[/]")
+        if choice is None or choice == "<- Back":
+            raise GoBack
+        if choice != "Enter manually":
+            return choice
+
     else:
-        ordered = model_ids
-        c.print(f"[green]{len(model_ids)} models found[/]")
+        c.print("[dim](could not fetch list)[/]")
 
-    answer = questionary.select(f"Select {label}", choices=ordered, style=QSTYLE).ask()
-    return answer or ""
+    # Free-text fallback
+    raw = input(f"  Type the {label} name (or 'back'): ").strip()
+    if not raw or raw.lower() in ("back", "b"):
+        raise GoBack
+    return raw
 
 
-def pick_model_beginner(provider_name: str, base_url: str, api_key_env: str, suggested: list[str]) -> str:
+def pick_model_beginner(
+    provider_name: str,
+    base_url: str,
+    api_key_env: str,
+    suggested_models: list[str],
+) -> str:
     """
-    Quickstart model picker: tries live endpoint first.
-    Falls back to the curated suggested_models list if unreachable.
+    Model picker for quickstart mode.
+    Shows a curated list of suggested models; falls back to fetching live list.
+    Returns the chosen model string, or "" if the user aborts.
     """
-    c.print(f"  Querying available models …", end=" ")
-    model_ids = fetch_models(base_url, api_key_env)
+    # Try to present the suggested list first
+    choices: list[str] = list(suggested_models)
 
-    if model_ids:
-        c.print(f"[green]{len(model_ids)} models found[/]")
-        answer = questionary.select("Select a model", choices=model_ids, style=QSTYLE).ask()
-    else:
-        c.print("[yellow]couldn't connect yet (API key may not be set) — showing recommended models[/]")
-        choices = suggested + ["Enter manually…"]
-        answer  = questionary.select("Pick a model to use", choices=choices, style=QSTYLE).ask()
-        if answer == "Enter manually…":
-            answer = questionary.text("Model name", style=QSTYLE).ask() or ""
+    if not choices:
+        # No suggestions — fall through to live fetch
+        return pick_model(base_url, api_key_env, label="model")
 
-    return answer or ""
+    choices += ["Show all available models", "<- Back"]
+
+    choice = questionary.select(
+        f"Pick a {provider_name} model:",
+        choices=choices,
+        style=QSTYLE,
+    ).ask()
+
+    if choice is None or choice == "<- Back":
+        raise GoBack
+
+    if choice == "Show all available models":
+        return pick_model(base_url, api_key_env, label="model")
+
+    return choice
 
 
 # ── legacy Config / set_env (kept for other callers) ─────────────────────────
