@@ -1,6 +1,7 @@
 EXTENSION_META = {
-    "name":    "cron",
-    "version": "1.0",
+    "name":        "cron",
+    "version":     "1.0",
+    "module_type": "singleton",   # runs once on the system lane; not per-lane
     "description": (
         "Scheduled agent turns. Jobs are stored in workspace/CRON.json "
         "and support three schedule kinds: 'at' (one-shot timestamp), "

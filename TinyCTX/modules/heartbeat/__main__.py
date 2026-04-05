@@ -168,8 +168,6 @@ def register(agent) -> None:
         name=f"heartbeat:{lane_node_id}",
     )
 
-    _patch_reset(agent, task)
-
     logger.info(
         "[heartbeat] started — every %dm, lane=%s, branch_from=%s, active_hours=%s",
         every_minutes, lane_node_id, branch_from, active_hours,

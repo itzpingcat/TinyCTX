@@ -631,13 +631,6 @@ def register(agent) -> None:
     runner = _CronRunner(agent, store_path)
     runner.start()
 
-    original_reset = agent.reset
-    def patched_reset():
-        original_reset()
-        runner.stop()
-        logger.info("[cron] runner stopped on session reset")
-    agent.reset = patched_reset
-
     def cron_list() -> str:
         """
         List all scheduled cron jobs, validate their configuration, and show next/last run times.

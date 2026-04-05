@@ -1,6 +1,7 @@
 EXTENSION_META = {
-    "name":    "heartbeat",
-    "version": "2.0",
+    "name":        "heartbeat",
+    "version":     "2.0",
+    "module_type": "singleton",   # runs once on the system lane; not per-lane
     "description": (
         "Periodic agent turns on a configurable interval, isolated on their own "
         "DB branch — never polluting the user's conversation thread. "

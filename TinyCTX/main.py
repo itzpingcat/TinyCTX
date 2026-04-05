@@ -45,6 +45,7 @@ async def main() -> None:
     logger.debug("creating router")
     gw = Router(config=cfg)
     logger.debug("router created")
+    gw.open_system_lane()
 
     tasks: list[asyncio.Task] = []
 

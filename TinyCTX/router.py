@@ -383,6 +383,39 @@ class Router:
         """Queue a generation with no new user message (run(None))."""
         return await self._lane_router.enqueue_synthetic(node_id)
 
+    def open_system_lane(self) -> None:
+        """
+        Create a permanent system lane for singleton modules (heartbeat, cron, etc.).
+        Opens a DB branch off the global root, starts a Lane, and loads all
+        modules declared as module_type='singleton' onto it.
+
+        Called once from main.py immediately after the Router is constructed,
+        before any bridge or gateway task starts. Safe to call with no bridges
+        enabled — the system lane runs for the lifetime of the process regardless.
+        """
+        from TinyCTX.db import ConversationDB
+        from TinyCTX.agent import AgentLoop
+        from pathlib import Path
+
+        workspace = Path(self._config.workspace.path).expanduser().resolve()
+        workspace.mkdir(parents=True, exist_ok=True)
+        db   = ConversationDB(workspace / "agent.db")
+        root = db.get_root()
+        node = db.add_node(parent_id=root.id, role="system", content="session:system")
+        node_id = node.id
+
+        self._node_platforms[node_id] = "system"
+        lane = self._lane_router.ensure_lane(node_id)
+
+        # Wire gateway reference so singleton modules can call gateway.push().
+        lane.loop.gateway = self
+        lane.loop.commands = self.commands
+
+        # Load only singleton modules onto the system agent.
+        lane.loop.load_singleton_modules()
+
+        logger.info("System lane started (node_id=%s)", node_id)
+
     def open_lane(self, node_id: str, platform: str) -> None:
         """
         Eagerly open a lane for node_id without enqueuing any work.

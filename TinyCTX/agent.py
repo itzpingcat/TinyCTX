@@ -212,6 +212,16 @@ class AgentLoop:
     # ------------------------------------------------------------------
 
     def load_modules(self) -> None:
+        """Load per_lane modules. Singleton modules are skipped — they run on the system lane only."""
+        self._load_modules_filtered(singleton=False)
+
+    def load_singleton_modules(self) -> None:
+        """Load singleton modules. Called once on the system lane at gateway startup."""
+        self._load_modules_filtered(singleton=True)
+
+    def _load_modules_filtered(self, *, singleton: bool) -> None:
+        """Load modules whose module_type matches the requested kind."""
+        target_type = "singleton" if singleton else "per_lane"
         if not MODULES_DIR.exists():
             return
         for entry in sorted(MODULES_DIR.iterdir()):
@@ -231,8 +241,21 @@ class AgentLoop:
                 else:
                     logger.warning("Module '%s' has no register() — skipping", entry.name)
                     continue
+
+                # Determine module_type from EXTENSION_META in __init__.py
+                module_type = "per_lane"  # default
+                try:
+                    init_mod = importlib.import_module(module_name)
+                    meta = getattr(init_mod, "EXTENSION_META", {})
+                    module_type = meta.get("module_type", "per_lane")
+                except Exception:
+                    pass
+
+                if module_type != target_type:
+                    continue
+
                 mod.register(self)
-                logger.info("Loaded module '%s'", entry.name)
+                logger.info("Loaded %s module '%s'", target_type, entry.name)
             except Exception:
                 logger.exception("Failed to load module '%s'", entry.name)
 
