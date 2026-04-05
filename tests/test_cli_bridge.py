@@ -37,7 +37,7 @@ def _make_config(
     return Config(
         models={
             "main": ModelConfig(
-                base_url="http://localhost:8080/v1",
+                base_url="http://localhost:8085/v1",
                 model="llama3",
                 api_key_env="N/A",
             )
@@ -231,7 +231,7 @@ def test_settings_round_trips_menu_updates_runtime_config(tmp_path):
         """
 models:
   main:
-    base_url: http://localhost:8080/v1
+    base_url: http://localhost:8085/v1
     model: llama3
     api_key_env: N/A
 llm:
@@ -267,7 +267,7 @@ def test_settings_toggle_persists_cli_option(tmp_path):
         """
 models:
   main:
-    base_url: http://localhost:8080/v1
+    base_url: http://localhost:8085/v1
     model: llama3
     api_key_env: N/A
 llm:
@@ -326,7 +326,7 @@ def test_settings_can_create_provider_preset_profile(tmp_path):
         """
 models:
   main:
-    base_url: http://localhost:8080/v1
+    base_url: http://localhost:8085/v1
     model: llama3
     api_key_env: N/A
 llm:
@@ -361,7 +361,7 @@ def test_settings_can_set_primary_profile_from_provider_menu(tmp_path):
         """
 models:
   main:
-    base_url: http://localhost:8080/v1
+    base_url: http://localhost:8085/v1
     model: llama3
     api_key_env: N/A
   ollama:

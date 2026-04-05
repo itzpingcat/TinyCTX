@@ -40,7 +40,7 @@ const FIELD_MAP = {
 // ---------------------------------------------------------------------------
 
 const DEFAULT_SETTINGS = Object.freeze({
-    endpoint:         "http://127.0.0.1:8080",
+    endpoint:         "http://127.0.0.1:8085",
     api_key:          "",
     session_id:       "sillytavern",
     show_tool_events: true,
@@ -665,7 +665,7 @@ const SETTINGS_HTML = `
 
     <div class="tinyctx-field">
         <label for="tinyctx-endpoint">Gateway endpoint</label>
-        <input type="text" id="tinyctx-endpoint" placeholder="http://127.0.0.1:8080">
+        <input type="text" id="tinyctx-endpoint" placeholder="http://127.0.0.1:8085">
     </div>
 
     <div class="tinyctx-field">
@@ -712,7 +712,7 @@ function bindSettings() {
     sf.checked   = s.sync_card_fields;
 
     const persist = () => {
-        s.endpoint         = ep.value.trim().replace(/\/$/, "") || "http://127.0.0.1:8080";
+        s.endpoint         = ep.value.trim().replace(/\/$/, "") || "http://127.0.0.1:8085";
         s.api_key          = key.value.trim();
         s.session_id       = sid_el.value.trim() || "sillytavern";
         s.show_tool_events = te.checked;

@@ -196,7 +196,7 @@ llm:
 gateway:                        # HTTP/SSE API gateway (external clients)
   enabled: true
   host: 127.0.0.1
-  port: 8080
+  port: 8085
   api_key: "your-secret-token"
 
 workspace:

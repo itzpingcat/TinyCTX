@@ -122,12 +122,12 @@ class GatewayConfig:
         gateway:
           enabled: true
           host: 127.0.0.1
-          port: 8080
+          port: 8085
           api_key: "your-secret-token"
     """
     enabled: bool = False
     host:    str  = "127.0.0.1"
-    port:    int  = 8080
+    port:    int  = 8085
     api_key: str  = ""
 
 
@@ -350,7 +350,7 @@ def load(path="config.yaml") -> Config:
     gateway = GatewayConfig(
         enabled=bool(gw_raw.get("enabled", False)),
         host=gw_raw.get("host", "127.0.0.1"),
-        port=int(gw_raw.get("port", 8080)),
+        port=int(gw_raw.get("port", 8085)),
         api_key=gw_raw.get("api_key", ""),
     )
 

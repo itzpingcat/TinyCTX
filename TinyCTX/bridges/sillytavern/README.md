@@ -25,7 +25,7 @@ the bridge loader. There is no server-side component beyond the gateway you alre
 gateway:
   enabled: true
   host: 127.0.0.1
-  port: 8080
+  port: 8085
   api_key: "your-secret"
 ```
 
@@ -56,7 +56,7 @@ Add a config block to the character's **Description** field:
 
 ```
 [TINYCTX]
-endpoint: http://127.0.0.1:8080
+endpoint: http://127.0.0.1:8085
 session: my-agent
 token: your-secret
 [/TINYCTX]

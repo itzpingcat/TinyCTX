@@ -174,14 +174,14 @@ For external clients (custom scripts, SillyTavern, etc.):
 gateway:
   enabled: true
   host: 127.0.0.1
-  port: 8080
+  port: 8085
   api_key: "your-secret-token"
 ```
 
 Send messages:
 
 ```bash
-curl -N http://localhost:8080/v1/sessions/alice/message \
+curl -N http://localhost:8085/v1/sessions/alice/message \
   -H "Authorization: Bearer your-secret-token" \
   -H "Content-Type: application/json" \
   -d '{"text": "Hello!", "stream": true}'

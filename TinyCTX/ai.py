@@ -270,7 +270,7 @@ class Embedder:
 
     Works with any server that speaks the OpenAI embeddings API:
       - OpenAI          base_url = https://api.openai.com/v1
-      - llama-swap      base_url = http://localhost:8080/v1
+      - llama-swap      base_url = http://localhost:8085/v1
       - Ollama          base_url = http://localhost:11434/v1
       - LM Studio       base_url = http://localhost:1234/v1
 
