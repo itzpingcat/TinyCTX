@@ -36,8 +36,8 @@ A lightweight agentic assistant framework. Connect it to your LLM, configure a b
 ```bash
 git clone <repo>
 cd TinyCTX
-pip install -r requirements.txt
-cp example.config.yaml config.yaml
+pip install -e .
+python -m TinyCTX onboard
 ```
 
 ---

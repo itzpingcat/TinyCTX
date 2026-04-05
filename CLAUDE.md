@@ -214,40 +214,9 @@ Modules access workspace via `agent.config.workspace.path`. There is no `memory.
 
 ---
 
-## Gateway API
+## Gateway API (OUTDATED)
 
-All endpoints require `Authorization: Bearer <api_key>`. Health is always public.
-
-```
-GET    /v1/sessions                              list all sessions (active lanes + cursor map)
-DELETE /v1/sessions/{id}                         reset in-memory context (tree preserved)
-POST   /v1/sessions/{id}/message                 send message; SSE stream or JSON response
-PUT    /v1/sessions/{id}/generation              trigger generation with no new user message
-DELETE /v1/sessions/{id}/generation             abort in-flight generation (204, no-op if idle)
-POST   /v1/sessions/{id}/reset                  alias for DELETE session (backwards compat)
-GET    /v1/sessions/{id}/history                raw dialogue from agent.db ancestor chain
-GET    /v1/workspace/files/{path}               read any file under workspace root
-PUT    /v1/workspace/files/{path}               write any file under workspace root
-GET    /v1/health                               status, uptime_s, per-lane queue/turn info
-```
-
-**Session identity:** `{id}` is a human-readable string (e.g. `"main"`, `"user-123"`). The gateway maps it to a `node_id` UUID in `workspace/cursors/gateway.json`. On first use a child of the global DB root is created and persisted; subsequent calls reuse the same node_id.
-
-**Backpressure:** `/message` and `/generation` return HTTP 429 if the lane queue is full.
-
-**POST /message body:**
-```json
-{
-  "text": "what is in this image?",
-  "stream": true,
-  "attachments": [
-    {"name": "photo.png", "data_b64": "<base64>", "mime_type": "image/png"}
-  ]
-}
-```
-`text` or `attachments` (or both) must be present. `stream` defaults to `true`.
-
-**PUT /generation body:** `{ "stream": true }` (optional). Queues a synthetic turn — no user message is added; agent generates against current context as-is.
+this section is outdated
 
 **SSE event types** (streaming responses):
 ```json
@@ -298,11 +267,11 @@ A background branch is a child node written into `agent.db` off the current tail
 
 ```python
 # From anywhere — a hook, a command handler, a module:
-from agent import _run_background
+from agent import run_background
 import asyncio
 
 branch_node = agent._db.add_node(parent_id=agent.context.tail_node_id, role="user", content="...")
-asyncio.create_task(_run_background(branch_node.id, agent.config))
+asyncio.create_task(run_background(branch_node.id, agent.config))
 ```
 
 `asyncio.create_task` schedules the branch on the event loop without blocking the caller. The branch runs independently and writes its own nodes into `agent.db`.
@@ -312,14 +281,14 @@ asyncio.create_task(_run_background(branch_node.id, agent.config))
 ```python
 async def _my_hook(tail_node_id: str, config) -> None:
     opening = agent._db.add_node(parent_id=tail_node_id, role="user", content="...")
-    asyncio.create_task(_run_background(opening.id, config))
+    asyncio.create_task(run_background(opening.id, config))
 
 agent.register_background_hook(_my_hook)
 ```
 
 Background hooks are skipped for synthetic turns (they are themselves background work).
 
-**`queue_background_branch()` is removed.** It was a deferred-flush mechanism that only worked inside `AgentLoop.run()`. All callers now use `asyncio.create_task(_run_background(...))` directly.
+**`queue_background_branch()` is removed.** It was a deferred-flush mechanism that only worked inside `AgentLoop.run()`. All callers now use `asyncio.create_task(run_background(...))` directly.
 
 ---
 
@@ -516,7 +485,7 @@ The memory module has two layers:
 - `auto_inject: false` — results only via `memory_search` tool
 - **Search skips embedder** when all chunks fit within `memory_budget_tokens` (`store.total_chunks_text_tokens() ≤ budget_tokens`) — pure BM25 fetch instead, no embedding round-trip
 - Config key: `memory_search:` in `config.yaml` (avoids collision with `workspace:`)
-- **Context nudge:** when threshold is hit and a DB is wired, creates an opening node via `db.add_node()` off the current tail and fires `asyncio.create_task(_run_background(...))`. The background `AgentLoop` handles consolidation; the live conversation is untouched. Falls back to inline injection when no DB is wired (tests/legacy).
+- **Context nudge:** when threshold is hit and a DB is wired, creates an opening node via `db.add_node()` off the current tail and fires `asyncio.create_task(run_background(...))`. The background `AgentLoop` handles consolidation; the live conversation is untouched. Falls back to inline injection when no DB is wired (tests/legacy).
 - **`/memory consolidate` command** — registered via `agent.commands`; fires a background branch immediately off the current tail regardless of nudge threshold.
 
 ---

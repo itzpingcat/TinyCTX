@@ -35,7 +35,7 @@ Background branches (Phase 3):
   opening node off the current tail via db.add_node(), construct a new
   AgentLoop pointing at it, and run it to completion.
 
-  _run_background(tail_node_id, config) — module-level helper that fires a
+  run_background(tail_node_id, config) — module-level helper that fires a
   standalone AgentLoop in a detached task and discards all events.
 
 Model pool:
@@ -100,14 +100,14 @@ def _build_llm(cfg: ModelConfig) -> LLM:
     )
 
 
-async def _run_background(tail_node_id: str, config: Config) -> None:
+async def run_background(tail_node_id: str, config: Config) -> None:
     """
     Run a standalone AgentLoop on tail_node_id as a synthetic turn, discarding
     all events. Called as a detached asyncio task — never awaited by the caller.
 
     Usage (from a background hook):
         opening = db.add_node(parent_id=current_tail, role="user", content="...")
-        asyncio.create_task(_run_background(opening.id, agent.config))
+        asyncio.create_task(run_background(opening.id, agent.config))
     """
     try:
         loop = AgentLoop(tail_node_id=tail_node_id, config=config, is_subagent=True)
@@ -466,7 +466,7 @@ class AgentLoop:
     # Background branch runner
     # ------------------------------------------------------------------
 
-    async def _run_background(self, tail_node_id: str) -> None:
+    async def run_background(self, tail_node_id: str) -> None:
         """
         Run a synthetic agent turn on a detached branch. Events are discarded.
         The branch writes its own nodes into agent.db; the caller's cursor is
@@ -483,12 +483,12 @@ class AgentLoop:
 
     def queue_background_branch(self, tail_node_id: str) -> None:
         """
-        Deprecated — call asyncio.create_task(_run_background(node_id, config)) directly.
+        Deprecated — call asyncio.create_task(run_background(node_id, config)) directly.
         Kept temporarily so old call sites fail loudly rather than silently.
         """
         raise RuntimeError(
             "queue_background_branch() is removed. "
-            "Use asyncio.create_task(_run_background(node_id, agent.config)) directly."
+            "Use asyncio.create_task(run_background(node_id, agent.config)) directly."
         )
 
     # ------------------------------------------------------------------

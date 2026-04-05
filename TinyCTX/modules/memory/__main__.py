@@ -361,8 +361,8 @@ def register(agent) -> None:
                     role="user",
                     content=msg,
                 )
-                from TinyCTX.agent import _run_background
-                asyncio.create_task(_run_background(opening.id, config))
+                from TinyCTX.agent import run_background
+                asyncio.create_task(run_background(opening.id, config))
             else:
                 # No-DB (legacy/test) path: inject the nudge inline so the agent
                 # sees it on the next assemble().
@@ -476,8 +476,8 @@ def register(agent) -> None:
 
             # Fire directly — queue_background_branch() only drains inside
             # AgentLoop.run(), which never runs for a slash command handler.
-            from TinyCTX.agent import _run_background
-            asyncio.create_task(_run_background(opening.id, agent.config))
+            from TinyCTX.agent import run_background
+            asyncio.create_task(run_background(opening.id, agent.config))
 
             if console:
                 console.print(f"[{c('tool_ok')}]  ✓  memory consolidation started (branch off tail={tail[:8]}…)[/{c('tool_ok')}]")
