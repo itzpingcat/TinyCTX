@@ -180,6 +180,9 @@ class LLM:
             payload["thinking"] = {"type": "enabled", "budget_tokens": self.budget_tokens}
         if self.reasoning_effort is not None:
             payload["reasoning_effort"] = self.reasoning_effort
+        # llama.cpp specific flag
+        if self.cache_prompts:
+            payload["cache_prompt"] = True
 
         headers = {
             "Content-Type":  "application/json",
