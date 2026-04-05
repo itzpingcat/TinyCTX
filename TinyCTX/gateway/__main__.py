@@ -11,6 +11,7 @@ POST   /v1/lane/message    Push a user message; returns SSE event stream.
 POST   /v1/lane/branch     Create a new branch node; return its node_id.
                            Non-destructive — no existing lane is modified.
 DELETE /v1/lane/abort      Abort in-flight generation for a node_id.
+POST   /v1/shutdown        Gracefully shut down the daemon (auth required).
 GET    /v1/health          Always public.
 
 Kept from old gateway
@@ -359,6 +360,23 @@ async def handle_lane_abort(request: web.Request) -> web.Response:
 
 
 # ---------------------------------------------------------------------------
+# POST /v1/shutdown
+# ---------------------------------------------------------------------------
+
+async def handle_shutdown(request: web.Request) -> web.Response:
+    """
+    Gracefully shut down the daemon by setting the app-level shutdown event.
+    Returns 204 immediately; the daemon exits after the response is sent.
+    """
+    logger.info("gateway: shutdown requested via /v1/shutdown")
+    # Schedule the event to fire after the response is flushed.
+    loop = asyncio.get_event_loop()
+    shutdown_event: asyncio.Event = request.app["shutdown_event"]
+    loop.call_soon(shutdown_event.set)
+    return web.Response(status=204)
+
+
+# ---------------------------------------------------------------------------
 # Workspace
 # ---------------------------------------------------------------------------
 
@@ -439,21 +457,25 @@ async def handle_health(request: web.Request) -> web.Response:
 # App factory + entrypoint
 # ---------------------------------------------------------------------------
 
-def _make_app(router, cfg: GatewayConfig) -> web.Application:
+def _make_app(router, cfg: GatewayConfig, shutdown_event: asyncio.Event) -> web.Application:
     workspace = Path(router._config.workspace.path).expanduser().resolve()
     workspace.mkdir(parents=True, exist_ok=True)
 
     app = web.Application(middlewares=[_auth_middleware(cfg.api_key)])
-    app["router"]     = router
-    app["workspace"]  = workspace
-    app["start_time"] = time.time()
-    app["fanout"]     = {}   # node_id -> set[asyncio.Queue]
+    app["router"]         = router
+    app["workspace"]      = workspace
+    app["start_time"]     = time.time()
+    app["fanout"]         = {}   # node_id -> set[asyncio.Queue]
+    app["shutdown_event"] = shutdown_event
 
     # Lane API
     app.router.add_post(  "/v1/lane/open",                handle_lane_open)
     app.router.add_post(  "/v1/lane/message",             handle_lane_message)
     app.router.add_post(  "/v1/lane/branch",              handle_lane_branch)
     app.router.add_delete("/v1/lane/abort",               handle_lane_abort)
+
+    # Shutdown
+    app.router.add_post(  "/v1/shutdown",                 handle_shutdown)
 
     # Workspace (kept)
     app.router.add_get(   "/v1/workspace/files/{path:.+}", handle_workspace_get)
@@ -466,13 +488,15 @@ def _make_app(router, cfg: GatewayConfig) -> web.Application:
 
 
 async def run(router, cfg: GatewayConfig) -> None:
-    app    = _make_app(router, cfg)
+    shutdown_event = asyncio.Event()
+    app    = _make_app(router, cfg, shutdown_event)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, cfg.host, cfg.port)
     await site.start()
     logger.info("Gateway listening on http://%s:%d", cfg.host, cfg.port)
     try:
-        await asyncio.Event().wait()
+        await shutdown_event.wait()
+        logger.info("Gateway shutdown event received — stopping.")
     finally:
         await runner.cleanup()

@@ -1,61 +1,85 @@
 """
 commands/stop.py — `tinyctx stop`
 
-Sends SIGTERM to the daemon and waits up to 5 seconds before SIGKILL.
+Asks the running daemon to shut down via POST /v1/shutdown.
+Gateway host/port/api_key are read directly from config.yaml.
+
+Flags
+-----
+  --config PATH  Path to config.yaml (default: ./config.yaml).
 """
 from __future__ import annotations
 
 import argparse
-import os
-import signal
+import json
 import sys
 import time
+import urllib.request
+from pathlib import Path
 
-from TinyCTX.utils import pid as pidfile
 
-_DRAIN_TIMEOUT  = 5.0
-_POLL_INTERVAL  = 0.2
+_DRAIN_TIMEOUT  = 8.0
+_POLL_INTERVAL  = 0.25
+
+
+def _gateway_url_and_key(args: argparse.Namespace) -> tuple[str, str]:
+    config_path = Path(getattr(args, "config", None) or "config.yaml").resolve()
+    if not config_path.exists():
+        print(f"error: config not found: {config_path}", file=sys.stderr)
+        sys.exit(1)
+    from TinyCTX.config import load as load_config
+    cfg = load_config(str(config_path))
+    return f"http://{cfg.gateway.host}:{cfg.gateway.port}", cfg.gateway.api_key or ""
+
+
+def _is_alive(gateway_url: str) -> bool:
+    try:
+        with urllib.request.urlopen(f"{gateway_url}/v1/health", timeout=2) as r:
+            return r.status == 200
+    except Exception:
+        return False
 
 
 def run(args: argparse.Namespace) -> None:
-    info = pidfile.read()
-    if not info:
-        print("TinyCTX is not running (no pid file).")
+    gateway_url, api_key = _gateway_url_and_key(args)
+
+    if not _is_alive(gateway_url):
+        print("TinyCTX is not running (gateway not reachable).")
         return
 
-    daemon_pid = info["pid"]
-    if not pidfile.is_alive(daemon_pid):
-        print("TinyCTX is not running (stale pid).")
-        pidfile.clean()
-        return
+    print(f"Stopping TinyCTX at {gateway_url}…")
 
-    print(f"Stopping TinyCTX (pid {daemon_pid})…")
+    req = urllib.request.Request(
+        f"{gateway_url}/v1/shutdown",
+        method="POST",
+        data=b"{}",
+        headers={
+            "Content-Type":  "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+    )
     try:
-        if sys.platform == "win32":
-            os.kill(daemon_pid, signal.SIGTERM)
+        with urllib.request.urlopen(req, timeout=5) as r:
+            pass  # 204 No Content expected
+    except urllib.error.HTTPError as exc:
+        if exc.code == 204:
+            pass  # success
         else:
-            os.kill(daemon_pid, signal.SIGTERM)
-    except (OSError, ProcessLookupError):
-        pidfile.clean()
-        print("Done.")
-        return
+            print(f"error: shutdown request failed: {exc}", file=sys.stderr)
+            sys.exit(1)
+    except Exception as exc:
+        # Connection reset / closed mid-response is fine — daemon is shutting down.
+        if not isinstance(exc, (ConnectionResetError, ConnectionAbortedError)):
+            print(f"error: {exc}", file=sys.stderr)
+            sys.exit(1)
 
+    # Wait for the gateway to stop responding.
     deadline = time.monotonic() + _DRAIN_TIMEOUT
     while time.monotonic() < deadline:
-        if not pidfile.is_alive(daemon_pid):
-            pidfile.clean()
+        if not _is_alive(gateway_url):
             print("Done.")
             return
         time.sleep(_POLL_INTERVAL)
 
-    # SIGKILL fallback.
-    try:
-        if sys.platform == "win32":
-            os.kill(daemon_pid, signal.SIGKILL)
-        else:
-            os.kill(daemon_pid, signal.SIGKILL)
-    except (OSError, ProcessLookupError):
-        pass
-
-    pidfile.clean()
-    print("Force-killed.")
+    print("⚠  daemon did not stop within "
+          f"{_DRAIN_TIMEOUT}s — it may still be running.")

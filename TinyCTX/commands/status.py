@@ -1,20 +1,34 @@
 """
 commands/status.py — `tinyctx status`
 
-Reads the PID file and hits /v1/health to report daemon health.
+Reads gateway host/port/api_key directly from config.yaml and hits
+/v1/health to report daemon health. No PID file involved.
+
+Flags
+-----
+  --config PATH  Path to config.yaml (default: ./config.yaml).
 """
 from __future__ import annotations
 
 import argparse
 import json
 import sys
+import urllib.request
+from pathlib import Path
 
-from TinyCTX.utils import pid as pidfile
+
+def _gateway_url_and_key(args: argparse.Namespace) -> tuple[str, str]:
+    config_path = Path(getattr(args, "config", None) or "config.yaml").resolve()
+    if not config_path.exists():
+        print(f"error: config not found: {config_path}", file=sys.stderr)
+        sys.exit(1)
+    from TinyCTX.config import load as load_config
+    cfg = load_config(str(config_path))
+    return f"http://{cfg.gateway.host}:{cfg.gateway.port}", cfg.gateway.api_key or ""
 
 
 def _health(gateway_url: str, api_key: str) -> dict | None:
     try:
-        import urllib.request
         req = urllib.request.Request(
             f"{gateway_url}/v1/health",
             headers={"Authorization": f"Bearer {api_key}"},
@@ -26,32 +40,21 @@ def _health(gateway_url: str, api_key: str) -> dict | None:
 
 
 def run(args: argparse.Namespace) -> None:
-    info = pidfile.read()
-    if not info:
-        print("TinyCTX is not running.")
-        return
+    gateway_url, api_key = _gateway_url_and_key(args)
 
-    daemon_pid = info["pid"]
-    alive      = pidfile.is_alive(daemon_pid)
+    print(f"Gateway: {gateway_url}")
 
-    print(f"PID:         {daemon_pid}  ({'running' if alive else 'dead'})")
-    print(f"Gateway:     {info['gateway_url']}")
-    print(f"Started:     {info['started_at']}")
-
-    if not alive:
-        print("(daemon is dead — run `tinyctx start`)")
-        return
-
-    health = _health(info["gateway_url"], info["api_key"])
+    health = _health(gateway_url, api_key)
     if not health:
-        print("Health:      unreachable")
+        print("Status:  unreachable")
         return
 
     if "error" in health:
-        print(f"Health:      error — {health['error']}")
+        print(f"Status:  not running ({health['error']})")
         return
 
-    print(f"Uptime:      {health.get('uptime_s', '?')}s")
+    print(f"Status:  running")
+    print(f"Uptime:  {health.get('uptime_s', '?')}s")
     lanes = health.get("lanes", {})
     if lanes:
         print(f"Active lanes: {len(lanes)}")

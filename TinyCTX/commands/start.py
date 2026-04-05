@@ -1,8 +1,11 @@
 """
 commands/start.py — `tinyctx start`
 
-Spawns the TinyCTX daemon (main.py) as a detached background process,
-writes the PID file, and polls /v1/health until the daemon is ready.
+Spawns the TinyCTX daemon (main.py) as a detached background process
+and polls /v1/health until the daemon is ready.
+
+Gateway host/port/api_key are read directly from config.yaml — no PID
+file is written or consulted.
 
 Flags
 -----
@@ -12,13 +15,10 @@ Flags
 from __future__ import annotations
 
 import argparse
-import datetime
 import subprocess
 import sys
 import time
 from pathlib import Path
-
-from TinyCTX.utils import pid as pidfile
 
 
 _POLL_TIMEOUT  = 8.0   # seconds to wait for daemon to come up
@@ -40,23 +40,15 @@ def run(args: argparse.Namespace) -> None:
         print(f"error: config not found: {config_path}", file=sys.stderr)
         sys.exit(1)
 
-    # Load config to get gateway URL / api_key.
-    sys.path.insert(0, str(config_path.parent))
     from TinyCTX.config import load as load_config
     cfg = load_config(str(config_path))
     gateway_url = f"http://{cfg.gateway.host}:{cfg.gateway.port}"
     api_key     = cfg.gateway.api_key or ""
 
-    # Check for an existing live daemon.
-    info = pidfile.read()
-    if info and pidfile.is_alive(info["pid"]):
-        print(f"✓ TinyCTX already running — {info['gateway_url']}")
-        print(f"  API key: {info['api_key']}")
+    # Check if the daemon is already running.
+    if _health_check(gateway_url):
+        print(f"✓ TinyCTX already running — {gateway_url}")
         return
-
-    # Clean stale pid.
-    if info:
-        pidfile.clean()
 
     log_file = Path.home() / ".tinyctx" / "daemon.log"
     log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -92,14 +84,6 @@ def run(args: argparse.Namespace) -> None:
                     start_new_session=True,
                 )
 
-    pidfile.write(
-        pid=proc.pid,
-        gateway_url=gateway_url,
-        api_key=api_key,
-        config_path=str(config_path),
-        started_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
-    )
-
     if foreground:
         try:
             proc.wait()
@@ -113,7 +97,8 @@ def run(args: argparse.Namespace) -> None:
     while time.monotonic() < deadline:
         if _health_check(gateway_url):
             print(f"✓ TinyCTX running — {gateway_url}")
-            print(f"  API key: {api_key}")
+            if api_key:
+                print(f"  API key: {api_key}")
             print(f"  logs:    {log_file}")
             return
         time.sleep(_POLL_INTERVAL)
