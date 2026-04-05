@@ -32,7 +32,8 @@ def run(args: argparse.Namespace) -> None:
 
     config_path = Path(getattr(args, "config", None) or _DEFAULT_CONFIG).resolve()
     if not config_path.exists():
-        print(f"error: config not found: {config_path}", file=sys.stderr)
+        print("error: no config.yaml found.", file=sys.stderr)
+        print("  Run 'TinyCTX onboard' to set up TinyCTX, or manually create a config.yaml.", file=sys.stderr)
         sys.exit(1)
 
     from TinyCTX.config import load as load_config
