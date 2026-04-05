@@ -73,7 +73,7 @@ from TinyCTX.db import ConversationDB
 
 logger = logging.getLogger(__name__)
 
-MODULES_DIR = Path("modules")
+MODULES_DIR = Path(__file__).parent / "modules"
 _EXIT_ERROR_RE = re.compile(r"(^|\n)\[exit \d+\](?=\n|$)")
 
 def _looks_like_failed_tool_output(output: str) -> bool:
@@ -219,7 +219,7 @@ class AgentLoop:
                 continue
             if not ((entry / "__main__.py").exists() or (entry / "__init__.py").exists()):
                 continue
-            module_name = f"modules.{entry.name}"
+            module_name = f"TinyCTX.modules.{entry.name}"
             try:
                 for suffix in (".__main__", ""):
                     try:
