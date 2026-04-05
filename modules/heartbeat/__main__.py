@@ -191,6 +191,8 @@ async def _heartbeat_loop(
     max_continuations: int,
     active_hours: dict | None,
 ) -> None:
+    while getattr(agent, "gateway", None) is None:
+        await asyncio.sleep(1)
     await asyncio.sleep(interval_secs)
 
     while True:
