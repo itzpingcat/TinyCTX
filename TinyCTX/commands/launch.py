@@ -72,4 +72,7 @@ def run(args: argparse.Namespace) -> None:
 
     import asyncio
     from TinyCTX.bridges.cli.__main__ import run_detached
-    asyncio.run(run_detached(gateway_url, api_key, options))
+    try:
+        asyncio.run(run_detached(gateway_url, api_key, options))
+    except KeyboardInterrupt:
+        pass

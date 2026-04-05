@@ -350,7 +350,10 @@ class CLIBridge:
 
     async def _prompt(self, prompt_str: str) -> str:
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, lambda: input(prompt_str))
+        try:
+            return await loop.run_in_executor(None, lambda: input(prompt_str))
+        except (asyncio.CancelledError, EOFError):
+            raise EOFError
 
     async def _handle_help(self) -> None:
         c = self._theme.c

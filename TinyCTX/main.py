@@ -33,11 +33,7 @@ GATEWAY_MOD = "TinyCTX.gateway.__main__"
 
 
 def _startup_log_level(cfg) -> int:
-    level = resolve_log_level(cfg.logging.level, default=logging.INFO)
-    cli_cfg = cfg.bridges.get("cli")
-    if cli_cfg and cli_cfg.enabled and bool(cli_cfg.options.get("quiet_startup", True)):
-        return max(level, logging.WARNING)
-    return level
+    return resolve_log_level(cfg.logging.level, default=logging.INFO)
 
 
 async def main() -> None:
