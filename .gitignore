@@ -8,7 +8,7 @@ __pycache__/
 .pytest_cache/
 *.pyc
 *.pyo
-tinyctx.egg-info
+tinyctx.egg-info/
 
 # sessions / workspace data
 sessions/
