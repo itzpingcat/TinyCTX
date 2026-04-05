@@ -320,7 +320,7 @@ def register(agent) -> None:
             f"{i:>6}\t{l}" for i, l in enumerate(lines, 1)
         )
 
-    def write_file(path: str, content: str = "", mode: str = "append") -> str:
+    def write_file(path: str, content: str = "", mode: str = "overwrite") -> str:
         """Write content to a file. Creates the file and any missing parent directories if they don't exist.
         Existing files must be read with view() first (prevents blind overwrites).
 
@@ -328,9 +328,9 @@ def register(agent) -> None:
             path: Path to the file.
             content: Content to write. Omit or pass empty string to create/truncate to empty.
             mode: How to write the content.
-                  'append'    — add content after existing content (default).
+                  'append'    — add content after existing content.
                   'prepend'   — insert content before existing content.
-                  'overwrite' — replace the entire file with content.
+                  'overwrite' — replace the entire file with content (default).
         """
         p = resolve(path)
         p.parent.mkdir(parents=True, exist_ok=True)
