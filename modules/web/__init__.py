@@ -1,9 +1,10 @@
 EXTENSION_META = {
     "name":    "web",
-    "version": "1.1",
+    "version": "1.2",
     "description": (
-        "Web tools: DuckDuckGo search, direct page browsing/scraping, async HTTP requests, "
-        "and Playwright browser automation (navigate, click, type, extract, screenshot). "
+        "Web tools: DuckDuckGo search, open_url (fetch or browser-render a page returning "
+        "elements/text/html), async HTTP requests, and Playwright browser automation "
+        "(click, type, extract, screenshot). "
         "Screenshots are saved to workspace/downloads/. "
         "One browser instance per agent session."
     ),

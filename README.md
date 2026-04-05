@@ -5,7 +5,7 @@ A lightweight agentic assistant framework. Connect it to your LLM, configure a b
 ## Highlights
 
 - Terminal UI with persistent session restore, slash commands, paste refs, and copy helpers
-- Direct web browsing via `web_search`, `browse_url`, and `navigate`
+- Direct web browsing via `web_search` and `open_url` (always browser-rendered; headless by default, windowed on request for captchas)
 - Branch-backed conversation history with automatic compaction when context pressure gets high
 - Static + searchable memory with BM25 or embeddings, plus background memory consolidation
 - Detached child branches via `spawn_agent` / `wait_agent` for bounded subagent work
@@ -94,7 +94,6 @@ Useful keys and commands:
 - `Ctrl+Q` — quit TinyCTX
 - `/reset` — start a fresh CLI session
 - `/resume` — keep using the saved CLI session
-- `/debug heartbeat` — trigger one heartbeat tick immediately
 ---
 
 ### Discord
@@ -319,8 +318,7 @@ The following tools are available to the agent out of the box (if the correspond
 | `grep` | Search file contents with regex (ripgrep with Python fallback) |
 | `glob_search` | Find files by name pattern, sorted by modification time |
 | `web_search` | Search the web via DuckDuckGo |
-| `browse_url` | Fetch and scrape a specific URL; supports text or HTML output, optional JS rendering, and an optional `prompt` for focused extraction |
-| `navigate` | Open a page in the browser automation session and return a compact element map |
+| `open_url` | Open any URL in a browser and return text, raw HTML, or an interactive element map. Pass `headless=False` to make the window visible (useful for captchas and login walls). |
 | `memory_search` | Search the semantic memory index |
 | `spawn_agent` | Start a detached subagent on a child branch |
 | `wait_agent` | Wait for a spawned subagent to finish or poll its current status |

@@ -3,10 +3,9 @@ modules/web/__main__.py
 
 Registers web tools into the agent loop's tool_handler:
   - web_search     — DuckDuckGo text search
-  - browse_url     — fetch and scrape a page directly
+  - open_url       — fetch or browser-render a URL; returns elements, text, or HTML
   - http_request   — generic async HTTP (GET/POST/etc.)
-  - navigate       — open a URL in Playwright, returns element map
-  - click          — click an element
+  - click          — click an element on the current browser page
   - type_text      — type into a field
   - extract_text   — get visible text from element or whole page
   - extract_html   — get HTML from element or whole page
@@ -51,18 +50,9 @@ _BLOCK_TAGS = {
     "h4", "h5", "h6", "header", "hr", "li", "main", "nav", "ol", "p", "pre",
     "section", "table", "tbody", "td", "tfoot", "th", "thead", "tr", "ul",
 }
+_HEADING_PREFIX = {"h1": "# ", "h2": "## ", "h3": "### ", "h4": "#### ", "h5": "##### ", "h6": "###### "}
 _IGNORED_TEXT_TAGS = {
     "canvas", "head", "meta", "link", "noscript", "script", "style", "svg", "title",
-}
-_TEXTUAL_CONTENT_TYPES = {
-    "application/json",
-    "application/javascript",
-    "application/x-javascript",
-    "application/xml",
-    "application/xhtml+xml",
-    "application/rss+xml",
-    "application/atom+xml",
-    "image/svg+xml",
 }
 _TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 
@@ -109,7 +99,12 @@ class _HTMLTextExtractor(HTMLParser):
         super().__init__(convert_charrefs=True)
         self._ignored_tags = ignored_tags
         self._ignored_depth = 0
+        self._pre_depth = 0
         self._chunks: list[str] = []
+        self._list_stack: list[tuple[str, int]] = []  # (tag, counter)
+        self._current_href: str = ""
+        self._link_text_chunks: list[str] = []
+        self._in_link = False
 
     def handle_starttag(self, tag: str, attrs) -> None:  # noqa: ANN001
         tag = tag.lower()
@@ -118,8 +113,58 @@ class _HTMLTextExtractor(HTMLParser):
             return
         if self._ignored_depth:
             return
-        if tag == "br" or tag in _BLOCK_TAGS:
+
+        if tag == "pre":
+            self._pre_depth += 1
             self._chunks.append("\n")
+            return
+
+        if tag == "br":
+            self._chunks.append("\n")
+            return
+
+        if tag in _BLOCK_TAGS:
+            self._chunks.append("\n")
+
+        if tag in _HEADING_PREFIX:
+            self._chunks.append(_HEADING_PREFIX[tag])
+            return
+
+        if tag == "li":
+            depth   = sum(1 for t, _ in self._list_stack if t in ("ul", "ol"))
+            indent  = "  " * max(0, depth - 1)
+            if self._list_stack and self._list_stack[-1][0] == "ol":
+                t, n = self._list_stack[-1]
+                n += 1
+                self._list_stack[-1] = (t, n)
+                self._chunks.append(f"{indent}{n}. ")
+            else:
+                self._chunks.append(f"{indent}- ")
+            return
+
+        if tag in ("ul", "ol"):
+            self._list_stack.append((tag, 0))
+            return
+
+        if tag == "a":
+            attrs_map = {k: v for k, v in attrs}
+            href = attrs_map.get("href", "") or ""
+            if href and not href.startswith(("javascript:", "#", "mailto:")):
+                self._current_href = href
+                self._link_text_chunks = []
+                self._in_link = True
+            return
+
+        if tag == "img":
+            attrs_map = {k: v for k, v in attrs}
+            alt = (attrs_map.get("alt") or "").strip()
+            if alt:
+                self._chunks.append(f"[img: {alt}]")
+            return
+
+        if tag == "hr":
+            self._chunks.append("\n---\n")
+            return
 
     def handle_startendtag(self, tag: str, attrs) -> None:  # noqa: ANN001
         self.handle_starttag(tag, attrs)
@@ -133,13 +178,44 @@ class _HTMLTextExtractor(HTMLParser):
             return
         if self._ignored_depth:
             return
-        if tag in _BLOCK_TAGS:
+
+        if tag == "pre":
+            if self._pre_depth:
+                self._pre_depth -= 1
+            self._chunks.append("\n")
+            return
+
+        if tag in ("ul", "ol"):
+            if self._list_stack:
+                self._list_stack.pop()
+            self._chunks.append("\n")
+            return
+
+        if tag == "a" and self._in_link:
+            link_text = "".join(self._link_text_chunks).strip()
+            if link_text:
+                self._chunks.append(f"{link_text} ({self._current_href})")
+            self._in_link = False
+            self._current_href = ""
+            self._link_text_chunks = []
+            return
+
+        if tag in _HEADING_PREFIX or tag in _BLOCK_TAGS:
             self._chunks.append("\n")
 
     def handle_data(self, data: str) -> None:
         if self._ignored_depth or not data:
             return
-        self._chunks.append(data)
+        if self._pre_depth:
+            self._chunks.append(data)
+            return
+        text = " ".join(data.split())
+        if not text:
+            return
+        if self._in_link:
+            self._link_text_chunks.append(text)
+        else:
+            self._chunks.append(text + " ")
 
     def get_text(self) -> str:
         return _normalise_extracted_text("".join(self._chunks))
@@ -151,7 +227,6 @@ def _html_to_text(html_text: str, extra_ignored_tags: list[str] | None = None) -
     parser.feed(html_text)
     parser.close()
     return parser.get_text()
-
 
 def _extract_html_title(html_text: str) -> Optional[str]:
     match = _TITLE_RE.search(html_text)
@@ -248,31 +323,6 @@ def _parse_duckduckgo_results(html_text: str, max_results: int) -> list[dict[str
     return parser.results
 
 
-def _is_textual_content_type(content_type: str) -> bool:
-    ctype = content_type.split(";", 1)[0].strip().lower()
-    if not ctype:
-        return True
-    return (
-        ctype.startswith("text/")
-        or ctype in _TEXTUAL_CONTENT_TYPES
-        or ctype.endswith("+json")
-        or ctype.endswith("+xml")
-    )
-
-
-def _looks_like_html_content(content_type: str, body_text: str) -> bool:
-    ctype = content_type.lower()
-    if "html" in ctype:
-        return True
-    probe = body_text.lstrip()[:512].lower()
-    return (
-        probe.startswith("<!doctype html")
-        or probe.startswith("<html")
-        or "<html" in probe
-        or "<body" in probe
-    )
-
-
 def _validate_browse_url(url: str) -> Optional[str]:
     try:
         parsed = urlparse(url)
@@ -285,87 +335,6 @@ def _validate_browse_url(url: str) -> Optional[str]:
     if parsed.username or parsed.password:
         return "Error: URLs with embedded credentials are not supported."
     return None
-
-
-def _web_prompt(_ctx) -> str:
-    return (
-        "<web_tools>\n"
-        "- Use web_search when you need discovery, current information, or you do not yet have a URL.\n"
-        "- Use navigate when you have a specific URL and need the page contents, or when you need browser actions like click, type, wait_for, extract_text, screenshot, or extract_html.\n"
-        "- Do not use shell with curl, wget, Invoke-WebRequest, or similar commands for normal web fetching when navigate or http_request can handle it.\n"
-        "- Reserve shell/network commands for debugging or edge cases the web tools cannot handle.\n"
-        "</web_tools>"
-    )
-
-
-async def _read_response_body(resp, max_bytes: int) -> bytes:
-    chunks: list[bytes] = []
-    total = 0
-
-    async for chunk in resp.content.iter_chunked(16384):
-        total += len(chunk)
-        if total > max_bytes:
-            raise ValueError(f"Response body exceeds configured limit ({max_bytes} bytes).")
-        chunks.append(chunk)
-
-    return b"".join(chunks)
-
-
-async def _browse_with_http(
-    url: str,
-    mode: str,
-    *,
-    max_chars: int,
-    max_bytes: int,
-    timeout_ms: int,
-    user_agent: str,
-    ignored_tags: list[str] | None = None,
-) -> dict:
-    timeout = aiohttp.ClientTimeout(total=max(timeout_ms / 1000, 1))
-    headers = {
-        "Accept": (
-            "text/html,application/xhtml+xml,application/xml;q=0.9,"
-            "text/plain;q=0.8,application/json;q=0.7,*/*;q=0.5"
-        ),
-        "User-Agent": user_agent,
-    }
-
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(url, allow_redirects=True, headers=headers) as resp:
-            body = await _read_response_body(resp, max_bytes=max_bytes)
-            charset = resp.charset or "utf-8"
-            try:
-                body_text = body.decode(charset, errors="replace")
-            except LookupError:
-                body_text = body.decode("utf-8", errors="replace")
-
-            content_type = resp.headers.get("Content-Type", "")
-            if not _is_textual_content_type(content_type):
-                raise ValueError(
-                    f"Unsupported content type for browse_url: {content_type or 'unknown'}"
-                )
-
-            is_html = _looks_like_html_content(content_type, body_text)
-            title = _extract_html_title(body_text) if is_html else None
-            content = body_text if mode == "html" else (
-                _html_to_text(body_text, ignored_tags) if is_html
-                else _normalise_extracted_text(body_text)
-            )
-            content, truncated = _truncate_content(content, max_chars)
-
-            return {
-                "url": url,
-                "final_url": str(resp.url),
-                "status_code": resp.status,
-                "content_type": content_type,
-                "mode": mode,
-                "rendered": False,
-                "truncated": truncated,
-                "bytes": len(body),
-                "title": title,
-                "content": content,
-            }
-
 
 async def _search_with_duckduckgo_html(
     query: str,
@@ -385,57 +354,13 @@ async def _search_with_duckduckgo_html(
             params={"q": query},
             allow_redirects=True,
         ) as resp:
-            body = await _read_response_body(resp, max_bytes=1_000_000)
+            body = await resp.read()
+            if len(body) > 1_000_000:
+                body = body[:1_000_000]
             charset = resp.charset or "utf-8"
             html_text = body.decode(charset, errors="replace")
 
     return _parse_duckduckgo_results(html_text, max_results=num_results)
-
-
-async def _browse_with_browser(
-    agent,
-    url: str,
-    mode: str,
-    *,
-    max_chars: int,
-    timeout_ms: int,
-    ignored_tags: list[str] | None = None,
-) -> dict:
-    st = _state(agent)
-    page = await _ensure_page(agent)
-    response = await page.goto(
-        url,
-        wait_until=st["settings"]["wait_until"],
-        timeout=timeout_ms,
-    )
-
-    status_code = response.status if response is not None else 200
-    content_type = "text/html"
-    if response is not None:
-        try:
-            headers = await response.all_headers()
-            content_type = headers.get("content-type", content_type)
-        except Exception:
-            pass
-
-    html_text = await page.content()
-    title = await page.title()
-    content = html_text if mode == "html" else _html_to_text(html_text, ignored_tags)
-    content, truncated = _truncate_content(content, max_chars)
-
-    return {
-        "url": url,
-        "final_url": page.url,
-        "status_code": status_code,
-        "content_type": content_type,
-        "mode": mode,
-        "rendered": True,
-        "truncated": truncated,
-        "bytes": len(html_text.encode("utf-8")),
-        "title": title or _extract_html_title(html_text),
-        "content": content,
-    }
-
 
 # ---------------------------------------------------------------------------
 # Per-session browser state (stored on agent instance)
@@ -527,61 +452,60 @@ async def _locate(agent, target: str, nth: int = 0, exact: Optional[bool] = None
 
 
 async def _dynamic_discovery(agent) -> list[dict]:
-    """Walk the DOM and return a compact element map (max 40 entries)."""
+    """Walk the DOM in a single JS evaluate call and return a compact element map."""
     page = await _ensure_page(agent)
     st   = _state(agent)
     settings     = st["settings"]
-    ignore_tags  = settings.get("ignore_tags", [])
+    ignore_tags  = list(settings.get("ignore_tags", []))
     max_elements = settings.get("max_discovery_elements", 40)
 
-    candidates   = page.locator("*")
-    count        = await candidates.count()
-    seen_content: set[str] = set()
-    result: list[dict]     = []
+    return await page.evaluate("""
+        ([ignoreTags, maxElements]) => {
+            const ignore = new Set(ignoreTags);
+            const seen   = new Set();
+            const result = [];
 
-    for i in range(count):
-        if len(result) >= max_elements:
-            break
-        try:
-            handle = await candidates.nth(i).element_handle()
-            if not handle:
-                continue
+            for (const el of document.querySelectorAll('*')) {
+                if (result.length >= maxElements) break;
+                const tag = el.tagName.toLowerCase();
+                if (ignore.has(tag)) continue;
 
-            tag_name = await handle.evaluate("el => el.tagName.toLowerCase()")
-            if tag_name in ignore_tags:
-                continue
+                // skip nodes whose direct children already carry the text
+                const hasTextChild = Array.from(el.children).some(
+                    c => c.innerText && c.innerText.trim().length > 0
+                );
+                if (hasTextChild) continue;
 
-            has_text_children = await handle.evaluate("""
-                el => Array.from(el.children).some(
-                    child => child.innerText && child.innerText.trim().length > 0
-                )
-            """)
-            if has_text_children:
-                continue
+                const raw  = (el.innerText || '').trim();
+                const text = raw.replace(/\\s+/g, ' ');
+                if (text.length < 3 || seen.has(text)) continue;
 
-            role = await handle.get_attribute("role") or tag_name
-            raw  = await handle.inner_text()
-            text = " ".join(raw.strip().split())
+                const bloat = (text.match(/[\\n\\t]|  +/g) || []).length;
+                if (text.length > 0 && bloat / text.length > 0.3) continue;
 
-            bloat = text.count("\n") + text.count("\t") + len(re.findall(r" {2,}", text))
-            bloat_pct = bloat / len(text) if text else 0
-
-            if len(text) < 3 or text in seen_content or bloat_pct > 0.3:
-                continue
-
-            seen_content.add(text)
-            selector = await handle.evaluate("""
-                el => el.tagName.toLowerCase()
+                seen.add(text);
+                const role = el.getAttribute('role') || tag;
+                const cls  = Array.from(el.classList).slice(0, 2).join('.');
+                const selector = tag
                     + (el.id ? '#' + el.id : '')
-                    + (el.className
-                        ? '.' + el.className.split(' ').filter(Boolean).slice(0,2).join('.')
-                        : '')
-            """)
-            result.append({"role": role, "text": text, "selector": selector, "nth": i})
-        except Exception:
-            continue
+                    + (cls ? '.' + cls : '');
+                result.push({ role, text, selector });
+            }
+            return result;
+        }
+    """, [ignore_tags, max_elements])
 
-    return result
+
+def _web_prompt(_ctx) -> str:
+    return (
+        "<web_tools>\n"
+        "- Use web_search when you need discovery, current information, or you do not yet have a URL.\n"
+        "- Use open_url when you have a specific URL. Returns text by default; use type='elements' when you need to click/type/interact, or type='html' for raw markup.\n"
+        "- If open_url returns a captcha or login wall, retry with headless=False so the browser window becomes visible.\n"
+        "- Use click, type_text, wait_for, extract_text, extract_html, or screenshot after open_url(type='elements') to interact with the loaded page.\n"
+        "- Do not use shell with curl, wget, Invoke-WebRequest, or similar commands for normal web fetching.\n"
+        "</web_tools>"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -616,13 +540,6 @@ def register(agent) -> None:
         "browse_max_chars":       int(cfg.get("browse_max_chars", 20000)),
         "browse_user_agent":      str(cfg.get("browse_user_agent", "TinyCTX/1.1")),
     })
-
-    agent.context.register_prompt(
-        "web_tools",
-        _web_prompt,
-        role="system",
-        priority=int(cfg.get("prompt_priority", 12)),
-    )
 
     original_reset = agent.reset
 
@@ -730,28 +647,76 @@ def register(agent) -> None:
         except Exception as e:
             return f"[error: {e}]"
 
-    async def navigate(url: str) -> str:
+    async def open_url(
+        url: str,
+        type: str = "text",
+        headless: bool = None,
+    ) -> str:
         """
-        Open a URL in the browser and return a map of interactive elements.
-        Always call this before using click, type_text, or extract on a new page.
+        Open a URL in the browser and return its content.
+        If you hit a captcha or login wall, call with headless=False so the
+        browser window becomes visible and you can solve it manually.
 
         Args:
-            url: The full URL to navigate to (include https://).
+            url: The full URL to open (include https://).
+            type: What to return — "text" (visible page text, default),
+                  "html" (raw HTML markup), or "elements" (interactive element map).
+            headless: Override the session headless setting for this request.
+                      None = use session default. False = show browser window
+                      (useful for captchas). True = force headless.
         """
-        st   = _state(agent)
-        page = await _ensure_page(agent)
+        st  = _state(agent)
+        err = _validate_browse_url(url)
+        if err:
+            return err
+
+        mode = type.lower().strip()
+        if mode not in ("elements", "text", "html"):
+            return "Error: type must be 'elements', 'text', or 'html'."
+
         try:
-            await page.goto(
-                url,
-                wait_until=st["settings"]["wait_until"],
-                timeout=st["settings"]["timeout_ms"],
-            )
-            elements = await _dynamic_discovery(agent)
-            return (
-                f"Navigated to {url}.\n"
-                f"Elements: {json.dumps(elements, indent=2)}\n"
-                "Use extract_text or extract_html to get full page content."
-            )
+            # Override headless for this request if specified
+            original_headless = st["settings"]["headless"]
+            if headless is not None:
+                st["settings"]["headless"] = headless
+                # If a browser is already open with the wrong headless mode, close and reopen
+                if st["browser"] is not None:
+                    await _close_browser(agent)
+
+            try:
+                page     = await _ensure_page(agent)
+                response = await page.goto(
+                    url,
+                    wait_until=st["settings"]["wait_until"],
+                    timeout=st["settings"]["timeout_ms"],
+                )
+                status = response.status if response else 200
+
+                if mode == "elements":
+                    elements = await _dynamic_discovery(agent)
+                    return (
+                        f"Opened {url} (status {status}).\n"
+                        f"Elements: {json.dumps(elements, indent=2)}\n"
+                        "Use open_url with type='text' or type='html' for full page content."
+                    )
+
+                html = await page.content()
+                if mode == "html":
+                    content = html
+                else:
+                    content = _html_to_text(html, st["settings"]["ignore_tags"])
+                content, truncated = _truncate_content(content, st["settings"]["browse_max_chars"])
+                title = await page.title() or _extract_html_title(html) or ""
+
+            finally:
+                # Always restore the session headless setting
+                if headless is not None:
+                    st["settings"]["headless"] = original_headless
+
+            suffix     = "\n[truncated]" if truncated else ""
+            title_line = f"# {title}\n" if title else ""
+            return f"{title_line}{url} (status {status})\n\n{content}{suffix}"
+
         except Exception as e:
             return f"[error: {e}]"
 
@@ -859,9 +824,9 @@ def register(agent) -> None:
         except Exception as e:
             return f"[error: {e}]"
 
-    async def screenshot(target: str = None, filename: str = None, nth: int = 0, exact: bool = None) -> str:
+    async def screenshot_browser(target: str = None, filename: str = None, nth: int = 0, exact: bool = None) -> str:
         """
-        Take a screenshot of the page or a specific element.
+        Take a screenshot of a browser page or a specific element.
         Saved to workspace/downloads/<filename>.
 
         Args:
@@ -966,7 +931,7 @@ def register(agent) -> None:
         else:
             return f"Error: unknown action '{action}'. Valid: {valid}"
 
-    # Defaults: web_search, browse_url and navigate are always_on; the rest are deferred.
+    # Defaults: web_search, and navigate are always_on; the rest are deferred.
     # Can be overridden per-tool via config: web.tools.<tool_name>: always_on|deferred|disabled
     try:
         from modules.web import EXTENSION_META as _META
@@ -980,27 +945,27 @@ def register(agent) -> None:
     _tools_cfg = {**_tools_cfg, **_runtime_tools_cfg}
 
     _WEB_DEFAULTS: dict[str, bool] = {
-        "web_search":    True,
-        "navigate":      True,
-        "http_request":  False,
-        "click":         False,
-        "type_text":     False,
-        "extract_text":  False,
-        "extract_html":  False,
-        "screenshot":    False,
-        "wait_for":      False,
+        "web_search":     True,
+        "open_url":       True,
+        "http_request":   False,
+        "click":          False,
+        "type_text":      False,
+        "extract_text":   False,
+        "extract_html":   False,
+        "screenshot_browser":     False,
+        "wait_for":       False,
         "manage_browser": False,
     }
 
     for fn in (
         web_search,
+        open_url,
         http_request,
-        navigate,
         click,
         type_text,
         extract_text,
         extract_html,
-        screenshot,
+        screenshot_browser,
         wait_for,
         manage_browser,
     ):
