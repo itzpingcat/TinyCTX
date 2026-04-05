@@ -38,7 +38,7 @@ Job schema (CRON.json):
     ]
   }
 
-The agent edits CRON.json directly using str_replace / view / create_file.
+The agent edits CRON.json directly using str_replace / view / write_file.
 cron_list is the only tool registered — it validates and summarises jobs.
 
 Convention: register(agent) — no imports from gateway or bridges.
@@ -281,7 +281,7 @@ def _build_cron_list(path: Path) -> str:
     if not path.exists():
         return (
             "No CRON.json found in workspace.\n\n"
-            f"To create scheduled jobs, create {path} using create_file.\n"
+            f"To create scheduled jobs, create {path} using write_file.\n"
             "See the CRON.json schema in the cron module docstring for the format."
         )
 
