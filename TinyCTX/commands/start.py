@@ -7,10 +7,13 @@ and polls /v1/health until the daemon is ready.
 Gateway host/port/api_key are read directly from config.yaml — no PID
 file is written or consulted.
 
+Default config path: <repo_root>/config.yaml  (next to the README, same
+as onboard uses). Override with --config.
+
 Flags
 -----
   --foreground   Run in the foreground instead of detaching.
-  --config PATH  Path to config.yaml (default: ./config.yaml).
+  --config PATH  Path to config.yaml.
 """
 from __future__ import annotations
 
@@ -20,8 +23,11 @@ import sys
 import time
 from pathlib import Path
 
+# Repo root = TinyCTX/commands/ -> TinyCTX/ -> repo root
+_REPO_ROOT     = Path(__file__).resolve().parent.parent.parent
+_DEFAULT_CONFIG = _REPO_ROOT / "config.yaml"
 
-_POLL_TIMEOUT  = 8.0   # seconds to wait for daemon to come up
+_POLL_TIMEOUT  = 8.0
 _POLL_INTERVAL = 0.25
 
 
@@ -35,7 +41,7 @@ def _health_check(gateway_url: str) -> bool:
 
 
 def run(args: argparse.Namespace) -> None:
-    config_path = Path(getattr(args, "config", None) or "config.yaml").resolve()
+    config_path = Path(getattr(args, "config", None) or _DEFAULT_CONFIG).resolve()
     if not config_path.exists():
         print(f"error: config not found: {config_path}", file=sys.stderr)
         sys.exit(1)
@@ -45,7 +51,6 @@ def run(args: argparse.Namespace) -> None:
     gateway_url = f"http://{cfg.gateway.host}:{cfg.gateway.port}"
     api_key     = cfg.gateway.api_key or ""
 
-    # Check if the daemon is already running.
     if _health_check(gateway_url):
         print(f"✓ TinyCTX already running — {gateway_url}")
         return
@@ -92,7 +97,6 @@ def run(args: argparse.Namespace) -> None:
             proc.wait()
         return
 
-    # Poll health.
     deadline = time.monotonic() + _POLL_TIMEOUT
     while time.monotonic() < deadline:
         if _health_check(gateway_url):

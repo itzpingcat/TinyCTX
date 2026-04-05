@@ -2,11 +2,13 @@
 commands/status.py — `tinyctx status`
 
 Reads gateway host/port/api_key directly from config.yaml and hits
-/v1/health to report daemon health. No PID file involved.
+/v1/health to report daemon health.
+
+Default config path: <repo_root>/config.yaml. Override with --config.
 
 Flags
 -----
-  --config PATH  Path to config.yaml (default: ./config.yaml).
+  --config PATH  Path to config.yaml.
 """
 from __future__ import annotations
 
@@ -16,9 +18,12 @@ import sys
 import urllib.request
 from pathlib import Path
 
+_REPO_ROOT      = Path(__file__).resolve().parent.parent.parent
+_DEFAULT_CONFIG = _REPO_ROOT / "config.yaml"
+
 
 def _gateway_url_and_key(args: argparse.Namespace) -> tuple[str, str]:
-    config_path = Path(getattr(args, "config", None) or "config.yaml").resolve()
+    config_path = Path(getattr(args, "config", None) or _DEFAULT_CONFIG).resolve()
     if not config_path.exists():
         print(f"error: config not found: {config_path}", file=sys.stderr)
         sys.exit(1)

@@ -4,26 +4,29 @@ commands/stop.py — `tinyctx stop`
 Asks the running daemon to shut down via POST /v1/shutdown.
 Gateway host/port/api_key are read directly from config.yaml.
 
+Default config path: <repo_root>/config.yaml. Override with --config.
+
 Flags
 -----
-  --config PATH  Path to config.yaml (default: ./config.yaml).
+  --config PATH  Path to config.yaml.
 """
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 import time
 import urllib.request
 from pathlib import Path
 
+_REPO_ROOT      = Path(__file__).resolve().parent.parent.parent
+_DEFAULT_CONFIG = _REPO_ROOT / "config.yaml"
 
 _DRAIN_TIMEOUT  = 8.0
 _POLL_INTERVAL  = 0.25
 
 
 def _gateway_url_and_key(args: argparse.Namespace) -> tuple[str, str]:
-    config_path = Path(getattr(args, "config", None) or "config.yaml").resolve()
+    config_path = Path(getattr(args, "config", None) or _DEFAULT_CONFIG).resolve()
     if not config_path.exists():
         print(f"error: config not found: {config_path}", file=sys.stderr)
         sys.exit(1)
@@ -60,20 +63,18 @@ def run(args: argparse.Namespace) -> None:
     )
     try:
         with urllib.request.urlopen(req, timeout=5) as r:
-            pass  # 204 No Content expected
+            pass
     except urllib.error.HTTPError as exc:
         if exc.code == 204:
-            pass  # success
+            pass
         else:
             print(f"error: shutdown request failed: {exc}", file=sys.stderr)
             sys.exit(1)
     except Exception as exc:
-        # Connection reset / closed mid-response is fine — daemon is shutting down.
         if not isinstance(exc, (ConnectionResetError, ConnectionAbortedError)):
             print(f"error: {exc}", file=sys.stderr)
             sys.exit(1)
 
-    # Wait for the gateway to stop responding.
     deadline = time.monotonic() + _DRAIN_TIMEOUT
     while time.monotonic() < deadline:
         if not _is_alive(gateway_url):
@@ -81,5 +82,4 @@ def run(args: argparse.Namespace) -> None:
             return
         time.sleep(_POLL_INTERVAL)
 
-    print("⚠  daemon did not stop within "
-          f"{_DRAIN_TIMEOUT}s — it may still be running.")
+    print(f"⚠  daemon did not stop within {_DRAIN_TIMEOUT}s — it may still be running.")

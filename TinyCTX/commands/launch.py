@@ -4,11 +4,13 @@ commands/launch.py — `tinyctx launch <target>`
 Currently supported targets: cli
 
 Reads gateway host/port/api_key directly from config.yaml and calls
-the bridge's run_detached() entry point. No PID file involved.
+the bridge's run_detached() entry point.
+
+Default config path: <repo_root>/config.yaml. Override with --config.
 
 Flags
 -----
-  --config PATH  Path to config.yaml (default: ./config.yaml).
+  --config PATH  Path to config.yaml.
 """
 from __future__ import annotations
 
@@ -16,6 +18,9 @@ import argparse
 import sys
 import urllib.request
 from pathlib import Path
+
+_REPO_ROOT      = Path(__file__).resolve().parent.parent.parent
+_DEFAULT_CONFIG = _REPO_ROOT / "config.yaml"
 
 
 def run(args: argparse.Namespace) -> None:
@@ -25,7 +30,7 @@ def run(args: argparse.Namespace) -> None:
         print(f"error: unknown launch target '{target}'", file=sys.stderr)
         sys.exit(1)
 
-    config_path = Path(getattr(args, "config", None) or "config.yaml").resolve()
+    config_path = Path(getattr(args, "config", None) or _DEFAULT_CONFIG).resolve()
     if not config_path.exists():
         print(f"error: config not found: {config_path}", file=sys.stderr)
         sys.exit(1)
@@ -40,7 +45,6 @@ def run(args: argparse.Namespace) -> None:
     gateway_url = f"http://{cfg.gateway.host}:{cfg.gateway.port}"
     api_key     = cfg.gateway.api_key or ""
 
-    # Verify gateway is actually reachable.
     try:
         with urllib.request.urlopen(f"{gateway_url}/v1/health", timeout=2) as r:
             if r.status != 200:
