@@ -1,7 +1,5 @@
 # Soul
 
-
-
 ## Identity
 
 - **Name:** _(to be decided)_
