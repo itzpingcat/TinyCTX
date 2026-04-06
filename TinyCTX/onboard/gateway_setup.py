@@ -3,9 +3,8 @@ onboard/gateway_setup.py — Step 4: Gateway port, API key, launch, and health c
 
 - Prompts for port (validates it's available).
 - Auto-generates a gateway API key.
-- Writes config, launches the gateway process.
-- Health-checks every second for up to 15 seconds.
-- On success, launches the CLI bridge and hands off to the agent.
+- Returns config dict (does NOT write config or launch — caller does that).
+- launch() is called by __main__.py after write_config().
 """
 
 from __future__ import annotations
@@ -37,22 +36,21 @@ from .helpers import (
 HEALTH_CHECK_TIMEOUT  = 15    # seconds
 HEALTH_CHECK_INTERVAL = 1.0   # seconds
 
-# main.py lives at tinyctx/main.py (one level up from commands/)
-_MAIN_PY = REPO_ROOT / "tinyctx" / "main.py"
+# main.py lives at TinyCTX/main.py (REPO_ROOT is the TinyCTX package dir)
+_MAIN_PY = REPO_ROOT / "main.py"
 
 
 def run(mode: Mode) -> dict[str, Any]:
     """
-    Run the gateway setup step.
+    Collect gateway config (host, port, api_key) from the user.
 
-    Collects port + API key, launches the gateway, health-checks it,
-    then hands off to the CLI bridge on success.
+    Does NOT launch the gateway — call launch() after write_config().
 
     Returns a gateway config dict: { enabled, host, port, api_key }
     Raises GoBack if the user wants to return to the previous step.
     """
     if mode == "quickstart":
-        section("Step 4 — Launching Your Agent")
+        section("Step 4 — Gateway Setup")
         c.print(
             "TinyCTX runs a local server so clients can connect to your agent.\n"
             "We'll auto-generate a secret key — keep it safe!\n"
@@ -76,29 +74,31 @@ def run(mode: Mode) -> dict[str, Any]:
 
         port = _pick_port(host)
 
-        raw_key = questionary.text(
-            "API key (leave blank to auto-generate):",
-            style=QSTYLE,
-        ).ask()
-        if raw_key is None:
-            raise GoBack
-        api_key = raw_key.strip() or secrets.token_hex(16)
+        api_key = secrets.token_hex(16)
 
         success(f"Gateway: http://{host}:{port}  key=[bold]{api_key}[/]")
 
-    gateway = {
+    return {
         "enabled": True,
         "host":    host,
         "port":    port,
         "api_key": api_key,
     }
 
+
+def launch(gateway: dict[str, Any]) -> None:
+    """
+    Spawn main.py as a detached background process and poll /v1/health.
+    Call this AFTER write_config() so the daemon finds a valid config on disk.
+    """
+    host    = gateway["host"]
+    port    = gateway["port"]
+    api_key = gateway["api_key"]
+
     if not _launch_and_healthcheck(host, port):
         sys.exit(1)
 
     _launch_cli_bridge(host, port, api_key)
-
-    return gateway
 
 
 # ── private: launch & health check ───────────────────────────────────────────
@@ -152,7 +152,7 @@ def _launch_and_healthcheck(host: str, port: int) -> bool:
     warn(
         f"Gateway did not respond after {HEALTH_CHECK_TIMEOUT} seconds.\n"
         f"  Check {log_file} for errors.\n"
-        "  Please report this issue at: https://github.com/Kawaiineko/TinyCTX/issues"
+        "  Please report this issue at: https://github.com/itzpingcat/TinyCTX/issues"
     )
     return False
 

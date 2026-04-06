@@ -194,6 +194,7 @@ def run_wizard(providers: dict, beginner_providers: dict, existing: dict | None)
                 results["workspace"] = workspace_setup.run(mode)
 
             elif current == "gateway":
+                # Collect config only — do NOT launch yet (config not written yet)
                 results["gateway"] = gateway_setup.run(mode)
 
             step_idx += 1
@@ -220,6 +221,9 @@ def run_wizard(providers: dict, beginner_providers: dict, existing: dict | None)
     )
     write_config(data)
     success(f"Config written to [bold]{CONFIG_PATH}[/]")
+
+    # ── Launch gateway AFTER config is on disk ────────────────────────────────
+    gateway_setup.launch(results["gateway"])
 
     step_summary(mode, results["gateway"])
 
