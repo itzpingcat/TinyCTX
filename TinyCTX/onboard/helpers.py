@@ -179,6 +179,15 @@ def is_valid_url(url: str) -> bool:
     except Exception:
         return False
 
+def base_url_fix(url: str) -> str:
+    """Ensure url starts with http:// and has no trailing slash."""
+    url = url.strip()
+    if not url.startswith(("http://", "https://")):
+        url = "http://" + url
+    url = url.rstrip("/")
+    if "/v1" not in url:
+        url = url + "/v1"
+    return url
 
 def fetch_models(base_url: str, api_key: str | None = None, timeout: float = 3.0) -> list[str] | None:
     """
@@ -188,27 +197,17 @@ def fetch_models(base_url: str, api_key: str | None = None, timeout: float = 3.0
         - None: Authentication failed (401/403), key required.
         - []: Network error or other failure.
     """
-    if not is_valid_url(base_url):
+
+    if not base_url.endswith("/models"):
+        url = base_url + "/models"
+    else:
+        url = base_url
+    if not is_valid_url(url):
         return []
 
-    # Normalize URL: ensures it ends in /v1/models or /models 
-    # depending on your base_url structure
-    url = base_url.rstrip("/")
-    if not url.endswith("/models"):
-        # Try /v1/models first if /v1 is not already in the path
-        if "/v1" not in url:
-            url_v1 = url + "/v1/models"
-        else:
-            url_v1 = None
-        url = url + "/models"
-    else:
-        url_v1 = None
-
     headers = {"Content-Type": "application/json"}
-    if api_key and api_key != "N/A":
-        # Resolve env var if api_key looks like one
-        actual_key = os.environ.get(api_key, api_key)
-        headers["Authorization"] = f"Bearer {actual_key}"
+    if api_key != "N/A":
+        headers["Authorization"] = f"Bearer {api_key}"
 
     def _try_fetch(target_url: str) -> list[str] | None:
         req = urllib.request.Request(target_url, headers=headers)
@@ -227,8 +226,8 @@ def fetch_models(base_url: str, api_key: str | None = None, timeout: float = 3.0
             return []
 
     # If we have a /v1/models candidate, try it first
-    if url_v1:
-        result = _try_fetch(url_v1)
+    if url:
+        result = _try_fetch(url)
         if result:  # non-empty list means success
             return result
         if result is None:  # 401/403 — propagate immediately

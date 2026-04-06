@@ -26,6 +26,7 @@ from .helpers import (
     c,
     fetch_models,
     is_valid_url,
+    base_url_fix,
     section,
     set_env,
     success,
@@ -138,6 +139,7 @@ def _pick_provider(
             raw = questionary.text("Enter base URL:", style=QSTYLE).ask()
             if not raw or raw.strip().lower() in ("back", "b"): continue
             base_url, provider_name = raw.strip(), "Custom"
+            base_url = base_url_fix(base_url)
             if not is_valid_url(base_url):
                 warn("Invalid URL."); continue
         else:
