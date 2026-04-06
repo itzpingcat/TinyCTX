@@ -195,7 +195,14 @@ def fetch_models(base_url: str, api_key: str | None = None, timeout: float = 3.0
     # depending on your base_url structure
     url = base_url.rstrip("/")
     if not url.endswith("/models"):
-        url += "/models"
+        # Try /v1/models first if /v1 is not already in the path
+        if "/v1" not in url:
+            url_v1 = url + "/v1/models"
+        else:
+            url_v1 = None
+        url = url + "/models"
+    else:
+        url_v1 = None
 
     headers = {"Content-Type": "application/json"}
     if api_key and api_key != "N/A":
@@ -203,23 +210,32 @@ def fetch_models(base_url: str, api_key: str | None = None, timeout: float = 3.0
         actual_key = os.environ.get(api_key, api_key)
         headers["Authorization"] = f"Bearer {actual_key}"
 
-    req = urllib.request.Request(url, headers=headers)
-    
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read())
-            models = [m["id"] for m in data.get("data", []) if "id" in m]
-            # Fallback for non-OpenAI spec providers that return a raw list
-            if not models and isinstance(data, list):
-                models = [m.get("id", m) if isinstance(m, dict) else m for m in data]
-            return sorted(models)
-            
-    except urllib.error.HTTPError as e:
-        if e.code in (401, 403):
-            return None  # Signal that Auth is the specific problem
-        return []
-    except Exception:
-        return []
+    def _try_fetch(target_url: str) -> list[str] | None:
+        req = urllib.request.Request(target_url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read())
+                models = [m["id"] for m in data.get("data", []) if "id" in m]
+                if not models and isinstance(data, list):
+                    models = [m.get("id", m) if isinstance(m, dict) else m for m in data]
+                return sorted(models)
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                return None  # auth required
+            return []
+        except Exception:
+            return []
+
+    # If we have a /v1/models candidate, try it first
+    if url_v1:
+        result = _try_fetch(url_v1)
+        if result:  # non-empty list means success
+            return result
+        if result is None:  # 401/403 — propagate immediately
+            return None
+        # result == [] — fall through and try bare /models
+
+    return _try_fetch(url)
 
 
 def health_ping(host: str, port: int, timeout: float = 4.0) -> bool:
