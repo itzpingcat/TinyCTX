@@ -413,7 +413,7 @@ class AgentLoop:
 
             if error:
                 logger.error("[cursor=%s] LLM error (all models exhausted): %s", self._tail_node_id, error)
-                yield AgentError(message=f"[LLM error: {error}]", **{**ev, "tail_node_id": self._tail_node_id}
+                yield AgentError(message=f"[LLM error: {error}]", **{**ev, "tail_node_id": self._tail_node_id})
                 return
 
             response_text = "".join(text_chunks)
