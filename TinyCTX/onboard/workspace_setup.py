@@ -30,7 +30,7 @@ from .helpers import (
 )
 
 # Boilerplate .md files that live in onboard/bundled/
-BOILERPLATE_MD = ["AGENTS.md", "SOUL.md", "MEMORY.md"]
+BOILERPLATE_MD = ["AGENTS.md", "SOUL.md", "MEMORY.md", "TOOLS.md", "USER.md"]
 
 # Optional recommended skills (must be zip files in onboard/bundled/)
 RECOMMENDED_SKILLS = ["clawhub", "weather", "skill-creator"]

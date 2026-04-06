@@ -149,6 +149,7 @@ def register(agent) -> None:
     soul_path   = _resolve(cfg["soul_file"])
     agents_path = _resolve(cfg["agents_file"])
     memory_path = _resolve(cfg["memory_file"])
+    tools_path = _resolve(cfg["tools_file"])
 
     # Build macro resolver for injected files. Built-ins ({date}, {datetime},
     # {workspace}) are handled by make_provider automatically.
@@ -174,10 +175,16 @@ def register(agent) -> None:
         role="system",
         priority=int(cfg["memory_priority"]),
     )
+    agent.context.register_prompt(
+        "tools",
+        make_provider(tools_path, workspace, extra_macros=resolver),
+        role="system",
+        priority=int(cfg["tools_priority"]),
+    )
 
     logger.info(
-        "[memory] static providers — soul: %s | agents: %s | memory: %s",
-        soul_path, agents_path, memory_path,
+        "[memory] static providers — soul: %s | agents: %s | memory: %s | tools: %s",
+        soul_path, agents_path, memory_path, tools_path,
     )
 
     # ------------------------------------------------------------------

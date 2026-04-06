@@ -12,10 +12,11 @@ EXTENSION_META = {
         "soul_file":    "SOUL.md",
         "agents_file":  "AGENTS.md",
         "memory_file":  "MEMORY.md",
+        "tools_file":   "TOOLS.md",
         "soul_priority":   0,
         "agents_priority": 10,
         "memory_priority": 20,
-
+        "tools_priority": 15,
         # --- Search index ---
         # Directory scanned recursively for *.md files, relative to workspace
         "memory_dir": "memory",

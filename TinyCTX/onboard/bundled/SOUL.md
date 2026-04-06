@@ -1,6 +1,6 @@
 # Soul
 
-<!-- This file defines who your agent is. Edit it freely. -->
+
 
 ## Identity
 

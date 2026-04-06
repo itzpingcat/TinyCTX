@@ -2,6 +2,7 @@
 config.yaml
 config.yaml.bak
 .env
+*temp*
 
 # python
 __pycache__/
