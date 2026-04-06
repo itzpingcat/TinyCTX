@@ -5,8 +5,8 @@ EXTENSION_META = {
     "default_config": {
         "same_call_dedup_after":      2,
         "cot_keep_recent_turns":      10000,
-        "tool_trim_after":            2,
-        "tool_output_truncate_after": 1,
+        "tool_trim_after":            5,
+        "tool_output_truncate_after": 5,
         "max_tool_output_chars":      2000,
     },
 }
