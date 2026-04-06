@@ -36,7 +36,7 @@ from .helpers import (
 HEALTH_CHECK_TIMEOUT  = 15    # seconds
 HEALTH_CHECK_INTERVAL = 1.0   # seconds
 
-# main.py lives at TinyCTX/main.py (REPO_ROOT is the TinyCTX package dir)
+# main.py lives at TinyCTX/TinyCTX/main.py (REPO_ROOT/TinyCTX is the TinyCTX package dir)
 _MAIN_PY = REPO_ROOT / "TinyCTX" / "main.py"
 
 
