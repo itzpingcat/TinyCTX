@@ -71,3 +71,5 @@
 - Users can Ctrl C at any time to cancel onboarding.
 - Users can undo their last decision.
 - Very robust input. It should not break if the user types something unexpected.
+- Verify inputs too. The wizard should not let you continue if your input would not work.
+- Eg. If it cannot fetch models from the list, do not proceed. Force the user to pick a valid provider.
