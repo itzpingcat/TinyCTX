@@ -20,7 +20,7 @@ What is unchanged
   handle_event, _start_reply, _get_live_render, _stop_live, _ensure_live
   _preprocess (code block label injection)
   _read_clipboard_text, _write_clipboard_text
-  /copy, /paste, /help built-in slash commands
+  /copy, /paste, /think built-in slash commands
   _prompt (async stdin reader)
   _load_cli_cursor_path / _save_cli_cursor_path (cursor file helpers)
 
@@ -29,7 +29,9 @@ What changed
   CLIBridge gains _gateway_url and _api_key (set by run_detached).
   _send() POSTs to /v1/lane/message and reads SSE instead of calling router.
   /reset calls POST /v1/lane/branch then POST /v1/lane/open.
-  Module slash commands removed (no in-process router).
+  Module slash commands are dispatched to POST /v1/lane/command before
+    falling through to built-in handlers or the message router.
+  /help fetches GET /v1/commands to include module-registered commands.
 """
 from __future__ import annotations
 
@@ -166,6 +168,49 @@ class CLIBridge:
                                     headers=self._http_headers()) as resp:
                 resp.raise_for_status()
                 return await resp.json()
+
+    async def _api_get(self, path: str) -> dict:
+        """GET from the gateway, return parsed response dict."""
+        import aiohttp
+        url = f"{self._gateway_url}{path}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=self._http_headers()) as resp:
+                resp.raise_for_status()
+                return await resp.json()
+
+    # --- Slash command dispatch via gateway ---
+
+    async def _dispatch_gateway_command(self, text: str) -> bool:
+        """
+        POST /v1/lane/command for module-registered slash commands.
+
+        Returns True if the gateway handled the command (bridge should not
+        fall through to built-ins or push as a message).
+
+        The gateway returns {"handled": true/false, "output": "..."}.
+        When handled, output is printed to the console.
+        When not handled, we return False so built-in handling can proceed.
+        """
+        c = self._theme.c
+        try:
+            data = await self._api_post(
+                "/v1/lane/command",
+                {"node_id": self._cursor, "text": text},
+            )
+        except Exception as exc:
+            # Network / server error — fall through to built-ins.
+            logger.debug("[cli] /v1/lane/command request failed: %s", exc)
+            return False
+
+        if not data.get("handled", False):
+            return False
+
+        output = (data.get("output") or "").strip()
+        if output:
+            # Render each line; use tool_ok color as neutral command output.
+            for line in output.splitlines():
+                self._console.print(f"  [{c('tool_ok')}]{line}[/{c('tool_ok')}]")
+        return True
 
     # --- Clipboard helpers ---
 
@@ -389,8 +434,14 @@ class CLIBridge:
             raise EOFError
 
     async def _handle_help(self) -> None:
+        """
+        Print built-in commands, then fetch module-registered commands from
+        GET /v1/commands and append them to the listing.
+        """
         c = self._theme.c
-        rows = [
+
+        # Built-in commands always available locally.
+        builtin_rows = [
             ("/reset",  "Start a new session branch"),
             ("/copy",   "Copy last agent reply to clipboard"),
             ("/paste",  "Submit clipboard contents as next message"),
@@ -398,10 +449,24 @@ class CLIBridge:
                         ("on" if self._show_thinking else "off") + ")"),
             ("/help",   "Show this help"),
         ]
-        rows.sort(key=lambda r: r[0])
+
+        # Module-registered commands from the gateway.
+        module_rows: list[tuple[str, str]] = []
+        try:
+            data = await self._api_get("/v1/commands")
+            for entry in data.get("commands", []):
+                cmd  = entry.get("command", "")
+                hlp  = entry.get("help", "")
+                if cmd:
+                    module_rows.append((cmd, hlp))
+        except Exception as exc:
+            logger.debug("[cli] could not fetch /v1/commands: %s", exc)
+
+        all_rows = sorted(builtin_rows + module_rows, key=lambda r: r[0])
+
         self._console.print(
             f"[{c('border')}]available commands:[/{c('border')}]")
-        for cmd, help_text in rows:
+        for cmd, help_text in all_rows:
             self._console.print(
                 f"  [{c('tool_call')}]{cmd}[/{c('tool_call')}]  {help_text}")
 
@@ -453,8 +518,10 @@ class CLIBridge:
                 if text.startswith("/"):
                     lower = text.lower()
 
+                    # --------------------------------------------------------
+                    # Built-in: /reset
+                    # --------------------------------------------------------
                     if lower == "/reset":
-                        # Branch off root (non-destructive), then open lane.
                         branch_data = await self._api_post(
                             "/v1/lane/branch", {"parent_node_id": None})
                         new_node_id = branch_data["node_id"]
@@ -467,6 +534,9 @@ class CLIBridge:
                             f"[/{c('reset')}]")
                         continue
 
+                    # --------------------------------------------------------
+                    # Built-in: /copy
+                    # --------------------------------------------------------
                     if lower.startswith("/copy"):
                         copied = self._write_clipboard_text(self._last_reply)
                         if copied:
@@ -479,6 +549,9 @@ class CLIBridge:
                                 f"[/{c('tool_error')}]")
                         continue
 
+                    # --------------------------------------------------------
+                    # Built-in: /paste  (falls through to _send below)
+                    # --------------------------------------------------------
                     if lower.startswith("/paste"):
                         pasted = self._read_clipboard_text().strip()
                         if not pasted:
@@ -492,6 +565,9 @@ class CLIBridge:
                         text = pasted
                         # Falls through to _send below.
 
+                    # --------------------------------------------------------
+                    # Built-in: /think
+                    # --------------------------------------------------------
                     elif lower == "/think":
                         self._show_thinking = not self._show_thinking
                         state = "on" if self._show_thinking else "off"
@@ -500,14 +576,24 @@ class CLIBridge:
                             f"[/{c('reset')}]")
                         continue
 
+                    # --------------------------------------------------------
+                    # Built-in: /help
+                    # --------------------------------------------------------
                     elif lower in {"/help", "/?"}:
                         await self._handle_help()
                         continue
 
+                    # --------------------------------------------------------
+                    # Module slash commands — dispatch to gateway first.
+                    # If the gateway handles it, we're done.
+                    # If not, surface an "unknown command" error.
+                    # --------------------------------------------------------
                     else:
-                        self._console.print(
-                            f"[{c('error')}]  unknown command: {text}"
-                            f"  (try /help)[/{c('error')}]")
+                        handled = await self._dispatch_gateway_command(text)
+                        if not handled:
+                            self._console.print(
+                                f"[{c('error')}]  unknown command: {text}"
+                                f"  (try /help)[/{c('error')}]")
                         continue
 
                 self._reply_done.clear()

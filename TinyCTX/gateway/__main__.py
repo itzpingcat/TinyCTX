@@ -11,6 +11,14 @@ POST   /v1/lane/message    Push a user message; returns SSE event stream.
 POST   /v1/lane/branch     Create a new branch node; return its node_id.
                            Non-destructive — no existing lane is modified.
 DELETE /v1/lane/abort      Abort in-flight generation for a node_id.
+POST   /v1/lane/command    Dispatch a slash command against the shared registry.
+                           Body: { "node_id": "...", "text": "/memory consolidate" }
+                           Returns: { "handled": true, "output": "..." }
+                           The command handler captures its console output via a
+                           lightweight StringConsole shim and returns it as JSON.
+GET    /v1/commands        List all registered slash commands and their help text.
+                           Returns: { "commands": [{ "command": "/memory consolidate",
+                                                      "help": "..." }, ...] }
 POST   /v1/shutdown        Gracefully shut down the daemon (auth required).
 GET    /v1/health          Always public.
 
@@ -360,6 +368,138 @@ async def handle_lane_abort(request: web.Request) -> web.Response:
 
 
 # ---------------------------------------------------------------------------
+# Slash-command helpers
+# ---------------------------------------------------------------------------
+
+class _StringConsole:
+    """
+    Minimal Rich Console shim that captures print() calls as plain text.
+
+    CommandRegistry handlers receive a ``context`` dict with a "console" key
+    that is normally a rich.console.Console.  This shim accepts the same
+    ``console.print(markup_string, ...)`` signature that all built-in handlers
+    use and strips Rich markup tags so the returned output is clean text.
+    """
+
+    def __init__(self) -> None:
+        self._lines: list[str] = []
+
+    def print(self, *args, **kwargs) -> None:  # noqa: A003
+        # Concatenate positional args (same as rich.Console.print behaviour).
+        raw = " ".join(str(a) for a in args)
+        # Strip Rich markup tags  [color]...[/color]  →  ...
+        import re
+        clean = re.sub(r"\[/?[^\[\]]*\]", "", raw).strip()
+        if clean:
+            self._lines.append(clean)
+
+    def get_output(self) -> str:
+        return "\n".join(self._lines)
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/lane/command
+# ---------------------------------------------------------------------------
+
+async def handle_lane_command(request: web.Request) -> web.Response:
+    """
+    Dispatch a slash command against the router's shared CommandRegistry.
+
+    Body
+    ----
+    {
+        "node_id": "<cursor uuid>",          // required
+        "text":    "/memory consolidate"     // required — must start with /
+    }
+
+    Response (200)
+    --------------
+    { "handled": true,  "output": "✓  memory consolidation started (branch off …)" }
+    { "handled": false, "output": "" }   // unknown command
+
+    Response (400)
+    --------------
+    { "error": "..." }   // missing field or text doesn't start with /
+    """
+    router = request.app["router"]
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise web.HTTPBadRequest(content_type="application/json",
+                                 body=json.dumps({"error": "invalid JSON"}))
+
+    node_id = (body.get("node_id") or "").strip()
+    if not node_id:
+        raise web.HTTPBadRequest(content_type="application/json",
+                                 body=json.dumps({"error": "node_id required"}))
+
+    text = (body.get("text") or "").strip()
+    if not text:
+        raise web.HTTPBadRequest(content_type="application/json",
+                                 body=json.dumps({"error": "text required"}))
+    if not text.startswith("/"):
+        raise web.HTTPBadRequest(content_type="application/json",
+                                 body=json.dumps({"error": "text must start with /"}))
+
+    # Build the context dict that command handlers expect.
+    console = _StringConsole()
+
+    # Resolve the agent attached to this lane (if open) so handlers that
+    # need agent._db / agent.context work correctly.
+    lane = router._lane_router._lanes.get(node_id)
+    agent = lane.loop if lane is not None else None
+
+    context: dict = {
+        "node_id":   node_id,
+        "console":   console,
+        "gateway":   router,
+        "agent":     agent,
+        # Neutral theme_c — returns empty string for all keys so handlers
+        # that call c("tool_ok") etc. get plain text from _StringConsole.
+        "theme_c":   lambda _k: "",
+    }
+
+    handled = await router.commands.dispatch(text, context)
+    output  = console.get_output()
+
+    logger.info(
+        "gateway: /v1/lane/command node_id=%s text=%r handled=%s",
+        node_id, text, handled,
+    )
+
+    return web.Response(
+        content_type="application/json",
+        body=json.dumps({"handled": handled, "output": output}),
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/commands
+# ---------------------------------------------------------------------------
+
+async def handle_commands_list(request: web.Request) -> web.Response:
+    """
+    Return all registered slash commands and their one-line help strings.
+
+    Response (200)
+    --------------
+    {
+        "commands": [
+            { "command": "/memory consolidate", "help": "Spawn a memory consolidation branch immediately" },
+            ...
+        ]
+    }
+    """
+    router = request.app["router"]
+    rows = router.commands.list_commands()
+    return web.Response(
+        content_type="application/json",
+        body=json.dumps({"commands": [{"command": cmd, "help": hlp} for cmd, hlp in rows]}),
+    )
+
+
+# ---------------------------------------------------------------------------
 # POST /v1/shutdown
 # ---------------------------------------------------------------------------
 
@@ -473,6 +613,10 @@ def _make_app(router, cfg: GatewayConfig, shutdown_event: asyncio.Event) -> web.
     app.router.add_post(  "/v1/lane/message",             handle_lane_message)
     app.router.add_post(  "/v1/lane/branch",              handle_lane_branch)
     app.router.add_delete("/v1/lane/abort",               handle_lane_abort)
+    app.router.add_post(  "/v1/lane/command",             handle_lane_command)
+
+    # Command discovery
+    app.router.add_get(   "/v1/commands",                 handle_commands_list)
 
     # Shutdown
     app.router.add_post(  "/v1/shutdown",                 handle_shutdown)
