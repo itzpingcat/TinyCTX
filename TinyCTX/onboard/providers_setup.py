@@ -30,6 +30,7 @@ from .helpers import (
     set_env,
     success,
     warn,
+    is_local
 )
 
 
@@ -134,7 +135,7 @@ def _pick_provider(
 
     Returns (base_url, api_key_env, provider_name).  Raises GoBack.
     """
-    names = sorted(providers.keys()) + ["Custom", "← Back"]
+    names =  ["← Back", "Custom"] + sorted(providers.keys())
 
     while True:
         choice = questionary.select(
@@ -166,9 +167,7 @@ def _pick_provider(
         api_key_env = _ensure_api_key(provider_name, mode)
 
         # ── Connection test ───────────────────────────────────────────────
-        # Local / custom providers without a key skip the mandatory test,
-        # but we still try so the user gets early feedback.
-        is_local = provider_name in LOCAL_PROVIDERS or provider_name == "Custom"
+        locality = provider_name in LOCAL_PROVIDERS or is_local(base_url)
         c.print("  Testing connection…", end=" ")
         models = fetch_models(base_url, api_key_env, timeout=8.0)
 
@@ -178,10 +177,10 @@ def _pick_provider(
 
         c.print("[bold red]failed ✗[/]")
 
-        if is_local:
+        if locality:
             warn(
                 f"Could not reach {base_url}. "
-                "Make sure the local server is running, then try again."
+                "Make sure the server is running, then try again."
             )
             # Loop back to provider selection
             continue
@@ -293,7 +292,7 @@ def _pick_provider_quickstart(
     """
     from rich.panel import Panel
 
-    names = list(beginner_providers.keys()) + ["← Back"]
+    names = ["← Back"] + list(beginner_providers.keys())
 
     while True:
         choice = questionary.select(
@@ -409,7 +408,7 @@ def _ensure_api_key(provider_name: str, mode: Mode) -> str:
     Check / prompt for an API key for standard / advanced mode.
     Returns the env-var name to store in config.
     """
-    if provider_name in LOCAL_PROVIDERS or provider_name == "Custom":
+    if provider_name in LOCAL_PROVIDERS:
         return "N/A"
 
     api_key_env = api_key_env_for(provider_name)

@@ -18,6 +18,8 @@ import yaml
 from questionary import Style
 from rich.console import Console
 from rich.rule import Rule
+import socket, ipaddress
+from urllib.parse import urlparse
 
 # ── paths & constants ─────────────────────────────────────────────────────────
 
@@ -205,6 +207,35 @@ def health_ping(host: str, port: int, timeout: float = 4.0) -> bool:
     except Exception:
         return False
 
+TAILSCALE_NET = ipaddress.ip_network("100.64.0.0/10")
+
+def is_local(url: str) -> bool:
+    try:
+        h = urlparse(url).hostname or url.split("/")[0]
+        if not h:
+            return False
+
+        if h in ("localhost",) or h.endswith(".local"):
+            return True
+
+        def check(ip):
+            return (
+                ip.is_private or ip.is_loopback or
+                ip.is_link_local or ip in TAILSCALE_NET
+            )
+
+        try:
+            return check(ipaddress.ip_address(h))
+        except ValueError:
+            pass
+
+        for a in socket.getaddrinfo(h, None):
+            if check(ipaddress.ip_address(a[4][0])):
+                return True
+
+        return False
+    except:
+        return False
 
 # ── legacy Config / set_env (kept for other callers) ─────────────────────────
 

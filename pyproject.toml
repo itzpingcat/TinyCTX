@@ -27,6 +27,9 @@ dependencies = [
     "croniter",
     "discord.py",
     "matrix-nio",
+    "socket",
+    "ipaddress",
+    "urllib"
 ]
 
 [project.scripts]
