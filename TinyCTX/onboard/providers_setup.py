@@ -432,7 +432,7 @@ def _ensure_api_key(provider_name: str, mode: Mode) -> str:
             raw = ""
 
         if not raw:
-            warn(f"{api_key_env} not set — connection test will be skipped.")
+            warn(f"{api_key_env} not set — some providers may require a API key.")
             return api_key_env
 
         os.environ[api_key_env] = raw
