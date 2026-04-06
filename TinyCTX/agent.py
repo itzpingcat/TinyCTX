@@ -321,7 +321,7 @@ class AgentLoop:
             # Abort check between cycles
             if abort_event and abort_event.is_set():
                 logger.info("[%s] aborted before cycle %d", self._tail_node_id, cycle)
-                yield AgentError(message="[generation aborted]", **ev)
+                yield AgentError(message="[generation aborted]", **{**ev, "tail_node_id": self._tail_node_id})
                 return
 
             # Stage 2: Context Assembly
@@ -360,7 +360,7 @@ class AgentLoop:
                 async for llm_event in llm.stream(messages, tools=tools):
                     if abort_event and abort_event.is_set():
                         logger.info("[%s] aborted mid-stream", self._tail_node_id)
-                        yield AgentError(message="[generation aborted]", **ev)
+                        yield AgentError(message="[generation aborted]", **{**ev, "tail_node_id": self._tail_node_id})
                         return
 
                     if isinstance(llm_event, ThinkingDelta):
@@ -413,7 +413,7 @@ class AgentLoop:
 
             if error:
                 logger.error("[cursor=%s] LLM error (all models exhausted): %s", self._tail_node_id, error)
-                yield AgentError(message=f"[LLM error: {error}]", **ev)
+                yield AgentError(message=f"[LLM error: {error}]", **{**ev, "tail_node_id": self._tail_node_id}
                 return
 
             response_text = "".join(text_chunks)
@@ -455,7 +455,10 @@ class AgentLoop:
             logger.warning("[cursor=%s] hit max_tool_cycles (%d)", self._tail_node_id, max_cycles)
             final_text = final_text or "[Tool cycle limit reached.]"
 
-        yield AgentTextFinal(text=final_text if not streaming_active else "", **ev)
+        yield AgentTextFinal(
+            text=final_text if not streaming_active else "",
+            **{**ev, "tail_node_id": self._tail_node_id},
+        )
 
         # Fire background hooks after the turn completes.
         # Skipped for synthetic turns — they are themselves background work.
