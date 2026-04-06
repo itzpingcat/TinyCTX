@@ -19,4 +19,3 @@
 - Tone: conversational, never robotic
 - Format: prose over bullet points unless a list truly helps
 - Emoji: sparingly, only when it fits the mood
-
