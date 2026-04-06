@@ -136,10 +136,14 @@ class CLIBridge:
         self._reply_done  = asyncio.Event()
 
         self._current_content = ""
+        self._thinking_content = ""
         self._live: Live | None = None
         self._cursor: str | None = None   # node_id cursor, managed locally
         self._label_printed   = False
         self._last_reply: str = ""
+        self._show_thinking: bool = bool(
+            options.get("show_thinking", False) if options else False
+        )
 
         # Set by run_detached before run() is called.
         self._gateway_url: str = ""
@@ -204,11 +208,18 @@ class CLIBridge:
             self._console.print(f"{t('agent_label')}:", style=c('agent_label'))
             self._label_printed = True
 
-    def _get_live_render(self, content: str, is_thinking: bool = False) -> Group:
+    def _get_live_render(self, content: str, is_thinking: bool = False,
+                           thinking_content: str = "") -> Group:
         c = self._theme.c
         parts = []
-        if is_thinking and not content:
-            parts.append(Text(" ⠋ thinking...", style=c('thinking')))
+        if is_thinking:
+            if self._show_thinking and thinking_content:
+                parts.append(Text(" ⠋ thinking...", style=c('thinking')))
+                parts.append(Markdown(
+                    f"```\n{thinking_content}\n```"
+                ))
+            elif not content:
+                parts.append(Text(" ⠋ thinking...", style=c('thinking')))
         if content:
             parts.append(Markdown(_preprocess(content)))
         return Group(*parts)
@@ -233,17 +244,22 @@ class CLIBridge:
 
         if isinstance(event, (AgentThinkingChunk, _FakeThinkingChunk)):
             self._start_reply()
+            if self._show_thinking and event.text:
+                self._thinking_content += event.text
             self._ensure_live(is_thinking=True)
             if self._live:
                 self._live.update(self._get_live_render(
-                    self._current_content, is_thinking=True))
+                    self._current_content, is_thinking=True,
+                    thinking_content=self._thinking_content))
 
         elif isinstance(event, (AgentTextChunk, _FakeTextChunk)):
             self._start_reply()
             self._current_content += event.text
             self._ensure_live()
             if self._live:
-                self._live.update(self._get_live_render(self._current_content))
+                self._live.update(self._get_live_render(
+                    self._current_content,
+                    thinking_content=self._thinking_content))
 
         elif isinstance(event, (AgentToolCall, _FakeToolCall)):
             if self._live:
@@ -278,6 +294,7 @@ class CLIBridge:
             if final_text:
                 self._last_reply = final_text
             self._current_content = ""
+            self._thinking_content = ""
             self._label_printed   = False
             self._reply_done.set()
 
@@ -377,6 +394,8 @@ class CLIBridge:
             ("/reset",  "Start a new session branch"),
             ("/copy",   "Copy last agent reply to clipboard"),
             ("/paste",  "Submit clipboard contents as next message"),
+            ("/think",  "Toggle display of thinking content (currently " +
+                        ("on" if self._show_thinking else "off") + ")"),
             ("/help",   "Show this help"),
         ]
         rows.sort(key=lambda r: r[0])
@@ -472,6 +491,14 @@ class CLIBridge:
                             f"from clipboard)[/{c('tool_call')}]")
                         text = pasted
                         # Falls through to _send below.
+
+                    elif lower == "/think":
+                        self._show_thinking = not self._show_thinking
+                        state = "on" if self._show_thinking else "off"
+                        self._console.print(
+                            f"[{c('reset')}]  💭  thinking display {state}"
+                            f"[/{c('reset')}]")
+                        continue
 
                     elif lower in {"/help", "/?"}:
                         await self._handle_help()
