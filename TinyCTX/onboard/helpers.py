@@ -25,7 +25,8 @@ import urllib.error
 
 # ── paths & constants ─────────────────────────────────────────────────────────
 
-REPO_ROOT               = Path(__file__).resolve().parent.parent
+# onboard/ -> TinyCTX/ (package) -> repo root
+REPO_ROOT               = Path(__file__).resolve().parent.parent.parent
 BUNDLED_DIR             = Path(__file__).parent / "bundled"
 PROVIDERS_FILE          = Path(__file__).parent / "providers.json"
 BEGINNER_PROVIDERS_FILE = Path(__file__).parent / "beginner-providers.json"
