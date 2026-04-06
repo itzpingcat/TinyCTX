@@ -48,7 +48,7 @@ BUNDLED_MD = ["SOUL.md", "AGENTS.md", "MEMORY.md"]
 
 LOCAL_PROVIDERS = {"Ollama", "LMStudio", "vLLM", "llama-cpp", "Custom (local)"}
 
-Mode = Literal["quickstart", "standard", "advanced"]
+Mode = Literal["quickstart", "standard"]
 
 QSTYLE = Style([
     ("qmark",       "fg:#00cfff bold"),

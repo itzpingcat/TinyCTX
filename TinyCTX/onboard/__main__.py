@@ -79,7 +79,6 @@ def step_select_mode() -> Mode:
         choices=[
             "🟢  Quick Start  — I'm new to AI agents, just get me going",
             "🟡  Standard     — I know what I'm doing",
-            "🔴  Advanced     — Show me everything",
             "← Back",
         ],
         style=QSTYLE,

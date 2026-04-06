@@ -52,16 +52,12 @@ def run(providers: dict, beginner_providers: dict, mode: Mode) -> dict[str, Any]
         base_url, api_key_env, provider_name = _pick_provider_quickstart(beginner_providers, "LLM")
         info  = beginner_providers[provider_name]
         model = _pick_model_beginner(provider_name, base_url, api_key_env, info.get("suggested_models", []))
-        max_tokens, temperature = 4096, 1.0
     else:
         section("Step 1 — LLM Provider & Model")
         base_url, api_key_env, provider_name = _pick_provider(providers, "LLM", mode)
         model = _pick_model(base_url, api_key_env, label="model")
-        if mode == "advanced":
-            max_tokens  = int(questionary.text("max_tokens",  default="4096", style=QSTYLE).ask() or "4096")
-            temperature = float(questionary.text("temperature", default="1",   style=QSTYLE).ask() or "1")
-        else:
-            max_tokens, temperature = 4096, 1.0
+        
+    max_tokens, temperature = 4096, 1.0
 
     if not model:
         sys.exit(0)
@@ -215,17 +211,18 @@ def _pick_provider(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _pick_model(base_url: str, api_key_env: str, label: str = "model") -> str:
-    """
-    Fetch the model list from the provider and let the user pick one.
-    Falls back to a free-text prompt if the list can't be fetched.
-    Returns the chosen model string (never empty — exits if user aborts).
-    """
     c.print(f"  Fetching {label} list…", end=" ")
     models = fetch_models(base_url, api_key_env)
 
     if models:
         c.print(f"[dim]({len(models)} found)[/]")
-        choices = models + ["✏  Enter manually", "← Back"]
+        shown = models[:20]
+        truncated = len(models) > 20
+
+        choices = shown + (
+            ["… (truncated, type manually for more)"] if truncated else []
+        ) + ["✏  Enter manually", "← Back"]
+
         choice = questionary.select(
             f"Select {label}:",
             choices=choices,
@@ -234,20 +231,29 @@ def _pick_model(base_url: str, api_key_env: str, label: str = "model") -> str:
 
         if choice is None or choice == "← Back":
             raise GoBack
-        if choice != "✏  Enter manually":
+        if choice not in ("✏  Enter manually", "… (truncated, type manually for more)"):
             return choice
     else:
         c.print("[dim](could not fetch list)[/]")
 
-    # Free-text fallback
+    # Free-text fallback + validation
+    model_set = set(models or [])
+
     while True:
         raw = questionary.text(f"  Type the {label} name:", style=QSTYLE).ask()
         if not raw or raw.strip().lower() in ("back", "b"):
             raise GoBack
+
         raw = raw.strip()
-        if raw:
-            return raw
-        warn("Model name cannot be empty.")
+        if not raw:
+            warn("Model name cannot be empty.")
+            continue
+
+        if model_set and raw not in model_set:
+            warn("Model not found in registry. Check spelling or pick from list.")
+            continue
+
+        return raw
 
 
 def _pick_model_beginner(
