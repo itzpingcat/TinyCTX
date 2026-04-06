@@ -132,7 +132,7 @@ def assemble_config(
     base = existing or {}
 
     models = base.get("models", {})
-    models["primary"] = model_cfg
+    models["primary"] = {k: v for k, v in model_cfg.items() if k != "context"}
     if embed_cfg:
         models["embed"] = embed_cfg
     base["models"] = models
@@ -143,7 +143,7 @@ def assemble_config(
         "fallback_on": {"any_error": False, "http_codes": [429, 500, 502, 503, 504]},
     }
 
-    base.setdefault("context", 16384)
+    base["context"] = model_cfg.get("context", 16384)
     base["workspace"] = {"path": workspace}
     base["gateway"]   = gateway
 

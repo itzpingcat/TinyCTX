@@ -60,6 +60,8 @@ def run(providers: dict, beginner_providers: dict, mode: Mode) -> dict[str, Any]
     if not model:
         sys.exit(0)
 
+    context = _pick_context(mode)
+
     success(f"LLM: [bold]{model}[/] via {provider_name}")
     return {
         "base_url":    base_url,
@@ -67,6 +69,7 @@ def run(providers: dict, beginner_providers: dict, mode: Mode) -> dict[str, Any]
         "api_key_env": api_key_env,
         "max_tokens":  max_tokens,
         "temperature": temperature,
+        "context":     context,
     }
 
 
@@ -232,6 +235,103 @@ def _pick_model(base_url: str, api_key_env: str, label: str = "model") -> str:
             continue
 
         return raw
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Context window
+# ─────────────────────────────────────────────────────────────────────────────
+
+_CONTEXT_PRESETS = [
+    ("16k — 16,384  (default)",              16384),
+    ("32k — 32,768",                         32768),
+    ("64k — 65,536",                         65536),
+    ("128k — 131,072",                      131072),
+    ("✏  Enter manually",                      None),
+]
+
+def _validate_context(val: int) -> int | None:
+    """
+    Warn on suspicious context sizes.
+    Returns the value if confirmed, or None to signal the user wants to re-enter.
+    """
+    if val > 1_000_000:
+        if not _confirm_context(
+            f"{val:,} tokens is over 1 million — are you sure your model supports this??????"
+        ):
+            return None
+
+    if val < 16384:
+        if not _confirm_context(
+            f"Context of {val:,} tokens is below 16k — TinyCTX may not work properly "
+            "(system prompt + memory injection can easily exceed this)."
+        ):
+            return None
+
+    if val % 2 != 0:
+        if not _confirm_context(
+            f"{val:,} is an odd number — are you sure your model supports this context size?"
+        ):
+            return None
+
+    return val
+
+
+def _confirm_context(warning: str) -> bool:
+    """Show a warning and force the user to explicitly confirm or go back."""
+    warn(warning)
+    choice = questionary.select(
+        "How would you like to proceed?",
+        choices=["Yes, I'm sure this is what I want.", "No, let me change that."],
+        style=QSTYLE,
+    ).ask()
+    return choice is not None and choice.startswith("Yes")
+
+
+def _pick_context(mode: Mode) -> int:
+    """Ask for context window size in standard mode; return default in quickstart."""
+    if mode == "quickstart":
+        return 16384
+
+    c.print()
+    c.print("  Context window — how many tokens the model can see per turn.")
+    c.print("  Check your model's spec if unsure.\n")
+
+    labels  = [label for label, _ in _CONTEXT_PRESETS]
+    values  = {label: val for label, val in _CONTEXT_PRESETS}
+
+    choice = questionary.select(
+        "Context window size:",
+        choices=labels,
+        default="16k — 16,384  (default)",
+        style=QSTYLE,
+    ).ask()
+
+    if choice is None:
+        return 16384
+
+    if values[choice] is not None:
+        result = _validate_context(values[choice])
+        if result is not None:
+            return result
+        # User said "No, let me change that" -- drop back to preset menu
+        return _pick_context(mode)
+
+    # Manual entry
+    while True:
+        raw = questionary.text("  Enter context size (tokens):", style=QSTYLE).ask()
+        if not raw:
+            return 16384
+        try:
+            val = int(raw.strip().replace(",", "").replace("_", ""))
+            if val < 512:
+                warn("Context size seems too small (minimum 512).")
+                continue
+            result = _validate_context(val)
+            if result is not None:
+                return result
+            # User said "No, let me change that" -- re-prompt
+        except ValueError:
+            warn(f"'{raw}' is not a valid integer.")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # API-key helpers
