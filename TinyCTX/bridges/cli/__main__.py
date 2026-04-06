@@ -303,12 +303,28 @@ class CLIBridge:
 
         url = f"{self._gateway_url}/v1/lane/message"
 
-        async with aiohttp.ClientSession() as session:
+        # Use a large max_line_size so big tool_result SSE lines don't hit
+        # aiohttp's default 131072-byte readline cap.
+        _MAX_LINE = 8 * 1024 * 1024  # 8 MB
+
+        connector = aiohttp.TCPConnector()
+        async with aiohttp.ClientSession(
+            connector=connector,
+            read_bufsize=_MAX_LINE,
+        ) as session:
             async with session.post(
                 url, json=payload, headers=self._http_headers()
             ) as resp:
                 resp.raise_for_status()
-                async for raw_line in resp.content:
+                while True:
+                    try:
+                        raw_line = await resp.content.readuntil(
+                            b"\n", max_size=_MAX_LINE
+                        )
+                    except Exception:
+                        raw_line = b""
+                    if not raw_line:
+                        break
                     line = raw_line.decode("utf-8", errors="replace").strip()
                     if not line.startswith("data:"):
                         continue
