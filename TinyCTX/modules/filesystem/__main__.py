@@ -84,37 +84,6 @@ _EXT_TO_MIME: dict[str, str] = {
     ".webp": "image/webp",
 }
 
-
-def _filesystem_prompt(workspace: Path, source_root: Path):
-    workspace_str = str(workspace)
-    source_root_str = str(source_root)
-
-    lines = [
-        "<filesystem>",
-        f"- Persistent workspace root: {workspace_str}",
-        "- The shell() tool runs PowerShell on Windows and bash on Linux/macOS.",
-        f"- shell() starts in the workspace root above, not necessarily in the source checkout.",
-    ]
-
-    if source_root_str != workspace_str:
-        lines.extend([
-            f"- Current launch/source directory: {source_root_str}",
-            "- If the user asks about TinyCTX's own code, the repo, or 'your code', start from the source directory above.",
-            "- Do not waste tool calls rediscovering the repo path with shell listings when it is already provided here.",
-            "- Prefer view(), grep(), and glob_search() against that path for code inspection; they accept absolute paths.",
-        ])
-    else:
-        lines.append("- The workspace root above is also the current launch/source directory.")
-
-    lines.extend([
-        "- On Windows, prefer PowerShell-native commands such as Get-ChildItem, Get-Content, Get-Location, and Select-String.",
-        "- Avoid Unix-only flags like `ls -la` on Windows.",
-        "- Prefer view(), grep(), and glob_search() for file inspection when they are sufficient.",
-        "</filesystem>",
-    ])
-    return "\n".join(lines)
-
-
 def _image_mime(path: Path) -> str | None:
     """Return the vision-compatible MIME type for a file, or None if not an image."""
     ext = path.suffix.lower()
@@ -132,14 +101,6 @@ def register(agent) -> None:
     workspace.mkdir(parents=True, exist_ok=True)
 
     shell_timeout: int = getattr(agent.config, 'shell_timeout', 60)
-
-    if hasattr(agent, "context"):
-        agent.context.register_prompt(
-            "filesystem_tools",
-            lambda _ctx: _filesystem_prompt(workspace, source_root),
-            role="system",
-            priority=11,
-        )
 
     # Load blacklist once at register time. Restart to pick up edits.
     blacklist = load_blacklist()

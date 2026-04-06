@@ -324,3 +324,29 @@ logging:
   level: INFO
 
 max_tool_cycles: 10
+
+# ---------------------------------------------------------------------------
+# equipment_manifest:  (consumed by modules/equipment_manifest)
+#
+# Reads EM.md, renders it as a lightweight template, and injects it as a
+# system prompt. Variables available in the template:
+#   {{ system }}         — OS: "Windows" | "Linux" | "Darwin"
+#   {{ date }}           — e.g. "2025-07-04"
+#   {{ time }}           — e.g. "14:32:07"
+#   {{ workspace_path }} — absolute path to workspace
+#   {{ config_path }}    — absolute path to config.yaml
+#
+# Conditional blocks:
+#   {% if system == 'Windows' %}...{% else %}...{% endif %}
+#
+# em_path controls where EM.md is loaded from:
+#   ""               (default) — EM.md in the module directory itself
+#   "workspace:X"    — relative to workspace.path, e.g. "workspace:EM.md"
+#   absolute path    — used as-is
+#
+# If EM.md is missing or empty, the module is a silent no-op.
+# ---------------------------------------------------------------------------
+# equipment_manifest:
+#   em_path: ""            # default: EM.md next to the module's __init__.py
+#   prompt_priority: 5     # injected before SOUL.md (priority 0) by default?
+#                          # raise to > 0 to inject after soul, e.g. 3
