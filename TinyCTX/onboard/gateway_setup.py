@@ -37,7 +37,7 @@ HEALTH_CHECK_TIMEOUT  = 15    # seconds
 HEALTH_CHECK_INTERVAL = 1.0   # seconds
 
 # main.py lives at TinyCTX/main.py (REPO_ROOT is the TinyCTX package dir)
-_MAIN_PY = REPO_ROOT / "main.py"
+_MAIN_PY = REPO_ROOT / "TinyCTX" / "main.py"
 
 
 def run(mode: Mode) -> dict[str, Any]:
