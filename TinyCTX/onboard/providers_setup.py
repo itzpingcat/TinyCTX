@@ -49,14 +49,12 @@ def run(providers: dict, beginner_providers: dict, mode: Mode) -> dict[str, Any]
     if mode == "quickstart":
         section("Step 1 — Your AI Brain")
         c.print("Pick the AI service that will power TinyCTX.\n")
-        base_url, api_key_env, provider_name = _pick_provider_quickstart(beginner_providers, "LLM")
-        info  = beginner_providers[provider_name]
-        model = _pick_model_beginner(provider_name, base_url, api_key_env, info.get("suggested_models", []))
+        base_url, api_key_env, provider_name = _pick_provider(beginner_providers, "LLM", mode)
     else:
         section("Step 1 — LLM Provider & Model")
         base_url, api_key_env, provider_name = _pick_provider(providers, "LLM", mode)
-        model = _pick_model(base_url, api_key_env, label="model")
-        
+
+    model = _pick_model(base_url, api_key_env, label="model")      
     max_tokens, temperature = 4096, 1.0
 
     if not model:
@@ -121,17 +119,7 @@ def _pick_provider(
     label: str,
     mode: Mode,
 ) -> tuple[str, str, str]:
-    """
-    Standard / advanced provider selector.
-
-    After picking a provider and entering a key, performs a live connection
-    test. If the test fails the user is told why and must either retry their
-    key or choose a different provider — they cannot proceed with a broken
-    provider.
-
-    Returns (base_url, api_key_env, provider_name).  Raises GoBack.
-    """
-    names =  ["← Back", "Custom"] + sorted(providers.keys())
+    names = ["← Back", "Custom"] + sorted(providers.keys())
 
     while True:
         choice = questionary.select(
@@ -144,67 +132,56 @@ def _pick_provider(
             raise GoBack
 
         if choice == "Custom":
-            raw = questionary.text(
-                "Enter base URL (e.g. http://localhost:8000/v1):",
-                style=QSTYLE,
-            ).ask()
-            if not raw or raw.strip().lower() in ("back", "b"):
-                raise GoBack
-            raw = raw.strip()
-            if not is_valid_url(raw):
-                warn("That doesn't look like a valid URL. Try again.")
-                continue
-            base_url      = raw
-            provider_name = "Custom"
+            raw = questionary.text("Enter base URL:", style=QSTYLE).ask()
+            if not raw or raw.strip().lower() in ("back", "b"): continue
+            base_url, provider_name = raw.strip(), "Custom"
+            if not is_valid_url(base_url):
+                warn("Invalid URL."); continue
         else:
-            provider_name = choice
-            base_url      = providers[choice]
+            provider_name, base_url = choice, providers[choice]
 
+        # ── Autodetect Auth Requirement ──────────────────────────────────────
+        c.print(f"  Probing {provider_name}...", end=" ")
+        
+        # Probe 1: Try without a key
+        probe_models = fetch_models(base_url, None)
+        
+        if probe_models is not None:
+            # Success! No key needed (returned a list, even if empty)
+            c.print("[bold green]Open ✓[/]")
+            return base_url, "N/A", provider_name
+        
+        # Probe failed with 401/403 (None) -> Key is required
         api_key_env = _ensure_api_key(provider_name, mode)
 
-        # ── Connection test ───────────────────────────────────────────────
-        locality = provider_name in LOCAL_PROVIDERS or is_local(base_url)
-        c.print("  Testing connection…", end=" ")
-        models = fetch_models(base_url, api_key_env, timeout=8.0)
+        # Final connection test with the key
+        api_key = os.environ.get(api_key_env, "")
+        models = fetch_models(base_url, api_key)
 
         if models:
-            c.print(f"[bold green]OK ✓[/] [dim]({len(models)} models)[/]")
+            c.print(f"  [bold green]Connected ✓[/] [dim]({len(models)} models)[/]")
             return base_url, api_key_env, provider_name
 
+        # ── Failure Handling ────────────────────────────────────────────────
         c.print("[bold red]failed ✗[/]")
-
+        locality = provider_name in LOCAL_PROVIDERS or is_local(base_url)
         if locality:
-            warn(
-                f"Could not reach {base_url}. "
-                "Make sure the server is running, then try again."
-            )
-            # Loop back to provider selection
+            warn(f"Could not reach {base_url}. Ensure the server is running.")
             continue
 
-        # Remote provider — key is likely wrong or service is down
-        warn("Could not reach the API. The key may be invalid or the service may be down.")
         action = questionary.select(
             "What would you like to do?",
-            choices=[
-                "Re-enter API key",
-                "Choose a different provider",
-                "← Back",
-            ],
+            choices=["Re-enter API key", "Choose a different provider", "← Back"],
             style=QSTYLE,
         ).ask()
 
-        if action is None or action == "← Back":
-            raise GoBack
+        if action in (None, "← Back"): raise GoBack
         if action == "Choose a different provider":
-            # Clear the bad key so _ensure_api_key will prompt again
             os.environ.pop(api_key_env, None)
             continue
-
-        # Re-enter key: clear and re-run _ensure_api_key inline
+        
         os.environ.pop(api_key_env, None)
-        api_key_env = _ensure_api_key(provider_name, mode)
-        # Loop will re-test on next iteration
-
+        # Loop will re-prompt for key
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Model picking
@@ -212,7 +189,8 @@ def _pick_provider(
 
 def _pick_model(base_url: str, api_key_env: str, label: str = "model") -> str:
     c.print(f"  Fetching {label} list…", end=" ")
-    models = fetch_models(base_url, api_key_env)
+    api_key = os.environ.get(api_key_env) if api_key_env != "N/A" else None
+    models = fetch_models(base_url, api_key)
 
     if models:
         c.print(f"[dim]({len(models)} found)[/]")
@@ -254,156 +232,6 @@ def _pick_model(base_url: str, api_key_env: str, label: str = "model") -> str:
             continue
 
         return raw
-
-
-def _pick_model_beginner(
-    provider_name: str,
-    base_url: str,
-    api_key_env: str,
-    suggested_models: list[str],
-) -> str:
-    """
-    Beginner model picker: show curated suggestions first, then offer
-    the full live list or manual entry as a fallback.
-    Returns the chosen model string.
-    """
-    choices: list[str] = list(suggested_models)
-
-    if not choices:
-        return _pick_model(base_url, api_key_env, label="model")
-
-    choices += ["Show all available models", "← Back"]
-
-    choice = questionary.select(
-        f"Which {provider_name} model would you like to use?",
-        choices=choices,
-        style=QSTYLE,
-    ).ask()
-
-    if choice is None or choice == "← Back":
-        raise GoBack
-    if choice == "Show all available models":
-        return _pick_model(base_url, api_key_env, label="model")
-    return choice
-
-
-def _pick_provider_quickstart(
-    beginner_providers: dict[str, dict],
-    label: str,
-) -> tuple[str, str, str]:
-    """
-    Beginner provider selector with guided API-key setup and mandatory
-    connection test.
-    Returns (base_url, api_key_env, provider_name).  Raises GoBack.
-    """
-    from rich.panel import Panel
-
-    names = ["← Back"] + list(beginner_providers.keys())
-
-    while True:
-        choice = questionary.select(
-            f"Which service should power your {label}?",
-            choices=names,
-            style=QSTYLE,
-        ).ask()
-
-        if choice is None or choice == "← Back":
-            raise GoBack
-
-        info          = beginner_providers[choice]
-        base_url      = info["base_url"]
-        provider_name = choice
-
-        # Local providers (e.g. Ollama) need no key — test and loop on failure
-        if not info.get("key_url"):
-            steps = info.get("key_steps", [])
-            if steps:
-                c.print(Panel(
-                    "\n".join(f"  {i+1}. {step}" for i, step in enumerate(steps)),
-                    title=f"[bold cyan]Setting up {provider_name}[/]",
-                    border_style="cyan",
-                ))
-                input("  Press Enter when ready… ")
-
-            c.print("  Testing connection…", end=" ")
-            models = fetch_models(base_url, "N/A", timeout=8.0)
-            if models:
-                c.print(f"[bold green]OK ✓[/] [dim]({len(models)} models)[/]")
-                return base_url, "N/A", provider_name
-
-            c.print("[bold red]failed ✗[/]")
-            warn(f"Could not reach {base_url}. Make sure {provider_name} is running.")
-            retry = questionary.select(
-                "What would you like to do?",
-                choices=["Try again", "Choose a different provider", "← Back"],
-                style=QSTYLE,
-            ).ask()
-            if retry is None or retry == "← Back":
-                raise GoBack
-            if retry == "Try again":
-                # Re-show the setup panel and test again
-                continue
-            # Choose a different provider — loop to top
-            continue
-
-        api_key_env = api_key_env_for(provider_name)
-        if os.environ.get(api_key_env, "").strip():
-            success(f"{api_key_env} is already set.")
-            c.print("  Testing connection…", end=" ")
-            models = fetch_models(base_url, api_key_env, timeout=8.0)
-            if models:
-                c.print(f"[bold green]OK ✓[/] [dim]({len(models)} models)[/]")
-                return base_url, api_key_env, provider_name
-            c.print("[bold red]failed ✗[/]")
-            warn("Existing key didn't work. Let's re-enter it.")
-            os.environ.pop(api_key_env, None)
-
-        # Guided key setup
-        steps = info.get("key_steps", [])
-        c.print(Panel(
-            "\n".join(f"  {i+1}. {step}" for i, step in enumerate(steps)),
-            title=f"[bold cyan]Getting your {provider_name} API key[/]",
-            border_style="cyan",
-        ))
-
-        while True:
-            try:
-                raw = getpass.getpass(f"\n  Paste your {provider_name} API key: ").strip()
-            except (KeyboardInterrupt, EOFError):
-                raw = ""
-
-            if not raw:
-                warn("No key entered. Returning to provider selection.")
-                break  # back to outer while to re-pick provider
-
-            os.environ[api_key_env] = raw
-            try:
-                set_env(api_key_env, raw)
-                success(f"{api_key_env} saved.")
-            except Exception as e:
-                warn(f"Could not persist {api_key_env} permanently ({e}) — set it manually if needed.")
-
-            c.print("  Testing connection…", end=" ")
-            models = fetch_models(base_url, api_key_env, timeout=8.0)
-            if models:
-                c.print(f"[bold green]OK ✓[/] [dim]({len(models)} models)[/]")
-                return base_url, api_key_env, provider_name
-
-            c.print("[bold red]failed ✗[/]")
-            warn("Could not reach the API. The key may be wrong or the service may be down.")
-            action = questionary.select(
-                "What would you like to do?",
-                choices=["Re-enter API key", "Choose a different provider", "← Back"],
-                style=QSTYLE,
-            ).ask()
-            if action is None or action == "← Back":
-                raise GoBack
-            if action == "Choose a different provider":
-                os.environ.pop(api_key_env, None)
-                break  # back to outer while
-            # Re-enter key — clear and loop inner while
-            os.environ.pop(api_key_env, None)
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # API-key helpers

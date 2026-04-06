@@ -20,6 +20,8 @@ from rich.console import Console
 from rich.rule import Rule
 import socket, ipaddress
 from urllib.parse import urlparse
+import urllib.request
+import urllib.error
 
 # ── paths & constants ─────────────────────────────────────────────────────────
 
@@ -177,24 +179,44 @@ def is_valid_url(url: str) -> bool:
         return False
 
 
-def fetch_models(base_url: str, api_key_env: str, timeout: float = 6.0) -> list[str]:
-    """Query GET /v1/models. Returns sorted model ID list, or [] on failure."""
+def fetch_models(base_url: str, api_key: str | None = None, timeout: float = 3.0) -> list[str] | None:
+    """
+    Queries GET /models. 
+    Returns:
+        - list[str]: Success (even if list is empty).
+        - None: Authentication failed (401/403), key required.
+        - []: Network error or other failure.
+    """
     if not is_valid_url(base_url):
         return []
-    url = base_url.rstrip("/")
-    if not url.endswith("/v1"):
-        url += "/v1"
-    url += "/models"
 
-    api_key = os.environ.get(api_key_env, "") if api_key_env != "N/A" else "ignored"
-    req = urllib.request.Request(url, headers={
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    })
+    # Normalize URL: ensures it ends in /v1/models or /models 
+    # depending on your base_url structure
+    url = base_url.rstrip("/")
+    if not url.endswith("/models"):
+        url += "/models"
+
+    headers = {"Content-Type": "application/json"}
+    if api_key and api_key != "N/A":
+        # Resolve env var if api_key looks like one
+        actual_key = os.environ.get(api_key, api_key)
+        headers["Authorization"] = f"Bearer {actual_key}"
+
+    req = urllib.request.Request(url, headers=headers)
+    
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read())
-            return sorted(m["id"] for m in data.get("data", []) if "id" in m)
+            models = [m["id"] for m in data.get("data", []) if "id" in m]
+            # Fallback for non-OpenAI spec providers that return a raw list
+            if not models and isinstance(data, list):
+                models = [m.get("id", m) if isinstance(m, dict) else m for m in data]
+            return sorted(models)
+            
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            return None  # Signal that Auth is the specific problem
+        return []
     except Exception:
         return []
 
