@@ -134,7 +134,10 @@ class CLIBridge:
             colors=options.get("customcolors") or {} if options else {},
             text=options.get("customtext") or {} if options else {}
         )
-        self._console     = Console(highlight=False)
+        # force_terminal=True ensures Rich uses ANSI cursor-up for Live updates
+        # on Windows, preventing each live.update() from printing a new line
+        # instead of overwriting in place (which causes response duplication).
+        self._console     = Console(highlight=False, force_terminal=True)
         self._reply_done  = asyncio.Event()
 
         self._current_content = ""
