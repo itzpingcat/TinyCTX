@@ -17,7 +17,7 @@ import subprocess
 import sys
 import time
 from typing import Any
-
+from pathlib import Path
 import questionary
 
 from .helpers import (
@@ -136,7 +136,7 @@ def _launch_and_healthcheck(host: str, port: int) -> bool:
                 start_new_session=True,
             )
 
-    c.print("  Waiting for gateway", end="", flush=True)
+    c.print("  Waiting for gateway", end="")
     for _ in range(HEALTH_CHECK_TIMEOUT):
         time.sleep(HEALTH_CHECK_INTERVAL)
         if health_ping(host, port):
@@ -146,7 +146,7 @@ def _launch_and_healthcheck(host: str, port: int) -> bool:
                 f"  Logs: {log_file}"
             )
             return True
-        c.print(".", end="", flush=True)
+        c.print(".", end="")
 
     c.print()
     warn(

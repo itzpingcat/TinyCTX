@@ -169,7 +169,7 @@ def _pick_provider(
         # Local / custom providers without a key skip the mandatory test,
         # but we still try so the user gets early feedback.
         is_local = provider_name in LOCAL_PROVIDERS or provider_name == "Custom"
-        c.print("  Testing connection…", end=" ", flush=True)
+        c.print("  Testing connection…", end=" ")
         models = fetch_models(base_url, api_key_env, timeout=8.0)
 
         if models:
@@ -320,7 +320,7 @@ def _pick_provider_quickstart(
                 ))
                 input("  Press Enter when ready… ")
 
-            c.print("  Testing connection…", end=" ", flush=True)
+            c.print("  Testing connection…", end=" ")
             models = fetch_models(base_url, "N/A", timeout=8.0)
             if models:
                 c.print(f"[bold green]OK ✓[/] [dim]({len(models)} models)[/]")
@@ -344,7 +344,7 @@ def _pick_provider_quickstart(
         api_key_env = api_key_env_for(provider_name)
         if os.environ.get(api_key_env, "").strip():
             success(f"{api_key_env} is already set.")
-            c.print("  Testing connection…", end=" ", flush=True)
+            c.print("  Testing connection…", end=" ")
             models = fetch_models(base_url, api_key_env, timeout=8.0)
             if models:
                 c.print(f"[bold green]OK ✓[/] [dim]({len(models)} models)[/]")
@@ -378,7 +378,7 @@ def _pick_provider_quickstart(
             except Exception as e:
                 warn(f"Could not persist {api_key_env} permanently ({e}) — set it manually if needed.")
 
-            c.print("  Testing connection…", end=" ", flush=True)
+            c.print("  Testing connection…", end=" ")
             models = fetch_models(base_url, api_key_env, timeout=8.0)
             if models:
                 c.print(f"[bold green]OK ✓[/] [dim]({len(models)} models)[/]")
