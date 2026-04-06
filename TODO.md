@@ -2,14 +2,33 @@
 
 Top is more important.
 
-Equipment manifest module. Expose date, time, os, workspace path, config path, etc to the model
+Equipment manifest module. Expose date, time, os, workspace path, config path, etc to the model. Take in a EM.md like this and parse it. Then inject as prompt.
 
-Make HEARTBEAT module not run when HEARTBEAT.md is missing.
+{% if system == 'Windows' %}
+## Platform Policy (Windows)
+- You are running on Windows. Do not assume GNU tools like `grep`, `sed`, or `awk` exist.
+- Prefer Windows-native commands or file tools when they are more reliable.
+- If terminal output is garbled, retry with UTF-8 output enabled.
+{% else %}
+## Platform Policy (POSIX)
+- You are running on a POSIX system. Prefer UTF-8 and standard shell tools.
+- Use file tools when they are simpler or more reliable than shell commands.
+{% endif %}
+
+Allow disabling Equipment Manifest
+
+
+Make HEARTBEAT module not run a heartbeat when HEARTBEAT.md is missing.
 Basic tokenade defense system in ctx_tools.
 
 Reduce memory vector search RAM usage by reranking a smaller candidate set instead of loading all embeddings on every query.
 
+Telegram bridge
+
 Replace the memory all-fits top_k=999 path with a real full-store retrieval path that does not silently depend on BM25 query matches.
+
+weChat bridge 
+Line bridge
 
 **Web UI** — not a chat interface; an admin/stats panel.
 Likely a single-page aiohttp route serving a small HTML+JS dashboard.
