@@ -2,7 +2,7 @@
 tests/test_filesystem_tools.py
 
 Tests for the filesystem module's new tools and guards:
-  - replace_all on str_replace
+  - replace_all on edit_file
   - grep (ripgrep wrapper / Python fallback)
   - glob_search
   - read-before-write guard
@@ -112,13 +112,13 @@ def filesystem_agent(workspace):
 
 
 # ===================================================================
-# str_replace — replace_all flag
+# edit_file — replace_all flag
 # ===================================================================
 
 class TestStrReplaceAll:
     def test_single_match_works(self, tools, workspace):
         tools["view"](path="hello.py")
-        result = tools["str_replace"](path="hello.py", old_str="world", new_str="earth")
+        result = tools["edit_file"](path="hello.py", old_str="world", new_str="earth")
         assert "replaced 1 occurrence" in result
         content = (workspace / "hello.py").read_text(encoding="utf-8")
         assert "earth" in content
@@ -127,26 +127,26 @@ class TestStrReplaceAll:
         # Write a file with repeated content
         (workspace / "dup.txt").write_text("aaa bbb aaa ccc aaa", encoding="utf-8")
         tools["view"](path="dup.txt")
-        result = tools["str_replace"](path="dup.txt", old_str="aaa")
+        result = tools["edit_file"](path="dup.txt", old_str="aaa")
         assert "appears 3 times" in result
         assert "replace_all" in result
 
     def test_replace_all_replaces_every_occurrence(self, tools, workspace):
         (workspace / "dup.txt").write_text("aaa bbb aaa ccc aaa", encoding="utf-8")
         tools["view"](path="dup.txt")
-        result = tools["str_replace"](path="dup.txt", old_str="aaa", new_str="zzz", replace_all=True)
+        result = tools["edit_file"](path="dup.txt", old_str="aaa", new_str="zzz", replace_all=True)
         assert "replaced 3 occurrences" in result
         content = (workspace / "dup.txt").read_text(encoding="utf-8")
         assert content == "zzz bbb zzz ccc zzz"
 
     def test_replace_all_with_single_match(self, tools, workspace):
         tools["view"](path="hello.py")
-        result = tools["str_replace"](path="hello.py", old_str="world", new_str="earth", replace_all=True)
+        result = tools["edit_file"](path="hello.py", old_str="world", new_str="earth", replace_all=True)
         assert "replaced 1 occurrence" in result
 
     def test_replace_all_not_found(self, tools, workspace):
         tools["view"](path="hello.py")
-        result = tools["str_replace"](path="hello.py", old_str="zzznomatch")
+        result = tools["edit_file"](path="hello.py", old_str="zzznomatch")
         assert "not found" in result
 
 
@@ -275,15 +275,15 @@ class TestFilesystemPrompt:
 # ===================================================================
 
 class TestReadBeforeWrite:
-    def test_str_replace_blocked_without_read(self, tools, workspace):
-        result = tools["str_replace"](path="hello.py", old_str="world", new_str="earth")
+    def test_edit_file_blocked_without_read(self, tools, workspace):
+        result = tools["edit_file"](path="hello.py", old_str="world", new_str="earth")
         assert "not been read" in result
         # File should be unchanged
         assert "world" in (workspace / "hello.py").read_text(encoding="utf-8")
 
-    def test_str_replace_allowed_after_read(self, tools, workspace):
+    def test_edit_file_allowed_after_read(self, tools, workspace):
         tools["view"](path="hello.py")
-        result = tools["str_replace"](path="hello.py", old_str="world", new_str="earth")
+        result = tools["edit_file"](path="hello.py", old_str="world", new_str="earth")
         assert "replaced" in result
 
     def test_write_file_blocked_for_existing_without_read(self, tools, workspace):
@@ -304,11 +304,11 @@ class TestReadBeforeWrite:
         assert "overwrote" in result
         assert (workspace / "new.txt").read_text(encoding="utf-8") == "second"
 
-    def test_str_replace_after_str_replace_works(self, tools, workspace):
+    def test_edit_file_after_edit_file_works(self, tools, workspace):
         """Back-to-back edits should work (mtime updated after each write)."""
         tools["view"](path="hello.py")
-        tools["str_replace"](path="hello.py", old_str="world", new_str="earth")
-        result = tools["str_replace"](path="hello.py", old_str="earth", new_str="mars")
+        tools["edit_file"](path="hello.py", old_str="world", new_str="earth")
+        result = tools["edit_file"](path="hello.py", old_str="earth", new_str="mars")
         assert "replaced" in result
 
 
@@ -322,7 +322,7 @@ class TestStalenessDetection:
         # Simulate external modification
         time.sleep(0.05)
         (workspace / "hello.py").write_text("# externally changed\n", encoding="utf-8")
-        result = tools["str_replace"](path="hello.py", old_str="externally", new_str="changed")
+        result = tools["edit_file"](path="hello.py", old_str="externally", new_str="changed")
         assert "modified since" in result
 
     def test_re_read_clears_staleness(self, tools, workspace):
@@ -330,12 +330,12 @@ class TestStalenessDetection:
         time.sleep(0.05)
         (workspace / "hello.py").write_text("# externally changed\n", encoding="utf-8")
         # First attempt blocked
-        result = tools["str_replace"](path="hello.py", old_str="externally", new_str="internally")
+        result = tools["edit_file"](path="hello.py", old_str="externally", new_str="internally")
         assert "modified since" in result
         # Re-read
         tools["view"](path="hello.py")
         # Second attempt succeeds
-        result = tools["str_replace"](path="hello.py", old_str="externally", new_str="internally")
+        result = tools["edit_file"](path="hello.py", old_str="externally", new_str="internally")
         assert "replaced" in result
 
     def test_write_file_staleness(self, tools, workspace):
@@ -357,7 +357,7 @@ class TestQuoteNormalization:
             "She said \u201CHello\u201D and \u2018goodbye\u2019\n", encoding="utf-8"
         )
         tools["view"](path="quotes.txt")
-        result = tools["str_replace"](
+        result = tools["edit_file"](
             path="quotes.txt",
             old_str='She said "Hello"',
             new_str='She said "Hi"',
@@ -373,7 +373,7 @@ class TestQuoteNormalization:
             'He said "yes" and \'no\'\n', encoding="utf-8"
         )
         tools["view"](path="straight.txt")
-        result = tools["str_replace"](
+        result = tools["edit_file"](
             path="straight.txt",
             old_str='He said \u201Cyes\u201D',
             new_str='He said "maybe"',
@@ -386,7 +386,7 @@ class TestQuoteNormalization:
             'say "hello" world\n', encoding="utf-8"
         )
         tools["view"](path="exact.txt")
-        result = tools["str_replace"](
+        result = tools["edit_file"](
             path="exact.txt",
             old_str='"hello"',
             new_str='"hi"',
@@ -398,7 +398,7 @@ class TestQuoteNormalization:
     def test_no_match_still_fails(self, tools, workspace):
         """Normalization doesn't create false matches."""
         tools["view"](path="hello.py")
-        result = tools["str_replace"](path="hello.py", old_str="zzznomatch")
+        result = tools["edit_file"](path="hello.py", old_str="zzznomatch")
         assert "not found" in result
 
 
@@ -410,7 +410,7 @@ class TestTrailingWhitespace:
     def test_trailing_spaces_stripped_from_replacement(self, tools, workspace):
         (workspace / "ws.txt").write_text("line1\nline2\n", encoding="utf-8")
         tools["view"](path="ws.txt")
-        result = tools["str_replace"](
+        result = tools["edit_file"](
             path="ws.txt",
             old_str="line1",
             new_str="replaced   ",  # trailing spaces
@@ -424,7 +424,7 @@ class TestTrailingWhitespace:
     def test_multiline_trailing_ws_stripped(self, tools, workspace):
         (workspace / "multi.txt").write_text("aaa\nbbb\n", encoding="utf-8")
         tools["view"](path="multi.txt")
-        result = tools["str_replace"](
+        result = tools["edit_file"](
             path="multi.txt",
             old_str="aaa\nbbb",
             new_str="xxx   \nyyy  ",
@@ -437,7 +437,7 @@ class TestTrailingWhitespace:
         """Non-trailing whitespace is preserved."""
         (workspace / "indent.txt").write_text("def foo():\n    pass\n", encoding="utf-8")
         tools["view"](path="indent.txt")
-        result = tools["str_replace"](
+        result = tools["edit_file"](
             path="indent.txt",
             old_str="    pass",
             new_str="    return 42",
@@ -487,9 +487,9 @@ class TestUnchangedDetection:
         assert "unchanged" in result
 
     def test_write_clears_stub(self, tools, workspace):
-        """After str_replace, next view() returns full content (not stub)."""
+        """After edit_file, next view() returns full content (not stub)."""
         tools["view"](path="hello.py")
-        tools["str_replace"](path="hello.py", old_str="world", new_str="earth")
+        tools["edit_file"](path="hello.py", old_str="world", new_str="earth")
         result = tools["view"](path="hello.py")
         assert "earth" in result
         assert "unchanged" not in result

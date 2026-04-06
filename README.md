@@ -159,7 +159,7 @@ The following tools are available to the agent out of the box (if the correspond
 | `shell` | Run a shell command in the workspace directory |
 | `view` | Read a file with line numbers, or list a directory |
 | `write_file` | Create or write to a file (append, prepend, overwrite) |
-| `str_replace` | Edit an existing file by replacing a string (`replace_all` supported) |
+| `edit_file` | Edit an existing file by replacing a string (`replace_all` supported) |
 | `grep` | Search file contents with regex (ripgrep with Python fallback) |
 | `glob_search` | Find files by name pattern, sorted by modification time |
 | `web_search` | Search the web via DuckDuckGo |
@@ -171,6 +171,6 @@ The following tools are available to the agent out of the box (if the correspond
 | `todo_write` | Update the session task checklist (for multi-step work) |
 | `todo_read` | View the current task list |
 
-Write tools (`write_file`, `str_replace`) require the file to have been read first via `view()` — this prevents blind overwrites and catches stale edits from external changes.
+Write tools (`write_file`, `edit_file`) require the file to have been read first via `view()` — this prevents blind overwrites and catches stale edits from external changes.
 
 Modules are enabled automatically if their directory exists under `modules/`. No configuration needed beyond having the right dependencies installed.

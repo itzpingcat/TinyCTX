@@ -2,7 +2,7 @@ EXTENSION_META = {
     "name":    "filesystem",
     "version": "3.0",
     "description": (
-        "Core filesystem tools: shell, view, write_file, str_replace, grep, glob_search. "
+        "Core filesystem tools: shell, view, write_file, edit_file, grep, glob_search. "
         "grep wraps ripgrep (with Python fallback). glob_search finds files by pattern. "
         "view automatically converts files via registered handlers (pdf, images, etc)."
     ),

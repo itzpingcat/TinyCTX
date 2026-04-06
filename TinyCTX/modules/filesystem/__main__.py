@@ -1,7 +1,7 @@
 """
 modules/filesystem/__main__.py
 
-Registers filesystem tools (shell, view, write_file, str_replace, grep, glob)
+Registers filesystem tools (shell, view, write_file, edit_file, grep, glob)
 into the agent loop's tool_handler. No imports from utils or contracts —
 everything arrives through the agent argument.
 
@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Quote normalization — LLMs output straight quotes but files may have curly
-# ones. Normalizing lets str_replace match even when quote styles differ.
+# ones. Normalizing lets edit_file match even when quote styles differ.
 # ---------------------------------------------------------------------------
 
 _CURLY_QUOTE_MAP = str.maketrans({
@@ -357,7 +357,7 @@ def register(agent) -> None:
         _update_after_write(p)
         return f"[{action} {p} ({len(content)} chars)]"
 
-    def str_replace(path: str, old_str: str, new_str: str = "", replace_all: bool = False) -> str:
+    def edit_file(path: str, old_str: str, new_str: str = "", replace_all: bool = False) -> str:
         """Replace a string in an existing file. By default old_str must appear exactly once.
         The file must have been read with view() first.
 
@@ -371,7 +371,7 @@ def register(agent) -> None:
         if not p.exists():
             return f"[error: file not found: {p}]"
 
-        # Staleness check — str_replace always targets existing files.
+        # Staleness check — edit_file always targets existing files.
         err = _check_staleness(p)
         if err:
             return err
@@ -675,6 +675,6 @@ def register(agent) -> None:
     agent.tool_handler.register_tool(shell,       always_on=True)
     agent.tool_handler.register_tool(view,        always_on=True)
     agent.tool_handler.register_tool(write_file,  always_on=True)
-    agent.tool_handler.register_tool(str_replace, always_on=True)
+    agent.tool_handler.register_tool(edit_file, always_on=True)
     agent.tool_handler.register_tool(grep,        always_on=True)
     agent.tool_handler.register_tool(glob_search, always_on=True)

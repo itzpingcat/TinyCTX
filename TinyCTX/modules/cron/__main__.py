@@ -38,7 +38,7 @@ Job schema (CRON.json):
     ]
   }
 
-The agent edits CRON.json directly using str_replace / view / write_file.
+The agent edits CRON.json directly using edit_file / view / write_file.
 cron_list is the only tool registered — it validates and summarises jobs.
 
 Convention: register(agent) — no imports from gateway or bridges.
@@ -288,12 +288,12 @@ def _build_cron_list(path: Path) -> str:
     try:
         jobs, _ = _load_store(path)
     except Exception as exc:
-        return f"⚠ Could not parse CRON.json: {exc}\n\nFix the file using str_replace."
+        return f"⚠ Could not parse CRON.json: {exc}\n\nFix the file using edit_file."
 
     if not jobs:
         return (
             "CRON.json exists but contains no jobs.\n\n"
-            "To add a job, edit workspace/CRON.json using str_replace or view."
+            "To add a job, edit workspace/CRON.json using edit_file or view."
         )
 
     lines = [f"{len(jobs)} cron job{'s' if len(jobs) != 1 else ''}:\n"]
@@ -344,7 +344,7 @@ def _build_cron_list(path: Path) -> str:
         lines.append("")
 
     lines.append(
-        "To add, edit, or remove jobs, edit workspace/CRON.json directly using str_replace or view."
+        "To add, edit, or remove jobs, edit workspace/CRON.json directly using edit_file or view."
     )
 
     return "\n".join(lines)
@@ -634,7 +634,7 @@ def register(agent) -> None:
     def cron_list() -> str:
         """
         List all scheduled cron jobs, validate their configuration, and show next/last run times.
-        To add, edit, or remove jobs, edit workspace/CRON.json directly using str_replace or view.
+        To add, edit, or remove jobs, edit workspace/CRON.json directly using edit_file or view.
         """
         return _build_cron_list(store_path)
 

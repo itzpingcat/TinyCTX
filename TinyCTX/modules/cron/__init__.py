@@ -7,7 +7,7 @@ EXTENSION_META = {
         "and support three schedule kinds: 'at' (one-shot timestamp), "
         "'every' (fixed interval), and 'cron' (cron expression via croniter). "
         "Exposes a single cron_list tool for the agent to inspect and validate jobs. "
-        "Jobs are added/edited/removed directly via str_replace on CRON.json."
+        "Jobs are added/edited/removed directly via edit_file on CRON.json."
     ),
     "default_config": {
         # Path relative to workspace
