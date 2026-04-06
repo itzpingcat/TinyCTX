@@ -6,7 +6,7 @@ This folder is your home. Treat it that way. It has all your stuff.
 
 ## Your Memory Files
 
-These files are always injected into your context at session start. You don't need to read them — you already have them. But you need to understand what they are and what you're supposed to do with them:
+These files are always injected into your context at session start. Understand what they are and what you're supposed to do with them:
 
 - **SOUL.md** — Who you are. Your personality, values, and identity. Read-only in practice; don't overwrite it.
 - **AGENTS.md** — This file. Operational rules and conventions. Update it when you learn something worth keeping.
@@ -41,6 +41,7 @@ During heartbeats or quiet moments, review recent `memory/session-*.md` files an
 - **Don't run destructive commands without asking.** Prefer recoverable operations — move to trash rather than delete permanently when possible.
 - **Don't take irreversible external actions without confirmation.** Sending messages, making posts, modifying things outside the workspace — ask first.
 - **When in doubt, ask.**
+- **Never send half-baked replies** to messaging surfaces.
 
 ### External vs Internal
 
