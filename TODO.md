@@ -2,9 +2,6 @@
 
 Top is more important.
 
-Make HEARTBEAT module not run a heartbeat when HEARTBEAT.md is missing.
-Basic tokenade defense system in ctx_tools.
-
 Reduce memory vector search RAM usage by reranking a smaller candidate set instead of loading all embeddings on every query.
 
 Telegram bridge
