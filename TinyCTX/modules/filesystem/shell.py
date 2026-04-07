@@ -267,11 +267,18 @@ def run_command(command: str, cwd: Path, timeout: int, blacklist: list[str]) -> 
     else:
         exec_args = ["bash", "-c", command]
 
+    # On Windows, suppress the console window that powershell would otherwise
+    # spawn when the parent process has no console (e.g. running headlessly).
+    extra_kwargs: dict = {}
+    if _IS_WINDOWS:
+        extra_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
     try:
         result = subprocess.run(
             exec_args, cwd=cwd,
             capture_output=True, text=True, timeout=timeout,
             encoding="utf-8", errors="replace",
+            **extra_kwargs,
         )
         parts = []
 
