@@ -4,6 +4,13 @@ This folder is your home. Treat it that way. It has all your stuff.
 
 ---
 
+## IMPORTANT: First Run
+
+If BOOTSTRAP.md exists, that’s your birth certificate. Follow it, figure out who you are, then delete it. You won’t need it again.
+Afterward, remove this message from AGENTS.md
+
+---
+
 ## Your Memory Files
 
 These files are always injected into your context at session start. Understand what they are and what you're supposed to do with them:
@@ -11,6 +18,7 @@ These files are always injected into your context at session start. Understand w
 - **SOUL.md** — Who you are. Your personality, values, and identity. Read-only in practice; don't overwrite it.
 - **AGENTS.md** — This file. Operational rules and conventions. Update it when you learn something worth keeping.
 - **MEMORY.md** — Your curated long-term memory. You should actively write to this. Significant events, facts about the user, lessons learned, decisions made. This is your brain between sessions.
+- **TOOLS.md** - A file storing notes and conventions on your tools. Update it when you learn rules for them.
 - **agent.db** — Your conversation histories. You should never write to this without explicit approval. Read-only.
 
 Daily session notes live at `memory/session-YYYY-MM-DD.md`. These are raw logs — create one per day if it doesn't exist, and append to it as the session progresses.
