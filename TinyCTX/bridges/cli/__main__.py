@@ -92,7 +92,7 @@ class CLITheme:
     def t(self, key: str) -> str:
         defaults = {
             "name": "TinyCTX", "tagline": "Agent Framework",
-            "user_label": "you", "agent_label": "agent", "bye_message": "Bye.",
+            "user_label": "You", "agent_label": "Agent", "bye_message": "Bye.",
         }
         return self.text.get(key) or defaults.get(key, "")
 
@@ -282,8 +282,13 @@ class CLIBridge:
             self._live = Live(
                 self._get_live_render(self._current_content, is_thinking),
                 console=self._console,
-                refresh_per_second=12,
-                vertical_overflow="visible"
+                refresh_per_second=8,
+                vertical_overflow="visible",
+                get_renderable=lambda: self._get_live_render(
+                    self._current_content, 
+                    is_thinking=is_thinking, 
+                    thinking_content=self._thinking_content
+                )
             )
             self._live.start()
 
@@ -333,18 +338,33 @@ class CLIBridge:
                 f"  [{status_color}]{icon}  {event.tool_name}:[/{status_color}] ",
                 end="")
             self._console.print(preview, markup=False, style="bright_black")
-
         elif isinstance(event, (AgentTextFinal, _FakeTextFinal)):
+            # 1. Capture the text
             final_text = (event.text or self._current_content).strip()
-            if self._live:
-                self._live.update(self._get_live_render(final_text))
-            self._stop_live()
+            
+            # 2. Shut down the live display immediately 
+            # (This flushes the current state to the console once)
+            self._stop_live() 
+            
+            # 3. Clean up for next message
             if final_text:
                 self._last_reply = final_text
+                
             self._current_content = ""
             self._thinking_content = ""
-            self._label_printed   = False
+            self._label_printed = False
             self._reply_done.set()
+        # elif isinstance(event, (AgentTextFinal, _FakeTextFinal)):
+        #     final_text = (event.text or self._current_content).strip()
+        #     if self._live:
+        #         self._live.update(self._get_live_render(final_text))
+        #     self._stop_live()
+        #     if final_text:
+        #         self._last_reply = final_text
+        #     self._current_content = ""
+        #     self._thinking_content = ""
+        #     self._label_printed   = False
+        #     self._reply_done.set()
 
         elif isinstance(event, (AgentError, _FakeError)):
             self._stop_live()
