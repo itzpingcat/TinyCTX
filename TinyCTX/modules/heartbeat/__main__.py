@@ -111,6 +111,17 @@ def register(agent) -> None:
     branch_from         = cfg.get("branch_from", "root")
     interval_secs       = every_minutes * 60
 
+    # Guard: if HEARTBEAT.md is missing, this module is not configured for
+    # this workspace. Skip entirely rather than creating a branch and looping
+    # on an empty prompt.
+    workspace_path = Path(agent.config.workspace.path).expanduser().resolve()
+    if not (workspace_path / "HEARTBEAT.md").exists():
+        logger.info(
+            "[heartbeat] HEARTBEAT.md not found in %s — heartbeat disabled",
+            workspace_path,
+        )
+        return
+
     # Bootstrap the branch cursor while agent's tail_node_id is fresh.
     lane_node_id, tail_node_id = _get_or_create_cursor(agent, branch_from)
 

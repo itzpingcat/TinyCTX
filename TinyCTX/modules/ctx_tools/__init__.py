@@ -8,5 +8,6 @@ EXTENSION_META = {
         "tool_trim_after":            25,
         "tool_output_truncate_after": 5,
         "max_tool_output_chars":      2000,
+        "tokenade_threshold":         20000,
     },
 }
