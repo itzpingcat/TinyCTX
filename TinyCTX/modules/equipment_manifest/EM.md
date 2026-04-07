@@ -1,6 +1,8 @@
-# Equipment Manifest
+<equipment_manifest>
 
-- **Date:** {{ date }}  **Time:** {{ time }}
+# Equipment Manifest (EM)
+
+- **Date:** {{ date }}
 - **OS:** {{ system }}
 - **Workspace:** {{ workspace_path }}
 {%- if config_path %}
@@ -22,3 +24,4 @@
 - You are running on a POSIX system ({{ system }}). Prefer UTF-8 and standard shell tools.
 - Use file tools when they are simpler or more reliable than shell commands.
 {% endif %}
+</equipment_manifest>
