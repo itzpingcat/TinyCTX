@@ -384,8 +384,13 @@ class DiscordBridge:
         intents.members         = True
         self._client = discord.Client(intents=intents)
 
-        self._client.event(self._on_ready)
-        self._client.event(self._on_message)
+        # Assign directly by name so discord.py dispatches to `on_ready` /
+        # `on_message`. Using client.event() would register under the method's
+        # __name__ (`_on_ready`, `_on_message`) — with the leading underscore —
+        # causing discord to silently drop every event because it looks for the
+        # un-prefixed names.
+        self._client.on_ready = self._on_ready
+        self._client.on_message = self._on_message
 
     # ------------------------------------------------------------------
     # Cursor management
@@ -508,7 +513,7 @@ class DiscordBridge:
     # ------------------------------------------------------------------
 
     async def handle_event(self, event) -> None:
-        node_id = event.tail_node_id
+        node_id = event.lane_node_id   # stable lane key � never advances during a turn
         acc     = self._accumulators.get(node_id)
         if acc is None:
             logger.debug("Discord: received event for unknown cursor %s", node_id)
@@ -821,18 +826,22 @@ class DiscordBridge:
         active_event: asyncio.Event,
         done_event: asyncio.Event,
     ) -> None:
+        # Wait until the first real activity (thinking/tool/reply chunk) before
+        # showing the typing indicator — avoids a spurious indicator on errors
+        # that resolve instantly.
+        await active_event.wait()
         while not done_event.is_set():
-            await active_event.wait()
-            if done_event.is_set():
-                break
             try:
-                await channel.typing().__aenter__()
+                # Use the context manager correctly so __aexit__ is always
+                # called.  The old code called __aenter__ without __aexit__,
+                # leaking discord.py's internal keepalive task on every cycle.
+                async with channel.typing():
+                    try:
+                        await asyncio.wait_for(done_event.wait(), timeout=8.0)
+                    except asyncio.TimeoutError:
+                        pass  # Loop back and send another typing burst
             except Exception:
-                pass
-            try:
-                await asyncio.wait_for(done_event.wait(), timeout=8.0)
-            except asyncio.TimeoutError:
-                pass
+                await asyncio.sleep(1)
 
     async def _handle_turn(
         self,
