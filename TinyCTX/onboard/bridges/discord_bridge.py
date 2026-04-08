@@ -1,8 +1,8 @@
 """
-onboard/bridges/telegram.py — Telegram bridge setup.
+onboard/bridges/discord.py — Discord bridge setup.
 
-Called by bridges_setup.py when the user selects the Telegram bridge.
-run() returns a bridges["telegram"] config dict, or None to skip.
+Called by bridges_setup.py when the user selects the Discord bridge.
+run() returns a bridges["discord"] config dict, or None to skip.
 """
 
 from __future__ import annotations
@@ -13,46 +13,54 @@ from typing import Any
 
 from rich.panel import Panel
 
-from onboard.helpers import GoBack, Mode, c, set_env, success, warn
+from ..helpers import GoBack, Mode, c, set_env, success, warn
 
 DEFAULT_OPTIONS = {
-    "token_env":        "TELEGRAM_BOT_TOKEN",
-    "allowed_user_ids": [],
-    "dm_enabled":       True,
-    "max_reply_length": 4096,
+    "token_env":       "DISCORD_BOT_TOKEN",
+    "allowed_users":   [],
+    "dm_enabled":      True,
+    "guild_ids":       [],
+    "prefix_required": True,
+    "command_prefix":  "!",
+    "max_reply_length": 1900,
     "typing_indicator": True,
 }
 
 
 def run(mode: Mode) -> dict[str, Any] | None:
     """
-    Guide the user through Telegram bot setup.
+    Guide the user through Discord bot setup.
 
     Returns a bridge config dict, or None if the user skips.
     Raises GoBack to return to the bridge selection screen.
     """
     c.print()
     c.print(Panel(
-        "  1. Open Telegram and search for [bold]@BotFather[/]\n"
-        "  2. Send [bold]/newbot[/] and follow the prompts\n"
-        "  3. Copy the token BotFather gives you (looks like 123456:ABC-DEF…)",
-        title="[bold cyan]Telegram Bot Setup[/]",
+        "  1. Go to [bold]discord.com/developers/applications[/]\n"
+        "  2. Click [bold]New Application[/] and give it a name\n"
+        "  3. Go to [bold]Bot[/] → click [bold]Add Bot[/]\n"
+        "  4. Under [bold]Privileged Gateway Intents[/], enable:\n"
+        "       • Message Content Intent\n"
+        "       • Server Members Intent\n"
+        "  5. Click [bold]Reset Token[/] and copy it",
+        title="[bold cyan]Discord Bot Setup[/]",
         border_style="cyan",
     ))
 
-    raw = input("\n  Set up Telegram bridge? (y/n/back, default y): ").strip().lower()
+    raw = input("\n  Set up Discord bridge? (y/n/back, default y): ").strip().lower()
     if raw in ("back", "b"):
         raise GoBack
     if raw in ("n", "no"):
-        warn("Skipping Telegram bridge.")
+        warn("Skipping Discord bridge.")
         return None
 
     cfg: dict[str, Any] = {"enabled": True, "options": dict(DEFAULT_OPTIONS)}
+
     token_env = cfg["options"]["token_env"]
 
     if not os.environ.get(token_env):
         c.print()
-        entered = _prompt_secret("Paste your Telegram bot token (or leave blank to set it later)")
+        entered = _prompt_secret(f"Paste your Discord bot token (or leave blank to set it later)")
         if entered:
             os.environ[token_env] = entered
             try:

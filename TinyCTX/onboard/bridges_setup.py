@@ -8,13 +8,20 @@ appropriate per-bridge setup.
 
 from __future__ import annotations
 
-import importlib
-from pathlib import Path
 from typing import Any
 
 import questionary
 
 from .helpers import GoBack, Mode, QSTYLE, c, section, success, warn
+from .bridges import discord_bridge as _discord_setup
+from .bridges import matrix_bridge as _matrix_setup
+from .bridges import telegram_bridge as _telegram_setup
+
+_BRIDGE_MODULES = {
+    "discord":  _discord_setup,
+    "matrix":   _matrix_setup,
+    "telegram": _telegram_setup,
+}
 
 # Bridges that are bundled with TinyCTX.
 # Each name here must have a matching file at onboard/bridges/<name>.py
@@ -23,8 +30,6 @@ AVAILABLE_BRIDGES = [
     "matrix",
     "telegram",
 ]
-
-BRIDGES_DIR = Path(__file__).parent / "bridges"
 
 
 def run(mode: Mode) -> dict[str, Any]:
@@ -43,8 +48,8 @@ def run(mode: Mode) -> dict[str, Any]:
         section("Step 2 — Bridges")
         c.print("CLI is always enabled. Select additional bridges to configure.\n")
 
-    # Build choices list — only show bridges that have a setup file
-    available = [b for b in AVAILABLE_BRIDGES if (BRIDGES_DIR / f"{b}.py").exists()]
+    # Only show bridges that have a registered setup module
+    available = [b for b in AVAILABLE_BRIDGES if b in _BRIDGE_MODULES]
     if not available:
         warn("No bridge setup files found in onboard/bridges/ — skipping.")
         return {"cli": {"enabled": True}}
@@ -53,8 +58,8 @@ def run(mode: Mode) -> dict[str, Any]:
         questionary.Choice(title=b.title(), value=b)
         for b in available
     ]
-    choices.append(questionary.Choice(title="← Skip bridges for now", value="__skip__"))
 
+    c.print("  [dim]Space to select · Enter to confirm[/]\n")
     raw = questionary.checkbox(
         "Which bridges would you like to configure?",
         choices=choices,
@@ -64,20 +69,19 @@ def run(mode: Mode) -> dict[str, Any]:
     if raw is None:
         raise GoBack
 
-    chosen = [b for b in raw if b != "__skip__"]
+    chosen = [b for b in raw]
 
     bridges: dict[str, Any] = {"cli": {"enabled": True}}
 
     for bridge_name in chosen:
-        module_path = f"onboard.bridges.{bridge_name}"
         try:
-            mod = importlib.import_module(module_path)
+            mod = _BRIDGE_MODULES[bridge_name]
             bridge_cfg = mod.run(mode)
             if bridge_cfg:
                 bridges[bridge_name] = bridge_cfg
             success(f"{bridge_name.title()} bridge configured.")
-        except ImportError:
-            warn(f"No setup file found for bridge '{bridge_name}' — skipping.")
+        except ImportError as e:
+            warn(f"Could not load bridge '{bridge_name}': {e}")
         except GoBack:
             warn(f"Skipped {bridge_name.title()} bridge setup.")
         except Exception as e:

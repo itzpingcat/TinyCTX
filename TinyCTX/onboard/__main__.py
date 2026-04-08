@@ -158,24 +158,51 @@ That's it! Re-run `python -m onboard` at any time to reconfigure.
 
 # ── wizard runner (with GoBack support) ──────────────────────────────────────
 
-def run_wizard(providers: dict, beginner_providers: dict, existing: dict | None) -> None:
+def run_wizard(providers: dict, beginner_providers: dict, existing: dict | None, modify: bool = False) -> None:
     """
     Run all wizard steps in order.
     Any step can raise GoBack to return to the previous step.
+    In modify mode, the user picks which steps to run; others keep existing values.
     """
 
-    # ── Step 0b: mode selection ───────────────────────────────────────────────
     step_idx = 0
-    mode: Mode = "quickstart"
+    mode: Mode = "standard"
     results: dict[str, Any] = {}
 
-    steps = [
-        "mode",
-        "providers",
-        "bridges",
-        "workspace",
-        "gateway",
-    ]
+    # Pre-populate results from existing config so skipped steps don't blow up assemble_config
+    if existing and modify:
+        # Reconstruct minimal results from existing config
+        primary = existing.get("models", {}).get("primary", {})
+        results["model_cfg"] = {**primary, "context": existing.get("context", 16384)}
+        embed = existing.get("models", {}).get("embed")
+        results["embed_cfg"] = embed
+        results["workspace"] = existing.get("workspace", {}).get("path", "~/.tinyctx")
+        results["bridges"]   = existing.get("bridges", {"cli": {"enabled": True}})
+        results["gateway"]   = existing.get("gateway", {})
+
+    all_steps = ["mode", "providers", "bridges", "workspace", "gateway"]
+    step_labels = {
+        "providers": "Providers & Models",
+        "bridges":   "Bridges",
+        "workspace": "Workspace",
+        "gateway":   "Gateway",
+    }
+
+    if modify:
+        section("Modify Configuration")
+        c.print("Choose which sections you'd like to reconfigure:\n")
+        c.print("  [dim]Space to select · Enter to confirm[/]\n")
+        chosen_steps = questionary.checkbox(
+            "Which sections would you like to update?",
+            choices=[questionary.Choice(title=label, value=key) for key, label in step_labels.items()],
+            style=QSTYLE,
+        ).ask()
+        if not chosen_steps:
+            success("Nothing changed.")
+            sys.exit(0)
+        steps = chosen_steps
+    else:
+        steps = all_steps
 
     while step_idx < len(steps):
         current = steps[step_idx]
@@ -222,8 +249,9 @@ def run_wizard(providers: dict, beginner_providers: dict, existing: dict | None)
     write_config(data)
     success(f"Config written to [bold]{CONFIG_PATH}[/]")
 
-    # ── Launch gateway AFTER config is on disk ────────────────────────────────
-    gateway_setup.launch(results["gateway"])
+    # ── Launch gateway AFTER config is on disk (only if gateway was reconfigured) ──
+    if not modify or "gateway" in steps:
+        gateway_setup.launch(results["gateway"])
 
     step_summary(mode, results["gateway"])
 
@@ -258,7 +286,7 @@ def main() -> None:
         ))
 
     try:
-        run_wizard(providers, beginner_providers, existing)
+        run_wizard(providers, beginner_providers, existing, modify=(detect == "modify"))
     except KeyboardInterrupt:
         c.print("\n\n[bold yellow]Onboarding cancelled.[/] Run [bold]python -m onboard[/] to start again.")
         sys.exit(0)

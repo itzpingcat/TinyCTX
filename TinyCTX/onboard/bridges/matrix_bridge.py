@@ -14,7 +14,7 @@ from typing import Any
 import questionary
 from rich.panel import Panel
 
-from onboard.helpers import GoBack, Mode, QSTYLE, c, set_env, success, warn
+from ..helpers import GoBack, Mode, QSTYLE, c, set_env, success, warn
 
 DEFAULT_OPTIONS = {
     "password_env":     "MATRIX_PASSWORD",
