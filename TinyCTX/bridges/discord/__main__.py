@@ -27,9 +27,6 @@ Config (in config.yaml under bridges.discord.options):
   buffer_timeout_s:  In group channels, seconds to wait after a non-trigger
                      message before flushing buffered messages anyway.
                      0 = disabled (only flush on trigger). Default: 0
-  buffer_max_lines:  Hard cap on buffered (non-trigger) messages per channel.
-                     Oldest are dropped when limit is hit (sliding window).
-                     0 = unlimited. Default: 200
   buffer_head_lines: When truncating a large burst, keep this many messages
                      from the START (topic context). Default: 2
   buffer_tail_lines: Messages to keep from the END of a truncated burst
@@ -123,7 +120,6 @@ DEFAULTS = {
     "command_prefix": "!",
     "reset_command": "/reset",
     "buffer_timeout_s": 0,
-    "buffer_max_lines": 200,
     "buffer_head_lines": 2,
     "buffer_tail_lines": 10,
     "max_reply_length": 1900,
@@ -311,7 +307,6 @@ class DiscordBridge:
         self._dm_enabled:       bool  = bool(self._opts["dm_enabled"])
         self._guild_ids:        set[int] = {int(g) for g in self._opts["guild_ids"]}
         self._buffer_timeout_s:  float = float(self._opts["buffer_timeout_s"])
-        self._buffer_max_lines:  int   = int(self._opts["buffer_max_lines"])
         self._buffer_head_lines: int   = int(self._opts["buffer_head_lines"])
         self._buffer_tail_lines: int   = int(self._opts["buffer_tail_lines"])
 
@@ -438,7 +433,6 @@ class DiscordBridge:
             bot_mxid=f"<@{bot_id}>",        # Discord mention format
             bot_localpart=f"<@!{bot_id}>",   # legacy mention format
             buffer_timeout_s=self._buffer_timeout_s,
-            buffer_max_lines=self._buffer_max_lines,
             buffer_head_lines=self._buffer_head_lines,
             buffer_tail_lines=self._buffer_tail_lines,
         )

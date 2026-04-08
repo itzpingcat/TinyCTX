@@ -69,8 +69,6 @@ class GroupPolicy:
     bot_localpart:     @localpart derived from bot_mxid, or empty string
     buffer_timeout_s:  seconds to wait before flushing buffered non-trigger
                        messages without a trigger arriving. 0 = disabled.
-    buffer_max_lines:  hard cap on buffered messages; oldest are dropped
-                       (sliding window). 0 = unlimited. Default: 200.
     buffer_head_lines: lines to keep from the START of the buffer when
                        truncating (topic context). Default: 2.
     buffer_tail_lines: lines to keep from the END of the buffer (closest
@@ -82,7 +80,6 @@ class GroupPolicy:
     bot_mxid:          str            = ""
     bot_localpart:     str            = ""
     buffer_timeout_s:  float          = 0.0
-    buffer_max_lines:  int            = 200
     buffer_head_lines: int            = 2
     buffer_tail_lines: int            = 10
 

@@ -208,9 +208,6 @@ class GroupLane:
 
         if not self._is_trigger(text, p):
             self._buffer.append(msg)
-            # Enforce sliding-window cap: drop oldest when over limit.
-            if p.buffer_max_lines > 0 and len(self._buffer) > p.buffer_max_lines:
-                self._buffer.pop(0)
             if p.buffer_timeout_s > 0:
                 self._reset_timeout()
             return True
@@ -249,7 +246,6 @@ class GroupLane:
             bot_mxid=p.bot_mxid,
             bot_localpart=p.bot_localpart,
             buffer_timeout_s=p.buffer_timeout_s,
-            buffer_max_lines=p.buffer_max_lines,
             buffer_head_lines=p.buffer_head_lines,
             buffer_tail_lines=p.buffer_tail_lines,
         )
