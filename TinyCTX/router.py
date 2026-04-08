@@ -136,6 +136,31 @@ class Lane:
 # GroupLane helpers
 # ---------------------------------------------------------------------------
 
+def _format_buffer_lines(
+    lines: list[str],
+    head_lines: int = 2,
+    tail_lines: int = 10,
+) -> str:
+    """
+    Render a list of "[Name]: text" lines as a transcript, truncating the
+    middle when the total exceeds head_lines + tail_lines.
+
+    Full transcript is returned when len(lines) <= head_lines + tail_lines,
+    so small bursts are never needlessly trimmed.
+    """
+    n      = len(lines)
+    window = head_lines + tail_lines
+    if window <= 0 or n <= window:
+        return "\n".join(lines)
+    omitted   = n - window
+    separator = f"... [{omitted} message{'s' if omitted != 1 else ''} not shown] ..."
+    return "\n".join(
+        lines[:head_lines]
+        + [separator]
+        + lines[n - tail_lines:]
+    )
+
+
 def _gp_strip_trigger(text: str, policy: GroupPolicy) -> str:
     if policy.bot_mxid:
         text = text.replace(policy.bot_mxid, "")
@@ -183,6 +208,9 @@ class GroupLane:
 
         if not self._is_trigger(text, p):
             self._buffer.append(msg)
+            # Enforce sliding-window cap: drop oldest when over limit.
+            if p.buffer_max_lines > 0 and len(self._buffer) > p.buffer_max_lines:
+                self._buffer.pop(0)
             if p.buffer_timeout_s > 0:
                 self._reset_timeout()
             return True
@@ -221,6 +249,9 @@ class GroupLane:
             bot_mxid=p.bot_mxid,
             bot_localpart=p.bot_localpart,
             buffer_timeout_s=p.buffer_timeout_s,
+            buffer_max_lines=p.buffer_max_lines,
+            buffer_head_lines=p.buffer_head_lines,
+            buffer_tail_lines=p.buffer_tail_lines,
         )
 
     def _is_trigger(self, text: str, p: GroupPolicy) -> bool:
@@ -240,9 +271,15 @@ class GroupLane:
         self._buffer  = []
         if not buffered:
             return trigger
+        p     = self._policy
         lines = [f"[{m.author.username}]: {m.text}" for m in buffered]
         lines.append(trigger.text)
-        return _gp_replace_text(trigger, "\n".join(lines))
+        combined_text = _format_buffer_lines(
+            lines,
+            head_lines=p.buffer_head_lines,
+            tail_lines=p.buffer_tail_lines,
+        )
+        return _gp_replace_text(trigger, combined_text)
 
     def _reset_timeout(self) -> None:
         self._cancel_timeout()

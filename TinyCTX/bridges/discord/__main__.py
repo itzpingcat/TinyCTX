@@ -27,16 +27,17 @@ Config (in config.yaml under bridges.discord.options):
   buffer_timeout_s:  In group channels, seconds to wait after a non-trigger
                      message before flushing buffered messages anyway.
                      0 = disabled (only flush on trigger). Default: 0
-  buffer_max_lines:  Hard cap on buffered (non-trigger) lines per channel.
-                     Oldest lines are dropped to keep the buffer within this
-                     limit (sliding window). Default: 200
-  buffer_head_lines: When formatting a flushed buffer that exceeds
-                     head + tail lines, keep this many lines from the
-                     START of the burst (topic context). Default: 2
-  buffer_tail_lines: Lines to keep from the END of the burst (closest
-                     to the trigger). Default: 10
-                     Omitted middle lines are replaced with:
+  buffer_max_lines:  Hard cap on buffered (non-trigger) messages per channel.
+                     Oldest are dropped when limit is hit (sliding window).
+                     0 = unlimited. Default: 200
+  buffer_head_lines: When truncating a large burst, keep this many messages
+                     from the START (topic context). Default: 2
+  buffer_tail_lines: Messages to keep from the END of a truncated burst
+                     (closest to the trigger). Default: 10
+                     Omitted middle is replaced with:
                      "... [N messages not shown] ..."
+                     Trigger detection, buffering, and truncation are all
+                     handled by GroupLane in router.py via GroupPolicy.
   max_reply_length:  Discord message length cap before chunking. Default: 1900
   typing_indicator: Show "Bot is typing..." while the agent thinks. Default: true
 
@@ -82,13 +83,13 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import discord
 
 from TinyCTX.contracts import (
+    ActivationMode,
     AgentError,
     AgentThinkingChunk,
     AgentTextChunk,
@@ -97,6 +98,7 @@ from TinyCTX.contracts import (
     AgentToolResult,
     Attachment,
     content_type_for,
+    GroupPolicy,
     InboundMessage,
     Platform,
     UserIdentity,
@@ -235,130 +237,6 @@ class CursorStore:
 
 
 # ---------------------------------------------------------------------------
-# GroupBuffer
-# ---------------------------------------------------------------------------
-
-@dataclass
-class _BufferedLine:
-    user_id: str
-    display_name: str
-    text: str
-
-
-class GroupBuffer:
-    """Per-channel message buffer.
-
-    Hard-capped at ``max_lines`` entries (default 200, configurable via
-    ``buffer_max_lines`` in config.yaml).  When the cap is hit the oldest
-    line is dropped so the buffer stays a sliding window of recent chat.
-
-    When flushed, ``format()`` returns either the full list (if it fits
-    within head + tail) or a condensed form:
-
-        [Alice]: first message
-        [Bob]: second message
-        ... [N messages not shown] ...
-        [Carol]: tenth-from-last
-        ...
-        [Dave]: final message before trigger
-    """
-
-    def __init__(
-        self,
-        timeout_s: float,
-        max_lines: int = 200,
-        head_lines: int = 2,
-        tail_lines: int = 10,
-    ) -> None:
-        self._timeout_s = timeout_s
-        self._max_lines = max(1, max_lines)
-        self._head_lines = max(0, head_lines)
-        self._tail_lines = max(0, tail_lines)
-        self._lines: list[_BufferedLine] = []
-        self._flush_task: asyncio.Task | None = None
-        self._flush_callback = None
-
-    def set_flush_callback(self, cb) -> None:
-        self._flush_callback = cb
-
-    def add(self, user_id: str, display_name: str, text: str) -> None:
-        self._lines.append(_BufferedLine(user_id, display_name, text))
-        # Enforce the sliding-window cap — drop the oldest line when over limit.
-        if len(self._lines) > self._max_lines:
-            self._lines.pop(0)
-        if self._timeout_s > 0:
-            self._reset_timer()
-
-    def flush(
-        self,
-        trigger_user_id: str | None = None,
-        trigger_display_name: str | None = None,
-        trigger_text: str | None = None,
-    ) -> list[_BufferedLine]:
-        self._cancel_timer()
-        lines = list(self._lines)
-        if trigger_text and trigger_user_id and trigger_display_name:
-            lines.append(_BufferedLine(trigger_user_id, trigger_display_name, trigger_text))
-        self._lines.clear()
-        return lines
-
-    def clear(self) -> None:
-        self._cancel_timer()
-        self._lines.clear()
-
-    def _reset_timer(self) -> None:
-        self._cancel_timer()
-        if self._flush_callback:
-            self._flush_task = asyncio.create_task(self._timeout_flush())
-
-    def _cancel_timer(self) -> None:
-        if self._flush_task and not self._flush_task.done():
-            self._flush_task.cancel()
-        self._flush_task = None
-
-    async def _timeout_flush(self) -> None:
-        try:
-            await asyncio.sleep(self._timeout_s)
-            if self._lines and self._flush_callback:
-                await self._flush_callback()
-        except asyncio.CancelledError:
-            pass
-
-
-def _format_buffer(
-    lines: list[_BufferedLine],
-    head_lines: int = 2,
-    tail_lines: int = 10,
-) -> str:
-    """Render buffered lines as a multi-speaker transcript.
-
-    When the total number of lines exceeds ``head_lines + tail_lines``, the
-    middle is replaced with a single ``... [N messages not shown] ...`` marker
-    so the LLM always sees context from the *start* of the conversation burst
-    (for topic setup) and the lines *closest to the trigger* (most relevant).
-
-    If head_lines + tail_lines >= len(lines), the full list is returned.
-    """
-    def _render(line: _BufferedLine) -> str:
-        return f"[{line.display_name}]: {line.text}"
-
-    n = len(lines)
-    window = head_lines + tail_lines
-    if window <= 0 or n <= window:
-        return "\n".join(_render(l) for l in lines)
-
-    head  = lines[:head_lines]
-    tail  = lines[n - tail_lines:]
-    omitted = n - window
-    separator = f"... [{omitted} message{'s' if omitted != 1 else ''} not shown] ..."
-    return "\n".join(
-        [_render(l) for l in head]
-        + [separator]
-        + [_render(l) for l in tail]
-    )
-
-
-# ---------------------------------------------------------------------------
 # Reply accumulator
 # ---------------------------------------------------------------------------
 
@@ -432,10 +310,10 @@ class DiscordBridge:
         self._reset_command:    str   = str(self._opts["reset_command"])
         self._dm_enabled:       bool  = bool(self._opts["dm_enabled"])
         self._guild_ids:        set[int] = {int(g) for g in self._opts["guild_ids"]}
-        self._buffer_timeout_s: float = float(self._opts["buffer_timeout_s"])
-        self._buffer_max_lines: int   = int(self._opts["buffer_max_lines"])
-        self._buffer_head_lines: int  = int(self._opts["buffer_head_lines"])
-        self._buffer_tail_lines: int  = int(self._opts["buffer_tail_lines"])
+        self._buffer_timeout_s:  float = float(self._opts["buffer_timeout_s"])
+        self._buffer_max_lines:  int   = int(self._opts["buffer_max_lines"])
+        self._buffer_head_lines: int   = int(self._opts["buffer_head_lines"])
+        self._buffer_tail_lines: int   = int(self._opts["buffer_tail_lines"])
 
         self._allowed_users: set[int] = {int(u) for u in self._opts["allowed_users"]}
         self._admin_users:   set[int] = {int(u) for u in self._opts["admin_users"]}
@@ -443,7 +321,6 @@ class DiscordBridge:
         # In-flight state (not persisted)
         self._accumulators:  dict[str, _ReplyAccumulator] = {}
         self._typing_active: dict[str, asyncio.Event]     = {}
-        self._group_buffers: dict[str, GroupBuffer]       = {}
 
         # Persisted cursor store
         workspace   = Path(router._config.workspace.path).expanduser().resolve()
@@ -551,23 +428,20 @@ class DiscordBridge:
     def _is_admin(self, user_id: int) -> bool:
         return user_id in self._admin_users
 
-    def _get_or_create_buffer(self, channel_id: str) -> GroupBuffer:
-        if channel_id not in self._group_buffers:
-            self._group_buffers[channel_id] = GroupBuffer(
-                self._buffer_timeout_s,
-                max_lines=self._buffer_max_lines,
-                head_lines=self._buffer_head_lines,
-                tail_lines=self._buffer_tail_lines,
-            )
-        return self._group_buffers[channel_id]
-
-    def _strip_trigger(self, text: str) -> str:
-        if self._client.user:
-            text = text.replace(f"<@{self._client.user.id}>", "")
-            text = text.replace(f"<@!{self._client.user.id}>", "")
-        if text.startswith(self._prefix):
-            text = text[len(self._prefix):]
-        return text.strip()
+    def _build_group_policy(self) -> GroupPolicy:
+        """Build the GroupPolicy for this channel from bridge config."""
+        activation = ActivationMode.ALWAYS if not self._prefix_required else ActivationMode.MENTION
+        bot_id     = str(self._client.user.id) if self._client.user else ""
+        return GroupPolicy(
+            activation=activation,
+            trigger_prefix=self._prefix,
+            bot_mxid=f"<@{bot_id}>",        # Discord mention format
+            bot_localpart=f"<@!{bot_id}>",   # legacy mention format
+            buffer_timeout_s=self._buffer_timeout_s,
+            buffer_max_lines=self._buffer_max_lines,
+            buffer_head_lines=self._buffer_head_lines,
+            buffer_tail_lines=self._buffer_tail_lines,
+        )
 
     async def _fetch_attachments(self, message: discord.Message) -> tuple:
         if not message.attachments:
@@ -705,17 +579,17 @@ class DiscordBridge:
             return
 
         # ── Group channel ─────────────────────────────────────────────
+        # Trigger detection, mention stripping, buffering, and truncation are
+        # all handled by GroupLane in router.py via the GroupPolicy we attach.
         if self._guild_ids and message.guild and message.guild.id not in self._guild_ids:
             return
 
         channel_id = str(message.channel.id)
         cursor_key = f"group:{channel_id}"
-        buf        = self._get_or_create_buffer(channel_id)
         raw_text   = message.content.strip()
 
         if raw_text == self._reset_command:
             if self._is_admin(message.author.id):
-                buf.clear()
                 node_id = self._get_cursor(cursor_key)
                 if node_id:
                     self._router.reset_lane(node_id)
@@ -743,41 +617,34 @@ class DiscordBridge:
             if handled:
                 return
 
-        mentioned  = self._client.user is not None and self._client.user in message.mentions
-        prefixed   = raw_text.startswith(self._prefix)
-        is_trigger = mentioned or prefixed
-
-        if self._prefix_required and not is_trigger:
-            humanized = await _humanize_mentions(raw_text, self._client)
-
-            async def _timeout_flush_cb(
-                _buf=buf, _channel_id=channel_id,
-                _cursor_key=cursor_key, _channel=message.channel,
-            ):
-                await self._flush_group_buffer(
-                    _buf, _channel_id, _cursor_key, _channel,
-                    trigger_user_id=None, trigger_display_name=None, trigger_text=None,
-                )
-
-            buf.set_flush_callback(_timeout_flush_cb)
-            buf.add(str(message.author.id), message.author.display_name, humanized)
-            logger.debug(
-                "Discord: buffered non-trigger message from %s in channel %s",
-                message.author.display_name, channel_id,
-            )
+        text        = await _humanize_mentions(raw_text, self._client)
+        attachments = await self._fetch_attachments(message)
+        if not text and not attachments:
             return
 
-        stripped          = self._strip_trigger(raw_text)
-        humanized_trigger = await _humanize_mentions(stripped, self._client)
-        attachments       = await self._fetch_attachments(message)
-
-        await self._flush_group_buffer(
-            buf, channel_id, cursor_key, message.channel,
-            trigger_user_id=str(message.author.id),
-            trigger_display_name=message.author.display_name,
-            trigger_text=humanized_trigger,
+        node_id = self._get_or_create_cursor(cursor_key)
+        author  = UserIdentity(
+            platform=Platform.DISCORD,
+            user_id=str(message.author.id),
+            username=message.author.display_name,
+        )
+        msg = InboundMessage(
+            tail_node_id=node_id,
+            author=author,
+            content_type=content_type_for(text, bool(attachments)),
+            text=text,
+            message_id=str(message.id),
+            timestamp=time.time(),
             attachments=attachments,
-            trigger_message_id=str(message.id),
+            group_policy=self._build_group_policy(),
+        )
+        acc = _ReplyAccumulator(message.channel, self._max_len)
+        self._accumulators[node_id] = acc
+        asyncio.create_task(
+            self._handle_turn(
+                msg, message.channel, node_id, acc, cursor_key,
+                record_msg_node=str(message.id),
+            )
         )
 
     # ------------------------------------------------------------------
@@ -830,71 +697,6 @@ class DiscordBridge:
         self._accumulators[node_id] = acc
         asyncio.create_task(
             self._handle_turn(msg, message.channel, node_id, acc, cursor_key)
-        )
-
-    # ------------------------------------------------------------------
-    # Group channel flush
-    # ------------------------------------------------------------------
-
-    async def _flush_group_buffer(
-        self,
-        buf: GroupBuffer,
-        channel_id: str,
-        cursor_key: str,
-        channel: discord.abc.Messageable,
-        trigger_user_id: str | None,
-        trigger_display_name: str | None,
-        trigger_text: str | None,
-        attachments: tuple = (),
-        trigger_message_id: str | None = None,
-    ) -> None:
-        lines = buf.flush(
-            trigger_user_id=trigger_user_id,
-            trigger_display_name=trigger_display_name,
-            trigger_text=trigger_text,
-        )
-        if not lines and not attachments:
-            return
-
-        combined_text = _format_buffer(
-            lines,
-            head_lines=self._buffer_head_lines,
-            tail_lines=self._buffer_tail_lines,
-        )
-        node_id       = self._get_or_create_cursor(cursor_key)
-
-        if trigger_user_id:
-            author_uid  = trigger_user_id
-            author_name = trigger_display_name or trigger_user_id
-            msg_id      = trigger_message_id or str(time.time_ns())
-        else:
-            first       = lines[0] if lines else None
-            author_uid  = first.user_id if first else "unknown"
-            author_name = first.display_name if first else "unknown"
-            msg_id      = str(time.time_ns())
-
-        author = UserIdentity(
-            platform=Platform.DISCORD,
-            user_id=author_uid,
-            username=author_name,
-        )
-        msg = InboundMessage(
-            tail_node_id=node_id,
-            author=author,
-            content_type=content_type_for(combined_text, bool(attachments)),
-            text=combined_text,
-            message_id=msg_id,
-            timestamp=time.time(),
-            attachments=attachments,
-        )
-
-        acc = _ReplyAccumulator(channel, self._max_len)
-        self._accumulators[node_id] = acc
-        asyncio.create_task(
-            self._handle_turn(
-                msg, channel, node_id, acc, cursor_key,
-                record_msg_node=trigger_message_id,
-            )
         )
 
     # ------------------------------------------------------------------

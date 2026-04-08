@@ -63,18 +63,28 @@ class GroupPolicy:
     Bridges attach this to InboundMessage for group sessions.
     GroupLane in router.py enforces it — bridges pass raw message text.
 
-    activation:       MENTION | PREFIX | ALWAYS
-    trigger_prefix:   command prefix string (e.g. "!")
-    bot_mxid:         full @user:server MXID (Matrix) or empty string
-    bot_localpart:    @localpart derived from bot_mxid, or empty string
-    buffer_timeout_s: seconds to wait before flushing buffered non-trigger
-                      messages without a trigger arriving. 0 = disabled.
+    activation:        MENTION | PREFIX | ALWAYS
+    trigger_prefix:    command prefix string (e.g. "!")
+    bot_mxid:          full @user:server MXID (Matrix) or empty string
+    bot_localpart:     @localpart derived from bot_mxid, or empty string
+    buffer_timeout_s:  seconds to wait before flushing buffered non-trigger
+                       messages without a trigger arriving. 0 = disabled.
+    buffer_max_lines:  hard cap on buffered messages; oldest are dropped
+                       (sliding window). 0 = unlimited. Default: 200.
+    buffer_head_lines: lines to keep from the START of the buffer when
+                       truncating (topic context). Default: 2.
+    buffer_tail_lines: lines to keep from the END of the buffer (closest
+                       to trigger). Default: 10. Omitted lines are replaced
+                       with "... [N messages not shown] ...".
     """
-    activation:       ActivationMode = ActivationMode.MENTION
-    trigger_prefix:   str            = "!"
-    bot_mxid:         str            = ""
-    bot_localpart:    str            = ""
-    buffer_timeout_s: float          = 0.0
+    activation:        ActivationMode = ActivationMode.MENTION
+    trigger_prefix:    str            = "!"
+    bot_mxid:          str            = ""
+    bot_localpart:     str            = ""
+    buffer_timeout_s:  float          = 0.0
+    buffer_max_lines:  int            = 200
+    buffer_head_lines: int            = 2
+    buffer_tail_lines: int            = 10
 
 
 class AttachmentKind(str, Enum):
