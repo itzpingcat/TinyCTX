@@ -479,6 +479,11 @@ class Router:
             return True
         return False
 
+    @property
+    def config(self) -> Config:
+        """Public read-only access to the router's Config instance."""
+        return self._config
+
     async def shutdown(self) -> None:
         await self._lane_router.close_all()
 
