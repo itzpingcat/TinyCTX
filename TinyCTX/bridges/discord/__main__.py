@@ -24,10 +24,20 @@ Config (in config.yaml under bridges.discord.options):
                     Default: "!"
   reset_command:    Command string that triggers a session reset in group channels.
                     Default: "/reset"
-  buffer_timeout_s: In group channels, seconds to wait after a non-trigger
-                    message before flushing buffered messages anyway.
-                    0 = disabled (only flush on trigger). Default: 0
-  max_reply_length: Discord message length cap before chunking. Default: 1900
+  buffer_timeout_s:  In group channels, seconds to wait after a non-trigger
+                     message before flushing buffered messages anyway.
+                     0 = disabled (only flush on trigger). Default: 0
+  buffer_max_lines:  Hard cap on buffered (non-trigger) lines per channel.
+                     Oldest lines are dropped to keep the buffer within this
+                     limit (sliding window). Default: 200
+  buffer_head_lines: When formatting a flushed buffer that exceeds
+                     head + tail lines, keep this many lines from the
+                     START of the burst (topic context). Default: 2
+  buffer_tail_lines: Lines to keep from the END of the burst (closest
+                     to the trigger). Default: 10
+                     Omitted middle lines are replaced with:
+                     "... [N messages not shown] ..."
+  max_reply_length:  Discord message length cap before chunking. Default: 1900
   typing_indicator: Show "Bot is typing..." while the agent thinks. Default: true
 
 Thread branching:
@@ -111,6 +121,9 @@ DEFAULTS = {
     "command_prefix": "!",
     "reset_command": "/reset",
     "buffer_timeout_s": 0,
+    "buffer_max_lines": 200,
+    "buffer_head_lines": 2,
+    "buffer_tail_lines": 10,
     "max_reply_length": 1900,
     "typing_indicator": True,
     "typing_on_thinking": True,
@@ -233,10 +246,34 @@ class _BufferedLine:
 
 
 class GroupBuffer:
-    """Per-channel message buffer."""
+    """Per-channel message buffer.
 
-    def __init__(self, timeout_s: float) -> None:
+    Hard-capped at ``max_lines`` entries (default 200, configurable via
+    ``buffer_max_lines`` in config.yaml).  When the cap is hit the oldest
+    line is dropped so the buffer stays a sliding window of recent chat.
+
+    When flushed, ``format()`` returns either the full list (if it fits
+    within head + tail) or a condensed form:
+
+        [Alice]: first message
+        [Bob]: second message
+        ... [N messages not shown] ...
+        [Carol]: tenth-from-last
+        ...
+        [Dave]: final message before trigger
+    """
+
+    def __init__(
+        self,
+        timeout_s: float,
+        max_lines: int = 200,
+        head_lines: int = 2,
+        tail_lines: int = 10,
+    ) -> None:
         self._timeout_s = timeout_s
+        self._max_lines = max(1, max_lines)
+        self._head_lines = max(0, head_lines)
+        self._tail_lines = max(0, tail_lines)
         self._lines: list[_BufferedLine] = []
         self._flush_task: asyncio.Task | None = None
         self._flush_callback = None
@@ -246,6 +283,9 @@ class GroupBuffer:
 
     def add(self, user_id: str, display_name: str, text: str) -> None:
         self._lines.append(_BufferedLine(user_id, display_name, text))
+        # Enforce the sliding-window cap — drop the oldest line when over limit.
+        if len(self._lines) > self._max_lines:
+            self._lines.pop(0)
         if self._timeout_s > 0:
             self._reset_timer()
 
@@ -285,8 +325,37 @@ class GroupBuffer:
             pass
 
 
-def _format_buffer(lines: list[_BufferedLine]) -> str:
-    return "\n".join(f"[{line.display_name}]: {line.text}" for line in lines)
+def _format_buffer(
+    lines: list[_BufferedLine],
+    head_lines: int = 2,
+    tail_lines: int = 10,
+) -> str:
+    """Render buffered lines as a multi-speaker transcript.
+
+    When the total number of lines exceeds ``head_lines + tail_lines``, the
+    middle is replaced with a single ``... [N messages not shown] ...`` marker
+    so the LLM always sees context from the *start* of the conversation burst
+    (for topic setup) and the lines *closest to the trigger* (most relevant).
+
+    If head_lines + tail_lines >= len(lines), the full list is returned.
+    """
+    def _render(line: _BufferedLine) -> str:
+        return f"[{line.display_name}]: {line.text}"
+
+    n = len(lines)
+    window = head_lines + tail_lines
+    if window <= 0 or n <= window:
+        return "\n".join(_render(l) for l in lines)
+
+    head  = lines[:head_lines]
+    tail  = lines[n - tail_lines:]
+    omitted = n - window
+    separator = f"... [{omitted} message{'s' if omitted != 1 else ''} not shown] ..."
+    return "\n".join(
+        [_render(l) for l in head]
+        + [separator]
+        + [_render(l) for l in tail]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -364,6 +433,9 @@ class DiscordBridge:
         self._dm_enabled:       bool  = bool(self._opts["dm_enabled"])
         self._guild_ids:        set[int] = {int(g) for g in self._opts["guild_ids"]}
         self._buffer_timeout_s: float = float(self._opts["buffer_timeout_s"])
+        self._buffer_max_lines: int   = int(self._opts["buffer_max_lines"])
+        self._buffer_head_lines: int  = int(self._opts["buffer_head_lines"])
+        self._buffer_tail_lines: int  = int(self._opts["buffer_tail_lines"])
 
         self._allowed_users: set[int] = {int(u) for u in self._opts["allowed_users"]}
         self._admin_users:   set[int] = {int(u) for u in self._opts["admin_users"]}
@@ -481,7 +553,12 @@ class DiscordBridge:
 
     def _get_or_create_buffer(self, channel_id: str) -> GroupBuffer:
         if channel_id not in self._group_buffers:
-            self._group_buffers[channel_id] = GroupBuffer(self._buffer_timeout_s)
+            self._group_buffers[channel_id] = GroupBuffer(
+                self._buffer_timeout_s,
+                max_lines=self._buffer_max_lines,
+                head_lines=self._buffer_head_lines,
+                tail_lines=self._buffer_tail_lines,
+            )
         return self._group_buffers[channel_id]
 
     def _strip_trigger(self, text: str) -> str:
@@ -779,7 +856,11 @@ class DiscordBridge:
         if not lines and not attachments:
             return
 
-        combined_text = _format_buffer(lines)
+        combined_text = _format_buffer(
+            lines,
+            head_lines=self._buffer_head_lines,
+            tail_lines=self._buffer_tail_lines,
+        )
         node_id       = self._get_or_create_cursor(cursor_key)
 
         if trigger_user_id:
