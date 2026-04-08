@@ -24,17 +24,6 @@ Config (in config.yaml under bridges.discord.options):
                     Default: "!"
   reset_command:    Command string that triggers a session reset in group channels.
                     Default: "/reset"
-  buffer_timeout_s:  In group channels, seconds to wait after a non-trigger
-                     message before flushing buffered messages anyway.
-                     0 = disabled (only flush on trigger). Default: 0
-  buffer_head_lines: When truncating a large burst, keep this many messages
-                     from the START (topic context). Default: 2
-  buffer_tail_lines: Messages to keep from the END of a truncated burst
-                     (closest to the trigger). Default: 10
-                     Omitted middle is replaced with:
-                     "... [N messages not shown] ..."
-                     Trigger detection, buffering, and truncation are all
-                     handled by GroupLane in router.py via GroupPolicy.
   max_reply_length:  Discord message length cap before chunking. Default: 1900
   typing_indicator: Show "Bot is typing..." while the agent thinks. Default: true
 
@@ -119,9 +108,6 @@ DEFAULTS = {
     "prefix_required": True,
     "command_prefix": "!",
     "reset_command": "/reset",
-    "buffer_timeout_s": 0,
-    "buffer_head_lines": 2,
-    "buffer_tail_lines": 10,
     "max_reply_length": 1900,
     "typing_indicator": True,
     "typing_on_thinking": True,
@@ -306,9 +292,6 @@ class DiscordBridge:
         self._reset_command:    str   = str(self._opts["reset_command"])
         self._dm_enabled:       bool  = bool(self._opts["dm_enabled"])
         self._guild_ids:        set[int] = {int(g) for g in self._opts["guild_ids"]}
-        self._buffer_timeout_s:  float = float(self._opts["buffer_timeout_s"])
-        self._buffer_head_lines: int   = int(self._opts["buffer_head_lines"])
-        self._buffer_tail_lines: int   = int(self._opts["buffer_tail_lines"])
 
         self._allowed_users: set[int] = {int(u) for u in self._opts["allowed_users"]}
         self._admin_users:   set[int] = {int(u) for u in self._opts["admin_users"]}
@@ -432,9 +415,6 @@ class DiscordBridge:
             trigger_prefix=self._prefix,
             bot_mxid=f"<@{bot_id}>",        # Discord mention format
             bot_localpart=f"<@!{bot_id}>",   # legacy mention format
-            buffer_timeout_s=self._buffer_timeout_s,
-            buffer_head_lines=self._buffer_head_lines,
-            buffer_tail_lines=self._buffer_tail_lines,
         )
 
     async def _fetch_attachments(self, message: discord.Message) -> tuple:
