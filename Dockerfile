@@ -52,4 +52,4 @@ USER tinyctx
 
 EXPOSE 8085
 
-ENTRYPOINT ["python", "-m", "TinyCTX"]
+ENTRYPOINT ["python", "TinyCTX/main.py"]

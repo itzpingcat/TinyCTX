@@ -1,69 +1,63 @@
 # TinyCTX — Docker Setup
 
 Runs TinyCTX in a hardened Linux container on your Windows host.
-The agent is sandboxed: it can't see your host filesystem (except the
-workspace it's explicitly given), can't escalate privileges, and can't
-eat all your RAM/CPU.
 
-## Usage
+## Quick start
 
-```powershell
-# From repo root
-cd docker
+```sh
+# 1. Copy and fill in your config
+cp example.config.yaml config.yaml
 
-# Build (takes a few minutes first time — playwright downloads chromium)
-docker compose build
+# 2. Make sure your secrets are set in your shell (same as running natively)
+#    The onboard wizard does this for you — if you've run it, you're good.
+#    If not, set them manually:
+#      Windows:  $env:DISCORD_BOT_TOKEN = "your-token"
+#      Linux:    export DISCORD_BOT_TOKEN=your-token
 
-# Start detached
+# 3. Start
 docker compose up -d
-
-# Logs
-docker compose logs -f
-
-# Stop
-docker compose down
 ```
+
+## How secrets work
+
+TinyCTX reads secrets (like `DISCORD_BOT_TOKEN`) directly from environment
+variables. The `compose.yaml` forwards those vars from your host into the
+container using bare keys — no `.env` file, no extra config needed. Whatever
+your shell has, the container gets.
 
 ## What the container can and can't do
 
 | | |
 |---|---|
-| **Network** | Internet + Tailscale IPs (llama-swap at 100.64.72.3:5000 works as-is) |
-| **Isolated from** | Other Docker networks on your machine (Matrix stack etc.) |
+| **Network** | Internet + Tailscale IPs (llama-swap works as-is) |
+| **Isolated from** | Other Docker networks on your machine |
 | **Reads/writes** | `~/.tinyctx` only (mounted as `/workspace`) |
 | **Can't touch** | Anything else on the host filesystem |
 | **CPU** | Max 4 cores |
 | **RAM** | Max 4 GB |
-| **Root fs** | Read-only — container code can't be tampered with at runtime |
-| **Privileges** | Non-root user, no-new-privileges, all Linux caps dropped |
+| **Root fs** | Read-only |
+| **Privileges** | Non-root, no-new-privileges, all caps dropped |
 
-## Gateway port
+## Workspace location
 
-`127.0.0.1:8080` on the host. Your bridges connect the same as before.
+Defaults to `~/.tinyctx`. Override:
+```sh
+TINYCTX_WORKSPACE=/your/path docker compose up -d
+```
 
-## Code changes made to TinyCTX
+## Common commands
 
-Two env var overrides were added to `TinyCTX/config/__main__.py`:
-
-- `TINYCTX_WORKSPACE_OVERRIDE` — redirects the workspace path so the
-  Windows path in config.yaml doesn't break inside the container.
-- `TINYCTX_GATEWAY_HOST` — forces the gateway to bind `0.0.0.0` so
-  Docker port forwarding can reach it (config.yaml has `127.0.0.1`).
+```sh
+docker compose up -d        # start detached
+docker compose logs -f      # follow logs
+docker compose down         # stop
+docker compose up -d --build  # rebuild after code changes
+```
 
 ## Notes
 
-**Python 3.14-rc**: If `python:3.14-rc-slim` is unavailable, change the
-`FROM` line in Dockerfile to `python:3.13-slim` — should work fine.
+**Python 3.14-rc**: If the image is unavailable, change `FROM` in
+`Dockerfile` to `python:3.13-slim`.
 
-**Tailscale**: llama-swap's Tailscale IP is reachable from inside the
-container because Docker bridge traffic routes through the Windows host.
-Requires Tailscale to be running on Windows.
-
-**Playwright sandbox**: If you see Chromium sandbox errors, add
-`SYS_ADMIN` to `cap_add` in compose.yaml and set env var
-`PLAYWRIGHT_CHROMIUM_SANDBOX=0`.
-
-**Rebuild after code changes**:
-```powershell
-docker compose build && docker compose up -d
-```
+**Playwright sandbox**: If you see Chromium sandbox errors, add `SYS_ADMIN`
+to `cap_add` in `compose.yaml`.

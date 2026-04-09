@@ -31,13 +31,16 @@ services:
         read_only: true
 
     # ── environment ────────────────────────────────────────────────────────
+    # Bare keys (no value) forward the var from the host environment.
+    # Set these on your host before running docker compose up — the same
+    # way TinyCTX's onboard wizard sets them in your shell profile.
     environment:
-      # Redirect workspace to the container-internal mount point.
-      # Overrides whatever Windows path config.yaml has.
+      # Container-internal
       TINYCTX_WORKSPACE_OVERRIDE: /workspace
-      # Make the gateway bind to 0.0.0.0 so Docker port forwarding works.
-      # Without this, host: 127.0.0.1 in config.yaml would be unreachable.
       TINYCTX_GATEWAY_HOST: "0.0.0.0"
+      # Bridge secrets — forwarded from host env
+      DISCORD_BOT_TOKEN:
+      MATRIX_PASSWORD:
 
     # ── security hardening ─────────────────────────────────────────────────
     security_opt:
