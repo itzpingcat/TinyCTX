@@ -28,9 +28,13 @@ Config (in config.yaml under bridges.matrix.options):
                     Default: "!"
   reset_command:    Command string that triggers a session reset in group rooms.
                     Default: "/reset"
-  buffer_timeout_s: In group rooms, seconds to wait after a non-trigger
+  buffer_timeout_s:  In group rooms, seconds to wait after a non-trigger
                     message before flushing buffered messages anyway.
                     0 = disabled (only flush on trigger). Default: 0
+  buffer_head_lines: When truncating a large burst, keep this many messages
+                    from the START (topic context). Default: 2
+  buffer_tail_lines: Messages to keep from the END of a truncated burst
+                    (closest to the trigger). Default: 10
   max_reply_length: Max characters per Matrix message before chunking.
                     Default: 16000
   sync_timeout_ms:  Long-poll timeout per /sync call in ms. Default: 30000
@@ -45,11 +49,13 @@ Required:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from nio import (
@@ -111,6 +117,8 @@ DEFAULTS = {
     "command_prefix": "!",
     "reset_command": "/reset",
     "buffer_timeout_s": 0,
+    "buffer_head_lines": 2,
+    "buffer_tail_lines": 10,
     "max_reply_length": 16000,
     "sync_timeout_ms": 30000,
     "typing_indicator": True,
@@ -223,7 +231,9 @@ class MatrixBridge:
         self._typing_on_thinking: bool = bool(self._opts["typing_on_thinking"])
         self._typing_on_tools: bool = bool(self._opts["typing_on_tools"])
         self._typing_on_reply: bool = bool(self._opts["typing_on_reply"])
-        self._buffer_timeout_s: float = float(self._opts["buffer_timeout_s"])
+        self._buffer_timeout_s:  float = float(self._opts["buffer_timeout_s"])
+        self._buffer_head_lines: int   = int(self._opts["buffer_head_lines"])
+        self._buffer_tail_lines: int   = int(self._opts["buffer_tail_lines"])
 
         raw_allowed: list = self._opts["allowed_users"]
         self._allowed_users: set[str] = {str(u) for u in raw_allowed}
@@ -242,8 +252,13 @@ class MatrixBridge:
         self._typing_active: dict[str, asyncio.Event] = {}
         # sender+room_id → pending Attachments (media arrives before text in Matrix)
         self._pending_attachments: dict[str, list[Attachment]] = {}
-        # cursor persistence: room_id / dm sender_id → node_id
-        self._cursors: dict[str, str] = {}
+
+        # Persisted cursor store
+        workspace   = Path(router._config.workspace.path).expanduser().resolve()
+        cursors_dir = workspace / "cursors"
+        cursors_dir.mkdir(parents=True, exist_ok=True)
+        self._cursor_file: Path = cursors_dir / "matrix.json"
+        self._cursors: dict[str, str] = self._load_cursors()
 
         self._client: AsyncClient | None = None
         self._own_user_id: str = ""
@@ -276,6 +291,8 @@ class MatrixBridge:
             bot_mxid=self._username,
             bot_localpart=localpart,
             buffer_timeout_s=self._buffer_timeout_s,
+            buffer_head_lines=self._buffer_head_lines,
+            buffer_tail_lines=self._buffer_tail_lines,
         )
 
     # ------------------------------------------------------------------
@@ -283,7 +300,7 @@ class MatrixBridge:
     # ------------------------------------------------------------------
 
     async def handle_event(self, event) -> None:
-        node_id = event.tail_node_id
+        node_id = event.lane_node_id
         acc = self._accumulators.get(node_id)
         if acc is None:
             logger.debug("Matrix: received event for unknown cursor %s", node_id)
@@ -512,6 +529,26 @@ class MatrixBridge:
             except Exception:
                 pass
 
+    @staticmethod
+    def _load_cursors_from(path: Path) -> dict[str, str]:
+        if path.exists():
+            try:
+                return json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                logger.warning("Matrix: corrupt cursor file %s — starting fresh", path)
+        return {}
+
+    def _load_cursors(self) -> dict[str, str]:
+        return self._load_cursors_from(self._cursor_file)
+
+    def _save_cursors(self) -> None:
+        try:
+            self._cursor_file.write_text(
+                json.dumps(self._cursors, indent=2), encoding="utf-8"
+            )
+        except Exception:
+            logger.exception("Matrix: failed to save cursor file %s", self._cursor_file)
+
     def _get_or_create_cursor(self, cursor_key: str) -> str:
         """Return the node_id for a cursor_key, creating it in the DB if new."""
         if cursor_key in self._cursors:
@@ -522,6 +559,8 @@ class MatrixBridge:
         root        = db.get_root()
         node        = db.add_node(parent_id=root.id, role="system", content=f"session:{cursor_key}")
         self._cursors[cursor_key] = node.id
+        self._save_cursors()
+        logger.info("Matrix: created cursor %s -> %s", cursor_key, node.id)
         return node.id
 
     async def _handle_turn(
@@ -563,8 +602,9 @@ class MatrixBridge:
                 lane = self._router._lane_router._lanes.get(node_id)
                 if lane:
                     new_id = lane.loop._tail_node_id
-                    if new_id and new_id != node_id:
+                    if new_id and new_id != self._cursors.get(cursor_key):
                         self._cursors[cursor_key] = new_id
+                        self._save_cursors()
         except Exception:
             logger.exception("Matrix: error handling turn for cursor %s", node_id)
         finally:

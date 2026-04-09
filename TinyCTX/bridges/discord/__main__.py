@@ -112,10 +112,10 @@ logger = logging.getLogger(__name__)
 
 DEFAULTS = {
     "token_env": "DISCORD_BOT_TOKEN",
-    "allowed_users": [],
+    "allowed_users_dm": [],
+    "allowed_servers": {},
     "admin_users": [],
     "dm_enabled": True,
-    "guild_ids": [],
     "prefix_required": True,
     "command_prefix": "!",
     "reset_command": "/reset",
@@ -305,12 +305,18 @@ class DiscordBridge:
         self._prefix_required:  bool  = bool(self._opts["prefix_required"])
         self._reset_command:    str   = str(self._opts["reset_command"])
         self._dm_enabled:       bool  = bool(self._opts["dm_enabled"])
-        self._guild_ids:        set[int] = {int(g) for g in self._opts["guild_ids"]}
+
+        # allowed_servers: {guild_id: set[channel_id]} — empty set = all channels
+        raw_servers = self._opts["allowed_servers"]
+        self._allowed_servers: dict[int, set[int]] = {
+            int(guild_id): {int(c) for c in channels}
+            for guild_id, channels in raw_servers.items()
+        }
         self._buffer_timeout_s:  float = float(self._opts["buffer_timeout_s"])
         self._buffer_head_lines: int   = int(self._opts["buffer_head_lines"])
         self._buffer_tail_lines: int   = int(self._opts["buffer_tail_lines"])
 
-        self._allowed_users: set[int] = {int(u) for u in self._opts["allowed_users"]}
+        self._allowed_users_dm: set[int] = {int(u) for u in self._opts["allowed_users_dm"]}
         self._admin_users:   set[int] = {int(u) for u in self._opts["admin_users"]}
 
         # In-flight state (not persisted)
@@ -415,10 +421,18 @@ class DiscordBridge:
     # Helpers
     # ------------------------------------------------------------------
 
-    def _is_allowed(self, user_id: int) -> bool:
-        if not self._allowed_users:
+    def _is_allowed_dm(self, user_id: int) -> bool:
+        if not self._allowed_users_dm:
             return True
-        return user_id in self._allowed_users
+        return user_id in self._allowed_users_dm
+
+    def _is_allowed_server(self, guild_id: int, channel_id: int) -> bool:
+        """Return True if the guild is in allowed_servers and the channel is permitted."""
+        if guild_id not in self._allowed_servers:
+            return False
+        allowed_channels = self._allowed_servers[guild_id]
+        # Empty set means all channels in that server are allowed.
+        return not allowed_channels or channel_id in allowed_channels
 
     def _is_admin(self, user_id: int) -> bool:
         return user_id in self._admin_users
@@ -497,10 +511,15 @@ class DiscordBridge:
             self._client.user,
             self._client.user.id if self._client.user else "?",
         )
-        if not self._allowed_users:
+        if not self._allowed_users_dm:
             logger.warning(
-                "Discord bridge: allowed_users is empty — the bot will respond "
-                "to anyone. Set bridges.discord.options.allowed_users in config.yaml."
+                "Discord bridge: allowed_users_dm is empty — the bot will respond "
+                "to DMs from anyone. Set bridges.discord.options.allowed_users_dm in config.yaml."
+            )
+        if not self._allowed_servers:
+            logger.warning(
+                "Discord bridge: allowed_servers is empty — the bot will not respond "
+                "in any server. Set bridges.discord.options.allowed_servers in config.yaml."
             )
         if not self._admin_users:
             logger.warning(
@@ -512,12 +531,7 @@ class DiscordBridge:
         if self._client.user and message.author.id == self._client.user.id:
             return
 
-        if not self._is_allowed(message.author.id):
-            logger.debug(
-                "Discord: ignoring message from unauthorized user %s (%s)",
-                message.author.id, message.author.display_name,
-            )
-            return
+        # Per-context access checks happen below (DM vs group).
 
         # ── Thread message ────────────────────────────────────────────
         if isinstance(message.channel, discord.Thread):
@@ -527,6 +541,12 @@ class DiscordBridge:
         # ── DM ────────────────────────────────────────────────────────
         if isinstance(message.channel, discord.DMChannel):
             if not self._dm_enabled:
+                return
+            if not self._is_allowed_dm(message.author.id):
+                logger.debug(
+                    "Discord: ignoring DM from unauthorized user %s (%s)",
+                    message.author.id, message.author.display_name,
+                )
                 return
             text        = message.content.strip()
             attachments = await self._fetch_attachments(message)
@@ -575,7 +595,14 @@ class DiscordBridge:
         # ── Group channel ─────────────────────────────────────────────
         # Trigger detection, mention stripping, buffering, and truncation are
         # all handled by GroupLane in router.py via the GroupPolicy we attach.
-        if self._guild_ids and message.guild and message.guild.id not in self._guild_ids:
+        if not message.guild or not self._is_allowed_server(
+            message.guild.id, message.channel.id
+        ):
+            logger.debug(
+                "Discord: ignoring message in unallowed guild/channel %s/%s",
+                getattr(message.guild, "id", None),
+                message.channel.id,
+            )
             return
 
         channel_id = str(message.channel.id)
