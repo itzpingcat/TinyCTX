@@ -68,6 +68,30 @@ Thread branching:
   If the origin message isn't mapped (e.g. predates the bot), the thread falls
   back to the channel's current tail.
 
+Slash commands:
+  All commands registered via CommandRegistry are automatically registered as
+  native Discord application commands (slash commands). They appear in Discord's
+  autocomplete UI and are dispatched via Interaction objects, not text parsing.
+
+  Registration happens in two stages:
+    1. On bot startup, _sync_app_commands() walks CommandRegistry and builds
+       one discord.app_commands.Command per (namespace, sub) entry. Commands
+       with a subcommand become "/namespace_sub" (underscore-joined) to stay
+       within Discord's single-level command limit. Bare "/namespace" commands
+       become "/namespace".
+    2. After the tree is built, app_commands.CommandTree.sync() pushes the
+       full command list to Discord's API. Sync is global (no guild_ids needed)
+       and takes up to 1 hour to propagate to all clients.
+
+  Interaction handling:
+    Each command immediately defers the interaction (sends a "thinking..."
+    acknowledgement within Discord's 3-second window), calls the handler with
+    the standard context dict (plus "interaction" and "followup" keys), then
+    calls interaction.followup.send() with the result.
+
+  reset_command is also registered as a native slash command (/reset).
+  The text-based "/..." interception in on_message is removed entirely.
+
 Token setup:
   export DISCORD_BOT_TOKEN=your-bot-token-here
 
@@ -91,6 +115,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import discord
+from discord import app_commands
+from discord.ext import commands as discord_commands
 
 from TinyCTX.contracts import (
     ActivationMode,
@@ -339,14 +365,13 @@ class DiscordBridge:
         intents = discord.Intents.default()
         intents.message_content = True
         intents.members         = True
-        self._client = discord.Client(intents=intents)
+        # Use Bot instead of Client so we can attach an app_commands tree.
+        # command_prefix is set but unused — we rely on slash commands only.
+        self._client = discord_commands.Bot(command_prefix="\\", intents=intents)
+        self._tree   = self._client.tree
 
-        # Assign directly by name so discord.py dispatches to `on_ready` /
-        # `on_message`. Using client.event() would register under the method's
-        # __name__ (`_on_ready`, `_on_message`) — with the leading underscore —
-        # causing discord to silently drop every event because it looks for the
-        # un-prefixed names.
-        self._client.on_ready = self._on_ready
+        # Assign directly by name (same reason as before — avoid __name__ prefix).
+        self._client.on_ready   = self._on_ready
         self._client.on_message = self._on_message
 
     # ------------------------------------------------------------------
@@ -423,6 +448,138 @@ class DiscordBridge:
             new_id = lane.loop._tail_node_id
             if new_id and new_id != self._store.get(cursor_key):
                 self._store.set(cursor_key, new_id)
+
+    # ------------------------------------------------------------------
+    # App command sync
+    # ------------------------------------------------------------------
+
+    async def _sync_app_commands(self) -> None:
+        """
+        Walk CommandRegistry and register every entry as a native Discord
+        slash command, then sync the tree to Discord's API.
+
+        Naming: "/namespace sub" → "/namespace_sub" (Discord only allows one
+        level of nesting via CommandTree; subcommand groups add complexity we
+        don't need). Bare "/namespace" entries become "/namespace".
+
+        The /reset command is registered directly from bridge config so it
+        works even before any module has registered commands.
+        """
+        # Clear any previously registered commands so re-syncs are idempotent.
+        self._tree.clear_commands(guild=None)
+
+        # Register /reset from bridge config.
+        reset_cmd_name = self._reset_command.lstrip("/").replace(" ", "_")
+
+        @self._tree.command(name=reset_cmd_name, description="Reset the current session")
+        async def _reset_slash(interaction: discord.Interaction) -> None:
+            await self._handle_reset_interaction(interaction)
+
+        # Register all commands from the shared CommandRegistry.
+        for cmd_str, help_text in self._router.commands.list_commands():
+            # cmd_str is like "/memory consolidate" or "/heartbeat"
+            parts     = cmd_str.lstrip("/").split()
+            cmd_name  = "_".join(parts)          # "memory_consolidate" or "heartbeat"
+            namespace = parts[0]
+            sub       = parts[1] if len(parts) > 1 else ""
+            desc      = help_text or f"Run {cmd_str}"
+
+            # Capture loop variables in a closure.
+            def _make_handler(ns: str, s: str, cn: str):
+                @self._tree.command(name=cn, description=desc)
+                async def _slash_handler(interaction: discord.Interaction) -> None:
+                    await self._handle_command_interaction(interaction, ns, s)
+                return _slash_handler
+
+            _make_handler(namespace, sub, cmd_name)
+
+        try:
+            synced = await self._tree.sync()
+            logger.info(
+                "Discord bridge: synced %d app command(s) to Discord", len(synced)
+            )
+        except Exception:
+            logger.exception("Discord bridge: failed to sync app commands")
+
+    async def _handle_reset_interaction(self, interaction: discord.Interaction) -> None:
+        """Handle the /reset slash command."""
+        await interaction.response.defer(ephemeral=True)
+        user_id = interaction.user.id
+
+        if not self._is_admin(user_id):
+            await interaction.followup.send("⛔ Only admins can reset the session.", ephemeral=True)
+            return
+
+        # Find the cursor for the current channel/DM.
+        channel = interaction.channel
+        if isinstance(channel, discord.DMChannel):
+            cursor_key = f"dm:{interaction.user.id}"
+        elif isinstance(channel, discord.Thread):
+            cursor_key = f"thread:{channel.id}"
+        else:
+            cursor_key = f"group:{channel.id}" if channel else None
+
+        if cursor_key:
+            node_id = self._get_cursor(cursor_key)
+            if node_id:
+                self._router.reset_lane(node_id)
+        await interaction.followup.send("✅ Session reset.", ephemeral=True)
+        logger.info("Discord: session reset via /reset by %s", interaction.user.id)
+
+    async def _handle_command_interaction(
+        self,
+        interaction: discord.Interaction,
+        namespace: str,
+        sub: str,
+    ) -> None:
+        """Dispatch a registered CommandRegistry command via a native interaction."""
+        # Defer immediately — handlers can take longer than 3 seconds.
+        await interaction.response.defer(ephemeral=False)
+
+        # Build context dict matching what text-based dispatch used to pass,
+        # plus interaction-specific keys for handlers that want them.
+        channel = interaction.channel
+        if isinstance(channel, discord.DMChannel):
+            cursor_key = f"dm:{interaction.user.id}"
+        elif isinstance(channel, discord.Thread):
+            cursor_key = f"thread:{channel.id}"
+        else:
+            cursor_key = f"group:{channel.id}" if channel else None
+
+        node_id = self._get_or_create_cursor(cursor_key) if cursor_key else ""
+
+        reply_parts: list[str] = []
+
+        async def _send_reply(text: str) -> None:
+            reply_parts.append(text)
+
+        ctx = {
+            "channel":     channel,
+            "interaction": interaction,
+            "followup":    interaction.followup,
+            "guild":       interaction.guild,
+            "bridge":      self,
+            "router":      self._router,
+            "cursor":      node_id,
+            "send":        _send_reply,   # handlers call ctx["send"](text)
+        }
+
+        # Build the text form and dispatch through the registry.
+        text = f"/{namespace} {sub}".strip() if sub else f"/{namespace}"
+        handled = await self._router.commands.dispatch(text, ctx)
+
+        if not handled:
+            await interaction.followup.send("⚠️ Command not found.", ephemeral=True)
+            return
+
+        # If the handler accumulated reply parts via ctx["send"], send them.
+        if reply_parts:
+            combined = "\n".join(reply_parts)
+            for i in range(0, len(combined), self._max_len):
+                await interaction.followup.send(combined[i : i + self._max_len])
+        # If the handler sent nothing, send a silent acknowledgement.
+        else:
+            await interaction.followup.send("✅ Done.", ephemeral=True)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -530,9 +687,10 @@ class DiscordBridge:
             )
         if not self._admin_users:
             logger.warning(
-                "Discord bridge: admin_users is empty — nobody can use %s in group sessions.",
-                self._reset_command,
+                "Discord bridge: admin_users is empty — nobody can use /%s in group sessions.",
+                self._reset_command.lstrip("/"),
             )
+        await self._sync_app_commands()
 
     async def _on_message(self, message: discord.Message) -> None:
         if self._client.user and message.author.id == self._client.user.id:
@@ -559,22 +717,6 @@ class DiscordBridge:
             attachments = await self._fetch_attachments(message)
             if not text and not attachments:
                 return
-
-            # Slash commands in DMs also go through the module registry.
-            if text.startswith("/"):
-                dm_cursor_key = f"dm:{message.author.id}"
-                dm_node_id    = self._get_or_create_cursor(dm_cursor_key)
-                ctx = {
-                    "channel": message.channel,
-                    "message": message,
-                    "guild":   None,
-                    "bridge":  self,
-                    "router":  self._router,
-                    "cursor":  dm_node_id,
-                }
-                handled = await self._router.commands.dispatch(text, ctx)
-                if handled:
-                    return
 
             cursor_key = f"dm:{message.author.id}"
             node_id    = self._get_or_create_cursor(cursor_key)
@@ -615,35 +757,6 @@ class DiscordBridge:
         channel_id = str(message.channel.id)
         cursor_key = f"group:{channel_id}"
         raw_text   = message.content.strip()
-
-        if raw_text == self._reset_command:
-            if self._is_admin(message.author.id):
-                node_id = self._get_cursor(cursor_key)
-                if node_id:
-                    self._router.reset_lane(node_id)
-                await message.channel.send("✅ Session reset.")
-                logger.info(
-                    "Discord: group channel %s reset by admin %s",
-                    channel_id, message.author.id,
-                )
-            else:
-                await message.channel.send("⛔ Only admins can reset the session.")
-            return
-
-        # ── Slash commands (module registry) ─────────────────────────
-        if raw_text.startswith("/"):
-            node_id = self._get_or_create_cursor(cursor_key)
-            ctx = {
-                "channel":  message.channel,
-                "message":  message,
-                "guild":    message.guild,
-                "bridge":   self,
-                "router":   self._router,
-                "cursor":   node_id,
-            }
-            handled = await self._router.commands.dispatch(raw_text, ctx)
-            if handled:
-                return
 
         text        = await _humanize_mentions(raw_text, self._client)
         attachments = await self._fetch_attachments(message)
@@ -694,19 +807,6 @@ class DiscordBridge:
 
         node_id = self._get_or_create_thread_cursor(thread_id, channel_id)
 
-        # Slash commands in threads also go through the module registry.
-        if text.startswith("/"):
-            ctx = {
-                "channel": message.channel,
-                "message": message,
-                "guild":   message.guild,
-                "bridge":  self,
-                "router":  self._router,
-                "cursor":  node_id,
-            }
-            handled = await self._router.commands.dispatch(text, ctx)
-            if handled:
-                return
         author  = UserIdentity(
             platform=Platform.DISCORD,
             user_id=str(message.author.id),
