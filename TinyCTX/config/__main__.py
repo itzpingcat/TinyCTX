@@ -130,6 +130,14 @@ class GatewayConfig:
     port:    int  = 8085
     api_key: str  = ""
 
+    def __post_init__(self):
+        # Inside a container, the gateway must bind to 0.0.0.0 so Docker can
+        # forward the port. TINYCTX_GATEWAY_HOST overrides whatever config.yaml
+        # says without requiring a container-specific config file.
+        override = os.environ.get("TINYCTX_GATEWAY_HOST", "").strip()
+        if override:
+            self.host = override
+
 
 @dataclass
 class WorkspaceConfig:
@@ -145,7 +153,13 @@ class WorkspaceConfig:
     path: Path = field(default_factory=lambda: Path("~/.tinyctx").expanduser())
 
     def __post_init__(self):
-        self.path = Path(self.path).expanduser().resolve()
+        # Allow container deployments to override the workspace path via env var
+        # without modifying config.yaml (which may have a Windows host path).
+        override = os.environ.get("TINYCTX_WORKSPACE_OVERRIDE", "").strip()
+        if override:
+            self.path = Path(override).resolve()
+        else:
+            self.path = Path(self.path).expanduser().resolve()
 
 
 @dataclass

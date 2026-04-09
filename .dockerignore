@@ -1,0 +1,38 @@
+# .dockerignore — keep the build context lean and avoid leaking secrets
+
+# Version control
+.git
+.gitignore
+
+# Python artifacts
+__pycache__
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info
+.eggs
+dist/
+build/
+
+# Tests (not needed at runtime)
+tests/
+.pytest_cache/
+pytest.ini
+
+# Workspace (mounted at runtime, never baked in)
+workspace/
+.tinyctx/
+
+# Dev files
+*.bak
+*.swp
+*.swo
+TODO.md
+CLAUDE.md
+
+# Docker dir (just docs, not needed in image)
+
+# OS noise
+.DS_Store
+Thumbs.db
