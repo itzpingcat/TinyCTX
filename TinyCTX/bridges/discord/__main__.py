@@ -4,26 +4,33 @@ bridges/discord/__main__.py — Discord bridge for TinyCTX.
 Uses discord.py (pip install discord.py).
 
 Config (in config.yaml under bridges.discord.options):
-  token_env:        Name of the env var holding the bot token.
-                    Default: DISCORD_BOT_TOKEN
-  allowed_users:    Allowlist of Discord user IDs (integers) permitted to
-                    interact with the bot. Empty list = open to everyone.
-                    Messages from any user not on this list are silently
-                    ignored before being pushed to the router.
-                    Default: []  (WARNING: open access — set this!)
-  admin_users:      List of Discord user IDs (integers) permitted to use
-                    /reset in group sessions. Empty = nobody can reset.
-                    Default: []
-  dm_enabled:       Allow DMs to the bot. Default: true
-  guild_ids:        List of guild IDs where the bot responds in group channels.
-                    Empty = respond in all guilds. Default: []
-  prefix_required:  In group channels, only respond when @mentioned or when
-                    the message starts with the command_prefix.
-                    Default: true (ignore messages that don't mention or prefix)
-  command_prefix:   Text prefix that triggers the bot in group channels.
-                    Default: "!"
-  reset_command:    Command string that triggers a session reset in group channels.
-                    Default: "/reset"
+  token_env:         Name of the env var holding the bot token.
+                     Default: DISCORD_BOT_TOKEN
+  allowed_users_dm:  Allowlist of Discord user IDs (integers) permitted to DM
+                     the bot. Empty list = open to everyone.
+                     Default: []  (WARNING: open access — set this!)
+  allowed_servers:   Map of server (guild) ID to a list of allowed channel IDs.
+                     Only servers present in this map are served. For each
+                     server, an empty channel list means all channels are
+                     allowed; a non-empty list restricts to those channels.
+                     Default: {}  (WARNING: no servers will be served — set this!)
+                     Example:
+                       allowed_servers:
+                         123456789012345678: []          # all channels
+                         987654321098765432:             # specific channels only
+                           - 111111111111111111
+                           - 222222222222222222
+  admin_users:       List of Discord user IDs (integers) permitted to use
+                     /reset in group sessions. Empty = nobody can reset.
+                     Default: []
+  dm_enabled:        Allow DMs to the bot. Default: true
+  prefix_required:   In group channels, only respond when @mentioned or when
+                     the message starts with the command_prefix.
+                     Default: true (ignore messages that don't mention or prefix)
+  command_prefix:    Text prefix that triggers the bot in group channels.
+                     Default: "!"
+  reset_command:     Command string that triggers a session reset in group channels.
+                     Default: "/reset"
   buffer_timeout_s:  In group channels, seconds to wait after a non-trigger
                      message before flushing buffered messages anyway.
                      0 = disabled (only flush on trigger). Default: 0
@@ -36,7 +43,7 @@ Config (in config.yaml under bridges.discord.options):
                      Trigger detection, buffering, and truncation are all
                      handled by GroupLane in router.py via GroupPolicy.
   max_reply_length:  Discord message length cap before chunking. Default: 1900
-  typing_indicator: Show "Bot is typing..." while the agent thinks. Default: true
+  typing_indicator:  Show "Bot is typing..." while the agent thinks. Default: true
 
 Thread branching:
   When a Discord thread is created inside a tracked channel, the bot creates a

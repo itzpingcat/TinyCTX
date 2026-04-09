@@ -4,43 +4,58 @@ bridges/matrix/__main__.py — Matrix bridge for TinyCTX.
 Uses matrix-nio (pip install matrix-nio).
 
 Config (in config.yaml under bridges.matrix.options):
-  homeserver:       Full URL of your homeserver, e.g. https://matrix.org
-  username:         Full Matrix ID, e.g. @yourbot:matrix.org
-  password_env:     Name of the env var holding the account password.
-                    Default: MATRIX_PASSWORD
-  device_name:      Device display name registered with the server.
-                    Default: TinyCTX
-  store_path:       Path (relative to workspace) for nio's E2EE key store.
-                    Default: matrix_store
-  allowed_users:    Allowlist of Matrix user IDs (full MXIDs, e.g.
-                    "@you:matrix.org") permitted to interact with the bot.
-                    Empty list = open to everyone.
-                    Default: []  (WARNING: open access — set this!)
-  admin_users:      List of Matrix user IDs (full MXIDs) permitted to use
-                    /reset in group rooms. Empty = nobody can reset.
-                    Default: []
-  dm_enabled:       Respond to 1-on-1 rooms. Default: true
-  room_ids:         Whitelist of room IDs to respond in. Empty = all rooms
-                    the bot is joined to. Default: []
-  prefix_required:  In non-DM rooms, only respond when @mentioned or when
-                    the message starts with command_prefix. Default: true
-  command_prefix:   Text prefix that triggers the bot in rooms.
-                    Default: "!"
-  reset_command:    Command string that triggers a session reset in group rooms.
-                    Default: "/reset"
+  homeserver:        Full URL of your homeserver, e.g. https://matrix.org
+  username:          Full Matrix ID, e.g. @yourbot:matrix.org
+  password_env:      Name of the env var holding the account password.
+                     Default: MATRIX_PASSWORD
+  device_name:       Device display name registered with the server.
+                     Default: TinyCTX
+  store_path:        Path (relative to workspace) for nio's E2EE key store.
+                     Default: matrix_store
+  allowed_users:     Allowlist of Matrix user IDs (full MXIDs, e.g.
+                     "@you:matrix.org") permitted to interact with the bot.
+                     Empty list = open to everyone.
+                     Default: []  (WARNING: open access — set this!)
+  admin_users:       List of Matrix user IDs (full MXIDs) permitted to use
+                     /reset in group rooms. Empty = nobody can reset.
+                     Default: []
+  dm_enabled:        Respond to 1-on-1 rooms. Default: true
+  room_ids:          Whitelist of room IDs to respond in. Empty = all rooms
+                     the bot is joined to. Default: []
+  prefix_required:   In non-DM rooms, only respond when @mentioned or when
+                     the message starts with command_prefix. Default: true
+  command_prefix:    Text prefix that triggers the bot in rooms.
+                     Default: "!"
+  reset_command:     Command string that triggers a session reset in group rooms.
+                     Default: "/reset"
   buffer_timeout_s:  In group rooms, seconds to wait after a non-trigger
-                    message before flushing buffered messages anyway.
-                    0 = disabled (only flush on trigger). Default: 0
+                     message before flushing buffered messages anyway.
+                     0 = disabled (only flush on trigger). Default: 0
   buffer_head_lines: When truncating a large burst, keep this many messages
-                    from the START (topic context). Default: 2
+                     from the START (topic context). Default: 2
   buffer_tail_lines: Messages to keep from the END of a truncated burst
-                    (closest to the trigger). Default: 10
-  max_reply_length: Max characters per Matrix message before chunking.
-                    Default: 16000
-  sync_timeout_ms:  Long-poll timeout per /sync call in ms. Default: 30000
+                     (closest to the trigger). Default: 10
+                     Omitted middle is replaced with:
+                     "... [N messages not shown] ..."
+                     Trigger detection, buffering, and truncation are all
+                     handled by GroupLane in router.py via GroupPolicy.
+  max_reply_length:  Max characters per Matrix message before chunking.
+                     Default: 16000
+  sync_timeout_ms:   Long-poll timeout per /sync call in ms. Default: 30000
+
+Cursor persistence:
+  All cursors (DMs and group rooms) are persisted to
+  workspace/cursors/matrix.json so sessions survive bot restarts. The file maps
+  cursor_key strings to DB node UUIDs:
+    "dm:<sender_mxid>"    → node_id
+    "group:<room_id>"     → node_id  (advances with each turn)
 
 Password setup:
   export MATRIX_PASSWORD=your-password-here
+
+Finding your MXID:
+  Your full Matrix ID is shown in your client under Settings → Profile,
+  in the format @username:homeserver.tld
 
 Required:
   pip install matrix-nio

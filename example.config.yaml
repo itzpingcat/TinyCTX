@@ -108,33 +108,40 @@ bridges:
   # Invite URL scopes: bot
   # Invite URL permissions: Read Messages, Send Messages, Read Message History
   #
-  # Finding your user ID:
+  # Finding your user/server/channel IDs:
   #   Enable Developer Mode in Discord (Settings → Advanced → Developer Mode),
-  #   then right-click your username and select "Copy User ID".
+  #   then right-click any user, server, or channel and select "Copy ID".
   #
   # Options:
-  #   token_env        Env var holding the bot token. Default: DISCORD_BOT_TOKEN
-  #   allowed_users    Allowlist of Discord user IDs (integers). Only these users
-  #                    can interact with the bot. Empty = open to everyone
-  #                    (NOT recommended if the bot has tool access).
-  #   dm_enabled       Allow DMs to the bot. Default: true
-  #   guild_ids        Whitelist of guild IDs (integers). Empty = all guilds.
-  #   prefix_required  In guild channels, only respond when @mentioned or when
-  #                    the message starts with command_prefix. Default: true
-  #   command_prefix   Text prefix that triggers the bot in guild channels.
-  #                    Default: "!"
-  #   max_reply_length Max characters per Discord message before chunking.
-  #                    Default: 1900 (stays under Discord's 2000-char limit)
-  #   typing_indicator Show "Bot is typing..." while the agent is running.
-  #                    Default: true
+  #   token_env         Env var holding the bot token. Default: DISCORD_BOT_TOKEN
+  #   allowed_users_dm  Allowlist of Discord user IDs (integers) permitted to DM
+  #                     the bot. Empty = open to everyone (not recommended).
+  #   allowed_servers   Map of server (guild) ID → list of allowed channel IDs.
+  #                     Only servers listed here are served. An empty channel
+  #                     list means all channels in that server are allowed.
+  #   admin_users       User IDs permitted to use /reset in group channels.
+  #   dm_enabled        Allow DMs to the bot. Default: true
+  #   prefix_required   In guild channels, only respond when @mentioned or when
+  #                     the message starts with command_prefix. Default: true
+  #   command_prefix    Text prefix that triggers the bot in guild channels.
+  #                     Default: "!"
+  #   max_reply_length  Max characters per Discord message before chunking.
+  #                     Default: 1900 (stays under Discord's 2000-char limit)
+  #   typing_indicator  Show "Bot is typing..." while the agent is running.
+  #                     Default: true
   # --------------------------------------------------------------------------
   discord:
     enabled: false
     options:
       token_env: DISCORD_BOT_TOKEN
-      allowed_users: []           # e.g. [123456789012345678, 987654321098765432]
+      allowed_users_dm: []        # e.g. [123456789012345678]
+      allowed_servers: {}         # e.g.:
+                                  #   123456789012345678: []        # all channels
+                                  #   987654321098765432:           # specific channels
+                                  #     - 111111111111111111
+                                  #     - 222222222222222222
+      admin_users: []             # e.g. [123456789012345678]
       dm_enabled: true
-      guild_ids: []               # e.g. [123456789012345678]
       prefix_required: true
       command_prefix: "!"
       max_reply_length: 1900
@@ -152,21 +159,28 @@ bridges:
   #   in the format @username:homeserver.tld
   #
   # Options:
-  #   homeserver       Full URL of your homeserver.
-  #   username         Full Matrix ID of the bot account (@bot:server.tld).
-  #   password_env     Env var holding the account password. Default: MATRIX_PASSWORD
-  #   device_name      Device label shown in account sessions. Default: TinyCTX
-  #   store_path       nio key store path, relative to workspace. Default: matrix_store
-  #   allowed_users    Allowlist of full MXIDs (@user:server.tld). Only these users
-  #                    can interact with the bot. Empty = open to everyone
-  #                    (NOT recommended if the bot has tool access).
-  #   dm_enabled       Respond in 1-on-1 rooms. Default: true
-  #   room_ids         Whitelist of room IDs. Empty = all joined rooms.
-  #   prefix_required  In group rooms, only respond when @mentioned or prefixed.
-  #                    Default: true
-  #   command_prefix   Default: "!"
-  #   max_reply_length Default: 16000
-  #   sync_timeout_ms  Long-poll timeout per /sync call. Default: 30000
+  #   homeserver         Full URL of your homeserver.
+  #   username           Full Matrix ID of the bot account (@bot:server.tld).
+  #   password_env       Env var holding the account password. Default: MATRIX_PASSWORD
+  #   device_name        Device label shown in account sessions. Default: TinyCTX
+  #   store_path         nio key store path, relative to workspace. Default: matrix_store
+  #   allowed_users      Allowlist of full MXIDs (@user:server.tld). Only these users
+  #                      can interact with the bot. Empty = open to everyone
+  #                      (NOT recommended if the bot has tool access).
+  #   admin_users        MXIDs permitted to use /reset in group rooms.
+  #   dm_enabled         Respond in 1-on-1 rooms. Default: true
+  #   room_ids           Whitelist of room IDs. Empty = all joined rooms.
+  #   prefix_required    In group rooms, only respond when @mentioned or prefixed.
+  #                      Default: true
+  #   command_prefix     Default: "!"
+  #   buffer_timeout_s   Seconds to wait before flushing buffered non-trigger
+  #                      messages without a trigger arriving. 0 = disabled.
+  #   buffer_head_lines  Lines to keep from the START when truncating a burst.
+  #                      Default: 2
+  #   buffer_tail_lines  Lines to keep from the END when truncating a burst.
+  #                      Default: 10
+  #   max_reply_length   Default: 16000
+  #   sync_timeout_ms    Long-poll timeout per /sync call. Default: 30000
   # --------------------------------------------------------------------------
   matrix:
     enabled: false
@@ -177,10 +191,14 @@ bridges:
       device_name: TinyCTX
       store_path: matrix_store
       allowed_users: []           # e.g. ["@you:matrix.org", "@friend:matrix.org"]
+      admin_users: []             # e.g. ["@you:matrix.org"]
       dm_enabled: true
       room_ids: []
       prefix_required: true
       command_prefix: "!"
+      buffer_timeout_s: 0
+      buffer_head_lines: 2
+      buffer_tail_lines: 10
       max_reply_length: 16000
       sync_timeout_ms: 30000
 
