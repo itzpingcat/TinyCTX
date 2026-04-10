@@ -359,6 +359,7 @@ class DiscordBridge:
         # In-flight state (not persisted)
         self._accumulators:  dict[str, _ReplyAccumulator] = {}
         self._typing_active: dict[str, asyncio.Event]     = {}
+        self._tasks:         set[asyncio.Task]            = set()  # strong refs, prevent GC
         # Maps cursor_key -> original lane node_id (never advances after creation).
         # Used by reset so we look up the lane by its stable key, and so we
         # can rewind the persisted cursor back to the session anchor.
@@ -767,9 +768,11 @@ class DiscordBridge:
             )
             acc = _ReplyAccumulator(message.channel, self._max_len)
             self._accumulators[node_id] = acc
-            asyncio.create_task(
+            task = asyncio.create_task(
                 self._handle_turn(msg, message.channel, node_id, acc, cursor_key)
             )
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
             return
 
         # ── Group channel ─────────────────────────────────────────────
@@ -826,12 +829,14 @@ class DiscordBridge:
         )
         acc = _ReplyAccumulator(message.channel, self._max_len)
         self._accumulators[node_id] = acc
-        asyncio.create_task(
+        task = asyncio.create_task(
             self._handle_turn(
                 msg, message.channel, node_id, acc, cursor_key,
                 record_msg_node=str(message.id),
             )
         )
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
 
     # ------------------------------------------------------------------
     # Thread message handler
@@ -868,9 +873,11 @@ class DiscordBridge:
         )
         acc = _ReplyAccumulator(message.channel, self._max_len)
         self._accumulators[node_id] = acc
-        asyncio.create_task(
+        task = asyncio.create_task(
             self._handle_turn(msg, message.channel, node_id, acc, cursor_key)
         )
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
 
     # ------------------------------------------------------------------
     # Turn handling
