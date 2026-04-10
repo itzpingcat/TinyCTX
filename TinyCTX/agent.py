@@ -555,12 +555,23 @@ class AgentLoop:
     # Lifecycle
     # ------------------------------------------------------------------
 
-    def reset(self) -> None:
+    def reset(self, rewind_to: str | None = None) -> None:
         """
-        Clear in-memory context. Does NOT touch agent.db — the tree is
-        permanent. The cursor stays at the current tail; the agent will
-        continue to see prior history when it next assembles context.
+        Clear in-memory context and rewind the cursor.
+
+        rewind_to: node_id to rewind the cursor to (e.g. the original lane
+                   anchor). If None, rewinds to lane_node_id (the node this
+                   AgentLoop was opened with). Does NOT touch agent.db — the
+                   tree is permanent; history is simply re-walked from the
+                   rewound cursor on the next assemble().
         """
+        target = rewind_to if rewind_to is not None else self.lane_node_id
         self.context.clear()
+        self._tail_node_id = target
+        self.tail_node_id  = target
+        self.context.set_tail(target)
         self._turn_count = 0
-        logger.info("[cursor=%s] reset (in-memory only — tree intact)", self._tail_node_id)
+        logger.info(
+            "[cursor=%s] reset — rewound to %s",
+            target, target,
+        )

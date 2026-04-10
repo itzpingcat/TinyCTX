@@ -355,6 +355,10 @@ class DiscordBridge:
         # In-flight state (not persisted)
         self._accumulators:  dict[str, _ReplyAccumulator] = {}
         self._typing_active: dict[str, asyncio.Event]     = {}
+        # Maps cursor_key -> original lane node_id (never advances after creation).
+        # Used by reset so we look up the lane by its stable key, and so we
+        # can rewind the persisted cursor back to the session anchor.
+        self._lane_keys: dict[str, str] = {}
 
         # Persisted cursor store
         workspace   = Path(router._config.workspace.path).expanduser().resolve()
@@ -384,10 +388,16 @@ class DiscordBridge:
     def _get_or_create_cursor(self, cursor_key: str) -> str:
         node_id = self._store.get(cursor_key)
         if node_id:
+            # Restore lane_key if we lost it (e.g. after restart). On restart
+            # the persisted cursor IS the lane anchor because _advance_cursor
+            # wasn't called yet for the new lane lifetime.
+            if cursor_key not in self._lane_keys:
+                self._lane_keys[cursor_key] = node_id
             return node_id
         db      = _open_db(self._router)
         node_id = _make_session_node(db, cursor_key)
         self._store.set(cursor_key, node_id)
+        self._lane_keys[cursor_key] = node_id
         logger.info("Discord: created cursor %s -> %s", cursor_key, node_id)
         return node_id
 
@@ -505,14 +515,15 @@ class DiscordBridge:
         """Handle the /reset slash command."""
         await interaction.response.defer(ephemeral=True)
         user_id = interaction.user.id
+        channel = interaction.channel
+        is_dm   = isinstance(channel, discord.DMChannel)
 
-        if not self._is_admin(user_id):
+        if not is_dm and not self._is_admin(user_id):
             await interaction.followup.send("⛔ Only admins can reset the session.", ephemeral=True)
             return
 
-        # Find the cursor for the current channel/DM.
-        channel = interaction.channel
-        if isinstance(channel, discord.DMChannel):
+        # Determine cursor_key for this context.
+        if is_dm:
             cursor_key = f"dm:{interaction.user.id}"
         elif isinstance(channel, discord.Thread):
             cursor_key = f"thread:{channel.id}"
@@ -520,11 +531,23 @@ class DiscordBridge:
             cursor_key = f"group:{channel.id}" if channel else None
 
         if cursor_key:
-            node_id = self._get_cursor(cursor_key)
-            if node_id:
-                self._router.reset_lane(node_id)
+            # Look up the original lane node_id (never advances after creation).
+            lane_node_id = self._lane_keys.get(cursor_key)
+            if lane_node_id:
+                self._router.reset_lane(lane_node_id)
+                # Rewind the persisted cursor back to the session anchor so the
+                # next turn re-opens history from the beginning of this session.
+                self._store.set(cursor_key, lane_node_id)
+                logger.info(
+                    "Discord: session reset via /reset by %s — cursor rewound to %s",
+                    interaction.user.id, lane_node_id,
+                )
+            else:
+                logger.warning(
+                    "Discord: /reset by %s — no lane_key for cursor %s (no session yet?)",
+                    interaction.user.id, cursor_key,
+                )
         await interaction.followup.send("✅ Session reset.", ephemeral=True)
-        logger.info("Discord: session reset via /reset by %s", interaction.user.id)
 
     async def _handle_command_interaction(
         self,
@@ -760,6 +783,20 @@ class DiscordBridge:
 
         text        = await _humanize_mentions(raw_text, self._client)
         attachments = await self._fetch_attachments(message)
+
+        # Treat a Reply-to-bot as an @mention so GroupLane trigger detection
+        # fires even when the user didn't type the mention explicitly.
+        bot_id = self._client.user.id if self._client.user else None
+        if bot_id:
+            ref = message.reference
+            resolved = ref.resolved if ref else None
+            if (
+                isinstance(resolved, discord.Message)
+                and resolved.author.id == bot_id
+                and f"<@{bot_id}>" not in text
+                and f"<@!{bot_id}>" not in text
+            ):
+                text = f"<@{bot_id}> {text}"
         if not text and not attachments:
             return
 

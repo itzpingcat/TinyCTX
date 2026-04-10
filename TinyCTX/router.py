@@ -121,7 +121,8 @@ class Lane:
                 self.queue.task_done()
 
     def reset(self) -> None:
-        self.loop.reset()  # clears in-memory context; tree in agent.db is preserved
+        # Rewind cursor back to the lane's original anchor node.
+        self.loop.reset(rewind_to=self.node_id)
 
     async def stop(self) -> None:
         if self._worker and not self._worker.done():
