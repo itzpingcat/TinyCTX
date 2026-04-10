@@ -225,6 +225,10 @@ class CursorStore:
         self._cursors[cursor_key] = node_id
         self._save(self._cursor_file, self._cursors)
 
+    def delete(self, cursor_key: str) -> None:
+        self._cursors.pop(cursor_key, None)
+        self._save(self._cursor_file, self._cursors)
+
     def all_cursors(self) -> dict[str, str]:
         return dict(self._cursors)
 
@@ -531,22 +535,26 @@ class DiscordBridge:
             cursor_key = f"group:{channel.id}" if channel else None
 
         if cursor_key:
-            # Look up the original lane node_id (never advances after creation).
             lane_node_id = self._lane_keys.get(cursor_key)
             if lane_node_id:
+                # Live lane exists — reset it and rewind the persisted cursor
+                # back to the session anchor.
                 self._router.reset_lane(lane_node_id)
-                # Rewind the persisted cursor back to the session anchor so the
-                # next turn re-opens history from the beginning of this session.
                 self._store.set(cursor_key, lane_node_id)
                 logger.info(
                     "Discord: session reset via /reset by %s — cursor rewound to %s",
                     interaction.user.id, lane_node_id,
                 )
             else:
-                logger.warning(
-                    "Discord: /reset by %s — no lane_key for cursor %s (no session yet?)",
+                # No live lane (bot just restarted or no messages sent yet) —
+                # wipe the persisted cursor so the next message starts fresh.
+                self._store.delete(cursor_key)
+                logger.info(
+                    "Discord: session reset via /reset by %s — no live lane, cursor deleted for %s",
                     interaction.user.id, cursor_key,
                 )
+            # Clear lane_keys so the next message rebuilds from scratch.
+            self._lane_keys.pop(cursor_key, None)
         await interaction.followup.send("✅ Session reset.", ephemeral=True)
 
     async def _handle_command_interaction(
