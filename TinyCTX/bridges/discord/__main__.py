@@ -636,12 +636,14 @@ class DiscordBridge:
     def _build_group_policy(self) -> GroupPolicy:
         """Build the GroupPolicy for this channel from bridge config."""
         activation = ActivationMode.ALWAYS if not self._prefix_required else ActivationMode.MENTION
-        bot_id     = str(self._client.user.id) if self._client.user else ""
+        # Mentions are humanized to "@username" before trigger detection, so
+        # match against the humanized form rather than the raw <@id> snowflake.
+        bot_name   = self._client.user.name if self._client.user else ""
         return GroupPolicy(
             activation=activation,
             trigger_prefix=self._prefix,
-            bot_mxid=f"<@{bot_id}>",        # Discord mention format
-            bot_localpart=f"<@!{bot_id}>",   # legacy mention format
+            bot_mxid=f"@{bot_name}",   # matches humanized @mention
+            bot_localpart="",           # no legacy form needed after humanization
             buffer_timeout_s=self._buffer_timeout_s,
             buffer_head_lines=self._buffer_head_lines,
             buffer_tail_lines=self._buffer_tail_lines,
@@ -792,22 +794,23 @@ class DiscordBridge:
         cursor_key = f"group:{channel_id}"
         raw_text   = message.content.strip()
 
+        bot_id      = self._client.user.id if self._client.user else None
         text        = await _humanize_mentions(raw_text, self._client)
         attachments = await self._fetch_attachments(message)
 
         # Treat a Reply-to-bot as an @mention so GroupLane trigger detection
         # fires even when the user didn't type the mention explicitly.
-        bot_id = self._client.user.id if self._client.user else None
-        if bot_id:
+        # Note: text is already humanized, so inject "@botname" not "<@id>".
+        bot_name = self._client.user.name if self._client.user else None
+        if bot_id and bot_name:
             ref = message.reference
             resolved = ref.resolved if ref else None
             if (
                 isinstance(resolved, discord.Message)
                 and resolved.author.id == bot_id
-                and f"<@{bot_id}>" not in text
-                and f"<@!{bot_id}>" not in text
+                and f"@{bot_name}" not in text
             ):
-                text = f"<@{bot_id}> {text}"
+                text = f"@{bot_name} {text}"
         if not text and not attachments:
             return
 
