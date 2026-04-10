@@ -30,6 +30,13 @@ services:
         target: /app/config.yaml
         read_only: true
 
+      # Source: mount live source over the baked-in copy so code changes
+      # take effect on restart without rebuilding the image.
+      - type: bind
+        source: ./TinyCTX
+        target: /app/TinyCTX
+        read_only: true
+
     # ── environment ────────────────────────────────────────────────────────
     # Bare keys (no value) forward the var from the host environment.
     # Set these on your host before running docker compose up — the same
