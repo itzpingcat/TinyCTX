@@ -1,4 +1,4 @@
-"""
+﻿"""
 bridges/discord/__main__.py — Discord bridge for TinyCTX.
 
 Uses discord.py (pip install discord.py).
@@ -804,7 +804,7 @@ class DiscordBridge:
             author     = UserIdentity(
                 platform=Platform.DISCORD,
                 user_id=str(message.author.id),
-                username=message.author.display_name,
+                username=message.author.name,
             )
             msg = InboundMessage(
                 tail_node_id=node_id,
@@ -867,7 +867,7 @@ class DiscordBridge:
         author  = UserIdentity(
             platform=Platform.DISCORD,
             user_id=str(message.author.id),
-            username=message.author.display_name,
+            username=message.author.name,
         )
         policy = self._build_group_policy()
         msg = InboundMessage(
@@ -934,7 +934,7 @@ class DiscordBridge:
         author  = UserIdentity(
             platform=Platform.DISCORD,
             user_id=str(message.author.id),
-            username=message.author.display_name,
+            username=message.author.name,
         )
         msg = InboundMessage(
             tail_node_id=node_id,
