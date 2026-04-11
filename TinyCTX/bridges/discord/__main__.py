@@ -634,6 +634,19 @@ class DiscordBridge:
     def _is_admin(self, user_id: int) -> bool:
         return user_id in self._admin_users
 
+    def _is_group_trigger(self, text: str, policy: GroupPolicy) -> bool:
+        """Mirror of GroupLane._is_trigger — used to skip accumulator creation
+        for non-trigger messages that GroupLane will just buffer."""
+        if policy.activation == ActivationMode.ALWAYS:
+            return True
+        if text.startswith(policy.trigger_prefix):
+            return True
+        if policy.bot_mxid and policy.bot_mxid in text:
+            return True
+        if policy.bot_localpart and f"@{policy.bot_localpart}" in text:
+            return True
+        return False
+
     def _build_group_policy(self) -> GroupPolicy:
         """Build the GroupPolicy for this channel from bridge config."""
         activation = ActivationMode.ALWAYS if not self._prefix_required else ActivationMode.MENTION
@@ -825,6 +838,7 @@ class DiscordBridge:
             user_id=str(message.author.id),
             username=message.author.display_name,
         )
+        policy = self._build_group_policy()
         msg = InboundMessage(
             tail_node_id=node_id,
             author=author,
@@ -833,9 +847,21 @@ class DiscordBridge:
             message_id=str(message.id),
             timestamp=time.time(),
             attachments=attachments,
-            group_policy=self._build_group_policy(),
+            group_policy=policy,
         )
-        acc = _ReplyAccumulator(message.channel, self._max_len)
+
+        # Check if this message is a trigger BEFORE spawning _handle_turn.
+        # Non-trigger messages are just buffered by GroupLane — they will never
+        # produce an agent response on their own, so we must not wait on an
+        # accumulator for them (that would hold the lane lock and deadlock the
+        # next trigger message).
+        is_trigger = self._is_group_trigger(text, policy)
+        if not is_trigger:
+            # Push to GroupLane for buffering; no accumulator needed.
+            await self._router.push(msg)
+            return
+
+        acc  = _ReplyAccumulator(message.channel, self._max_len)
         task = asyncio.create_task(
             self._handle_turn(
                 msg, message.channel, node_id, acc, cursor_key,
