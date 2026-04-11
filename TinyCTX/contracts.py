@@ -141,6 +141,8 @@ class InboundMessage:
                     The router opens or reuses the Lane keyed by this id.
     author        — who sent the message (platform + user_id + display name)
     group_policy  — present for group/channel messages; None for DMs
+    server_name   — human-readable server/guild name (e.g. Discord guild name); None for DMs
+    channel_name  — human-readable channel or thread name; None for DMs
     """
     tail_node_id: str
     author:       UserIdentity
@@ -152,6 +154,8 @@ class InboundMessage:
     attachments:  tuple["Attachment", ...] = field(default_factory=tuple)
     trace_id:     str           = field(default_factory=lambda: str(uuid.uuid4()))
     group_policy: "GroupPolicy | None" = None  # set by bridge for group messages
+    server_name:  str | None    = None          # guild/server name (bridges populate when known)
+    channel_name: str | None    = None          # channel/thread name (bridges populate when known)
 
 
 # ---------------------------------------------------------------------------

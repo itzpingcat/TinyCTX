@@ -311,6 +311,16 @@ class AgentLoop:
             else:
                 # Ensure key is absent for DM lanes (e.g. after a reset).
                 self.context.state.pop("group_policy", None)
+            # Server/channel identity — stable for the lifetime of a lane, safe
+            # to use in the cached EM.md block.  Absent for DMs and CLI.
+            if msg.server_name is not None:
+                self.context.state["server_name"] = msg.server_name
+            else:
+                self.context.state.pop("server_name", None)
+            if msg.channel_name is not None:
+                self.context.state["channel_name"] = msg.channel_name
+            else:
+                self.context.state.pop("channel_name", None)
             if msg.attachments:
                 primary_cfg  = self.config.get_model_config(self.config.llm.primary)
                 user_content = build_content_blocks(

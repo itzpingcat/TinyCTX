@@ -121,6 +121,8 @@ def _build_variables(agent, ctx=None, trusted_users: frozenset = frozenset()) ->
         "is_dm":          not is_group_chat,
         "platform":       platform,
         "trusted":        trusted,
+        "server_name":    (ctx.state.get("server_name") or "") if ctx is not None else "",
+        "channel_name":   (ctx.state.get("channel_name") or "") if ctx is not None else "",
     }
 
 
@@ -160,6 +162,8 @@ def _build_static_variables(agent, ctx=None, trusted_users: frozenset = frozense
         "is_dm":          not is_group_chat,
         "platform":       platform,
         "trusted":        trusted,
+        "server_name":    (ctx.state.get("server_name") or "") if ctx is not None else "",
+        "channel_name":   (ctx.state.get("channel_name") or "") if ctx is not None else "",
     }
 
 

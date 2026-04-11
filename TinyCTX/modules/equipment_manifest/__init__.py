@@ -6,7 +6,9 @@ EXTENSION_META = {
         "EM.md is a Jinja2-lite template that may use {% if %}/{% else %}/{% endif %} "
         "blocks and {{ variable }} substitutions. Available variables: "
         "system (OS name), date, time, workspace_path, config_path, "
-        "is_group_chat, is_dm, platform, trusted. "
+        "is_group_chat, is_dm, platform, trusted, "
+        "server_name (guild/server name, empty string for DMs/CLI), "
+        "channel_name (channel or thread name, empty string for DMs/CLI). "
         "If EM.md is missing or empty, the module is a no-op."
     ),
     "default_config": {

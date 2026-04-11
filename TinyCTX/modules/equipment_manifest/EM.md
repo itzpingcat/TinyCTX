@@ -27,7 +27,8 @@
 
 {% if is_group_chat %}
 ## Group Chat Context
-You are operating in a multi-user group chat{% if platform %} on {{ platform }}{% endif %}. Multiple people share this session.
+
+You are operating in a multi-user group chat{% if platform %} on {{ platform }}{% endif %}{% if server_name %} in **{{ server_name }}**{% endif %}{% if channel_name %} / **#{{ channel_name }}**{% endif %}. Multiple people share this session.
 
 Each user message in the conversation history is prefixed with the sender's name in the format:
 `[username]: message text`

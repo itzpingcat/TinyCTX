@@ -814,6 +814,9 @@ class DiscordBridge:
                 message_id=str(message.id),
                 timestamp=time.time(),
                 attachments=attachments,
+                # DMs have no server or channel name.
+                server_name=None,
+                channel_name=None,
             )
             acc = _ReplyAccumulator(message.channel, self._max_len)
             task = asyncio.create_task(
@@ -876,6 +879,8 @@ class DiscordBridge:
             timestamp=time.time(),
             attachments=attachments,
             group_policy=policy,
+            server_name=message.guild.name if message.guild else None,
+            channel_name=message.channel.name if hasattr(message.channel, "name") else None,
         )
 
         # Check if this message is a trigger BEFORE spawning _handle_turn.
@@ -939,6 +944,8 @@ class DiscordBridge:
             message_id=str(message.id),
             timestamp=time.time(),
             attachments=attachments,
+            server_name=message.guild.name if message.guild else None,
+            channel_name=thread.name,
         )
         acc = _ReplyAccumulator(message.channel, self._max_len)
         task = asyncio.create_task(
