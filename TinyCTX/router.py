@@ -262,11 +262,12 @@ class GroupLane:
         self._cancel_timeout()
         buffered      = self._buffer[:]
         self._buffer  = []
+        p             = self._policy
+        trigger_line  = f"[{trigger.author.username}]: {trigger.text}"
         if not buffered:
-            return trigger
-        p     = self._policy
+            return _gp_replace_text(trigger, trigger_line)
         lines = [f"[{m.author.username}]: {m.text}" for m in buffered]
-        lines.append(trigger.text)
+        lines.append(trigger_line)
         combined_text = _format_buffer_lines(
             lines,
             head_lines=p.buffer_head_lines,
