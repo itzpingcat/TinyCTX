@@ -63,5 +63,5 @@ def register(agent) -> None:
         )
         return json.dumps(payload, ensure_ascii=False)
 
-    agent.tool_handler.register_tool(spawn_agent, always_on=True)
-    agent.tool_handler.register_tool(wait_agent, always_on=True)
+    agent.tool_handler.register_tool(spawn_agent, always_on=False)
+    agent.tool_handler.register_tool(wait_agent, always_on=False)
