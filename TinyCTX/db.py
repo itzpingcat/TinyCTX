@@ -21,12 +21,20 @@ ConversationDB(path)          — open (or create) the database
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+# Exhaustive set of roles the dialogue layer is allowed to write.
+# Anything outside this set is rejected at the DB boundary so malformed
+# or injected role strings can never corrupt assembly logic.
+_VALID_ROLES = {"user", "assistant", "system", "tool"}
 
 
 # ---------------------------------------------------------------------------
@@ -115,7 +123,11 @@ class ConversationDB:
 
     def ensure_schema(self) -> None:
         """Create tables and the global root node if they don't exist yet."""
-        self._conn.executescript(_SCHEMA)
+        # Run schema DDL inside an explicit transaction rather than via
+        # executescript(), which issues an implicit COMMIT first and would
+        # disable the WAL/foreign-key PRAGMAs set in __init__.
+        with self._conn:
+            self._conn.executescript(_SCHEMA)
         # Insert root node if not already present
         row = self._conn.execute("SELECT value FROM meta WHERE key = 'root_id'").fetchone()
         if row is None:
@@ -148,6 +160,21 @@ class ConversationDB:
         tool_call_id: str | None = None,
         author_id: str | None = None,
     ) -> Node:
+        # Validate role against the allowlist — all queries are already
+        # parameterized so there is no SQLi risk, but an invalid role would
+        # corrupt context assembly and is a sign something has gone wrong.
+        if role not in _VALID_ROLES:
+            raise ValueError(
+                f"ConversationDB.add_node: invalid role {role!r}. "
+                f"Must be one of {sorted(_VALID_ROLES)}."
+            )
+        # parent_id must be a non-empty string — only the global root node
+        # (written by ensure_schema) is allowed to have parent_id=None.
+        if not parent_id or not isinstance(parent_id, str):
+            raise ValueError(
+                "ConversationDB.add_node: parent_id must be a non-empty string. "
+                "Only the global root node may have parent_id=None."
+            )
         node_id = str(uuid.uuid4())
         now = time.time()
         self._conn.execute(
