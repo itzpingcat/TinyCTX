@@ -303,8 +303,9 @@ class AgentLoop:
             # Persist message metadata in context.state so modules (e.g. equipment_manifest)
             # can detect platform, DM vs group, etc. without importing bridge contracts.
             # These are set on every turn so state always reflects the current lane's identity.
-            self.context.state["platform"]     = msg.author.platform.value
-            self.context.state["author_name"]  = msg.author.username
+            self.context.state["platform"]    = msg.author.platform.value
+            self.context.state["author_name"] = msg.author.username
+            self.context.state["author_id"]   = msg.author.user_id
             if msg.group_policy is not None:
                 self.context.state["group_policy"] = msg.group_policy
             else:

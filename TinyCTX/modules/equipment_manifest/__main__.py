@@ -40,6 +40,10 @@ Available template variables (both templates):
   platform        — Bridge platform string: "discord", "matrix", "cli",
                     "api", "cron", or "" for synthetic/unknown turns.
                     Read from ctx.state["platform"].
+  trusted         — True when the current user is in the trusted_users list
+                    in equipment_manifest config (format: "platform:user_id").
+                    Always False for group chats — trust is DM-only.
+                    Read from ctx.state["author_id"] + ctx.state["platform"].
 
 NOTE: For best cache efficiency, avoid using {{ time }} or {{ date }} inside
 EM.md. Put time-sensitive content in EM_FOOTER.md instead.
@@ -80,7 +84,7 @@ _DEFAULT_FOOTER_TEMPLATE = "<clock>{{ time }}</clock>"
 # Variable builder
 # ---------------------------------------------------------------------------
 
-def _build_variables(agent, ctx=None) -> dict:
+def _build_variables(agent, ctx=None, trusted_users: frozenset = frozenset()) -> dict:
     now         = datetime.now()
     workspace   = Path(agent.config.workspace.path).expanduser().resolve()
     source_root = Path.cwd().resolve()
@@ -97,6 +101,14 @@ def _build_variables(agent, ctx=None) -> dict:
         ctx is not None and ctx.state.get("group_policy") is not None
     )
     platform = (ctx.state.get("platform") or "") if ctx is not None else ""
+    author_id = (ctx.state.get("author_id") or "") if ctx is not None else ""
+    # Trust is only meaningful in DMs — never grant it in group chats.
+    trusted = (
+        not is_group_chat
+        and bool(platform)
+        and bool(author_id)
+        and f"{platform}:{author_id}" in trusted_users
+    )
 
     return {
         "system":         platform_module.system(),
@@ -108,10 +120,11 @@ def _build_variables(agent, ctx=None) -> dict:
         "is_group_chat":  is_group_chat,
         "is_dm":          not is_group_chat,
         "platform":       platform,
+        "trusted":        trusted,
     }
 
 
-def _build_static_variables(agent, ctx=None) -> dict:
+def _build_static_variables(agent, ctx=None, trusted_users: frozenset = frozenset()) -> dict:
     """Like _build_variables but omits `time` so the result is cache-stable."""
     workspace   = Path(agent.config.workspace.path).expanduser().resolve()
     source_root = Path.cwd().resolve()
@@ -129,6 +142,13 @@ def _build_static_variables(agent, ctx=None) -> dict:
         ctx is not None and ctx.state.get("group_policy") is not None
     )
     platform = (ctx.state.get("platform") or "") if ctx is not None else ""
+    author_id = (ctx.state.get("author_id") or "") if ctx is not None else ""
+    trusted = (
+        not is_group_chat
+        and bool(platform)
+        and bool(author_id)
+        and f"{platform}:{author_id}" in trusted_users
+    )
 
     return {
         "system":         platform_module.system(),
@@ -139,6 +159,7 @@ def _build_static_variables(agent, ctx=None) -> dict:
         "is_group_chat":  is_group_chat,
         "is_dm":          not is_group_chat,
         "platform":       platform,
+        "trusted":        trusted,
     }
 
 
@@ -179,6 +200,9 @@ def register(agent) -> None:
     module_dir = Path(__file__).parent.resolve()
     em_path    = _resolve_em_path(str(cfg.get("em_path", "")), module_dir, workspace)
     priority   = int(cfg.get("prompt_priority", 5))
+    trusted_users = frozenset(
+        str(u) for u in cfg.get("trusted_users", []) if u
+    )
 
     if not em_path.exists():
         logger.debug("[equipment_manifest] EM.md not found at %s — module inactive", em_path)
@@ -205,7 +229,7 @@ def register(agent) -> None:
             logger.warning("[equipment_manifest] syntax error in %s: %s", em_path, exc)
             return None
 
-        variables = _build_static_variables(agent, ctx)
+        variables = _build_static_variables(agent, ctx, trusted_users)
         try:
             rendered = template.render(**variables).strip()
         except Exception as exc:
@@ -240,7 +264,7 @@ def register(agent) -> None:
     _builtin_footer_tmpl = jinja_env.from_string(_DEFAULT_FOOTER_TEMPLATE)
 
     def _em_prompt_footer(ctx) -> str | None:
-        variables = _build_variables(agent, ctx)
+        variables = _build_variables(agent, ctx, trusted_users)
 
         if has_footer_file:
             try:
