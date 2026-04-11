@@ -444,12 +444,27 @@ class Context:
         for i, node in enumerate(nodes):
             # Deserialise content: JSON → list if it was stored as list.
             # Only user messages store list content (attachments).
+            # Guard: only promote to list if every item is a recognised
+            # content block (type in text/image_url/image/document).
+            # Raw JSON pasted by users (e.g. eval fixtures) starts with "["
+            # but contains arbitrary dicts — those must stay as plain strings
+            # so llama.cpp never sees an unsupported content[].type.
+            _VALID_BLOCK_TYPES = {"text", "image_url", "image", "document"}
             content: str | list = node.content
             if node.role == ROLE_USER and content.startswith("["):
                 try:
                     parsed = json.loads(content)
-                    if isinstance(parsed, list):
+                    if isinstance(parsed, list) and all(
+                        isinstance(b, dict) and b.get("type") in _VALID_BLOCK_TYPES
+                        for b in parsed
+                    ):
                         content = parsed
+                    elif isinstance(parsed, list):
+                        logger.warning(
+                            "[load_from_db] node %s has list content with unrecognised "
+                            "block types — treating as plain string to avoid API errors",
+                            node.id,
+                        )
                 except (json.JSONDecodeError, ValueError):
                     pass  # leave as string
 

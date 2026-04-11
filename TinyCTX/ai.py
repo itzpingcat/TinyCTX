@@ -193,6 +193,24 @@ class LLM:
         # { index: {"id": str, "name": str, "args_buf": str} }
         tool_buf: dict[int, dict] = {}
 
+        # Log message structure (roles + content types) without giant base64 blobs
+        def _summarise_messages(msgs):
+            out = []
+            for m in msgs:
+                c = m.get("content", "")
+                if isinstance(c, list):
+                    block_info = []
+                    for b in c:
+                        if isinstance(b, dict):
+                            block_info.append({"type": b.get("type", "MISSING"), "keys": list(b.keys()), "preview": str(b)[:120]})
+                        else:
+                            block_info.append({"type": "NON-DICT", "value": str(b)[:80]})
+                    out.append({"role": m.get("role"), "content_blocks": block_info, "tool_calls": bool(m.get("tool_calls"))})
+                else:
+                    out.append({"role": m.get("role"), "content_len": len(str(c)), "tool_calls": bool(m.get("tool_calls"))})
+            return out
+        logger.debug("[ai] POST %s message structure:\n%s", self.endpoint, json.dumps(_summarise_messages(payload["messages"]), indent=2))
+
         try:
             async with aiohttp.ClientSession(timeout=self.timeout) as session:
                 async with session.post(

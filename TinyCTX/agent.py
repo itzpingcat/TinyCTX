@@ -321,7 +321,11 @@ class AgentLoop:
                     workspace=self.config.workspace.path,
                 )
             else:
-                user_content = msg.text
+                # Always treat msg.text as a plain string — never deserialise it.
+                # Users can paste arbitrary JSON (eval fixtures, config blobs, etc.)
+                # and we must not let it silently become a list of content blocks,
+                # which would produce unsupported content[].type errors at inference.
+                user_content = str(msg.text) if msg.text is not None else ""
             self.context.add(HistoryEntry.user(user_content))
 
         max_cycles       = self.config.max_tool_cycles
