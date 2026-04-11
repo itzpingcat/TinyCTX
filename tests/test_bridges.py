@@ -301,7 +301,7 @@ class TestDiscordMessageFiltering:
     def _make_discord_message(self, author_id: int, content: str, is_dm: bool = True):
         msg = MagicMock()
         msg.author.id = author_id
-        msg.author.display_name = f"user_{author_id}"
+        msg.author.name = f"user_{author_id}"
         msg.content = content
         msg.id = 12345
         msg.attachments = []
@@ -377,7 +377,7 @@ class TestDiscordMessageRouting:
         import discord
         msg = MagicMock()
         msg.author.id = author_id
-        msg.author.display_name = "tester"
+        msg.author.name = "tester"
         msg.content = "hello"
         msg.id = 1
         msg.attachments = []

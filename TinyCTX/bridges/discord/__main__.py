@@ -791,7 +791,7 @@ class DiscordBridge:
             if not self._is_allowed_dm(message.author.id):
                 logger.debug(
                     "Discord: ignoring DM from unauthorized user %s (%s)",
-                    message.author.id, message.author.display_name,
+                    message.author.id, message.author.name,
                 )
                 return
             text        = message.content.strip()
