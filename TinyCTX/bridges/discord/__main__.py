@@ -670,7 +670,7 @@ class DiscordBridge:
     # ------------------------------------------------------------------
 
     async def handle_event(self, event) -> None:
-        node_id = event.lane_node_id   # stable lane key � never advances during a turn
+        node_id = event.lane_node_id   # stable lane key — never advances during a turn
         acc     = self._accumulators.get(node_id)
         if acc is None:
             logger.debug("Discord: received event for unknown cursor %s", node_id)
@@ -727,7 +727,12 @@ class DiscordBridge:
         await self._sync_app_commands()
 
     async def _on_message(self, message: discord.Message) -> None:
-        if self._client.user and message.author.id == self._client.user.id:
+        # Ignore our own messages — use message.author.bot as a fallback
+        # for the edge case where self._client.user is None during startup.
+        if message.author.bot and (
+            self._client.user is None
+            or message.author.id == self._client.user.id
+        ):
             return
 
         # Per-context access checks happen below (DM vs group).
@@ -846,6 +851,14 @@ class DiscordBridge:
     # ------------------------------------------------------------------
 
     async def _handle_thread_message(self, message: discord.Message) -> None:
+        # Defensive self-reply guard — on_message already checks this, but
+        # belt-and-suspenders in case call sites change.
+        if message.author.bot and (
+            self._client.user is None
+            or message.author.id == self._client.user.id
+        ):
+            return
+
         thread     = message.channel  # discord.Thread
         thread_id  = str(thread.id)
         channel_id = str(thread.parent_id) if thread.parent_id else ""

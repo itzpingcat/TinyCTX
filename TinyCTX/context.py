@@ -669,9 +669,14 @@ class Context:
 
     def _render(self, entry: HistoryEntry) -> dict:
         if entry.role == ROLE_TOOL:
+            content = entry.content
+            if isinstance(content, list):
+                # Tool result content must be a plain string for API compatibility.
+                # Flatten list content (e.g. image blocks) to a JSON string.
+                content = json.dumps(content, ensure_ascii=False)
             return {
                 "role":         ROLE_TOOL,
-                "content":      entry.content,  # str or list[dict] for image blocks
+                "content":      content,
                 "tool_call_id": entry.tool_call_id,
             }
         if entry.role == ROLE_ASSISTANT:
