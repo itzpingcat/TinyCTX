@@ -363,6 +363,9 @@ class DiscordBridge:
         self._accumulators:  dict[str, _ReplyAccumulator] = {}
         self._typing_active: dict[str, asyncio.Event]     = {}
         self._tasks:         set[asyncio.Task]            = set()  # strong refs, prevent GC
+        # Per-lane asyncio.Lock — serialises concurrent _handle_turn calls that
+        # would otherwise race on the same node_id key in _accumulators.
+        self._lane_locks:    dict[str, asyncio.Lock]      = {}
         # Maps cursor_key -> original lane node_id (never advances after creation).
         # Used by reset so we look up the lane by its stable key, and so we
         # can rewind the persisted cursor back to the session anchor.
@@ -394,19 +397,22 @@ class DiscordBridge:
         return self._store.get(cursor_key)
 
     def _get_or_create_cursor(self, cursor_key: str) -> str:
+        # If we have a live lane anchor for this key, always return it.
+        # This ensures every message in a session routes to the same persistent
+        # lane regardless of what _advance_cursor has written to disk.
+        live = self._lane_keys.get(cursor_key)
+        if live:
+            return live
+        # No live anchor: first message this session (or post-restart).
+        # Read the persisted cursor (may be a tail snapshot from a previous run)
+        # and use it as the new anchor.
         node_id = self._store.get(cursor_key)
-        if node_id:
-            # Restore lane_key if we lost it (e.g. after restart). On restart
-            # the persisted cursor IS the lane anchor because _advance_cursor
-            # wasn't called yet for the new lane lifetime.
-            if cursor_key not in self._lane_keys:
-                self._lane_keys[cursor_key] = node_id
-            return node_id
-        db      = _open_db(self._router)
-        node_id = _make_session_node(db, cursor_key)
-        self._store.set(cursor_key, node_id)
+        if not node_id:
+            db      = _open_db(self._router)
+            node_id = _make_session_node(db, cursor_key)
+            self._store.set(cursor_key, node_id)
+            logger.info("Discord: created cursor %s -> %s", cursor_key, node_id)
         self._lane_keys[cursor_key] = node_id
-        logger.info("Discord: created cursor %s -> %s", cursor_key, node_id)
         return node_id
 
     def _get_or_create_thread_cursor(self, thread_id: str, channel_id: str) -> str:
@@ -424,48 +430,40 @@ class DiscordBridge:
              no cursor at all (e.g. bot never saw that channel).
         """
         cursor_key = f"thread:{thread_id}"
-        node_id    = self._store.get(cursor_key)
-        if node_id:
-            return node_id
-
-        # Try to fork from the specific message that created the thread.
-        # In Discord, thread.id == id of the starter message.
-        parent_node_id = self._store.get_msg_node(thread_id)
-
-        if parent_node_id is None:
-            # Fall back to wherever the channel currently is.
-            parent_node_id = self._store.get(f"group:{channel_id}")
-
-        if parent_node_id is None:
-            # No channel context at all — create a fresh branch.
-            db         = _open_db(self._router)
-            node_id    = _make_session_node(db, cursor_key)
-            logger.info(
-                "Discord: thread %s has no known parent — created fresh branch %s",
-                thread_id, node_id,
-            )
-        else:
-            # Fork: the thread's initial cursor IS the parent node.
-            # The first add() in this thread will create a child of parent_node_id.
-            node_id = parent_node_id
-            logger.info(
-                "Discord: thread %s forked from node %s", thread_id, parent_node_id
-            )
-
-        self._store.set(cursor_key, node_id)
+        # Return live anchor if we have one.
+        live = self._lane_keys.get(cursor_key)
+        if live:
+            return live
+        node_id = self._store.get(cursor_key)
+        if not node_id:
+            # Try to fork from the specific message that created the thread.
+            # In Discord, thread.id == id of the starter message.
+            parent_node_id = self._store.get_msg_node(thread_id)
+            if parent_node_id is None:
+                parent_node_id = self._store.get(f"group:{channel_id}")
+            if parent_node_id is None:
+                db      = _open_db(self._router)
+                node_id = _make_session_node(db, cursor_key)
+                logger.info("Discord: thread %s no parent — fresh branch %s", thread_id, node_id)
+            else:
+                node_id = parent_node_id
+                logger.info("Discord: thread %s forked from node %s", thread_id, parent_node_id)
+            self._store.set(cursor_key, node_id)
+        self._lane_keys[cursor_key] = node_id
         return node_id
 
     def _advance_cursor(self, cursor_key: str, router_node_id: str) -> None:
-        """
-        After a turn completes, read the lane's current tail and persist it.
-        router_node_id is the node_id the lane was opened with (may differ from
-        tail after the turn writes new nodes).
-        """
+        """Snapshot the lane's current tail for restart recovery. Does NOT affect
+        which node_id is used for the next message — _lane_keys handles that."""
         lane = self._router._lane_router._lanes.get(router_node_id)
         if lane:
-            new_id = lane.loop._tail_node_id
-            if new_id and new_id != self._store.get(cursor_key):
-                self._store.set(cursor_key, new_id)
+            tail = lane.loop._tail_node_id
+            if tail and tail != self._store.get(cursor_key):
+                self._store.set(cursor_key, tail)
+                logger.debug(
+                    "Discord: cursor %s tail snapshot %s (for restart recovery)",
+                    cursor_key, tail,
+                )
 
     # ------------------------------------------------------------------
     # App command sync
@@ -777,7 +775,6 @@ class DiscordBridge:
                 attachments=attachments,
             )
             acc = _ReplyAccumulator(message.channel, self._max_len)
-            self._accumulators[node_id] = acc
             task = asyncio.create_task(
                 self._handle_turn(msg, message.channel, node_id, acc, cursor_key)
             )
@@ -839,7 +836,6 @@ class DiscordBridge:
             group_policy=self._build_group_policy(),
         )
         acc = _ReplyAccumulator(message.channel, self._max_len)
-        self._accumulators[node_id] = acc
         task = asyncio.create_task(
             self._handle_turn(
                 msg, message.channel, node_id, acc, cursor_key,
@@ -891,7 +887,6 @@ class DiscordBridge:
             attachments=attachments,
         )
         acc = _ReplyAccumulator(message.channel, self._max_len)
-        self._accumulators[node_id] = acc
         task = asyncio.create_task(
             self._handle_turn(msg, message.channel, node_id, acc, cursor_key)
         )
@@ -937,64 +932,70 @@ class DiscordBridge:
         """
         Execute one agent turn.
 
+        Serialised per lane_node_id via _lane_locks so that rapid concurrent
+        messages on the same lane don't collide in _accumulators / _typing_active.
+
         record_msg_node: if set, this is the Discord message ID of the trigger
         message. After the user turn is written to the DB but before the agent
         replies, we snapshot the lane's tail (= the user turn node) and store
         it in the msg->node map so future threads can fork from it precisely.
         """
-        done_event = asyncio.Event()
-        typing_ev  = asyncio.Event()
-        self._typing_active[node_id] = typing_ev
+        lock = self._lane_locks.setdefault(node_id, asyncio.Lock())
+        async with lock:
+            done_event = asyncio.Event()
+            typing_ev  = asyncio.Event()
+            self._accumulators[node_id]  = acc
+            self._typing_active[node_id] = typing_ev
 
-        try:
-            accepted = await self._router.push(msg)
-            if not accepted:
-                await channel.send("⏳ I'm busy — please try again in a moment.")
-                return
+            try:
+                accepted = await self._router.push(msg)
+                if not accepted:
+                    await channel.send("⏳ I'm busy — please try again in a moment.")
+                    return
 
-            # Capture the user-turn node ID immediately after push.
-            # At this point the lane has ingested the user message and written
-            # its DB node, but hasn't replied yet — so tail == user turn node.
-            if record_msg_node:
-                lane = self._router._lane_router._lanes.get(node_id)
-                if lane:
-                    user_turn_node_id = lane.loop._tail_node_id
-                    if user_turn_node_id:
-                        self._store.set_msg_node(record_msg_node, user_turn_node_id)
-                        logger.debug(
-                            "Discord: mapped message %s -> node %s",
-                            record_msg_node, user_turn_node_id,
-                        )
+                # Capture the user-turn node ID immediately after push.
+                # At this point the lane has ingested the user message and written
+                # its DB node, but hasn't replied yet — so tail == user turn node.
+                if record_msg_node:
+                    lane = self._router._lane_router._lanes.get(node_id)
+                    if lane:
+                        user_turn_node_id = lane.loop._tail_node_id
+                        if user_turn_node_id:
+                            self._store.set_msg_node(record_msg_node, user_turn_node_id)
+                            logger.debug(
+                                "Discord: mapped message %s -> node %s",
+                                record_msg_node, user_turn_node_id,
+                            )
 
-            turn_timeout: float | None = float(self._opts.get("turn_timeout_s", 0)) or None
-            if self._typing:
-                keepalive = asyncio.create_task(
-                    self._typing_keepalive(channel, typing_ev, done_event)
-                )
-                try:
-                    await acc.wait_and_send(timeout=turn_timeout)
-                finally:
-                    done_event.set()    # stop keepalive loop first
-                    typing_ev.set()    # unblock active_event.wait() if never triggered
-                    await asyncio.sleep(0)  # let keepalive exit its typing() context cleanly
-                    keepalive.cancel()
+                turn_timeout: float | None = float(self._opts.get("turn_timeout_s", 0)) or None
+                if self._typing:
+                    keepalive = asyncio.create_task(
+                        self._typing_keepalive(channel, typing_ev, done_event)
+                    )
                     try:
-                        await keepalive
-                    except asyncio.CancelledError:
-                        pass
-            else:
-                await acc.wait_and_send(timeout=turn_timeout)
+                        await acc.wait_and_send(timeout=turn_timeout)
+                    finally:
+                        done_event.set()   # stop keepalive loop first
+                        typing_ev.set()    # unblock active_event.wait() if never triggered
+                        await asyncio.sleep(0)  # let keepalive exit its typing() context cleanly
+                        keepalive.cancel()
+                        try:
+                            await keepalive
+                        except asyncio.CancelledError:
+                            pass
+                else:
+                    await acc.wait_and_send(timeout=turn_timeout)
 
-            # Persist the advanced cursor after the full turn completes.
-            if cursor_key:
-                self._advance_cursor(cursor_key, node_id)
+                # Persist the advanced cursor after the full turn completes.
+                if cursor_key:
+                    self._advance_cursor(cursor_key, node_id)
 
-        except Exception:
-            logger.exception("Discord: error handling turn for cursor %s", node_id)
-        finally:
-            done_event.set()
-            self._accumulators.pop(node_id, None)
-            self._typing_active.pop(node_id, None)
+            except Exception:
+                logger.exception("Discord: error handling turn for cursor %s", node_id)
+            finally:
+                done_event.set()
+                self._accumulators.pop(node_id, None)
+                self._typing_active.pop(node_id, None)
 
     # ------------------------------------------------------------------
     # Entry point
