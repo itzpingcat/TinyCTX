@@ -295,8 +295,11 @@ class _ReplyAccumulator:
         self._error = message
         self._done.set()
 
-    async def wait_and_send(self) -> None:
-        await self._done.wait()
+    async def wait_and_send(self, timeout: float | None = None) -> None:
+        try:
+            await asyncio.wait_for(self._done.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            self._error = "Agent response timed out."
         if self._error:
             await self._channel.send(f"⚠️ {self._error}")
             return
@@ -963,18 +966,24 @@ class DiscordBridge:
                             record_msg_node, user_turn_node_id,
                         )
 
+            turn_timeout: float | None = float(self._opts.get("turn_timeout_s", 0)) or None
             if self._typing:
                 keepalive = asyncio.create_task(
                     self._typing_keepalive(channel, typing_ev, done_event)
                 )
                 try:
-                    await acc.wait_and_send()
+                    await acc.wait_and_send(timeout=turn_timeout)
                 finally:
-                    done_event.set()
-                    typing_ev.set()
+                    done_event.set()    # stop keepalive loop first
+                    typing_ev.set()    # unblock active_event.wait() if never triggered
+                    await asyncio.sleep(0)  # let keepalive exit its typing() context cleanly
                     keepalive.cancel()
+                    try:
+                        await keepalive
+                    except asyncio.CancelledError:
+                        pass
             else:
-                await acc.wait_and_send()
+                await acc.wait_and_send(timeout=turn_timeout)
 
             # Persist the advanced cursor after the full turn completes.
             if cursor_key:
