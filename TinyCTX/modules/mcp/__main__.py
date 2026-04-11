@@ -220,8 +220,8 @@ def register(agent) -> None:
     # ------------------------------------------------------------------ reset hook
     original_reset = agent.reset
 
-    def patched_reset() -> None:
-        original_reset()
+    def patched_reset(*args, **kwargs) -> None:
+        original_reset(*args, **kwargs)
 
         async def _restart():
             for srv in servers:

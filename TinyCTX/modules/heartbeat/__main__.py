@@ -377,8 +377,8 @@ def _patch_reset(agent, task: asyncio.Task) -> None:
     """Cancel the heartbeat task when agent.reset() is called."""
     original_reset = agent.reset
 
-    def patched_reset():
-        original_reset()
+    def patched_reset(*args, **kwargs):
+        original_reset(*args, **kwargs)
         if not task.done():
             task.cancel()
             logger.info("[heartbeat] task cancelled on session reset")
