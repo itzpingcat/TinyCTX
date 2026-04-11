@@ -300,6 +300,16 @@ class AgentLoop:
 
         # Stage 1: Intake (skipped for synthetic turns)
         if msg is not None:
+            # Persist message metadata in context.state so modules (e.g. equipment_manifest)
+            # can detect platform, DM vs group, etc. without importing bridge contracts.
+            # These are set on every turn so state always reflects the current lane's identity.
+            self.context.state["platform"]     = msg.author.platform.value
+            self.context.state["author_name"]  = msg.author.username
+            if msg.group_policy is not None:
+                self.context.state["group_policy"] = msg.group_policy
+            else:
+                # Ensure key is absent for DM lanes (e.g. after a reset).
+                self.context.state.pop("group_policy", None)
             if msg.attachments:
                 primary_cfg  = self.config.get_model_config(self.config.llm.primary)
                 user_content = build_content_blocks(

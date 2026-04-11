@@ -33,9 +33,18 @@ Available template variables (both templates):
   config_path     — resolved absolute path to config.yaml (best-effort)
   source_root     — cwd at launch time (where TinyCTX's own code lives);
                     equals workspace_path when launched from the workspace
+  is_group_chat   — True when the current lane has a GroupPolicy attached
+                    (i.e. a multi-user group channel/room). False for DMs
+                    and synthetic turns. Read from ctx.state["group_policy"].
+  is_dm           — Opposite of is_group_chat. True for 1:1 DM lanes.
+  platform        — Bridge platform string: "discord", "matrix", "cli",
+                    "api", "cron", or "" for synthetic/unknown turns.
+                    Read from ctx.state["platform"].
 
 NOTE: For best cache efficiency, avoid using {{ time }} or {{ date }} inside
 EM.md. Put time-sensitive content in EM_FOOTER.md instead.
+is_group_chat, is_dm, and platform are stable for the lifetime of a lane,
+so they are safe to use in EM.md without busting the cache.
 
 Full Jinja2 syntax is supported in both templates.
 
@@ -52,7 +61,7 @@ Convention: register(agent) — no imports from gateway or bridges.
 from __future__ import annotations
 
 import logging
-import platform
+import platform as platform_module
 from datetime import datetime
 from pathlib import Path
 
@@ -71,7 +80,7 @@ _DEFAULT_FOOTER_TEMPLATE = "<clock>{{ time }}</clock>"
 # Variable builder
 # ---------------------------------------------------------------------------
 
-def _build_variables(agent) -> dict[str, str]:
+def _build_variables(agent, ctx=None) -> dict:
     now         = datetime.now()
     workspace   = Path(agent.config.workspace.path).expanduser().resolve()
     source_root = Path.cwd().resolve()
@@ -84,17 +93,25 @@ def _build_variables(agent) -> dict[str, str]:
         except Exception:
             config_path = str(raw)
 
+    is_group_chat = bool(
+        ctx is not None and ctx.state.get("group_policy") is not None
+    )
+    platform = (ctx.state.get("platform") or "") if ctx is not None else ""
+
     return {
-        "system":         platform.system(),
+        "system":         platform_module.system(),
         "date":           now.strftime("%Y-%m-%d"),
         "time":           now.strftime("%H:%M"),
         "workspace_path": str(workspace),
         "config_path":    config_path,
         "source_root":    str(source_root),
+        "is_group_chat":  is_group_chat,
+        "is_dm":          not is_group_chat,
+        "platform":       platform,
     }
 
 
-def _build_static_variables(agent) -> dict[str, str]:
+def _build_static_variables(agent, ctx=None) -> dict:
     """Like _build_variables but omits `time` so the result is cache-stable."""
     workspace   = Path(agent.config.workspace.path).expanduser().resolve()
     source_root = Path.cwd().resolve()
@@ -107,12 +124,21 @@ def _build_static_variables(agent) -> dict[str, str]:
         except Exception:
             config_path = str(raw)
 
+    # is_group_chat is stable for the lifetime of a lane — safe in the cached block.
+    is_group_chat = bool(
+        ctx is not None and ctx.state.get("group_policy") is not None
+    )
+    platform = (ctx.state.get("platform") or "") if ctx is not None else ""
+
     return {
-        "system":         platform.system(),
+        "system":         platform_module.system(),
         "date":           datetime.now().strftime("%Y-%m-%d"),  # changes at midnight only
         "workspace_path": str(workspace),
         "config_path":    config_path,
         "source_root":    str(source_root),
+        "is_group_chat":  is_group_chat,
+        "is_dm":          not is_group_chat,
+        "platform":       platform,
     }
 
 
@@ -170,7 +196,7 @@ def register(agent) -> None:
     # Static top — system role, cache-stable
     # ------------------------------------------------------------------
 
-    def _em_prompt_top(_ctx) -> str | None:
+    def _em_prompt_top(ctx) -> str | None:
         try:
             template = jinja_env.get_template(em_path.name)
         except TemplateNotFound:
@@ -179,7 +205,7 @@ def register(agent) -> None:
             logger.warning("[equipment_manifest] syntax error in %s: %s", em_path, exc)
             return None
 
-        variables = _build_static_variables(agent)
+        variables = _build_static_variables(agent, ctx)
         try:
             rendered = template.render(**variables).strip()
         except Exception as exc:
@@ -213,8 +239,8 @@ def register(agent) -> None:
     # loaded via FileSystemLoader, so we use Environment.from_string).
     _builtin_footer_tmpl = jinja_env.from_string(_DEFAULT_FOOTER_TEMPLATE)
 
-    def _em_prompt_footer(_ctx) -> str | None:
-        variables = _build_variables(agent)
+    def _em_prompt_footer(ctx) -> str | None:
+        variables = _build_variables(agent, ctx)
 
         if has_footer_file:
             try:
