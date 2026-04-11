@@ -163,10 +163,6 @@ def _format_buffer_lines(
 
 
 def _gp_strip_trigger(text: str, policy: GroupPolicy) -> str:
-    if policy.bot_mxid:
-        text = text.replace(policy.bot_mxid, "")
-    if policy.bot_localpart:
-        text = text.replace(f"@{policy.bot_localpart}", "")
     if text.startswith(policy.trigger_prefix):
         text = text[len(policy.trigger_prefix):]
     return text.strip()
