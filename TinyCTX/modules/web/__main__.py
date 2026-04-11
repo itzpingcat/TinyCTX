@@ -543,8 +543,8 @@ def register(agent) -> None:
 
     original_reset = agent.reset
 
-    def patched_reset():
-        original_reset()
+    def patched_reset(*args, **kwargs):
+        original_reset(*args, **kwargs)
         # Use get_running_loop() — get_event_loop() is deprecated in 3.10+
         # and may raise if called outside an async context.
         try:

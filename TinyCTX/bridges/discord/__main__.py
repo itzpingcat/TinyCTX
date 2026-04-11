@@ -471,43 +471,71 @@ class DiscordBridge:
 
     async def _sync_app_commands(self) -> None:
         """
-        Walk CommandRegistry and register every entry as a native Discord
-        slash command, then sync the tree to Discord's API.
+        Walk CommandRegistry and register commands as native Discord slash commands.
 
-        Naming: "/namespace sub" → "/namespace_sub" (Discord only allows one
-        level of nesting via CommandTree; subcommand groups add complexity we
-        don't need). Bare "/namespace" entries become "/namespace".
+        Commands with a subcommand (e.g. "/memory consolidate") are registered
+        as proper Discord subcommands under an app_commands.Group, so they appear
+        in Discord's UI as "/memory" → select "consolidate".
 
-        The /reset command is registered directly from bridge config so it
-        works even before any module has registered commands.
+        Bare commands (e.g. "/heartbeat run" where there's only one sub, or a
+        top-level "/namespace" with no sub) are registered as flat slash commands.
+
+        /reset is always registered directly from bridge config.
         """
-        # Clear any previously registered commands so re-syncs are idempotent.
         self._tree.clear_commands(guild=None)
 
-        # Register /reset from bridge config.
+        # Register /reset.
         reset_cmd_name = self._reset_command.lstrip("/").replace(" ", "_")
 
         @self._tree.command(name=reset_cmd_name, description="Reset the current session")
         async def _reset_slash(interaction: discord.Interaction) -> None:
             await self._handle_reset_interaction(interaction)
 
-        # Register all commands from the shared CommandRegistry.
+        # Group commands by namespace so we can decide flat vs subcommand.
+        # namespace -> {sub -> (help_text, ns, sub)}
+        grouped: dict[str, dict[str, tuple[str, str, str]]] = {}
         for cmd_str, help_text in self._router.commands.list_commands():
-            # cmd_str is like "/memory consolidate" or "/heartbeat"
             parts     = cmd_str.lstrip("/").split()
-            cmd_name  = "_".join(parts)          # "memory_consolidate" or "heartbeat"
             namespace = parts[0]
             sub       = parts[1] if len(parts) > 1 else ""
-            desc      = help_text or f"Run {cmd_str}"
+            grouped.setdefault(namespace, {})[sub] = (help_text or f"Run {cmd_str}", namespace, sub)
 
-            # Capture loop variables in a closure.
-            def _make_handler(ns: str, s: str, cn: str):
-                @self._tree.command(name=cn, description=desc)
-                async def _slash_handler(interaction: discord.Interaction) -> None:
-                    await self._handle_command_interaction(interaction, ns, s)
-                return _slash_handler
+        for namespace, subs in grouped.items():
+            # If there's only a bare entry (no sub) or only one sub with no bare,
+            # register as a flat command to keep things simple.
+            has_bare = "" in subs
+            named_subs = {k: v for k, v in subs.items() if k}
 
-            _make_handler(namespace, sub, cmd_name)
+            if not named_subs:
+                # Bare namespace only — flat command.
+                desc, ns, sub = subs[""]
+                def _make_flat(ns: str, sub: str):
+                    @self._tree.command(name=ns, description=desc)
+                    async def _handler(interaction: discord.Interaction) -> None:
+                        await self._handle_command_interaction(interaction, ns, sub)
+                _make_flat(ns, sub)
+                continue
+
+            # Has named subcommands — use a Group.
+            group = app_commands.Group(name=namespace, description=f"{namespace} commands")
+
+            for sub_name, (desc, ns, sub) in named_subs.items():
+                def _make_sub(ns: str, sub: str, desc: str):
+                    @group.command(name=sub, description=desc)
+                    async def _sub_handler(interaction: discord.Interaction) -> None:
+                        await self._handle_command_interaction(interaction, ns, sub)
+                _make_sub(ns, sub_name, desc)
+
+            # If there's also a bare entry, add it as a subcommand named "run".
+            if has_bare:
+                desc, ns, sub = subs[""]
+                def _make_bare_as_run(ns: str, desc: str):
+                    @group.command(name="run", description=desc)
+                    async def _run_handler(interaction: discord.Interaction) -> None:
+                        await self._handle_command_interaction(interaction, ns, "")
+                _make_bare_as_run(ns, desc)
+
+            self._tree.add_command(group)
 
         try:
             synced = await self._tree.sync()
@@ -519,10 +547,10 @@ class DiscordBridge:
 
     async def _handle_reset_interaction(self, interaction: discord.Interaction) -> None:
         """Handle the /reset slash command."""
-        await interaction.response.defer(ephemeral=True)
-        user_id = interaction.user.id
         channel = interaction.channel
         is_dm   = isinstance(channel, discord.DMChannel)
+        await interaction.response.defer(ephemeral=False)
+        user_id = interaction.user.id
 
         if not is_dm and not self._is_admin(user_id):
             await interaction.followup.send("⛔ Only admins can reset the session.", ephemeral=True)
