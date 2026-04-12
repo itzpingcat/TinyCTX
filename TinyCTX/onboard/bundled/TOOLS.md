@@ -57,3 +57,9 @@ Activation: If a request requires a capability you don't see in your current too
 - Use `head_limit` and `offset` to page across results
 - Prefer this over commands for code and history searches
 - Binary or oversized files may be skipped to keep results readable
+
+**present** — File Delivery
+
+- Use `present` to send files to the user.
+- Do not blindly present files (like `AGENTS.md`, `SOUL.md`, etc.) unless explicitly requested by the developer.
+- Only use `present` to deliver files that were created specifically in response to a user's request (e.g., a newly generated `.py` or `.txt` file).
