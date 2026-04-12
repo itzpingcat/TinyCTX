@@ -45,6 +45,26 @@ Config (in config.yaml under bridges.discord.options):
   max_reply_length:  Discord message length cap before chunking. Default: 1900
   typing_indicator:  Show "Bot is typing..." while the agent thinks. Default: true
 
+Compat rules (bridges/discord/compat.json):
+  Per-pattern delay rules for proxy-bot compatibility. Each entry specifies a
+  match condition and a delay in seconds. When a non-webhook message matches,
+  it is held for delay_s then verified via fetch_message — if deleted (proxied),
+  it is dropped and the webhook repost is handled instead.
+
+  Match fields (all optional, ANDed together):
+    content_regex   — regex tested against message content
+    author_id       — exact Discord user ID (integer) of the sender
+    has_webhook_id  — if true, only match messages that ARE webhooks
+
+  Example compat.json:
+    [
+      {
+        "description": "Tupperbot proxy",
+        "match": { "content_regex": "^\\w+:.+" },
+        "delay_s": 0.8
+      }
+    ]
+
 Thread branching:
   When a Discord thread is created inside a tracked channel, the bot creates a
   new DB branch forked off the channel turn that spawned the thread. The channel
@@ -187,6 +207,80 @@ async def _humanize_mentions(text: str, client: discord.Client) -> str:
         last = m.end()
     parts.append(text[last:])
     return "".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Compat rules — pattern-based per-message delay for proxy-bot compatibility
+# ---------------------------------------------------------------------------
+
+class CompatRules:
+    """
+    Loads bridges/discord/compat.json and matches incoming messages against
+    a list of rules. Each rule specifies match conditions and a delay_s.
+
+    Schema (list of objects):
+      {
+        "description": "human label (optional)",
+        "match": {
+          "content_regex":  "regex against message.content",
+          "author_id":      12345678,   // exact user ID
+          "has_webhook_id": true        // true = message must be a webhook
+        },
+        "delay_s": 0.8
+      }
+
+    All match fields within a rule are ANDed. First matching rule wins.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._path  = path
+        self._rules: list[dict] = []
+        self._mtime: float      = 0.0
+        self._load()
+
+    def _load(self) -> None:
+        if not self._path.exists():
+            self._rules = []
+            return
+        try:
+            mtime = self._path.stat().st_mtime
+            if mtime == self._mtime:
+                return
+            raw = json.loads(self._path.read_text(encoding="utf-8"))
+            # Pre-compile regexes.
+            compiled = []
+            for rule in raw:
+                entry = dict(rule)
+                m = entry.get("match", {})
+                if "content_regex" in m:
+                    entry["_content_re"] = re.compile(m["content_regex"])
+                compiled.append(entry)
+            self._rules = compiled
+            self._mtime = mtime
+            logger.info("Discord compat: loaded %d rule(s) from %s", len(self._rules), self._path)
+        except Exception:
+            logger.exception("Discord compat: failed to load %s", self._path)
+
+    def match(self, message: discord.Message) -> float:
+        """
+        Return the delay_s for the first matching rule, or 0.0 if no rule matches.
+        Reloads the file if it has changed on disk.
+        """
+        self._load()
+        for rule in self._rules:
+            m = rule.get("match", {})
+            if "content_regex" in m:
+                if not rule["_content_re"].search(message.content):
+                    continue
+            if "author_id" in m:
+                if message.author.id != int(m["author_id"]):
+                    continue
+            if "has_webhook_id" in m:
+                want = bool(m["has_webhook_id"])
+                if bool(message.webhook_id) != want:
+                    continue
+            return float(rule.get("delay_s", 0.0))
+        return 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -381,6 +475,10 @@ class DiscordBridge:
         cursors_dir = workspace / "cursors"
         cursors_dir.mkdir(parents=True, exist_ok=True)
         self._store = CursorStore(cursors_dir)
+
+        # Compat rules — loaded from bridges/discord/compat.json
+        _bridge_dir  = Path(__file__).parent
+        self._compat = CompatRules(_bridge_dir / "compat.json")
 
         intents = discord.Intents.default()
         intents.message_content = True
@@ -914,9 +1012,59 @@ class DiscordBridge:
         # accumulator for them (that would hold the lane lock and deadlock the
         # next trigger message).
         is_trigger = self._is_group_trigger(text, policy)
+
+        # Proxy-bot compatibility: check compat.json for a matching rule.
+        # Only non-webhook messages can be proxied — webhooks are the repost.
+        compat_delay: float = self._compat.match(message) if message.webhook_id is None else 0.0
+
         if not is_trigger:
             # Push to GroupLane for buffering; no accumulator needed.
-            await self._router.push(msg)
+            if compat_delay > 0:
+                async def _delayed_buffer(m=message, msg_=msg) -> None:
+                    await asyncio.sleep(compat_delay)
+                    try:
+                        await m.channel.fetch_message(m.id)
+                    except discord.NotFound:
+                        logger.debug(
+                            "Discord: non-trigger message %s deleted (proxy bot) — dropped",
+                            m.id,
+                        )
+                        return
+                    except Exception:
+                        pass  # fetch failed for another reason; proceed anyway
+                    await self._router.push(msg_)
+                task = asyncio.create_task(_delayed_buffer())
+                self._tasks.add(task)
+                task.add_done_callback(self._tasks.discard)
+            else:
+                await self._router.push(msg)
+            return
+
+        if compat_delay > 0:
+            # Delay trigger messages too so the proxy repost arrives first.
+            async def _delayed_trigger(
+                m=message, msg_=msg, nid=node_id, ch=message.channel,
+                ck=cursor_key,
+            ) -> None:
+                await asyncio.sleep(compat_delay)
+                try:
+                    await m.channel.fetch_message(m.id)
+                except discord.NotFound:
+                    logger.debug(
+                        "Discord: trigger message %s deleted (proxy bot) — dropped",
+                        m.id,
+                    )
+                    return
+                except Exception:
+                    pass
+                acc_ = _ReplyAccumulator(ch, self._max_len)
+                await self._handle_turn(
+                    msg_, ch, nid, acc_, ck,
+                    record_msg_node=str(m.id),
+                )
+            task = asyncio.create_task(_delayed_trigger())
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
             return
 
         acc  = _ReplyAccumulator(message.channel, self._max_len)

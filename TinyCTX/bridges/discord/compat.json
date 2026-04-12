@@ -1,0 +1,7 @@
+[
+  {
+    "description": "Tupperbot proxy — messages matching 'name:text' may be deleted and reposted as a webhook",
+    "match": { "content_regex": "^\\S+:.+" },
+    "delay_s": 0.8
+  }
+]
