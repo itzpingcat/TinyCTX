@@ -34,6 +34,7 @@ SSE event types
   {"type": "text_final",     "text": "..."}
   {"type": "tool_call",      "tool_name": "...", "call_id": "...", "args": {...}}
   {"type": "tool_result",    "tool_name": "...", "call_id": "...", "output": "...", "is_error": false}
+  {"type": "outbound_files", "paths": [...]}
   {"type": "error",          "message": "..."}
   {"type": "done",           "node_id": "<new tail uuid>"}
 
@@ -61,7 +62,7 @@ from TinyCTX.contracts import (
     Platform, ContentType, content_type_for,
     UserIdentity, InboundMessage, Attachment,
     AgentThinkingChunk, AgentTextChunk, AgentTextFinal,
-    AgentToolCall, AgentToolResult, AgentError,
+    AgentToolCall, AgentToolResult, AgentError, AgentOutboundFiles,
 )
 
 logger = logging.getLogger(__name__)
@@ -114,6 +115,8 @@ def _event_to_dict(event) -> dict:
         return {"type": "tool_result", "tool_name": event.tool_name,
                 "call_id": event.call_id, "output": event.output,
                 "is_error": event.is_error}
+    if isinstance(event, AgentOutboundFiles):
+        return {"type": "outbound_files", "paths": list(event.paths)}
     if isinstance(event, AgentError):
         return {"type": "error", "message": event.message, "node_id": event.tail_node_id}
     return {}

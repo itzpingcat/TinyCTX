@@ -229,8 +229,22 @@ class AgentError(_AgentEventBase):
     message: str
 
 
+@dataclass(frozen=True)
+class AgentOutboundFiles(_AgentEventBase):
+    """
+    Emitted directly by the present() tool when the agent wants to deliver
+    files to the user. Bridges send each path as a file attachment.
+    Fired as a detached asyncio task from within the tool — agent.py is
+    never aware of it and receives a plain success string as the tool result.
+    """
+    paths: tuple[str, ...]
+
+
 # Union type used in type hints throughout the codebase.
-AgentEvent = Union[AgentThinkingChunk, AgentTextChunk, AgentTextFinal, AgentToolCall, AgentToolResult, AgentError]
+AgentEvent = Union[
+    AgentThinkingChunk, AgentTextChunk, AgentTextFinal,
+    AgentToolCall, AgentToolResult, AgentError, AgentOutboundFiles,
+]
 
 
 # ---------------------------------------------------------------------------

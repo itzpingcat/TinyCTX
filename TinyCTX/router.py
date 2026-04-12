@@ -470,6 +470,7 @@ class Router:
                 await handler(event)
             except Exception:
                 logger.exception("Cursor handler failed for %s", event.trace_id)
+                raise
             return
 
         platform = self._node_platforms.get(lane_id)
@@ -484,6 +485,7 @@ class Router:
             await handler(event)
         except Exception:
             logger.exception("Platform handler failed for %s", event.trace_id)
+            raise
 
     def reset_lane(self, node_id: str) -> None:
         lane = self._lane_router._lanes.get(node_id)

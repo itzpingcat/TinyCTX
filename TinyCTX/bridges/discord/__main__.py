@@ -121,6 +121,7 @@ from discord.ext import commands as discord_commands
 from TinyCTX.contracts import (
     ActivationMode,
     AgentError,
+    AgentOutboundFiles,
     AgentThinkingChunk,
     AgentTextChunk,
     AgentTextFinal,
@@ -294,6 +295,10 @@ class _ReplyAccumulator:
     def error(self, message: str) -> None:
         self._error = message
         self._done.set()
+
+    @property
+    def channel(self) -> discord.abc.Messageable:
+        return self._channel
 
     async def wait_and_send(self, timeout: float | None = None) -> None:
         try:
@@ -714,6 +719,26 @@ class DiscordBridge:
     async def handle_event(self, event) -> None:
         node_id = event.lane_node_id   # stable lane key — never advances during a turn
         acc     = self._accumulators.get(node_id)
+
+        # AgentOutboundFiles is fired outside the normal turn flow — the
+        # accumulator may or may not be present. Look up the channel directly.
+        if isinstance(event, AgentOutboundFiles):
+            channel = acc.channel if acc is not None else None
+            if channel is None:
+                raise RuntimeError(
+                    f"AgentOutboundFiles for lane {node_id} but no active channel"
+                )
+            failed: list[str] = []
+            for path in event.paths:
+                try:
+                    await channel.send(file=discord.File(path))
+                except Exception as exc:
+                    logger.warning("Discord: failed to upload file %s: %s", path, exc)
+                    failed.append(Path(path).name)
+            if failed:
+                raise RuntimeError(f"Failed to upload: {', '.join(failed)}")
+            return
+
         if acc is None:
             logger.debug("Discord: received event for unknown cursor %s", node_id)
             return

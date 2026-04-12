@@ -32,6 +32,7 @@ What changed
   Module slash commands are dispatched to POST /v1/lane/command before
     falling through to built-in handlers or the message router.
   /help fetches GET /v1/commands to include module-registered commands.
+  outbound_files SSE events print delivered file paths to the console.
 """
 from __future__ import annotations
 
@@ -354,17 +355,6 @@ class CLIBridge:
             self._thinking_content = ""
             self._label_printed = False
             self._reply_done.set()
-        # elif isinstance(event, (AgentTextFinal, _FakeTextFinal)):
-        #     final_text = (event.text or self._current_content).strip()
-        #     if self._live:
-        #         self._live.update(self._get_live_render(final_text))
-        #     self._stop_live()
-        #     if final_text:
-        #         self._last_reply = final_text
-        #     self._current_content = ""
-        #     self._thinking_content = ""
-        #     self._label_printed   = False
-        #     self._reply_done.set()
 
         elif isinstance(event, (AgentError, _FakeError)):
             self._stop_live()
@@ -440,6 +430,16 @@ class CLIBridge:
                             data.get("output", ""),
                             bool(data.get("is_error", False)),
                         ))
+                    elif event_type == "outbound_files":
+                        paths = data.get("paths", [])
+                        if paths:
+                            self._stop_live()
+                            c = self._theme.c
+                            self._console.print(
+                                f"  [{c('tool_ok')}]↓  files delivered:[/{c('tool_ok')}]")
+                            for p in paths:
+                                self._console.print(
+                                    f"     {p}", markup=False, style="bright_black")
                     elif event_type == "error":
                         await self.handle_event(_FakeError(data.get("message", "")))
                     elif event_type == "done":
