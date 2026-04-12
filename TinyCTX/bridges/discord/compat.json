@@ -3,5 +3,15 @@
     "description": "Tupperbot proxy — messages matching 'name:text' may be deleted and reposted as a webhook",
     "match": { "content_regex": "^\\S+:.+" },
     "delay_s": 0.8
+  },
+  {
+    "description": "PluralKit bracket-wrap proxy — e.g. [text] or {text}",
+    "match": { "content_regex": "^[\\[{].+[\\]}]$" },
+    "delay_s": 0.8
+  },
+  {
+    "description": "PluralKit suffix-only proxy — e.g. 'text -name' or 'text [name]'",
+    "match": { "content_regex": ".+\\s[-\\[].+$" },
+    "delay_s": 0.8
   }
 ]
