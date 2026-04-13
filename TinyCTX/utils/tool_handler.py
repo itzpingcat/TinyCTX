@@ -83,12 +83,34 @@ class ToolCallHandler:
         return main_line or f"Function: {func.__name__}", arg_descs
 
     def _python_type_to_json_schema(self, annotation) -> Dict[str, Any]:
-        # Handle generic aliases like list[str], list[int], etc.
+        import typing
+
         origin = getattr(annotation, '__origin__', None)
+        args   = getattr(annotation, '__args__', None)
+
+        # list[X]
         if origin is list:
-            args = getattr(annotation, '__args__', None)
             item_schema = self._python_type_to_json_schema(args[0]) if args else {"type": "string"}
             return {"type": "array", "items": item_schema}
+
+        # tuple[X, ...]
+        if origin is tuple:
+            return {"type": "array"}
+
+        # dict[K, V]
+        if origin is dict:
+            return {"type": "object"}
+
+        # Optional[X] == Union[X, None]
+        if origin is typing.Union:
+            non_none = [a for a in args if a is not type(None)]
+            if len(non_none) == 1:
+                return self._python_type_to_json_schema(non_none[0])
+            return {"type": "string"}
+
+        # Literal["a", "b"]
+        if origin is typing.Literal:
+            return {"type": "string", "enum": list(args)}
 
         mapping = {
             str:   {"type": "string"},
