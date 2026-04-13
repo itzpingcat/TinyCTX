@@ -16,7 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # --- create non-root user --------------------------------------------------
-RUN groupadd -r tinyctx && useradd -r -g tinyctx -d /app -s /sbin/nologin tinyctx
+RUN groupadd -r tinyctx && useradd -r -g tinyctx -d /home/tinyctx -m -s /sbin/nologin tinyctx
 
 WORKDIR /app
 
@@ -38,7 +38,7 @@ COPY pyproject.toml ./
 RUN pip install --no-cache-dir --no-deps -e .
 
 # --- permissions -----------------------------------------------------------
-RUN chown -R tinyctx:tinyctx /app /ms-playwright
+RUN chown -R tinyctx:tinyctx /home/tinyctx /ms-playwright
 
 USER tinyctx
 

@@ -16,12 +16,11 @@ services:
 
     # ── volumes ────────────────────────────────────────────────────────────
     volumes:
-      # Workspace: read-write so the agent can persist memory/sessions.
-      # Override with TINYCTX_WORKSPACE env var or a .env file.
-      # Default is ~/.tinyctx on the host, created automatically if absent.
+      # Workspace: the agent's entire home dir is the workspace.
+      # ~/.tinyctx on the host maps to /home/tinyctx inside the container.
       - type: bind
         source: ${TINYCTX_WORKSPACE:-~/.tinyctx}
-        target: /workspace
+        target: /home/tinyctx
 
       # Config: the repo ships example.config.yaml — copy it to config.yaml,
       # fill in your model URLs/keys, and it will be picked up here.
@@ -38,12 +37,8 @@ services:
         read_only: true
 
     # ── environment ────────────────────────────────────────────────────────
-    # Bare keys (no value) forward the var from the host environment.
-    # Set these on your host before running docker compose up — the same
-    # way TinyCTX's onboard wizard sets them in your shell profile.
     environment:
       # Container-internal
-      TINYCTX_WORKSPACE_OVERRIDE: /workspace
       TINYCTX_GATEWAY_HOST: "0.0.0.0"
       # Bridge secrets — forwarded from host env
       DISCORD_BOT_TOKEN:
@@ -65,7 +60,6 @@ services:
     tmpfs:
       - /tmp:size=256m,mode=1777
       - /app/__pycache__:size=64m
-      - /home/tinyctx:size=64m    # playwright browser profile lands here
 
     # ── resource limits ────────────────────────────────────────────────────
     deploy:

@@ -149,17 +149,14 @@ class WorkspaceConfig:
 
         workspace:
           path: ~/.tinyctx
+
+    In Docker the tinyctx user's home is /home/tinyctx, so ~ resolves
+    naturally to the bind-mounted workspace. No env var override needed.
     """
     path: Path = field(default_factory=lambda: Path("~/.tinyctx").expanduser())
 
     def __post_init__(self):
-        # Allow container deployments to override the workspace path via env var
-        # without modifying config.yaml (which may have a Windows host path).
-        override = os.environ.get("TINYCTX_WORKSPACE_OVERRIDE", "").strip()
-        if override:
-            self.path = Path(override).resolve()
-        else:
-            self.path = Path(self.path).expanduser().resolve()
+        self.path = Path(self.path).expanduser().resolve()  # ~ → /home/tinyctx in container, %USERPROFILE% on Windows
 
 
 @dataclass
@@ -340,7 +337,7 @@ def load(path="config.yaml") -> Config:
         legacy_path = raw.get("memory", {}).get("workspace_path")
         if legacy_path:
             ws_raw = {"path": legacy_path}
-    workspace = WorkspaceConfig(path=Path(ws_raw.get("path", "~/.tinyctx")))
+    workspace = WorkspaceConfig(path=ws_raw.get("path") or "~")
 
     # ------------------------------------------------------------------ rest
     router_raw = raw.get("router", {})
