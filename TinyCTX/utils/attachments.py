@@ -232,7 +232,6 @@ def build_content_blocks(
     for att in attachments:
         kind = classify(att)
         saved_path = save_upload(att, uploads_dir)
-        saved_rel  = saved_path.name  # just the filename for the reference note
 
         # --- threshold check ---
         over_count = inline_count >= att_cfg.inline_max_files
@@ -242,14 +241,14 @@ def build_content_blocks(
         # --- strategy selection ---
         if force_ref or kind == AttachmentKind.BINARY:
             ref_notes.append(
-                f"[File uploaded to workspace/uploads/{saved_rel}: {att.filename}]"
+                f"[File uploaded to {saved_path}: {att.filename}]"
             )
             continue
 
         if kind == AttachmentKind.IMAGE:
             if not model_cfg.supports_vision:
                 ref_notes.append(
-                    f"[Image uploaded to workspace/uploads/{saved_rel}: {att.filename}"
+                    f"[Image uploaded to {saved_path}: {att.filename}"
                     " — model does not support vision, use filesystem tools to inspect]"
                 )
                 continue
@@ -285,7 +284,7 @@ def build_content_blocks(
                 extracted = _extract_pdf_text(att.data)
                 if extracted is None:
                     ref_notes.append(
-                        f"[PDF uploaded to workspace/uploads/{saved_rel}: {att.filename}"
+                        f"[PDF uploaded to {saved_path}: {att.filename}"
                         " — install pdfplumber to extract text, or use filesystem tools]"
                     )
                     continue
@@ -293,7 +292,7 @@ def build_content_blocks(
                 extracted = _extract_docx_text(att.data)
                 if extracted is None:
                     ref_notes.append(
-                        f"[DOCX uploaded to workspace/uploads/{saved_rel}: {att.filename}"
+                        f"[DOCX uploaded to {saved_path}: {att.filename}"
                         " — install python-docx to extract text, or use filesystem tools]"
                     )
                     continue
@@ -305,7 +304,7 @@ def build_content_blocks(
                 inline_bytes += len(att.data)
             else:
                 ref_notes.append(
-                    f"[Document uploaded to workspace/uploads/{saved_rel}: {att.filename}]"
+                    f"[Document uploaded to {saved_path}: {att.filename}]"
                 )
 
     # --- assemble final content ---
