@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Awaitable
@@ -377,6 +378,27 @@ class _LaneRouter:
 # Router
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Inbound text sanitization
+# ---------------------------------------------------------------------------
+
+_SPEAKER_PREFIX_RE = re.compile(r'\n\s*\[[^\]]+\]\s*:')
+
+
+def _sanitize_inbound_text(text: str) -> str:
+    """
+    Strip injected speaker-prefix sequences from user-supplied text.
+
+    GroupLane formats multi-speaker context as "[Name]: message" lines joined
+    by newlines. A malicious user can embed a literal "\n[OtherUser]: ..."
+    in their own message to inject fake turns from other speakers.
+
+    This is called once in Router.push() — covering every bridge and future
+    bridge — before the message reaches any lane or agent.
+    """
+    return _SPEAKER_PREFIX_RE.sub(' ', text).strip()
+
+
 class Router:
     def __init__(self, config: Config) -> None:
         self._config             = config
@@ -406,6 +428,31 @@ class Router:
         self._cursor_handlers.pop(node_id, None)
 
     async def push(self, msg: InboundMessage) -> bool:
+        # Sanitize message text before routing to prevent speaker-prefix injection.
+        # A user sending literal "\n[SomeUser]: text" would otherwise be able to
+        # impersonate another speaker in any bridge that formats context as
+        # "[Name]: message" transcripts (e.g. GroupLane's buffer formatting).
+        sanitized_text = _sanitize_inbound_text(msg.text)
+        if sanitized_text != msg.text:
+            logger.debug(
+                "Router.push: sanitized injected speaker prefix from %s (platform=%s)",
+                msg.author.user_id,
+                msg.author.platform.value,
+            )
+            msg = InboundMessage(
+                tail_node_id=msg.tail_node_id,
+                author=msg.author,
+                content_type=msg.content_type,
+                text=sanitized_text,
+                message_id=msg.message_id,
+                timestamp=msg.timestamp,
+                reply_to_id=msg.reply_to_id,
+                attachments=msg.attachments,
+                trace_id=msg.trace_id,
+                group_policy=msg.group_policy,
+                server_name=msg.server_name,
+                channel_name=msg.channel_name,
+            )
         # Record which platform this cursor belongs to for event dispatch.
         self._node_platforms[msg.tail_node_id] = msg.author.platform.value
         return await self._lane_router.route(msg)
