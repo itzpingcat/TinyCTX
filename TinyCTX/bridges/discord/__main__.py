@@ -462,6 +462,10 @@ class DiscordBridge:
         self._accumulators:  dict[str, _ReplyAccumulator] = {}
         self._typing_active: dict[str, asyncio.Event]     = {}
         self._tasks:         set[asyncio.Task]            = set()  # strong refs, prevent GC
+        # Monotonically-increasing reset counter per cursor_key.
+        # _advance_cursor checks this so a post-reset turn can't re-advance
+        # the cursor after it has been rewound by /reset.
+        self._reset_epoch:   dict[str, int]               = {}
         # Per-lane asyncio.Lock — serialises concurrent _handle_turn calls that
         # would otherwise race on the same node_id key in _accumulators.
         self._lane_locks:    dict[str, asyncio.Lock]      = {}
@@ -668,6 +672,11 @@ class DiscordBridge:
             cursor_key = f"group:{channel.id}" if channel else None
 
         if cursor_key:
+            # Bump the epoch FIRST so any in-flight _handle_turn that finishes
+            # after this point will see a stale epoch and skip _advance_cursor,
+            # keeping the cursor rewound rather than re-advancing it.
+            self._reset_epoch[cursor_key] = self._reset_epoch.get(cursor_key, 0) + 1
+
             lane_node_id = self._lane_keys.get(cursor_key)
             if lane_node_id:
                 # Live lane exists — reset it and rewind the persisted cursor
@@ -1174,6 +1183,11 @@ class DiscordBridge:
         replies, we snapshot the lane's tail (= the user turn node) and store
         it in the msg->node map so future threads can fork from it precisely.
         """
+        # Snapshot the reset epoch before acquiring the lock. If /reset fires
+        # during this turn, the epoch will be bumped and we'll skip the final
+        # _advance_cursor call so the rewound cursor isn't overwritten.
+        epoch_at_start = self._reset_epoch.get(cursor_key, 0) if cursor_key else 0
+
         lock = self._lane_locks.setdefault(node_id, asyncio.Lock())
         async with lock:
             done_event = asyncio.Event()
@@ -1220,9 +1234,17 @@ class DiscordBridge:
                 else:
                     await acc.wait_and_send(timeout=turn_timeout)
 
-                # Persist the advanced cursor after the full turn completes.
+                # Persist the advanced cursor after the full turn completes,
+                # but only if no /reset happened while this turn was running.
                 if cursor_key:
-                    self._advance_cursor(cursor_key, node_id)
+                    current_epoch = self._reset_epoch.get(cursor_key, 0)
+                    if current_epoch == epoch_at_start:
+                        self._advance_cursor(cursor_key, node_id)
+                    else:
+                        logger.debug(
+                            "Discord: skipping cursor advance for %s — reset occurred during turn",
+                            cursor_key,
+                        )
 
             except Exception:
                 logger.exception("Discord: error handling turn for cursor %s", node_id)
