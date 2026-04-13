@@ -83,13 +83,20 @@ class ToolCallHandler:
         return main_line or f"Function: {func.__name__}", arg_descs
 
     def _python_type_to_json_schema(self, annotation) -> Dict[str, Any]:
+        # Handle generic aliases like list[str], list[int], etc.
+        origin = getattr(annotation, '__origin__', None)
+        if origin is list:
+            args = getattr(annotation, '__args__', None)
+            item_schema = self._python_type_to_json_schema(args[0]) if args else {"type": "string"}
+            return {"type": "array", "items": item_schema}
+
         mapping = {
-            str: {"type": "string"},
-            int: {"type": "integer"},
+            str:   {"type": "string"},
+            int:   {"type": "integer"},
             float: {"type": "number"},
-            bool: {"type": "boolean"},
-            dict: {"type": "object"},
-            list: {"type": "array"},
+            bool:  {"type": "boolean"},
+            dict:  {"type": "object"},
+            list:  {"type": "array"},
         }
         return mapping.get(annotation, {"type": "string"})
 
