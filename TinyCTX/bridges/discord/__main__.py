@@ -173,6 +173,7 @@ DEFAULTS = {
     "prefix_required": True,
     "command_prefix": "!",
     "reset_command": "/reset",
+    "shutdown_command": "/shutdown",
     "buffer_timeout_s": 0,
     "buffer_head_lines": 2,
     "buffer_tail_lines": 10,
@@ -443,6 +444,7 @@ class DiscordBridge:
         self._prefix:           str   = str(self._opts["command_prefix"])
         self._prefix_required:  bool  = bool(self._opts["prefix_required"])
         self._reset_command:    str   = str(self._opts["reset_command"])
+        self._shutdown_command: str   = str(self._opts["shutdown_command"])
         self._dm_enabled:       bool  = bool(self._opts["dm_enabled"])
 
         # allowed_servers: {guild_id: set[channel_id]} — empty set = all channels
@@ -598,6 +600,13 @@ class DiscordBridge:
         async def _reset_slash(interaction: discord.Interaction) -> None:
             await self._handle_reset_interaction(interaction)
 
+        # Register /shutdown.
+        shutdown_cmd_name = self._shutdown_command.lstrip("/").replace(" ", "_")
+
+        @self._tree.command(name=shutdown_cmd_name, description="Kill the TinyCTX gateway (admin only)")
+        async def _shutdown_slash(interaction: discord.Interaction) -> None:
+            await self._handle_shutdown_interaction(interaction)
+
         # Group commands by namespace so we can decide flat vs subcommand.
         # namespace -> {sub -> (help_text, ns, sub)}
         grouped: dict[str, dict[str, tuple[str, str, str]]] = {}
@@ -698,6 +707,57 @@ class DiscordBridge:
             # Clear lane_keys so the next message rebuilds from scratch.
             self._lane_keys.pop(cursor_key, None)
         await interaction.followup.send("✅ Session reset.", ephemeral=True)
+
+    async def _handle_shutdown_interaction(self, interaction: discord.Interaction) -> None:
+        """Handle the /shutdown slash command — kills the gateway process."""
+        await interaction.response.defer(ephemeral=True)
+
+        if not self._is_admin(interaction.user.id):
+            await interaction.followup.send(
+                "⛔ Only admins can shut down the gateway.", ephemeral=True
+            )
+            return
+
+        import urllib.request
+        import urllib.error
+
+        cfg       = self._router._config
+        gateway_url = f"http://{cfg.gateway.host}:{cfg.gateway.port}"
+        api_key     = cfg.gateway.api_key or ""
+
+        logger.warning(
+            "Discord: /shutdown invoked by %s (%s) — sending POST /v1/shutdown",
+            interaction.user.name, interaction.user.id,
+        )
+
+        try:
+            req = urllib.request.Request(
+                f"{gateway_url}/v1/shutdown",
+                method="POST",
+                data=b"{}",
+                headers={
+                    "Content-Type":  "application/json",
+                    "Authorization": f"Bearer {api_key}",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=5):
+                pass
+            await interaction.followup.send("🔴 Gateway is shutting down.", ephemeral=True)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 204:
+                await interaction.followup.send("🔴 Gateway is shutting down.", ephemeral=True)
+            else:
+                await interaction.followup.send(
+                    f"⚠️ Shutdown request failed (HTTP {exc.code}).", ephemeral=True
+                )
+        except Exception as exc:
+            # Connection reset/abort is expected — the server died mid-response.
+            if isinstance(exc, (ConnectionResetError, ConnectionAbortedError)):
+                await interaction.followup.send("🔴 Gateway is shutting down.", ephemeral=True)
+            else:
+                await interaction.followup.send(
+                    f"⚠️ Shutdown failed: {exc}", ephemeral=True
+                )
 
     async def _handle_command_interaction(
         self,
