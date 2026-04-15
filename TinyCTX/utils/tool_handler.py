@@ -202,8 +202,14 @@ class ToolCallHandler:
             if function_name not in self.tools:
                 return {
                     'tool_call_id': tool_call_id,
-                    'error': f"Tool '{function_name}' not found",
-                    'available_tools': list(self.tools.keys()),
+                    'error': "Tool not found or not enabled",
+                    'success': False
+                }
+
+            if function_name not in self.enabled:
+                return {
+                    'tool_call_id': tool_call_id,
+                    'error': "Tool not found or not enabled",
                     'success': False
                 }
                         

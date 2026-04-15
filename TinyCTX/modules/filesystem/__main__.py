@@ -193,7 +193,20 @@ def register(agent) -> None:
 
     def resolve(raw: str) -> Path:
         p = Path(raw)
-        return p if p.is_absolute() else workspace / p
+        # Resolve to an absolute path, then enforce containment.
+        # Allow access to the workspace and the TinyCTX source root, nothing else.
+        candidate = (workspace / p).resolve() if not p.is_absolute() else p.resolve()
+        try:
+            candidate.relative_to(workspace.resolve())
+            return candidate
+        except ValueError:
+            pass
+        try:
+            candidate.relative_to(source_root)
+            return candidate
+        except ValueError:
+            pass
+        raise ValueError(f"Path escapes allowed directories: {raw}")
 
     def shell(command: str) -> str:
         """Run a shell command in the workspace. Returns stdout, stderr, and exit code.

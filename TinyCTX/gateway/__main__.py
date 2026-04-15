@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hmac
 import json
 import logging
 import time
@@ -89,9 +90,12 @@ def _auth_middleware(api_key: str):
         if request.path == "/v1/health":
             return await handler(request)
         if not api_key:
-            return await handler(request)
+            raise web.HTTPUnauthorized(
+                content_type="application/json",
+                body=json.dumps({"error": "gateway api_key is not configured"}),
+            )
         auth = request.headers.get("Authorization", "")
-        if not auth.startswith("Bearer ") or auth[len("Bearer "):] != api_key:
+        if not auth.startswith("Bearer ") or not hmac.compare_digest(auth[len("Bearer "):], api_key):
             raise web.HTTPUnauthorized(
                 content_type="application/json",
                 body=json.dumps({"error": "invalid or missing api key"}),
@@ -549,8 +553,22 @@ async def handle_workspace_put(request: web.Request) -> web.Response:
     if target is None:
         raise web.HTTPForbidden(content_type="application/json",
                                 body=json.dumps({"error": "path escapes workspace root"}))
+    # Reject bodies larger than 10 MB to prevent OOM.
+    _MAX_BODY = 10 * 1024 * 1024
+    content_length = request.content_length
+    if content_length is not None and content_length > _MAX_BODY:
+        raise web.HTTPRequestEntityTooLarge(
+            max_size=_MAX_BODY, actual_size=content_length,
+        )
     try:
-        body = await request.json()
+        raw = await request.content.read(_MAX_BODY + 1)
+    except Exception:
+        raise web.HTTPBadRequest(content_type="application/json",
+                                 body=json.dumps({"error": "failed to read request body"}))
+    if len(raw) > _MAX_BODY:
+        raise web.HTTPRequestEntityTooLarge(max_size=_MAX_BODY, actual_size=len(raw))
+    try:
+        body = json.loads(raw)
     except Exception:
         raise web.HTTPBadRequest(content_type="application/json",
                                  body=json.dumps({"error": "invalid JSON"}))
@@ -573,25 +591,12 @@ async def handle_workspace_put(request: web.Request) -> web.Response:
 # ---------------------------------------------------------------------------
 
 async def handle_health(request: web.Request) -> web.Response:
-    router = request.app["router"]
     uptime = time.time() - request.app["start_time"]
-    fanout: dict = request.app["fanout"]
-
-    lanes_summary = {}
-    for node_id, lane in router._lane_router._lanes.items():
-        lanes_summary[node_id] = {
-            "turns":       lane.loop._turn_count,
-            "queue_depth": lane.queue.qsize(),
-            "queue_max":   lane.queue.maxsize,
-            "subscribers": len(fanout.get(node_id, [])),
-        }
-
     return web.Response(
         content_type="application/json",
         body=json.dumps({
             "status":   "ok",
             "uptime_s": round(uptime, 1),
-            "lanes":    lanes_summary,
         }),
     )
 

@@ -34,6 +34,58 @@ import aiohttp
 
 
 # ---------------------------------------------------------------------------
+# SSRF guard — block requests to private/loopback IPs and non-http(s) schemes
+# ---------------------------------------------------------------------------
+import ipaddress
+import socket
+
+_PRIVATE_NETWORKS = [
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("169.254.0.0/16"),   # link-local / cloud metadata
+    ipaddress.ip_network("100.64.0.0/10"),    # carrier-grade NAT
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),          # ULA
+]
+
+
+def _is_private_ip(address: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(address)
+        return any(ip in net for net in _PRIVATE_NETWORKS)
+    except ValueError:
+        return False
+
+
+def _check_ssrf(url: str) -> Optional[str]:
+    """Return an error string if the URL should be blocked for SSRF reasons."""
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return "[error: invalid URL]"
+    if parsed.scheme.lower() not in ("http", "https"):
+        return f"[error: scheme '{parsed.scheme}' is not allowed; use http or https]"
+    host = parsed.hostname or ""
+    if not host:
+        return "[error: URL has no host]"
+    # Block bare IP literals that are private
+    if _is_private_ip(host):
+        return f"[error: requests to private/loopback addresses are not allowed ({host})]"
+    # Resolve hostname and check each resulting IP
+    try:
+        infos = socket.getaddrinfo(host, None)
+        for info in infos:
+            addr = info[4][0]
+            if _is_private_ip(addr):
+                return f"[error: hostname '{host}' resolves to a private address ({addr}) — request blocked]"
+    except socket.gaierror:
+        pass  # unresolvable host — let aiohttp handle it
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -625,6 +677,9 @@ def register(agent) -> None:
             json_data: JSON payload.
             headers: Extra request headers.
         """
+        ssrf_err = _check_ssrf(url)
+        if ssrf_err:
+            return ssrf_err
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.request(
@@ -669,6 +724,10 @@ def register(agent) -> None:
         err = _validate_browse_url(url)
         if err:
             return err
+        # Also guard against SSRF to private/internal addresses.
+        ssrf_err = _check_ssrf(url)
+        if ssrf_err:
+            return ssrf_err
 
         mode = type.lower().strip()
         if mode not in ("elements", "text", "html"):
@@ -840,7 +899,13 @@ def register(agent) -> None:
 
         if not filename:
             filename = f"screenshot_{int(time.time())}.png"
-        path = st["downloads_dir"] / filename
+        # Strip any directory components — prevent path traversal outside downloads_dir.
+        safe_name = Path(filename).name
+        if not safe_name:
+            safe_name = f"screenshot_{int(time.time())}.png"
+        path = (st["downloads_dir"] / safe_name).resolve()
+        if not str(path).startswith(str(st["downloads_dir"].resolve())):
+            return "[error: filename escapes downloads directory]"
 
         try:
             if target:

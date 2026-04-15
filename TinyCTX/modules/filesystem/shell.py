@@ -50,8 +50,12 @@ def load_blacklist(path: Path = BLACKLIST_PATH) -> list[re.Pattern]:
     return patterns
 
 def check_blacklist(command: str, patterns: list[re.Pattern]) -> str | None:
+    # Strip leading/trailing whitespace so "  rm -rf /" doesn't bypass anchoring.
+    normalized = command.strip().lower()
     for pattern in patterns:
-        if pattern.fullmatch(command.lower()):
+        # Use search() so patterns match anywhere in the command string,
+        # not just when the entire command is an exact match (fullmatch).
+        if pattern.search(normalized):
             return pattern.pattern
     return None
 

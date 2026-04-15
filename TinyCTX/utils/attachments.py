@@ -136,7 +136,16 @@ def save_upload(attachment: Attachment, uploads_dir: Path) -> Path:
     so the caller can still include a reference note.
     """
     uploads_dir.mkdir(parents=True, exist_ok=True)
-    dest = uploads_dir / attachment.filename
+    # Sanitize filename: strip all directory components to prevent path traversal.
+    safe_name = Path(attachment.filename).name
+    if not safe_name:
+        safe_name = "unnamed"
+    dest = uploads_dir / safe_name
+    # Belt-and-suspenders: verify the resolved path stays inside uploads_dir.
+    resolved_dest = dest.resolve()
+    if not str(resolved_dest).startswith(str(uploads_dir.resolve())):
+        logger.error("Attachment filename escapes uploads dir: %s", attachment.filename)
+        raise ValueError(f"Filename escapes uploads directory: {attachment.filename}")
     # Avoid silent overwrites: append a counter suffix if the name is taken.
     if dest.exists():
         stem = dest.stem
