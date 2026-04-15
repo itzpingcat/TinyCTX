@@ -23,6 +23,7 @@ class ModelConfig:
     base_url:    str
     kind:        str   = "chat"       # "chat" | "embedding"
     api_key_env: str   = "ANTHROPIC_API_KEY"
+    _resolved_api_key: str | None = field(default=None, init=False, repr=False, compare=False)
     max_tokens:       int        = 2048
     temperature:      float      = 0.7
     budget_tokens:    int | None = None   # Anthropic extended thinking: budget_tokens > 0
@@ -48,11 +49,14 @@ class ModelConfig:
     def api_key(self) -> str:
         if not self.api_key_env or self.api_key_env.upper() == "N/A":
             return ""
-        key = os.environ.get(self.api_key_env, "").strip()
+        if self._resolved_api_key is not None:
+            return self._resolved_api_key
+        key = os.environ.pop(self.api_key_env, "").strip()
         if not key:
             raise EnvironmentError(
                 f"API key not set. Export {self.api_key_env} before starting."
             )
+        object.__setattr__(self, "_resolved_api_key", key)
         return key
 
     @property

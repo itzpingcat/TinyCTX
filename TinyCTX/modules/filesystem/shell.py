@@ -12,6 +12,7 @@ Blacklist is always enforced regardless of platform.
 Patterns are glob-style, case-insensitive, loaded from blacklist.txt.
 """
 from __future__ import annotations
+import os
 import re
 import fnmatch
 import logging
@@ -277,11 +278,23 @@ def run_command(command: str, cwd: Path, timeout: int, blacklist: list[str]) -> 
     if _IS_WINDOWS:
         extra_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
 
+    # Spawn subprocesses with a minimal sanitised environment so the agent
+    # cannot read API keys or other secrets from the parent process.
+    # PATH is kept so commands resolve normally; HOME/TMPDIR for well-behaved
+    # tools that need a writable temp location. Everything else is stripped.
+    _SAFE_ENV_KEYS = ("PATH", "HOME", "TMPDIR", "TEMP", "TMP", "LANG", "LC_ALL",
+                      "TERM", "USER", "LOGNAME",
+                      # Windows essentials — PowerShell needs these
+                      "SystemRoot", "SystemDrive", "windir",
+                      "PATHEXT", "COMSPEC", "USERPROFILE", "HOMEDRIVE", "HOMEPATH")
+    _subprocess_env = {k: v for k, v in os.environ.items() if k in _SAFE_ENV_KEYS}
+
     try:
         result = subprocess.run(
             exec_args, cwd=cwd,
             capture_output=True, text=True, timeout=timeout,
             encoding="utf-8", errors="replace",
+            env=_subprocess_env,
             **extra_kwargs,
         )
         parts = []

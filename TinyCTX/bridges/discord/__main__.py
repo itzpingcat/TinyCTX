@@ -1319,7 +1319,7 @@ class DiscordBridge:
 
     async def run(self) -> None:
         token_env = str(self._opts["token_env"])
-        token     = os.environ.get(token_env, "")
+        token     = os.environ.pop(token_env, "")
         if not token:
             raise RuntimeError(
                 f"Discord bridge: env var '{token_env}' is not set. "

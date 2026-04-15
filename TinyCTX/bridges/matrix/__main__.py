@@ -642,7 +642,7 @@ class MatrixBridge:
 
     async def run(self) -> None:
         password_env = str(self._opts["password_env"])
-        password = os.environ.get(password_env, "")
+        password = os.environ.pop(password_env, "")
         if not password:
             raise RuntimeError(
                 f"Matrix bridge: env var '{password_env}' is not set. "
