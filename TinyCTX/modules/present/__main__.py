@@ -51,4 +51,4 @@ def register(agent) -> None:
         names = ", ".join(Path(p).name for p in validated)
         return f"Successfully sent files: {names}"
 
-    agent.tool_handler.register_tool(present, always_on=True)
+    agent.tool_handler.register_tool(present, always_on=True, min_permission=25)

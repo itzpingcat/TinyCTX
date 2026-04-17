@@ -1022,6 +1022,19 @@ def register(agent) -> None:
         "manage_browser": False,
     }
 
+    _WEB_PERMISSIONS: dict[str, int] = {
+        "web_search":        25,
+        "open_url":          25,
+        "http_request":      75,
+        "click":             50,
+        "type_text":         50,
+        "extract_text":      25,
+        "extract_html":      25,
+        "screenshot_browser": 25,
+        "wait_for":          25,
+        "manage_browser":    50,
+    }
+
     for fn in (
         web_search,
         open_url,
@@ -1038,4 +1051,4 @@ def register(agent) -> None:
         if vis == "disabled":
             continue
         always_on = _WEB_DEFAULTS[fn.__name__] if vis == "" else vis == "always_on"
-        agent.tool_handler.register_tool(fn, always_on=always_on)
+        agent.tool_handler.register_tool(fn, always_on=always_on, min_permission=_WEB_PERMISSIONS[fn.__name__])

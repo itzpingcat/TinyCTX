@@ -165,5 +165,5 @@ def register(agent) -> None:
         return _format_todo_list(todos)
 
     # Register tools
-    agent.tool_handler.register_tool(todo_write, always_on=False)
-    agent.tool_handler.register_tool(todo_read, always_on=False)
+    agent.tool_handler.register_tool(todo_write, always_on=False, min_permission=25)
+    agent.tool_handler.register_tool(todo_read, always_on=False, min_permission=25)

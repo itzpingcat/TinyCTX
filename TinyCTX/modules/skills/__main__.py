@@ -210,7 +210,7 @@ def register(agent) -> None:
         cfg.get("tools", {}).get("use_skill", "always_on")
     ).lower().strip()
     if _sk_vis != "disabled":
-        agent.tool_handler.register_tool(use_skill, always_on=(_sk_vis != "deferred"))
+        agent.tool_handler.register_tool(use_skill, always_on=(_sk_vis != "deferred"), min_permission=25)
 
     initial = _refresh()
     if initial:

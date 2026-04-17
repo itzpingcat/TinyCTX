@@ -646,9 +646,9 @@ def register(agent) -> None:
     # Register all tools
     # ------------------------------------------------------------------
 
-    agent.tool_handler.register_tool(shell,       always_on=True)
-    agent.tool_handler.register_tool(view,        always_on=True)
-    agent.tool_handler.register_tool(write_file,  always_on=True)
-    agent.tool_handler.register_tool(edit_file, always_on=True)
-    agent.tool_handler.register_tool(grep,        always_on=True)
-    agent.tool_handler.register_tool(glob_search, always_on=True)
+    agent.tool_handler.register_tool(shell,       always_on=True, min_permission=75)
+    agent.tool_handler.register_tool(view,        always_on=True, min_permission=25)
+    agent.tool_handler.register_tool(write_file,  always_on=True, min_permission=50)
+    agent.tool_handler.register_tool(edit_file,   always_on=True, min_permission=50)
+    agent.tool_handler.register_tool(grep,        always_on=True, min_permission=25)
+    agent.tool_handler.register_tool(glob_search, always_on=True, min_permission=25)

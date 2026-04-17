@@ -452,7 +452,7 @@ def register(agent) -> None:
         cfg.get("tools", {}).get("memory_search", "always_on")
     ).lower().strip()
     if _ms_vis != "disabled":
-        agent.tool_handler.register_tool(memory_search, always_on=(_ms_vis != "deferred"))
+        agent.tool_handler.register_tool(memory_search, always_on=(_ms_vis != "deferred"), min_permission=25)
 
     # ------------------------------------------------------------------
     # 6. /memory consolidate command
