@@ -156,6 +156,7 @@ class InboundMessage:
     group_policy: "GroupPolicy | None" = None  # set by bridge for group messages
     server_name:  str | None    = None          # guild/server name (bridges populate when known)
     channel_name: str | None    = None          # channel/thread name (bridges populate when known)
+    permission_level: int       = 25            # 0-100; bridge sets per triggering sender. CLI=100.
 
 
 # ---------------------------------------------------------------------------

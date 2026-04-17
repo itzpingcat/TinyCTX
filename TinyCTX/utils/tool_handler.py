@@ -13,7 +13,8 @@ class ToolCallHandler:
                       func: Callable,
                       name: Optional[str] = None,
                       description: Optional[str] = None,
-                      always_on: bool = False):
+                      always_on: bool = False,
+                      min_permission: int = 25):
         """Register a tool function - auto-extracts name and description if not provided
         
         Args:
@@ -47,7 +48,8 @@ class ToolCallHandler:
             'description': description,
             'signature': sig,
             'properties': properties,
-            'required': required
+            'required': required,
+            'min_permission': min_permission,
         }
         if always_on:
             self.enabled.add(name)
@@ -160,12 +162,14 @@ class ToolCallHandler:
             return "No tools found matching that query."
         return f"Enabled: {', '.join(new)}"
 
-    def get_tool_definitions(self) -> List[Dict[str, Any]]:
+    def get_tool_definitions(self, caller_level: int = 100) -> List[Dict[str, Any]]:
         definitions = []
         for name in self.enabled:
             tool = self.tools.get(name)
             if tool is None:
                 continue
+            if caller_level < tool.get('min_permission', 25):
+                continue  # silently excluded — LLM never sees this tool
             definitions.append({
                 "type": "function",
                 "function": {
@@ -180,7 +184,7 @@ class ToolCallHandler:
             })
         return definitions
     
-    async def execute_tool_call(self, tool_call) -> Dict[str, Any]:
+    async def execute_tool_call(self, tool_call, caller_level: int = 100) -> Dict[str, Any]:
         """Execute a tool call from the LLM"""
         try:
             if hasattr(tool_call, 'function'):
@@ -211,6 +215,17 @@ class ToolCallHandler:
                     'tool_call_id': tool_call_id,
                     'error': "Tool not found or not enabled",
                     'success': False
+                }
+
+            # Permission guard — enforce even if LLM hallucinated a filtered tool.
+            if caller_level < self.tools[function_name].get('min_permission', 25):
+                return {
+                    'tool_call_id': tool_call_id,
+                    'error': (
+                        f"[PERMISSION DENIED] Tool '{function_name}' requires permission "
+                        f">= {self.tools[function_name]['min_permission']}; caller has {caller_level}."
+                    ),
+                    'success': False,
                 }
                         
             if isinstance(arguments, str):

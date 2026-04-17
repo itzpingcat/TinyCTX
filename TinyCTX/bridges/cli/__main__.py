@@ -372,7 +372,7 @@ class CLIBridge:
         """
         import aiohttp
 
-        payload: dict = {"node_id": self._cursor, "text": text}
+        payload: dict = {"node_id": self._cursor, "text": text, "permission_level": 100}
         if attachments:
             payload["attachments"] = attachments
 

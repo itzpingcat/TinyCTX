@@ -109,6 +109,8 @@ class Lane:
     async def _drain(self) -> None:
         while True:
             msg = await self.queue.get()
+            if msg is not None:
+                self.loop.permission_level = msg.permission_level
             self.abort_event.clear()  # fresh slate for every turn
             try:
                 async for event in self.loop.run(msg, abort_event=self.abort_event):

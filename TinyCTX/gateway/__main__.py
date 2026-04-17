@@ -255,6 +255,9 @@ async def handle_lane_message(request: web.Request) -> web.StreamResponse:
             ))
         attachments = tuple(parsed)
 
+    permission_level = int(body.get("permission_level", 25))
+    permission_level = max(0, min(100, permission_level))  # clamp to 0-100
+
     msg = InboundMessage(
         tail_node_id=node_id,
         author=_API_AUTHOR,
@@ -263,6 +266,7 @@ async def handle_lane_message(request: web.Request) -> web.StreamResponse:
         message_id=str(time.time_ns()),
         timestamp=time.time(),
         attachments=attachments,
+        permission_level=permission_level,
     )
 
     # Set up fanout before pushing so no events are missed.

@@ -282,6 +282,32 @@ class MatrixBridge:
     # Helpers
     # ------------------------------------------------------------------
 
+    def _resolve_permission_level(self, room: MatrixRoom, sender: str) -> int:
+        """
+        Resolve a Matrix sender's permission level (0-100) from their room power level.
+
+        Config (under bridges.matrix.options):
+          default_permission: 25
+          power_level_map:       # Matrix power level -> our level
+            100: 100
+            50:  50
+            0:   25
+        """
+        default   = int(self._opts.get("default_permission", 25))
+        level_map = self._opts.get("power_level_map", {})
+        if not level_map:
+            return default
+        # Get the sender's Matrix power level in this room.
+        power = room.power_levels.get_user_level(sender) if hasattr(room, "power_levels") else 0
+        # Exact match first, then nearest lower key.
+        int_map = {int(k): int(v) for k, v in level_map.items()}
+        if power in int_map:
+            return int_map[power]
+        lower_keys = [k for k in int_map if k <= power]
+        if lower_keys:
+            return int_map[max(lower_keys)]
+        return default
+
     def _is_allowed(self, sender: str) -> bool:
         if not self._allowed_users:
             return True
@@ -408,6 +434,7 @@ class MatrixBridge:
                 message_id=event.event_id,
                 timestamp=time.time(),
                 attachments=attachments,
+                permission_level=self._resolve_permission_level(room, event.sender),
             )
             acc = _ReplyAccumulator(self._max_len)
             self._accumulators[node_id] = acc
@@ -474,6 +501,7 @@ class MatrixBridge:
             timestamp=time.time(),
             attachments=attachments,
             group_policy=self._build_group_policy(),
+            permission_level=self._resolve_permission_level(room, event.sender),
         )
         acc = _ReplyAccumulator(self._max_len)
         self._accumulators[node_id] = acc

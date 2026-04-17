@@ -818,6 +818,29 @@ class DiscordBridge:
     # Helpers
     # ------------------------------------------------------------------
 
+    def _resolve_permission_level(self, member_roles: list | None) -> int:
+        """
+        Resolve a Discord sender's permission level (0-100) from their roles.
+
+        Iterates roles highest-position first, returns the first mapped level.
+        Falls back to default_permission if no role matches.
+
+        Config (under bridges.discord.options):
+          default_permission: 25
+          role_permissions:
+            "Admin":     100
+            "Moderator": 50
+            "Member":    25
+        """
+        role_map = self._opts.get("role_permissions", {})
+        default  = int(self._opts.get("default_permission", 25))
+        if not member_roles or not role_map:
+            return default
+        for role in sorted(member_roles, key=lambda r: r.position, reverse=True):
+            if role.name in role_map:
+                return int(role_map[role.name])
+        return default
+
     def _is_allowed_dm(self, user_id: int) -> bool:
         if not self._allowed_users_dm:
             return True
@@ -1009,6 +1032,7 @@ class DiscordBridge:
                 # DMs have no server or channel name.
                 server_name=None,
                 channel_name=None,
+                permission_level=self._opts.get("dm_permission", 25),
             )
             acc = _ReplyAccumulator(message.channel, self._max_len)
             task = asyncio.create_task(
@@ -1062,6 +1086,7 @@ class DiscordBridge:
             username=message.author.name,
         )
         policy = self._build_group_policy()
+        member_roles = getattr(message.author, "roles", None)
         msg = InboundMessage(
             tail_node_id=node_id,
             author=author,
@@ -1073,6 +1098,7 @@ class DiscordBridge:
             group_policy=policy,
             server_name=message.guild.name if message.guild else None,
             channel_name=message.channel.name if hasattr(message.channel, "name") else None,
+            permission_level=self._resolve_permission_level(member_roles),
         )
 
         # Check if this message is a trigger BEFORE spawning _handle_turn.
@@ -1178,6 +1204,7 @@ class DiscordBridge:
             user_id=str(message.author.id),
             username=message.author.name,
         )
+        member_roles = getattr(message.author, "roles", None)
         msg = InboundMessage(
             tail_node_id=node_id,
             author=author,
@@ -1188,6 +1215,7 @@ class DiscordBridge:
             attachments=attachments,
             server_name=message.guild.name if message.guild else None,
             channel_name=thread.name,
+            permission_level=self._resolve_permission_level(member_roles),
         )
         acc = _ReplyAccumulator(message.channel, self._max_len)
         task = asyncio.create_task(

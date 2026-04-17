@@ -123,6 +123,7 @@ class AgentLoop:
         self.lane_node_id  = tail_node_id  # original lane key — never changes
         self.config        = config
         self.is_subagent   = is_subagent
+        self.permission_level: int = 100 if is_subagent else 25  # overridden per-turn by Lane._drain
         primary_mc         = config.models.get(config.llm.primary)
         self.context       = Context(
             token_limit=config.context,
@@ -351,7 +352,7 @@ class AgentLoop:
 
             # Stage 2: Context Assembly
             await self.context.run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC)
-            tools    = self.tool_handler.get_tool_definitions() or None
+            tools    = self.tool_handler.get_tool_definitions(caller_level=self.permission_level) or None
             messages = self.context.assemble(tools=tools)
 
             # Token budget telemetry
@@ -533,7 +534,7 @@ class AgentLoop:
             "function": {"name": call.tool_name, "arguments": call.args},
             "id": call.call_id,
         }
-        result = await self.tool_handler.execute_tool_call(proxy)
+        result = await self.tool_handler.execute_tool_call(proxy, caller_level=self.permission_level)
         raw_output = str(result.get("result", result.get("error", "[no output]")))
         is_error    = (not result.get("success", False)) or _looks_like_failed_tool_output(raw_output)
 

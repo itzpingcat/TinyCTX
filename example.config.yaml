@@ -142,6 +142,12 @@ bridges:
                                   #     - 222222222222222222
       admin_users: []             # e.g. [123456789012345678]
       dm_enabled: true
+      dm_permission: 50           # permission level granted to DM senders (0-100)
+      default_permission: 25      # fallback level for users with no matching role
+      role_permissions:           # Discord role name -> permission level (0-100)
+        # "Admin":     100
+        # "Moderator": 50
+        # "Member":    25
       prefix_required: true
       command_prefix: "!"
       max_reply_length: 1900
@@ -194,6 +200,11 @@ bridges:
       admin_users: []             # e.g. ["@you:matrix.org"]
       dm_enabled: true
       room_ids: []
+      default_permission: 25      # fallback level for users with no matching power level
+      power_level_map:            # Matrix power level -> permission level (0-100)
+        # 100: 100
+        # 50:  50
+        # 0:   25
       prefix_required: true
       command_prefix: "!"
       buffer_timeout_s: 0
