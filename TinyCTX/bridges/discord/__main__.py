@@ -822,23 +822,26 @@ class DiscordBridge:
         """
         Resolve a Discord sender's permission level (0-100) from their roles.
 
+        Keyed by role ID (integer) to prevent spoofing via role renames.
         Iterates roles highest-position first, returns the first mapped level.
         Falls back to default_permission if no role matches.
 
         Config (under bridges.discord.options):
           default_permission: 25
           role_permissions:
-            "Admin":     100
-            "Moderator": 50
-            "Member":    25
+            123456789012345678: 100   # Admin role ID
+            234567890123456789: 50    # Moderator role ID
+            345678901234567890: 25    # Member role ID
         """
         role_map = self._opts.get("role_permissions", {})
         default  = int(self._opts.get("default_permission", 25))
         if not member_roles or not role_map:
             return default
+        # Normalise keys to int so YAML integer keys and string keys both work.
+        int_map = {int(k): int(v) for k, v in role_map.items()}
         for role in sorted(member_roles, key=lambda r: r.position, reverse=True):
-            if role.name in role_map:
-                return int(role_map[role.name])
+            if role.id in int_map:
+                return int_map[role.id]
         return default
 
     def _is_allowed_dm(self, user_id: int) -> bool:
