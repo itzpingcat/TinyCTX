@@ -146,7 +146,47 @@ def _register_trim(context, config):
     truncate_after = config.get("tool_output_truncate_after", 2)
     max_chars      = config.get("max_tool_output_chars", 2000)
 
+    # tool_call ids whose results are being hard-trimmed (not just truncated).
+    # Populated by pre_assemble, consumed by transform_turn to strip the
+    # matching tool_call from its assistant turn so no dangling calls remain.
+    trimmed_calls: set[str] = set()
+
+    def pre_assemble(ctx):
+        trimmed_calls.clear()
+        dialogue = ctx.dialogue
+        n = len(dialogue)
+
+        # Build call_map so we can look up the tool_call id from a tool result.
+        call_map: dict[str, dict] = {}
+        for entry in dialogue:
+            for tc in entry.tool_calls:
+                call_map[tc["id"]] = tc
+
+        for i in range(n):
+            entry = dialogue[i]
+            if entry.role != "tool" or not entry.tool_call_id:
+                continue
+            age = n - 1 - i
+            if age > trim_after:
+                # This result will be replaced with a stub — record the call id
+                # so the assistant turn gets its tool_call stripped too.
+                trimmed_calls.add(entry.tool_call_id)
+
     def transform_turn(entry, age, ctx):
+        if entry.role == "assistant":
+            # Strip tool_calls whose results have been hard-trimmed.
+            if not trimmed_calls:
+                return None
+            surviving = [
+                tc for tc in entry.tool_calls
+                if tc["id"] not in trimmed_calls
+            ]
+            if len(surviving) == len(entry.tool_calls):
+                return None
+            if not surviving and not entry.content.strip():
+                return None
+            return _copy(entry, tool_calls=surviving)
+
         if entry.role != "tool":
             return None
 
@@ -165,6 +205,9 @@ def _register_trim(context, config):
 
         return None
 
+    # pre_assemble at priority=8 — after dedup (0) and CoT strip (5),
+    # before the transform (10) that actually rewrites the entries.
+    context.register_hook("pre_assemble",   pre_assemble,   priority=8)
     context.register_hook("transform_turn", transform_turn, priority=10)
 
 
