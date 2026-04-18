@@ -161,30 +161,6 @@ def register(agent) -> None:
         except OSError:
             pass
 
-    def _check_unchanged(p: Path, view_range: tuple | None) -> str | None:
-        """If the file hasn't changed since the last identical read, return a
-        short stub instead of the full content. Returns None if the file should
-        be read normally."""
-        abs_key = str(p)
-        if abs_key not in file_read_state:
-            return None
-        state = file_read_state[abs_key]
-        # Only dedup when the view_range matches the previous read
-        if state.get("view_range") != view_range:
-            return None
-        try:
-            current_mtime = p.stat().st_mtime
-        except OSError:
-            return None
-        if current_mtime != state["mtime"]:
-            return None
-        lc = state.get("line_count", 0)
-        line_info = f", {lc} lines" if lc else ""
-        return (
-            f"[{p.name} unchanged since last read{line_info}. "
-            "The content from the earlier view() is still current.]"
-        )
-
     def resolve(raw: str) -> Path:
         p = Path(raw)
         # Resolve to an absolute path, then enforce containment.
@@ -251,12 +227,6 @@ def register(agent) -> None:
                 parsed_range = (int(view_range[0]), int(view_range[1]))
             except (ValueError, IndexError):
                 return "[error: view_range must be [start, end] or 'start,end' integers]"
-
-        # Check if the file is unchanged since the last identical read.
-        # Returns a short stub to save tokens on repetitive reads.
-        unchanged = _check_unchanged(p, parsed_range)
-        if unchanged:
-            return unchanged
 
         try:
             text = p.read_text(encoding="utf-8")
