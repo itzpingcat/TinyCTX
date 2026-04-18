@@ -35,6 +35,8 @@ Neither is required; attachments.py degrades gracefully.
 from __future__ import annotations
 
 import base64
+import hashlib
+import json
 import logging
 import mimetypes
 from pathlib import Path
@@ -127,9 +129,38 @@ def classify(attachment: Attachment) -> AttachmentKind:
 # Saving
 # ---------------------------------------------------------------------------
 
+def _load_cache(uploads_dir: Path) -> dict[str, str]:
+    """Load uploads/cache.json → {sha256hex: filename}.  Returns {} on any error."""
+    cache_path = uploads_dir / "cache.json"
+    try:
+        return json.loads(cache_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        logger.warning("Could not read upload cache: %s", exc)
+        return {}
+
+
+def _save_cache(uploads_dir: Path, cache: dict[str, str]) -> None:
+    """Persist cache.json atomically (write to .tmp, rename)."""
+    cache_path = uploads_dir / "cache.json"
+    tmp_path   = uploads_dir / "cache.json.tmp"
+    try:
+        tmp_path.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+        tmp_path.replace(cache_path)
+    except Exception as exc:
+        logger.warning("Could not write upload cache: %s", exc)
+
+
 def save_upload(attachment: Attachment, uploads_dir: Path) -> Path:
     """
-    Write attachment bytes to uploads_dir/<filename>.
+    Write attachment bytes to uploads_dir/<filename>, deduplicating by content.
+
+    A sidecar uploads/cache.json maps sha256 → stored filename so that
+    re-uploading the same file returns the existing path without a write.
+    Original filenames are preserved; a counter suffix is only added when
+    two genuinely different files share the same name.
+
     Creates the directory if it doesn't exist.
     Returns the absolute path of the saved file.
     If writing fails, logs the error and returns the intended path anyway
@@ -137,28 +168,48 @@ def save_upload(attachment: Attachment, uploads_dir: Path) -> Path:
     """
     uploads_dir.mkdir(parents=True, exist_ok=True)
     # Sanitize filename: strip all directory components to prevent path traversal.
-    safe_name = Path(attachment.filename).name
-    if not safe_name:
-        safe_name = "unnamed"
-    dest = uploads_dir / safe_name
+    safe_name = Path(attachment.filename).name or "unnamed"
+    # Protect the dedup sidecar from being clobbered by an uploaded file.
+    if safe_name in {"cache.json", "cache.json.tmp"}:
+        safe_name = safe_name + ".upload"
     # Belt-and-suspenders: verify the resolved path stays inside uploads_dir.
-    resolved_dest = dest.resolve()
-    if not str(resolved_dest).startswith(str(uploads_dir.resolve())):
-        logger.error("Attachment filename escapes uploads dir: %s", attachment.filename)
-        raise ValueError(f"Filename escapes uploads directory: {attachment.filename}")
-    # Avoid silent overwrites: append a counter suffix if the name is taken.
+    def _check(p: Path) -> Path:
+        if not str(p.resolve()).startswith(str(uploads_dir.resolve())):
+            logger.error("Attachment filename escapes uploads dir: %s", attachment.filename)
+            raise ValueError(f"Filename escapes uploads directory: {attachment.filename}")
+        return p
+
+    content_hash = hashlib.sha256(attachment.data).hexdigest()
+    cache = _load_cache(uploads_dir)
+
+    # Cache hit — same bytes already stored.
+    if content_hash in cache:
+        existing = uploads_dir / cache[content_hash]
+        if existing.exists():
+            logger.debug("Dedup: reusing existing upload %s", existing.name)
+            return existing
+        # Stale entry (file was deleted) — fall through and re-save.
+        logger.debug("Upload cache stale for %s, re-saving", safe_name)
+
+    # Determine destination, avoiding name collisions with different-content files.
+    dest = _check(uploads_dir / safe_name)
     if dest.exists():
-        stem = dest.stem
-        suffix = dest.suffix
+        stem    = dest.stem
+        suffix  = dest.suffix
         counter = 1
         while dest.exists():
-            dest = uploads_dir / f"{stem}_{counter}{suffix}"
+            dest = _check(uploads_dir / f"{stem}_{counter}{suffix}")
             counter += 1
+
     try:
         dest.write_bytes(attachment.data)
         logger.debug("Saved upload: %s (%d bytes)", dest.name, len(attachment.data))
     except OSError as exc:
         logger.error("Failed to save upload %s: %s", dest, exc)
+        return dest
+
+    cache[content_hash] = dest.name
+    _save_cache(uploads_dir, cache)
     return dest
 
 
