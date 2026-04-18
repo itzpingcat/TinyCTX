@@ -2,22 +2,6 @@ name: tinyctx
 
 services:
 
-  # ── firewall-init ──────────────────────────────────────────────────────────
-  # One-shot: installs iptables FORWARD rules on the host that prevent the
-  # sandbox from reaching RFC-1918 ranges and the Tailscale CGNAT block.
-  # Runs once at stack startup, never restarts.
-  # Needs NET_ADMIN on host network to write the host's iptables.
-  firewall_init:
-    build:
-      context: .
-      dockerfile: sandbox/Dockerfile.firewall
-    image: tinyctx-firewall:latest
-    network_mode: host
-    restart: "no"
-    cap_add:
-      - NET_ADMIN
-      - NET_RAW
-
   # ── agent ──────────────────────────────────────────────────────────────────
   agent:
     build:
@@ -26,8 +10,6 @@ services:
     image: tinyctx:latest
     container_name: tinyctx
     depends_on:
-      firewall_init:
-        condition: service_completed_successfully
       shell_sandbox:
         condition: service_healthy
     restart: unless-stopped
@@ -104,9 +86,6 @@ services:
       dockerfile: sandbox/Dockerfile
     image: tinyctx-sandbox:latest
     container_name: tinyctx_sandbox
-    depends_on:
-      firewall_init:
-        condition: service_completed_successfully
     restart: unless-stopped
 
     expose:
@@ -122,9 +101,13 @@ services:
       WORKSPACE_PATH: "/home/tinyctx"
 
     security_opt:
-      - no-new-privileges:true
+      - no-new-privileges:false   # must be false so entrypoint can setuid/setgid after iptables
     cap_drop:
       - ALL
+    cap_add:
+      - NET_ADMIN    # iptables rules in entrypoint.sh
+      - SETUID       # drop to tinyctx user after firewall setup
+      - SETGID       # drop to tinyctx group after firewall setup
     read_only: true
     tmpfs:
       - /tmp:size=256m,mode=1777
@@ -139,10 +122,10 @@ services:
 
     networks:
       agent_sandbox: {}   # IPC from agent
-      sandbox_egress: {}  # internet out (LAN/TS blocked by firewall-init)
+      sandbox_egress: {}  # internet out (LAN/TS blocked by sandbox at startup)
 
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8700/health"]
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8700/health"]
       interval: 15s
       timeout: 3s
       retries: 3

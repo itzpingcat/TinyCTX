@@ -11,9 +11,11 @@ Security model:
     dispatching. The sandbox just runs what it receives.
   - Runs as non-root. Root filesystem is read-only. /workspace is the only
     writable surface (shared bind mount with the agent).
-  - No LAN / Tailscale access. The sandbox_egress network has internet but
-    the firewall-init sidecar drops RFC-1918 and 100.64/10 at the iptables
-    level. The agent_sandbox IPC network (internal: true) has no egress at all.
+  - No LAN / Tailscale access. entrypoint.sh runs as root, installs
+    iptables OUTPUT rules in this container's own network namespace, then
+    drops to the tinyctx user via su-exec before starting the server.
+    Blocks RFC-1918, Tailscale CGNAT, link-local, and loopback.
+    The agent_sandbox IPC network (internal: true) has no egress at all.
 
 Environment variables:
   SANDBOX_HOST    — bind host (default 0.0.0.0)
@@ -26,6 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import pwd
 import subprocess
 import sys
 from pathlib import Path
@@ -37,6 +40,19 @@ logging.basicConfig(
     format="%(asctime)s [sandbox] %(levelname)s %(message)s",
 )
 log = logging.getLogger(__name__)
+
+
+def drop_privileges(username: str = "tinyctx") -> None:
+    """Drop from root to unprivileged user. No-op if already non-root.
+    Requires no-new-privileges:false on the container.
+    """
+    if os.getuid() != 0:
+        return
+    pw = pwd.getpwnam(username)
+    os.setgid(pw.pw_gid)
+    os.setuid(pw.pw_uid)
+    os.environ["HOME"] = pw.pw_dir
+    log.info("privileges dropped to %s (uid=%d)", username, pw.pw_uid)
 
 HOST      = os.environ.get("SANDBOX_HOST", "0.0.0.0")
 PORT      = int(os.environ.get("SANDBOX_PORT", "8700"))
@@ -105,5 +121,6 @@ def build_app() -> web.Application:
 
 
 if __name__ == "__main__":
+    drop_privileges()
     log.info("sandbox  host=%s  port=%d  workspace=%s", HOST, PORT, WORKSPACE)
     web.run_app(build_app(), host=HOST, port=PORT, access_log=None)

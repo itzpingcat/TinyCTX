@@ -10,6 +10,9 @@ FROM python:3.12-slim
 # Core utils, VCS, media, build tools, language runtimes
 RUN apt-get update && apt-get install -y --no-install-recommends \
     \
+    # Firewall
+    iptables \
+    \
     # Shell / core utils
     bash curl wget ca-certificates \
     coreutils findutils grep sed gawk diffutils patch \
@@ -112,11 +115,13 @@ WORKDIR /app
 
 # ── service code ───────────────────────────────────────────────────────────
 COPY sandbox/__main__.py ./sandbox/__main__.py
+COPY sandbox/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
 RUN chown -R tinyctx:tinyctx /app
 
-USER tinyctx
-
+# Stay as root so entrypoint.sh can apply iptables rules,
+# then it drops to tinyctx via su-exec.
 EXPOSE 8700
 
-ENTRYPOINT ["python", "-m", "sandbox"]
+ENTRYPOINT ["/entrypoint.sh"]
