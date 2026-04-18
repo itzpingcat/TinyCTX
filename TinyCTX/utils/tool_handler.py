@@ -1,5 +1,7 @@
-import json
+import asyncio
+import functools
 import inspect
+import json
 import math
 import re
 from typing import Dict, Any, Callable, List, Optional
@@ -240,10 +242,18 @@ class ToolCallHandler:
             else:
                 args = arguments
                         
-            # Call the function — await it if it's async
-            result = self.tools[function_name]['function'](**args)
-            if inspect.iscoroutine(result):
-                result = await result
+            # Call the function.
+            # Async functions are awaited directly.
+            # Sync functions are dispatched to a thread-pool executor so they
+            # cannot block the event loop (and starve Discord heartbeats, etc.).
+            fn = self.tools[function_name]['function']
+            if inspect.iscoroutinefunction(fn):
+                result = await fn(**args)
+            else:
+                loop = asyncio.get_event_loop()
+                result = await loop.run_in_executor(
+                    None, functools.partial(fn, **args)
+                )
                         
             return {
                 'tool_call_id': tool_call_id,
