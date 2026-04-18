@@ -21,7 +21,6 @@ import subprocess
 from pathlib import Path
 
 from TinyCTX.contracts import IMAGE_BLOCK_PREFIX
-from TinyCTX.modules.filesystem.shell import load_blacklist, run_command
 
 logger = logging.getLogger(__name__)
 
@@ -99,11 +98,6 @@ def register(agent) -> None:
     workspace = Path(agent.config.workspace.path).expanduser().resolve()
     source_root = Path.cwd().resolve()
     workspace.mkdir(parents=True, exist_ok=True)
-
-    shell_timeout: int = getattr(agent.config, 'shell_timeout', 60)
-
-    # Load blacklist once at register time. Restart to pick up edits.
-    blacklist = load_blacklist()
 
     # ------------------------------------------------------------------
     # File-state tracking (read-before-write + staleness + unchanged detection)
@@ -207,16 +201,6 @@ def register(agent) -> None:
         except ValueError:
             pass
         raise ValueError(f"Path escapes allowed directories: {raw}")
-
-    def shell(command: str) -> str:
-        """Run a shell command in the workspace. Returns stdout, stderr, and exit code.
-        On Linux/macOS runs via bash. On Windows runs via PowerShell.
-        Blocked commands return an error string without executing.
-
-        Args:
-            command: The shell command to run.
-        """
-        return run_command(command, cwd=workspace, timeout=shell_timeout, blacklist=blacklist)
 
     def view(path: str, view_range: list = None) -> str:
         """Read a file with line numbers, list a directory, or display an image.
@@ -646,7 +630,6 @@ def register(agent) -> None:
     # Register all tools
     # ------------------------------------------------------------------
 
-    agent.tool_handler.register_tool(shell,       always_on=True, min_permission=75)
     agent.tool_handler.register_tool(view,        always_on=True, min_permission=25)
     agent.tool_handler.register_tool(write_file,  always_on=True, min_permission=50)
     agent.tool_handler.register_tool(edit_file,   always_on=True, min_permission=50)

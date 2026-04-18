@@ -1,67 +1,77 @@
 name: tinyctx
 
 services:
+
+  # ── firewall-init ──────────────────────────────────────────────────────────
+  # One-shot: installs iptables FORWARD rules on the host that prevent the
+  # sandbox from reaching RFC-1918 ranges and the Tailscale CGNAT block.
+  # Runs once at stack startup, never restarts.
+  # Needs NET_ADMIN on host network to write the host's iptables.
+  firewall_init:
+    image: debian:bookworm-slim
+    network_mode: host
+    restart: "no"
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    command: >
+      bash -c "
+        apt-get update -qq &&
+        apt-get install -y -qq --no-install-recommends iptables &&
+        iptables -I FORWARD -d 10.0.0.0/8      -j DROP &&
+        iptables -I FORWARD -d 172.16.0.0/12   -j DROP &&
+        iptables -I FORWARD -d 192.168.0.0/16  -j DROP &&
+        iptables -I FORWARD -d 100.64.0.0/10   -j DROP &&
+        iptables -I FORWARD -d 169.254.0.0/16  -j DROP &&
+        echo '[firewall-init] rules installed.'
+      "
+
+  # ── agent ──────────────────────────────────────────────────────────────────
   agent:
     build:
       context: .
+      dockerfile: Dockerfile
     image: tinyctx:latest
     container_name: tinyctx
-
+    depends_on:
+      firewall_init:
+        condition: service_completed_successfully
+      shell_sandbox:
+        condition: service_healthy
     restart: unless-stopped
 
-    # ── ports ──────────────────────────────────────────────────────────────
-    # Only bind gateway to localhost — don't expose it to the LAN
     ports:
       - "127.0.0.1:8085:8085"
 
-    # ── volumes ────────────────────────────────────────────────────────────
     volumes:
-      # Workspace: the agent's entire home dir is the workspace.
-      # ~/.tinyctx on the host maps to /home/tinyctx inside the container.
       - type: bind
         source: ${TINYCTX_WORKSPACE:-~/.tinyctx}
         target: /home/tinyctx
-
-      # Config: the repo ships example.config.yaml — copy it to config.yaml,
-      # fill in your model URLs/keys, and it will be picked up here.
       - type: bind
         source: ./config.yaml
         target: /app/config.yaml
         read_only: true
-
-      # Source: mount live source over the baked-in copy so code changes
-      # take effect on restart without rebuilding the image.
       - type: bind
         source: ./TinyCTX
         target: /app/TinyCTX
         read_only: true
 
-    # ── environment ────────────────────────────────────────────────────────
     environment:
-      # Container-internal
       TINYCTX_GATEWAY_HOST: "0.0.0.0"
-      # Bridge secrets — forwarded from host env
       DISCORD_BOT_TOKEN:
       MATRIX_PASSWORD:
 
-    # ── security hardening ─────────────────────────────────────────────────
     security_opt:
-      - no-new-privileges:true   # can't escalate via setuid binaries
-
-    # Drop ALL linux capabilities, add back only the minimum.
+      - no-new-privileges:true
     cap_drop:
       - ALL
     cap_add:
-      - NET_BIND_SERVICE   # harmless — gateway port is 8080, not <1024
-
-    # Read-only root filesystem — container code can't be modified at runtime.
-    # tmpfs mounts provide writable scratch space for caches etc.
+      - NET_BIND_SERVICE
     read_only: true
     tmpfs:
       - /tmp:size=256m,mode=1777
       - /app/__pycache__:size=64m
 
-    # ── resource limits ────────────────────────────────────────────────────
     deploy:
       resources:
         limits:
@@ -70,13 +80,10 @@ services:
         reservations:
           memory: 512M
 
-    # ── network ────────────────────────────────────────────────────────────
-    # Bridge mode. Container gets internet + can reach Tailscale IPs
-    # (100.64.72.3) because Docker bridge traffic routes through the host.
     networks:
-      - tinyctx_net
+      tinyctx_net: {}     # internet + Tailscale
+      agent_sandbox: {}   # IPC to sandbox only
 
-    # ── healthcheck ────────────────────────────────────────────────────────
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8085/v1/health"]
       interval: 30s
@@ -84,9 +91,92 @@ services:
       retries: 3
       start_period: 15s
 
+  # ── shell_sandbox ──────────────────────────────────────────────────────────
+  # Executes shell commands forwarded by the agent's shell module.
+  #
+  # Access control is entirely network-based:
+  #   agent_sandbox (internal: true)
+  #     — the only network the agent and sandbox share
+  #     — internal: true means Docker adds no gateway, zero egress
+  #     — nothing outside this stack can reach port 8700
+  #   sandbox_egress
+  #     — gives the sandbox internet for curl, git, npm, pip, etc.
+  #     — firewall-init blocks LAN / Tailscale ranges on this bridge
+  #
+  # The agent is NOT on sandbox_egress, so it cannot be reached from there.
+  # The sandbox is NOT on tinyctx_net, so it cannot reach the agent's
+  # gateway or Tailscale services.
+  shell_sandbox:
+    build:
+      context: .
+      dockerfile: sandbox/Dockerfile
+    image: tinyctx-sandbox:latest
+    container_name: tinyctx_sandbox
+    depends_on:
+      firewall_init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+    expose:
+      - "8700"   # no host binding — only agent_sandbox peers can reach this
+
+    volumes:
+      - type: bind
+        source: ${TINYCTX_WORKSPACE:-~/.tinyctx}
+        target: /workspace
+
+    environment:
+      SANDBOX_PORT: "8700"
+      WORKSPACE_PATH: "/workspace"
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 4G
+        reservations:
+          memory: 256M
+
+    networks:
+      agent_sandbox: {}   # IPC from agent
+      sandbox_egress: {}  # internet out (LAN/TS blocked by firewall-init)
+
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8700/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+
+# ── networks ────────────────────────────────────────────────────────────────
+
 networks:
+  # Agent's primary network — Tailscale reachable via host routing.
   tinyctx_net:
     driver: bridge
     driver_opts:
-      # Named bridge so it doesn't share a network with your Matrix stack etc.
       com.docker.network.bridge.name: br_tinyctx
+
+  # IPC-only channel between agent and sandbox.
+  # internal: true = Docker adds no gateway = zero internet egress on this net.
+  # The only two containers on this network are the agent and the sandbox.
+  agent_sandbox:
+    driver: bridge
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.name: br_agentsbox
+
+  # Sandbox internet egress. Has a gateway; LAN/TS ranges blocked by firewall-init.
+  sandbox_egress:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: br_sandboxout

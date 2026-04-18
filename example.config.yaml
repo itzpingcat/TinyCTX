@@ -351,6 +351,18 @@ logging:
 max_tool_cycles: 10
 
 # ---------------------------------------------------------------------------
+# shell:  (consumed by modules/shell)
+#
+# sandbox_url:  Base URL of the sandbox HTTP service.
+#               In Docker Compose: http://tinyctx_sandbox:8700
+#               Leave null (default) for local execution (bare-metal / dev).
+# timeout:      Per-command timeout in seconds (default 60).
+# ---------------------------------------------------------------------------
+# shell:
+#   sandbox_url: http://tinyctx_sandbox:8700
+#   timeout: 60
+
+# ---------------------------------------------------------------------------
 # equipment_manifest:  (consumed by modules/equipment_manifest)
 #
 # Reads EM.md, renders it as a lightweight template, and injects it as a
