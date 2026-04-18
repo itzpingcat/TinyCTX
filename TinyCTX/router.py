@@ -183,6 +183,7 @@ def _gp_replace_text(msg: InboundMessage, new_text: str) -> InboundMessage:
         attachments=msg.attachments,
         trace_id=msg.trace_id,
         group_policy=msg.group_policy,
+        permission_level=msg.permission_level,
     )
 
 
