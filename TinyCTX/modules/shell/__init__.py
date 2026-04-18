@@ -1,19 +1,17 @@
 EXTENSION_META = {
     "name":    "shell",
-    "version": "1.0",
+    "version": "1.1",
     "description": (
-        "Shell execution tool. Runs bash commands in the workspace. "
-        "Enforces a command blacklist before dispatch. "
-        "When sandbox_url is configured, commands run inside an isolated "
-        "sandbox container (no LAN/Tailscale access). "
-        "Falls back to local bash/PowerShell when sandbox_url is unset."
+        "Shell execution tools. "
+        "shell: always-on, runs in the sandbox container (no LAN/Tailscale). "
+        "core_shell: deferred, runs directly on the host — permission 100 only. "
+        "Blacklist enforced on both before dispatch."
     ),
     "default_config": {
         "timeout": 60,
 
-        # Set sandbox_url to the sandbox service base URL to enable sandboxed execution.
-        # In Docker Compose this is: http://tinyctx_sandbox:8700
-        # Leave null to run commands locally (bare-metal / Windows / dev).
-        "sandbox_url": None,
+        # Default points at the sandbox container defined in compose.yaml.
+        # Override to null for bare-metal / Windows / dev (falls back to local).
+        "sandbox_url": "http://tinyctx_sandbox:8700",
     },
 }

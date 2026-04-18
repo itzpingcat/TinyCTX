@@ -256,39 +256,55 @@ def register(agent) -> None:
 
     _extra      = agent.config.extra.get("shell", {}) if hasattr(agent.config, "extra") else {}
     timeout     = int(_extra.get("timeout", 60))
-    sandbox_url = _extra.get("sandbox_url") or None
+    # Default to sandbox. Operators set null explicitly for bare-metal / dev.
+    sandbox_url = _extra.get("sandbox_url", "http://tinyctx_sandbox:8700") or None
 
     if sandbox_url:
         logger.info("shell: dispatching via sandbox at %s", sandbox_url)
     else:
-        logger.info("shell: dispatching locally")
+        logger.info("shell: dispatching locally (no sandbox configured)")
 
     blacklist = _load_blacklist()
 
-    def shell(command: str) -> str:
-        """Run a shell command in the workspace directory.
-
-        On Linux/macOS runs via bash. On Windows runs via PowerShell.
-        Blocked commands return an error string without executing.
-        When a sandbox is configured, the command runs in an isolated
-        container with no access to the local network or Tailscale.
-
-        Args:
-            command: The shell command to run.
-        """
+    def _dispatch(command: str, local: bool = False) -> str:
+        """Shared pipeline: blacklist → warning → dispatch."""
         hit = _check_blacklist(command, blacklist)
         if hit:
             logger.warning("shell: blocked command (pattern: %s): %.120s", hit, command)
             return f"[blocked: command matched blacklist pattern '{hit}']"
-
         warn = _destructive_warning(command)
         prefix = f"[{warn}]\n" if warn else ""
-
-        if sandbox_url:
-            output = _run_sandbox(command, sandbox_url, timeout)
-        else:
+        if local or not sandbox_url:
             output = _run_local(command, workspace, timeout)
-
+        else:
+            output = _run_sandbox(command, sandbox_url, timeout)
         return prefix + output
 
-    agent.tool_handler.register_tool(shell, always_on=True, min_permission=75)
+    def shell(command: str) -> str:
+        """Run a shell command in the isolated sandbox container.
+
+        The sandbox has full internet access but cannot reach the local
+        network, Tailscale, or the host. Use this for the vast majority
+        of shell work: building, running scripts, calling APIs, git, etc.
+        Blocked commands return an error string without executing.
+
+        Args:
+            command: The shell command to run.
+        """
+        return _dispatch(command)
+
+    def core_shell(command: str) -> str:
+        """Run a shell command directly on the core host (NOT sandboxed).
+
+        Has full access to the local network, Tailscale, and host resources.
+        Reserved for operations that specifically require host-level access:
+        managing services, writing to host paths, Tailscale operations, etc.
+        Requires permission level 100. Blacklist still applies.
+
+        Args:
+            command: The shell command to run on the host.
+        """
+        return _dispatch(command, local=True)
+
+    agent.tool_handler.register_tool(shell,      always_on=True, min_permission=50)
+    agent.tool_handler.register_tool(core_shell, always_on=False, min_permission=100)
