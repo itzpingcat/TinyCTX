@@ -133,7 +133,7 @@ class ToolCallHandler:
         self.enabled.add(name)
         return True
 
-    def tools_search(self, query: str) -> str:
+    def tools_search(self, query: str, caller_level: int = 100) -> str:
         """Search for available tools by keyword and enable them for use.
 
         Args:
@@ -151,18 +151,26 @@ class ToolCallHandler:
         bm25   = BM25(corpus)
         scored = bm25.search(query, top_k=len(corpus))
         # Only surface results with a positive BM25 score
-        hits   = [name for name, score in scored if score > 0.0]
+        hits = [name for name, score in scored if score > 0.0]
 
-        new     = [n for n in hits if n not in self.enabled]
-        already = [n for n in hits if n in self.enabled]
+        permitted = [n for n in hits if caller_level >= self.tools[n].get('min_permission', 25)]
+        denied    = [n for n in hits if caller_level <  self.tools[n].get('min_permission', 25)]
+
+        new     = [n for n in permitted if n not in self.enabled]
+        already = [n for n in permitted if n in self.enabled]
 
         self.enabled.update(new)
 
-        if not new:
-            if already:
-                return f"No new tools found. Already enabled: {', '.join(already)}"
+        parts = []
+        if new:
+            parts.append(f"Enabled: {', '.join(new)}")
+        if already:
+            parts.append(f"Already enabled: {', '.join(already)}")
+        if denied:
+            parts.append(f"Permission denied (insufficient access level): {', '.join(denied)}")
+        if not parts:
             return "No tools found matching that query."
-        return f"Enabled: {', '.join(new)}"
+        return "\n".join(parts)
 
     def get_tool_definitions(self, caller_level: int = 100) -> List[Dict[str, Any]]:
         definitions = []

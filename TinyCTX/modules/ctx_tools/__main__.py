@@ -19,7 +19,9 @@ def register(agent, config=None):
 def _register_dedup(context, config):
     dedup_after = config.get("same_call_dedup_after", 3)
 
+    # Maps suppressed entry index -> True (for tool result turns)
     suppressed_tool:  set[int] = set()
+    # Maps suppressed tool_call id -> True (for assistant tool_calls list)
     suppressed_calls: set[str] = set()
 
     def pre_assemble(ctx):
@@ -29,13 +31,18 @@ def _register_dedup(context, config):
         dialogue = ctx.dialogue
         n = len(dialogue)
 
-        call_map = {
-            tc["id"]: tc
-            for entry in dialogue
-            for tc in entry.tool_calls
-        }
+        # Build call_map from ALL assistant turns unconditionally.
+        # Keyed by tool_call id -> tool_call dict.
+        call_map: dict[str, dict] = {}
+        for entry in dialogue:
+            for tc in entry.tool_calls:
+                call_map[tc["id"]] = tc
 
-        seen: set[str] = set()
+        # Walk newest-to-oldest. First time we see a sig = canonical (keep).
+        # Subsequent occurrences beyond dedup_after turns = suppress.
+        # "age" here is the number of tool-result turns seen with the same sig
+        # before this one, i.e. how many newer copies already exist.
+        sig_last_seen: dict[str, int] = {}  # sig -> index of most recent occurrence
 
         for i in reversed(range(n)):
             entry = dialogue[i]
@@ -43,14 +50,20 @@ def _register_dedup(context, config):
                 continue
             tc = call_map.get(entry.tool_call_id)
             if not tc:
+                # Orphaned tool result — its paired assistant call is missing.
+                # Suppress it so the model never sees a dangling result.
+                suppressed_tool.add(i)
                 continue
             sig = tc["name"] + "::" + json.dumps(tc["arguments"], sort_keys=True)
-            age = n - 1 - i
-            if sig in seen and age > dedup_after:
-                suppressed_tool.add(i)
-                suppressed_calls.add(tc["id"])
-            else:
-                seen.add(sig)
+            if sig in sig_last_seen:
+                # A newer copy already exists; suppress this older one if it's
+                # far enough back (distance measured in dialogue entries).
+                distance = sig_last_seen[sig] - i
+                if distance > dedup_after:
+                    suppressed_tool.add(i)
+                    suppressed_calls.add(tc["id"])
+                    continue  # don't update sig_last_seen — newer copy stays canonical
+            sig_last_seen[sig] = i
 
     def filter_turn(entry, age, ctx):
         if entry.role == "tool" and entry.index in suppressed_tool:

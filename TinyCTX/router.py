@@ -454,6 +454,7 @@ class Router:
                 group_policy=msg.group_policy,
                 server_name=msg.server_name,
                 channel_name=msg.channel_name,
+                permission_level=msg.permission_level,
             )
         # Record which platform this cursor belongs to for event dispatch.
         self._node_platforms[msg.tail_node_id] = msg.author.platform.value
