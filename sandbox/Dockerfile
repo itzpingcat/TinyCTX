@@ -102,17 +102,20 @@ RUN pip install --no-cache-dir \
     anyio trio
 
 # ── non-root user ──────────────────────────────────────────────────────────
-RUN groupadd -r sandbox && \
-    useradd -r -g sandbox -d /home/sandbox -m -s /bin/bash sandbox
+RUN groupadd -r tinyctx && \
+    useradd -r -g tinyctx -d /home/tinyctx -m -s /bin/bash tinyctx
+
+# Workspace mount point
+RUN mkdir -p /home/tinyctx && chown tinyctx:tinyctx /home/tinyctx
 
 WORKDIR /app
 
 # ── service code ───────────────────────────────────────────────────────────
 COPY sandbox/__main__.py ./sandbox/__main__.py
 
-RUN chown -R sandbox:sandbox /app
+RUN chown -R tinyctx:tinyctx /app
 
-USER sandbox
+USER tinyctx
 
 EXPOSE 8700
 

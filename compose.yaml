@@ -123,11 +123,11 @@ services:
     volumes:
       - type: bind
         source: ${TINYCTX_WORKSPACE:-~/.tinyctx}
-        target: /workspace
+        target: /home/tinyctx
 
     environment:
       SANDBOX_PORT: "8700"
-      WORKSPACE_PATH: "/workspace"
+      WORKSPACE_PATH: "/home/tinyctx"
 
     security_opt:
       - no-new-privileges:true
