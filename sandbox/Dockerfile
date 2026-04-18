@@ -72,7 +72,7 @@ RUN pip install --no-cache-dir \
     \
     # Data formats
     openpyxl xlrd xlwt \
-    PyYAML toml tomllib-w \
+    PyYAML toml \
     ujson orjson \
     \
     # Document processing
