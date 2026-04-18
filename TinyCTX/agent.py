@@ -454,9 +454,29 @@ class AgentLoop:
 
             # Stages 4 & 5: Tool execution + result backfill
             logger.debug("[%s] cycle %d — %d tool call(s)", self._tail_node_id, cycle, len(tool_calls))
-            for tc in tool_calls:
+
+            # On the last allowed cycle, execute tools normally but override
+            # every result with the limit warning so the agent sees it and
+            # (hopefully) stops calling tools on the next inference pass.
+            # If it still calls tools after the warning the for/else exhausts
+            # and the existing force-stop path fires.
+            is_last_cycle = (cycle == max_cycles - 1)
+            if is_last_cycle:
+                logger.warning(
+                    "[cursor=%s] tool limit warning — cycle %d of %d",
+                    self._tail_node_id, cycle, max_cycles,
+                )
+
+            for tc_idx, tc in enumerate(tool_calls):
                 yield AgentToolCall(call_id=tc.call_id, tool_name=tc.tool_name, args=tc.args, **ev)
                 result = await self._execute_tool(tc)
+                if is_last_cycle and tc_idx == len(tool_calls) - 1:
+                    result = ToolResult(
+                        call_id=result.call_id,
+                        tool_name=result.tool_name,
+                        output="[Tool Limit Reached] You have used the maximum number of tool calls for this turn. Do not call any more tools — write your final reply now.",
+                        is_error=True,
+                    )
                 self.context.add(HistoryEntry.tool_result(result))
                 # For image results, inject a follow-up user message with the image_url
                 # block.  OpenAI-compat servers don't support list content in tool result
