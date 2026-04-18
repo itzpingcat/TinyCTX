@@ -1,0 +1,20 @@
+# sandbox/Dockerfile.firewall
+#
+# Minimal one-shot image for the firewall-init container.
+# Pre-installs iptables so there is zero apt-install window at runtime —
+# rules are applied the instant the container starts.
+
+FROM debian:bookworm-slim
+
+RUN apt-get update -qq \
+    && apt-get install -y -qq --no-install-recommends iptables \
+    && rm -rf /var/lib/apt/lists/*
+
+ENTRYPOINT ["sh", "-c", "\
+  iptables -I DOCKER-USER -d 10.0.0.0/8     -j DROP && \
+  iptables -I DOCKER-USER -d 172.16.0.0/12  -j DROP && \
+  iptables -I DOCKER-USER -d 192.168.0.0/16 -j DROP && \
+  iptables -I DOCKER-USER -d 100.64.0.0/10  -j DROP && \
+  iptables -I DOCKER-USER -d 169.254.0.0/16 -j DROP && \
+  iptables -I DOCKER-USER -d 127.0.0.0/8    -j DROP && \
+  echo '[firewall-init] rules installed.'"]

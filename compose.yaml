@@ -8,23 +8,15 @@ services:
   # Runs once at stack startup, never restarts.
   # Needs NET_ADMIN on host network to write the host's iptables.
   firewall_init:
-    image: debian:bookworm-slim
+    build:
+      context: .
+      dockerfile: sandbox/Dockerfile.firewall
+    image: tinyctx-firewall:latest
     network_mode: host
     restart: "no"
     cap_add:
       - NET_ADMIN
       - NET_RAW
-    command: >
-      bash -c "
-        apt-get update -qq &&
-        apt-get install -y -qq --no-install-recommends iptables &&
-        iptables -I FORWARD -d 10.0.0.0/8      -j DROP &&
-        iptables -I FORWARD -d 172.16.0.0/12   -j DROP &&
-        iptables -I FORWARD -d 192.168.0.0/16  -j DROP &&
-        iptables -I FORWARD -d 100.64.0.0/10   -j DROP &&
-        iptables -I FORWARD -d 169.254.0.0/16  -j DROP &&
-        echo '[firewall-init] rules installed.'
-      "
 
   # ── agent ──────────────────────────────────────────────────────────────────
   agent:
