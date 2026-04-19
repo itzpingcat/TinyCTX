@@ -351,6 +351,26 @@ logging:
 max_tool_cycles: 10
 
 # ---------------------------------------------------------------------------
+# permissions:
+#   Controls how the permission system interacts with the LLM's tool list.
+#
+#   minimal_tokens: true  (default)
+#     Only tools the caller has permission to execute are sent to the LLM.
+#     The LLM never sees higher-privilege tools — saves tokens and prevents
+#     the model from being confused by tools it cannot use.
+#
+#   minimal_tokens: false
+#     All enabled tools are sent to the LLM regardless of the caller's
+#     permission level. The LLM can see and attempt to call any tool.
+#     The execution-time guard in execute_tool_call() still applies —
+#     the call returns PERMISSION DENIED rather than executing. Useful
+#     when you want the agent to acknowledge that a capability exists
+#     but explain that it cannot use it for the current caller.
+# ---------------------------------------------------------------------------
+# permissions:
+#   minimal_tokens: false
+
+# ---------------------------------------------------------------------------
 # shell:  (consumed by modules/shell)
 #
 # sandbox_url:  Base URL of the sandbox HTTP service.

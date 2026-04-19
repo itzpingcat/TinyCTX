@@ -13,4 +13,5 @@ from TinyCTX.config.__main__ import (
     WorkspaceConfig,
     LoggingConfig,
     AttachmentConfig,
+    PermissionsConfig,
 )

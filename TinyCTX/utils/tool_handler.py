@@ -164,13 +164,13 @@ class ToolCallHandler:
             return "No tools found matching that query."
         return f"Enabled: {', '.join(new)}"
 
-    def get_tool_definitions(self, caller_level: int = 100) -> List[Dict[str, Any]]:
+    def get_tool_definitions(self, caller_level: int = 100, minimal_tokens: bool = False) -> List[Dict[str, Any]]:
         definitions = []
         for name in self.enabled:
             tool = self.tools.get(name)
             if tool is None:
                 continue
-            if caller_level < tool.get('min_permission', 25):
+            if minimal_tokens and caller_level < tool.get('min_permission', 25):
                 continue  # silently excluded — LLM never sees this tool
             definitions.append({
                 "type": "function",

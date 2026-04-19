@@ -114,30 +114,39 @@ async def _drain(self) -> None:
 
 ## 5. Filter Tool Definitions at Assembly Time
 
-In `agent.py` Stage 2 (Context Assembly), replace:
+Behaviour is controlled by `permissions.minimal_tokens` in `config.yaml`.
 
-```python
-tools = self.tool_handler.get_tool_definitions() or None
-```
+### `minimal_tokens: false` (default)
 
-with:
+All enabled tools are sent to the LLM regardless of `caller_level`. The
+LLM can see and attempt to call any tool. The execution-time guard in §6
+still fires — the call returns `PERMISSION DENIED` rather than executing.
+
+Use this when you want the agent to acknowledge that a capability exists
+but explain it cannot use it for the current caller, rather than acting
+as if the tool doesn't exist.
+
+### `minimal_tokens: true`
+
+In `agent.py` Stage 2, only tools the caller can actually execute are sent:
 
 ```python
 tools = self.tool_handler.get_tool_definitions(
-    caller_level=self.permission_level
+    caller_level=self.permission_level,
+    minimal_tokens=True,
 ) or None
 ```
 
 In `ToolCallHandler.get_tool_definitions`:
 
 ```python
-def get_tool_definitions(self, caller_level: int = 100) -> list[dict]:
+def get_tool_definitions(self, caller_level: int = 100, minimal_tokens: bool = True) -> list[dict]:
     definitions = []
     for name in self.enabled:
         tool = self.tools.get(name)
         if tool is None:
             continue
-        if caller_level < tool['min_permission']:
+        if minimal_tokens and caller_level < tool['min_permission']:
             continue   # silently excluded — LLM never sees this tool
         definitions.append(...)
     return definitions

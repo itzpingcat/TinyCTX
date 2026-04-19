@@ -65,6 +65,31 @@ class ModelConfig:
 
 
 @dataclass
+class PermissionsConfig:
+    """
+    Controls how the permission system interacts with the LLM's tool list.
+
+    Configured via the top-level 'permissions:' key in config.yaml:
+
+        permissions:
+          minimal_tokens: true
+
+    minimal_tokens: true  (default)
+        Only tools the caller has permission to execute are sent to the LLM.
+        The LLM never sees higher-privilege tools — saves tokens and prevents
+        the model from being confused by tools it cannot use.
+
+    minimal_tokens: false
+        All enabled tools are sent to the LLM regardless of permission level.
+        The LLM can see and attempt to call any tool. The execution-time guard
+        in execute_tool_call() still enforces permissions — the call will return
+        a PERMISSION DENIED error rather than execute. Useful when you want the
+        agent to be aware of what exists and explain why it can't do something.
+    """
+    minimal_tokens: bool = False
+
+
+@dataclass
 class AttachmentConfig:
     """
     Thresholds that control whether attachments are inlined into the
@@ -186,6 +211,7 @@ class Config:
     max_tool_cycles: int                     = 20
     context:         int                     = 16384
     attachments:     AttachmentConfig        = field(default_factory=AttachmentConfig)
+    permissions:     PermissionsConfig       = field(default_factory=PermissionsConfig)
     # Catch-all for unknown top-level keys (e.g. mcp:, custom module config, etc.)
     # Modules access this via agent.config.extra.get("mcp", {})
     extra:           dict                    = field(default_factory=dict)
@@ -287,7 +313,7 @@ def _parse_model(raw: dict) -> ModelConfig:
 # Known top-level keys — everything else goes into Config.extra
 _KNOWN_KEYS = {
     "models", "llm", "router", "bridges", "gateway", "workspace",
-    "logging", "max_tool_cycles", "context", "attachments",
+    "logging", "max_tool_cycles", "context", "attachments", "permissions",
 }
 
 
@@ -377,6 +403,12 @@ def load(path="config.yaml") -> Config:
         uploads_dir=att_raw.get("uploads_dir", "uploads"),
     )
 
+    # ------------------------------------------------------------------ permissions
+    perm_raw = raw.get("permissions", {})
+    permissions = PermissionsConfig(
+        minimal_tokens=bool(perm_raw.get("minimal_tokens", False)),
+    )
+
     # ------------------------------------------------------------------ extra
     extra = {k: v for k, v in raw.items() if k not in _KNOWN_KEYS}
 
@@ -394,6 +426,7 @@ def load(path="config.yaml") -> Config:
         max_tool_cycles=int(raw.get("max_tool_cycles", 20)),
         context=int(raw.get("context", 16384)),
         attachments=attachments,
+        permissions=permissions,
         extra=extra,
     )
     setattr(cfg, "_source_path", p.resolve())

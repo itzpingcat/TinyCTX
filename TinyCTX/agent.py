@@ -352,7 +352,11 @@ class AgentLoop:
 
             # Stage 2: Context Assembly
             await self.context.run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC)
-            tools    = self.tool_handler.get_tool_definitions(caller_level=self.permission_level) or None
+            minimal_tokens = self.config.permissions.minimal_tokens
+            tools    = self.tool_handler.get_tool_definitions(
+                caller_level=self.permission_level,
+                minimal_tokens=minimal_tokens,
+            ) or None
             messages = self.context.assemble(tools=tools)
 
             # Token budget telemetry
