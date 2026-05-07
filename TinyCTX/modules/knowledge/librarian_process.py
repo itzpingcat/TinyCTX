@@ -114,7 +114,7 @@ async def _run(
     libbuffer_dir: Path,
     sock_path: Path,
 ) -> None:
-    import kuzu
+    import ladybug as kuzu
     from TinyCTX.modules.knowledge.graph import init_schema, GraphDB
 
     # Open the write connection

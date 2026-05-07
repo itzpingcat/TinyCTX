@@ -1,338 +1,410 @@
-# PLAN: Scoped Tool Permissions
+# TinyCTX Architecture Redesign — PLAN.md
 
-**Goal:** Prevent a jailbroken AI from causing destruction when interacting with
-untrusted users. Each tool declares a minimum permission threshold (0–100).
-Inbound messages are stamped with the triggering sender's permission level. The
-tool list sent to the LLM is filtered to only what that user is allowed to call.
-If the LLM still tries to invoke a higher-privilege tool (e.g. via a jailbreak),
-`execute_tool_call` returns a hard "insufficient permissions" error instead of
-running it.
+## Problems Being Solved
 
----
+1. **GroupLane / multi-user handling is hacky.** Messages get collapsed into a
+   single buffered node. Attribution is glued on after the fact. The buffer is
+   invisible state, lossy across restarts, and makes nodes ambiguous.
 
-## 1. Permission Scale
+2. **Bridge inconsistency.** CLI speaks HTTP; Discord/Matrix call `router.push()`
+   in-process. Every bridge should be identical in shape.
 
-An integer in the range **0–100** (inclusive). Higher = more trusted.
+3. **AgentLoop / Lane / Router are stateful and tangled.** A `Lane` owns a live
+   `AgentLoop` which owns `Context`, tool handler, command registry wiring, DB
+   connection, cursor files, background hooks — all per-session. No clean seam
+   between "one turn of reasoning" and "the long-lived session object".
 
-```
-0        unprivileged / no tools
-1–24     guest (read-only, safe tools only)
-25–49    regular user
-50–74    trusted / moderator
-75–99    operator / admin
-100      full access — CLI always grants this
-```
-
-These bands are **conventions** for module authors. The only hard rules are:
-
-- `caller_level >= tool.min_permission` → allowed
-- `caller_level <  tool.min_permission` → denied
-- CLI is always `100`, unconditionally
+4. **Session state lives in memory.** `agent.context.state` holds platform,
+   author, channel, enabled tools, and other per-session data — all lost on
+   restart, not reproducible from the DB, not branchable.
 
 ---
 
-## 2. Stamp Every Inbound Message
+## Target Architecture
 
-Add one field to `InboundMessage` in `contracts.py`:
+```
+[Bridge] ──HTTP──> [Gateway] ──> [Runtime.push(InboundMessage)]
+                                       │
+                            save attachments to disk
+                            compute state delta vs previous node
+                            persist user node + delta to DB
+                                       │
+                              msg.trigger == True?
+                                  │           │
+                                 Yes          No
+                                  │           └─> return (accepted)
+                                  │
+                    at_capacity? reject : asyncio.create_task(_process(msg))
+                                  │
+                    AgentCycle.run() (concurrent, fire-and-forget)
+                                  │
+                     Context walks ancestors, replays state deltas
+                     writes assistant/tool nodes to DB
+                     (concurrent cycles on same branch = natural fork)
+                                  │
+                          yields AgentEvents
+                                  │
+                         SSE fanout → gateway → bridges
+                                  │
+                       task exits and is garbage collected
+```
+
+---
+
+## Key Design Decisions
+
+### Task pool, not a worker queue
+
+Each `InboundMessage` with `trigger=True` spawns an `asyncio.Task` via
+`asyncio.create_task()`. Tasks run concurrently, results arrive as they complete,
+no ordering guarantee across branches. Tasks are fire-and-forget — they exit when
+the cycle finishes and are garbage collected.
+
+Concurrency is capped by a semaphore (`max_workers` in config). At capacity,
+`push()` returns `False` and the gateway sends 429. No idle workers.
+
+### Concurrent cycles on the same branch = natural fork
+
+Two cycles triggered simultaneously on the same branch tail do not race
+destructively — they branch. Each cycle writes its assistant response as a child
+of its own `tail_node_id`, producing two valid subtrees. The graph structure makes
+concurrent processing safe without any per-branch locking. This is correct
+behaviour, not a bug.
+
+### Everything is a node. Nothing is buffered.
+
+Every inbound message — DM or group, trigger or non-trigger — is persisted as a
+node immediately upon receipt. The buffer is the tree. Group conversations produce
+one node per message with `author_id` and `author_name` set. No `GroupLane`, no
+in-memory buffer, no multi-message nodes.
+
+### State deltas on nodes
+
+Session state (platform, author, channel, enabled tools, etc.) is stored as a JSON
+delta on the node that caused the change. `Context` walks the full ancestor chain
+(not just the dialogue window) to replay deltas and reconstruct current state.
+
+```
+root
+  └─ [user] "hey"   state_delta: {platform:"discord", author_id:"u123", author_name:"Kamie", enabled_tools:["web","filesystem"]}
+       └─ [assistant] "hi"
+            └─ [user] "switch to matrix"   state_delta: {platform:"matrix"}
+                 └─ [user] "disable web"   state_delta: {enabled_tools:["filesystem"]}
+```
+
+State at any node = merge of all ancestor deltas in root→node order. Only changes
+are stored — a delta contains only the keys that changed. Reading a full state
+snapshot stored at a checkpoint node is identical in format to reading a delta,
+so the replay logic handles both transparently.
+
+**Caution: state deltas may be outside the context window.**
+`assemble()` trims old dialogue turns when the token budget is exceeded, but state
+deltas must always be fully replayed regardless of trimming. `_load_state_from_db()`
+must walk the *complete* ancestor chain for delta replay, independently of however
+many dialogue turns `assemble()` decides to include. A session where the platform
+was set 50 turns ago must still know its platform.
+
+**Future optimisation: checkpoint snapshots.**
+For very long trees, store a full state snapshot as a `state_delta` every N nodes
+(e.g. every 20). The replay walk can stop at the most recent full snapshot rather
+than walking to root. No changes to reading logic — a full snapshot is just a delta
+that happens to contain all keys. This can be added later without any schema change.
+
+**What lives in state deltas:**
+- `platform` — bridge platform identifier
+- `author_id`, `author_name` — who sent the triggering message
+- `server_name`, `channel_name` — guild/channel identity
+- `enabled_tools` — list of tool names currently active (replaces runtime mutable state)
+- `permission_level` — effective permission for this branch
+
+**What does NOT live in state deltas:**
+- Token counts, budget flags — ephemeral, computed per-cycle in `context.state`
+- Anything that changes every turn — keep that in-memory on `Context.state` as before
+- `activation_mode` — deleted entirely, bridges handle trigger detection locally
+
+### `enabled_tools` in state deltas
+
+Tool enabling/disabling is now durable and branchable. When a user or agent changes
+the active tool set, `Runtime.push()` writes the new list as a delta on the user
+node. Branching from any point inherits all prior tool state. Rewinding the cursor
+rewinds tool state too. `ToolCallHandler.get_tool_definitions()` reads
+`enabled_tools` from the assembled state rather than from a mutable runtime field.
+
+### `Context.assemble()` formats group history
+
+If the ancestor chain contains user turns with more than one distinct non-None
+`author_id`, `assemble()` prepends `[author_name]: ` to each user turn before
+rendering. Replaces all GroupLane buffer formatting.
+
+### `trigger: bool` on `InboundMessage` — bridges decide
 
 ```python
 @dataclass(frozen=True)
 class InboundMessage:
     ...
-    permission_level: int = 25   # NEW — 0-100; bridge sets per triggering sender
+    trigger: bool = True
 ```
 
-Default `25` = regular user. Bridges override this based on their own
-role/config resolution (see §7).
+The bridge sets `trigger`. Trigger detection (mention check, prefix check) is
+bridge-local logic. `GroupPolicy`, `ActivationMode`, and `GroupLane` are deleted.
+
+### Attachments: saved to disk by `Runtime.push()`, read by `Context`
+
+`attachments.py` already writes bytes to `workspace/uploads/` (SHA-256 dedup).
+`Runtime.push()` calls `save_upload()` and stores paths in the DB node
+(`attachment_paths` column, JSON list). `Context._load_from_db()` re-hydrates
+`Attachment` objects from disk and calls `build_content_blocks()`. Raw bytes never
+reach `AgentCycle`.
+
+### `AgentCycle` — sealed, stateless, no `Runtime` reference
+
+```python
+@dataclass
+class AgentCycle:
+    tail_node_id:     str
+    db:               ConversationDB
+    models:           dict[str, LLM]
+    tool_handler:     ToolCallHandler
+    config:           Config
+    abort_event:      asyncio.Event
+    permission_level: int
+    hooks:            CycleHooks
+    message_id:       str = "synthetic"
+    trace_id:         str = field(default_factory=lambda: str(uuid.uuid4()))
+```
+
+No reference to `Runtime`. Cannot call `runtime.push()` or touch module state.
+`Runtime` constructs it from its own fields inside `_process()`.
+
+`hooks` is explicit so background cycles can receive a stripped hook set
+(empty `post_turn`) to prevent recursive chaining.
+
+### Background branches: gone as a special concept
+
+A background branch is just another `InboundMessage` with `trigger=True` pointing
+at a branch node, pushed via `runtime.push()`. No `run_background()`, no
+`is_subagent`, no scattered `asyncio.create_task` in module code. The knowledge
+module's post-turn hook becomes:
+
+```python
+async def _post_turn_hook(tail_node_id: str, runtime: Runtime) -> None:
+    opening = runtime.db.add_node(parent_id=tail_node_id, ...)
+    await runtime.push(InboundMessage(tail_node_id=opening.id, trigger=True, ...))
+```
+
+Background cycles are given `CycleHooks(post_turn=[])`.
+
+### All bridges are HTTP-only
+
+Discord and Matrix bridges drop `router.push()` and gain an HTTP client identical
+to the CLI bridge. `run(gw: Router)` becomes `run()`. The gateway is the only
+consumer of `Runtime`. In-process event delivery is removed.
 
 ---
 
-## 3. Annotate Tools with a Minimum Threshold
+## What Changes
 
-Add `min_permission` to `register_tool` in `utils/tool_handler.py`:
+### `contracts.py`
 
-```python
-def register_tool(
-    self,
-    func: Callable,
-    name: str | None = None,
-    description: str | None = None,
-    always_on: bool = False,
-    min_permission: int = 25,        # NEW
-):
-    ...
-    self.tools[name] = {
-        ...
-        'min_permission': min_permission,
-    }
-```
+- Add `trigger: bool = True` to `InboundMessage`.
+- Remove `GroupPolicy`, `ActivationMode`.
+- Remove `lane_node_id` from `_AgentEventBase`.
+- Add `Platform.SYSTEM`.
 
-**Default `25`** — all existing tools keep working without changes.
-Module authors raise this for dangerous operations:
+### `db.py`
 
-| Tool                  | `min_permission` |
-|-----------------------|-----------------|
-| `tools_search`        | 25              |
-| `view` (read-only)    | 25              |
-| `web_search`          | 25              |
-| `write_file`          | 50              |
-| `shell` / `bash`      | 50              |
-| `db_query` (writes)   | 75              |
-| Config / admin ops    | 100             |
+- Add `author_name TEXT` column.
+- Add `attachment_paths TEXT` column (JSON list of paths, nullable).
+- Add `state_delta TEXT` column (JSON object of changed keys, nullable).
+- All added via `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` in `ensure_schema()`
+  for compatibility with existing DBs.
+- Update `add_node()` signature and `Node` dataclass accordingly.
+- Add `get_ancestors_full()` — like `get_ancestors()` but always walks to root,
+  used exclusively for state delta replay (not affected by context trimming).
 
----
+### `context.py`
 
-## 4. Thread the Level Through the Agent
+- `_load_state_from_db()` — new method. Walks the **complete** ancestor chain via
+  `db.get_ancestors_full()`, replays `state_delta` objects in root→tip order,
+  returns merged state dict. Called at the start of `assemble()` independently of
+  dialogue loading. State is always fully reconstructed regardless of how many
+  dialogue turns are trimmed by the token budget.
+- `_load_from_db()` reads `author_name` and `attachment_paths`. Re-hydrates
+  `Attachment` objects from disk paths; calls `build_content_blocks()`.
+- `assemble()` detects multi-author branches and prepends `[Name]: ` to user turns.
+- `context.state` retains its role for ephemeral per-cycle data (token counts,
+  budget flags) but is no longer the home for durable session identity.
 
-### 4a. `AgentLoop` holds the current level
+### `agent.py` → `cycle.py`
 
-```python
-class AgentLoop:
-    def __init__(self, ..., permission_level: int = 25):
-        ...
-        self.permission_level = permission_level   # NEW
-```
+- `AgentLoop` → `AgentCycle`.
+- `CycleHooks` dataclass defined here.
+- 6-stage loop moves verbatim; attributes sourced from cycle fields.
+- `run_background()`, `is_subagent`, background hook registry deleted.
+- `agent.py` kept as stub raising `RuntimeError`.
 
-### 4b. `Lane._drain` syncs it from each incoming message
+### `router.py` → deleted
 
-Permission is **re-evaluated every turn** from the live message — no stale state.
+Stub raising `RuntimeError` left temporarily.
 
-```python
-async def _drain(self) -> None:
-    while True:
-        msg = await self.queue.get()
-        if msg is not None:
-            self.loop.permission_level = msg.permission_level  # NEW
-        self.abort_event.clear()
-        try:
-            async for event in self.loop.run(msg, abort_event=self.abort_event):
-                await self.event_handler(event)
-        ...
-```
+### `runtime.py` (new)
 
----
+Owns DB, models, tool_handler, commands, semaphore, SSE handlers, module loading,
+module_env. `push()` computes state delta, persists node, spawns task.
+`_process()` acquires semaphore, constructs `AgentCycle`, runs it, exits.
 
-## 5. Filter Tool Definitions at Assembly Time
+Modules register via `register(runtime: Runtime)`. `Runtime` exposes:
+`runtime.tool_handler`, `runtime.commands`, `runtime.config`, `runtime.db`,
+`runtime.models`, `runtime.module_env`, `runtime.register_background_hook(fn)`,
+`runtime.register_pre_assemble_hook(fn)`.
 
-Behaviour is controlled by `permissions.minimal_tokens` in `config.yaml`.
+### `gateway/__main__.py`
 
-### `minimal_tokens: false` (default)
+- `app["router"]` → `app["runtime"]`.
+- `handle_lane_message` reads `trigger` from POST body.
+- `handle_lane_open` creates DB node; calls `runtime.register_sse_handler()`.
+- `handle_lane_command` context dict: `agent` key → `runtime` key.
+- `router.abort_generation()` → `runtime.abort(node_id)`.
+- Fanout table unchanged.
 
-All enabled tools are sent to the LLM regardless of `caller_level`. The
-LLM can see and attempt to call any tool. The execution-time guard in §6
-still fires — the call returns `PERMISSION DENIED` rather than executing.
-
-Use this when you want the agent to acknowledge that a capability exists
-but explain it cannot use it for the current caller, rather than acting
-as if the tool doesn't exist.
-
-### `minimal_tokens: true`
-
-In `agent.py` Stage 2, only tools the caller can actually execute are sent:
+### `main.py`
 
 ```python
-tools = self.tool_handler.get_tool_definitions(
-    caller_level=self.permission_level,
-    minimal_tokens=True,
-) or None
-```
-
-In `ToolCallHandler.get_tool_definitions`:
-
-```python
-def get_tool_definitions(self, caller_level: int = 100, minimal_tokens: bool = True) -> list[dict]:
-    definitions = []
-    for name in self.enabled:
-        tool = self.tools.get(name)
-        if tool is None:
-            continue
-        if minimal_tokens and caller_level < tool['min_permission']:
-            continue   # silently excluded — LLM never sees this tool
-        definitions.append(...)
-    return definitions
-```
-
-The LLM **never sees** tools the caller doesn't have permission for.
-
----
-
-## 6. Enforce at Execution Time (Defence in Depth)
-
-Even if a jailbreak causes the LLM to hallucinate a call to a filtered-out
-tool, `execute_tool_call` blocks it unconditionally:
-
-```python
-async def execute_tool_call(self, tool_call, caller_level: int = 100) -> dict:
-    ...
-    tool = self.tools.get(function_name)
-
-    if tool is None or function_name not in self.enabled:
-        return {'error': "Tool not found or not enabled", 'success': False, ...}
-
-    # NEW — permission guard
-    if caller_level < tool['min_permission']:
-        return {
-            'tool_call_id': tool_call_id,
-            'error': (
-                f"[PERMISSION DENIED] '{function_name}' requires permission "
-                f">= {tool['min_permission']}; caller has {caller_level}."
-            ),
-            'success': False,
-        }
+async def main():
+    cfg     = load_config()
+    runtime = Runtime(config=cfg)
+    await runtime.start()   # loads modules, starts cron/heartbeat tasks
+    tasks = []
+    if cfg.gateway.enabled:
+        tasks.append(create_task(gateway_mod.run(runtime, cfg.gateway)))
+    for each enabled bridge:
+        tasks.append(create_task(bridge_mod.run()))
     ...
 ```
 
-`AgentLoop._execute_tool` passes the level through:
+### `bridges/discord/`, `bridges/matrix/`
 
-```python
-result = await self.tool_handler.execute_tool_call(
-    proxy, caller_level=self.permission_level   # NEW
-)
-```
+- Remove `router: Router` param from `run()`.
+- Add HTTP client; trigger detection moves into bridge code.
+- `"trigger": bool` in POST body to `/v1/lane/message`.
+- Group buffering if desired is bridge-local in-memory state.
 
----
+### Modules
 
-## 7. Bridge Responsibilities
+`register(agent: AgentLoop)` → `register(runtime: Runtime)`.
 
-Each bridge resolves the **triggering sender's** level and stamps it on
-`InboundMessage` before calling `router.push()`.
+Modules with previously per-lane state:
 
-For group channels (Discord, Matrix) this is the person who sent the trigger
-message. `GroupLane` already routes the trigger author's `InboundMessage` to
-`Lane.enqueue` unchanged — no changes needed to `GroupLane` itself.
+| Module | Previous per-lane state | Migration |
+|---|---|---|
+| `memory` | nudge debounce per branch | `runtime.module_env["memory:last_nudge:{node_id}"]` |
+| `equipment_manifest` | EM.md cache | `runtime.module_env["em_cache:{node_id}"]` |
+| `heartbeat` | cursor node_id | field on Runtime directly |
+| `cron` | cursor per job in CRON.json | unchanged |
+| `web` | Playwright instance | field on Runtime |
+| `knowledge` | librarian process handle | field on Runtime |
+| all others | none | trivial rename |
 
-Permission config lives **under each bridge's existing block** in `config.yaml`,
-accessed via `BridgeConfig.options` (already supports arbitrary keys via
-`__getattr__`). No new top-level config key is needed.
+Knowledge module `_post_turn_hook` pushes a background `InboundMessage` via
+`runtime.push()`. Background cycles receive `CycleHooks(post_turn=[])`.
 
-### CLI bridge
+### Knowledge librarian: stays as subprocess
 
-Always `100`. No config needed.
-
-```python
-inbound = InboundMessage(..., permission_level=100)
-```
-
-### Discord bridge
-
-```yaml
-bridges:
-  discord:
-    enabled: true
-    token: "..."
-    default_permission: 25
-    admin_users: [123456789012345678]   # these user IDs always get level 100
-    role_permissions:
-      # Keys are Discord role IDs (integers), NOT role names.
-      # Role names can be renamed by anyone with Manage Roles; IDs are permanent.
-      # Right-click a role in Discord (Developer Mode on) → Copy Role ID.
-      # IMPORTANT: roles are per-server. A role ID from server A is not
-      # present in server B — a user in server B without a matching role
-      # will fall back to default_permission regardless of their status elsewhere.
-      123456789012345678: 100   # Admin role in server A
-      234567890123456789: 75    # Moderator role in server A
-      345678901234567890: 50    # Trusted role in server A
-```
-
-Resolution order (highest wins):
-1. If sender's user ID is in `admin_users` → unconditional `100`.
-2. Iterate sender's guild roles highest-position first; return first mapped level.
-3. Fall back to `default_permission`.
-
-**Role IDs are server-scoped.** A role that exists in server A has no
-presence in server B — `member.roles` only contains roles from the guild the
-message was sent in. If you want elevated permissions across multiple servers,
-you must either add the relevant role IDs from each server to `role_permissions`,
-or add the user's ID to `admin_users` (which is server-agnostic).
-
-```python
-def _resolve_permission_level(self, member_roles: list | None) -> int:
-    role_map = self._opts.get("role_permissions", {})
-    default  = int(self._opts.get("default_permission", 25))
-    # admin_users always get 100, regardless of roles or server.
-    # (Checked at call site before this function is called.)
-    if not member_roles or not role_map:
-        return default
-    # Normalise keys to int so YAML integer keys and string keys both work.
-    int_map = {int(k): int(v) for k, v in role_map.items()}
-    for role in sorted(member_roles, key=lambda r: r.position, reverse=True):
-        if role.id in int_map:
-            return int_map[role.id]
-    return default
-```
-
-The `admin_users` check is applied in `_on_message` before calling
-`_resolve_permission_level`, granting level `100` unconditionally:
-
-```python
-if message.author.id in self._admin_users:
-    permission_level = 100
-else:
-    permission_level = self._resolve_permission_level(
-        getattr(message.author, "roles", None)
-    )
-```
-
-### Matrix bridge
-
-```yaml
-bridges:
-  matrix:
-    enabled: true
-    homeserver: "..."
-    default_permission: 25
-    power_level_map:
-      100: 100
-      50:  50
-      0:   25
-```
-
-Resolution: look up sender's room power level, map through `power_level_map`
-(exact match, then nearest lower key), fall back to `default_permission`.
+Batch processor against KùzuDB. Not a conversational agent. Only change:
+`register(runtime)` instead of `register(agent)`.
 
 ---
 
-## 8. Files Changed
+## What Does NOT Change
 
-| File | Change |
-|------|--------|
-| `contracts.py` | Add `permission_level: int = 25` to `InboundMessage` |
-| `utils/tool_handler.py` | `register_tool` gains `min_permission`; `get_tool_definitions(caller_level)`; `execute_tool_call(caller_level)` |
-| `agent.py` | `AgentLoop` gets `permission_level` attr; passes `caller_level` in Stage 2 and `_execute_tool` |
-| `router.py` | `Lane._drain` syncs `loop.permission_level` from each message |
-| `bridges/cli/` | Stamp `permission_level=100` unconditionally |
-| `bridges/discord/` | Read `role_permissions` + `default_permission` + `admin_users` from options, resolve per sender; `admin_users` → unconditional 100 |
-| `bridges/matrix/` | Read `power_level_map` + `default_permission` from options, resolve per sender |
-| `example.config.yaml` | Document the new per-bridge permission keys |
-| `modules/*/` | Annotate dangerous `register_tool(...)` calls with `min_permission=N` |
-
----
-
-## 9. What This Prevents
-
-| Attack | Blocked by |
-|--------|-----------|
-| Jailbreak tries to call `shell` | Tool absent from list sent to LLM (§5) |
-| LLM hallucinates a filtered tool name | Execution-time guard returns hard denial (§6) |
-| `tools_search` "unlocks" a high-priv tool | `get_tool_definitions` still filters by level after enabling — enabling ≠ visible |
-| Privilege escalation mid-session | Level re-read from the message on every turn (§4b) |
-| Group channel: low-trust user triggers bot | Level comes from the trigger author, not the channel |
+- `db.py` schema logic (plus three new columns).
+- `ai.py` — `LLM.stream()`.
+- `attachments.py` — `save_upload()`, `build_content_blocks()`.
+- The 6-stage cycle logic (moves to `cycle.py`).
+- The SSE event types and wire format.
+- The HTTP gateway API surface (`/v1/lane/*` routes).
+- The workspace layout and cursor file conventions.
+- `tools_search` BM25 deferred tool discovery.
+- `context.py` hook pipeline stages and token budget logic.
+- `AttachmentKind`, `Attachment`, `UserIdentity`, `ContentType`.
+- All `AgentEvent` subtypes except `lane_node_id` removal.
+- The knowledge librarian subprocess and IPC protocol.
 
 ---
 
-## 10. Known Footguns
+## Migration Phases
 
-| Pitfall | Explanation |
-|---------|-------------|
-| Using role names as config keys | Role names can be changed by anyone with Manage Roles. Always use role IDs. |
-| Expecting cross-server roles to work | Discord roles are per-guild. A role from server A is invisible in server B. Use `admin_users` for cross-server elevated trust. |
-| Assuming `admin_users` grants shell | `admin_users` is used for `/reset` auth AND for permission resolution (grants level 100). Both must be wired — check your bridge code. |
-| `_gp_replace_text` drops fields | Any helper that reconstructs `InboundMessage` must copy **all** fields, including `permission_level`. Missing one silently resets it to the default (25). |
+### Phase 1 — Contracts
+- Add `trigger: bool = True` to `InboundMessage`.
+- Remove `GroupPolicy`, `ActivationMode`.
+- Remove `lane_node_id` from `_AgentEventBase`.
+- Add `Platform.SYSTEM`.
+
+### Phase 2 — DB columns
+- Add `author_name`, `attachment_paths`, `state_delta` columns.
+- Add `get_ancestors_full()`.
+- Update `add_node()` and `Node` dataclass.
+
+### Phase 3 — Context: state delta replay + attachment reconstruction + multi-author formatting
+- `_load_state_from_db()` replays deltas from full ancestor walk.
+- `_load_from_db()` re-hydrates attachments from paths.
+- `assemble()` prepends `[Name]: ` for multi-author branches.
+- New tests covering: delta replay across trimmed context, checkpoint snapshots,
+  state inherited across branch points.
+
+### Phase 4 — `CycleHooks` + `AgentCycle`
+- Write `cycle.py`.
+- Port 6-stage loop.
+- Stub `agent.py`.
+
+### Phase 5 — `Runtime`
+- Write `runtime.py` with semaphore-based task pool.
+- `push()` computes and writes state delta.
+- Port module `register()` signatures.
+- Wire `main.py`.
+- Stub `router.py`.
+
+### Phase 6 — Gateway update
+- Swap `app["router"]` for `app["runtime"]`.
+- `handle_lane_message` passes `trigger` through.
+- `handle_lane_open` → `runtime.register_sse_handler()`.
+- `handle_lane_command` uses `runtime`.
+
+### Phase 7 — Bridge unification
+- Port Discord and Matrix to HTTP-only.
+- Trigger detection into each bridge.
+- Delete `GroupLane`, `GroupPolicy`, `ActivationMode`.
+
+### Phase 8 — Cleanup
+- Delete `agent.py`, `router.py` stubs.
+- Update tests and `CLAUDE.md`.
 
 ---
 
-## 11. Non-Goals
+## Open Questions
 
-- Per-argument sandboxing (allow `shell` but only `ls`) — separate concern.
-- Audit logging of denied calls — trivial one-liner in §6, not in scope here.
-- Runtime role changes — bridges re-resolve on every message naturally.
+1. **Who computes the state delta?** `Runtime.push()` needs to know the previous
+   state to diff against. Options: fetch the parent node's accumulated state by
+   replaying ancestors at push time (a DB read per message); or trust the bridge
+   to send only what changed (fragile). Push-time replay is correct and the read
+   is cheap for short trees.
+
+2. **Checkpoint frequency.** Every 20 nodes is a reasonable starting point but can
+   be tuned. `Runtime.push()` checks if the new node's depth (ancestor count) is a
+   multiple of N and if so writes the full merged state instead of just the delta.
+   Depth can be queried cheaply with a COUNT on the ancestor CTE.
+
+3. **`enabled_tools` delta format.** Storing the full list on each change (not a
+   diff of the list) is simplest — lists are small and replace semantics are clear.
+   `["web", "filesystem"]` replaces whatever was there before. A null/absent
+   `enabled_tools` key in a delta means "no change", not "empty list".
+
+4. **Semaphore try-acquire for hard rejection.** Track `_active` count manually
+   alongside the semaphore, checked before `create_task`.
+
+5. **`/v1/lane/open` name.** Stale but changing breaks existing clients. Keep it.
+
+6. **Singleton module tasks (cron, heartbeat).** `Runtime.start()` creates these
+   as plain `asyncio.Task`s. They push `InboundMessage(trigger=True)` with their
+   stored cursor node_id. Whether they contend for the semaphore or get a reserved
+   path is TBD — simplest is normal contention to start.
