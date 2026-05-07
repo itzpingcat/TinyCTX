@@ -81,36 +81,51 @@ in-memory buffer, no multi-message nodes.
 ### State deltas on nodes
 
 Session state (platform, author, channel, enabled tools, etc.) is stored as a JSON
-delta on the node that caused the change. `Context` walks the full ancestor chain
-(not just the dialogue window) to replay deltas and reconstruct current state.
+delta on the node that caused the change. `Context` walks the ancestor chain
+tip→root to replay deltas and reconstruct current state.
 
 ```
 root
-  └─ [user] "hey"   state_delta: {platform:"discord", author_id:"u123", author_name:"Kamie", enabled_tools:["web","filesystem"]}
+  └─ [user] "hey"   state_delta: {_checkpoint:true, platform:"discord", author_id:"u123", author_name:"Kamie", enabled_tools:["web","filesystem"]}
        └─ [assistant] "hi"
             └─ [user] "switch to matrix"   state_delta: {platform:"matrix"}
                  └─ [user] "disable web"   state_delta: {enabled_tools:["filesystem"]}
 ```
 
-State at any node = merge of all ancestor deltas in root→node order. Only changes
-are stored — a delta contains only the keys that changed. Reading a full state
-snapshot stored at a checkpoint node is identical in format to reading a delta,
-so the replay logic handles both transparently.
+State at any node = merge of all ancestor deltas, walked tip→root, stopping early
+when a checkpoint is reached. Only changes are stored — a delta contains only the
+keys that changed.
 
-**Caution: state deltas may be outside the context window.**
-`assemble()` trims old dialogue turns when the token budget is exceeded, but state
-deltas must always be fully replayed regardless of trimming. `_load_state_from_db()`
-must walk the *complete* ancestor chain for delta replay, independently of however
-many dialogue turns `assemble()` decides to include. A session where the platform
-was set 50 turns ago must still know its platform.
+**State replay algorithm (tip→root, not root→tip):**
 
-**Future optimisation: checkpoint snapshots.**
-For very long trees, store a full state snapshot as a `state_delta` every N nodes
-(e.g. every 20). The replay walk can stop at the most recent full snapshot rather
-than walking to root. No changes to reading logic — a full snapshot is just a delta
-that happens to contain all keys. This can be added later without any schema change.
+`_load_state_from_db()` walks ancestors from tip toward root, filling in state
+keys as it encounters them in each delta. The walk stops as soon as it hits either:
+
+- A node whose `state_delta` contains `"_checkpoint": true` — a full state
+  snapshot; all keys are guaranteed present, so walking further is unnecessary.
+- The root node — no checkpoint exists yet; the walk completes naturally.
+
+After the walk, the number of nodes visited is counted. If that count exceeds
+`checkpoint_threshold` (default: 20), `Runtime.push()` writes the fully merged
+state — including `"_checkpoint": true` — as the `state_delta` of the node that
+was just created (the triggering node). Future walks starting from any descendant
+of that node will stop there immediately.
+
+This means:
+- The first walk on a fresh tree goes all the way to root and may write the first
+  checkpoint on the node being processed.
+- All subsequent walks on that branch hit the checkpoint within one step.
+- No separate synthetic checkpoint nodes; the checkpoint is written on the real
+  triggering node, whose delta already needs to be written anyway.
+
+**Distinguishing checkpoint from partial delta:**
+
+A checkpoint delta is a normal `state_delta` JSON object that includes
+`"_checkpoint": true` alongside all other state keys. Partial deltas simply omit
+this key. The replay logic checks for its presence to decide whether to stop.
 
 **What lives in state deltas:**
+- `_checkpoint` — boolean marker; present and `true` only on full snapshots
 - `platform` — bridge platform identifier
 - `author_id`, `author_name` — who sent the triggering message
 - `server_name`, `channel_name` — guild/channel identity
@@ -129,6 +144,10 @@ the active tool set, `Runtime.push()` writes the new list as a delta on the user
 node. Branching from any point inherits all prior tool state. Rewinding the cursor
 rewinds tool state too. `ToolCallHandler.get_tool_definitions()` reads
 `enabled_tools` from the assembled state rather than from a mutable runtime field.
+
+`enabled_tools` stores the full list on each change — not a diff. `["web",
+"filesystem"]` replaces whatever was there before. A null/absent `enabled_tools`
+key in a delta means "no change to tool set", not "empty list".
 
 ### `Context.assemble()` formats group history
 
@@ -219,16 +238,19 @@ consumer of `Runtime`. In-process event delivery is removed.
 - All added via `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` in `ensure_schema()`
   for compatibility with existing DBs.
 - Update `add_node()` signature and `Node` dataclass accordingly.
-- Add `get_ancestors_full()` — like `get_ancestors()` but always walks to root,
-  used exclusively for state delta replay (not affected by context trimming).
+- Add `get_ancestors_full()` — walks the complete ancestor chain to root,
+  used exclusively by `_load_state_from_db()` for state delta replay.
 
 ### `context.py`
 
-- `_load_state_from_db()` — new method. Walks the **complete** ancestor chain via
-  `db.get_ancestors_full()`, replays `state_delta` objects in root→tip order,
-  returns merged state dict. Called at the start of `assemble()` independently of
-  dialogue loading. State is always fully reconstructed regardless of how many
-  dialogue turns are trimmed by the token budget.
+- `_load_state_from_db()` — new method. Walks ancestors tip→root via
+  `db.get_ancestors_full()`, merging `state_delta` objects as it goes, filling in
+  keys not yet seen. Stops at the first node with `"_checkpoint": true` in its
+  delta, or at root if none is found. Counts nodes visited; if count exceeds
+  `config.checkpoint_threshold` (default 20), signals `Runtime.push()` to write
+  a full checkpoint on the triggering node. Called at the start of `assemble()`
+  independently of dialogue loading — state is always fully reconstructed
+  regardless of how many dialogue turns are trimmed by the token budget.
 - `_load_from_db()` reads `author_name` and `attachment_paths`. Re-hydrates
   `Attachment` objects from disk paths; calls `build_content_blocks()`.
 - `assemble()` detects multi-author branches and prepends `[Name]: ` to user turns.
@@ -250,7 +272,8 @@ Stub raising `RuntimeError` left temporarily.
 ### `runtime.py` (new)
 
 Owns DB, models, tool_handler, commands, semaphore, SSE handlers, module loading,
-module_env. `push()` computes state delta, persists node, spawns task.
+module_env. `push()` computes state delta, persists node, conditionally writes
+checkpoint (if walk depth exceeded threshold), spawns task.
 `_process()` acquires semaphore, constructs `AgentCycle`, runs it, exits.
 
 Modules register via `register(runtime: Runtime)`. `Runtime` exposes:
@@ -297,8 +320,8 @@ Modules with previously per-lane state:
 
 | Module | Previous per-lane state | Migration |
 |---|---|---|
-| `memory` | nudge debounce per branch | `runtime.module_env["memory:last_nudge:{node_id}"]` |
-| `equipment_manifest` | EM.md cache | `runtime.module_env["em_cache:{node_id}"]` |
+| `memory` | nudge debounce per branch | state, persisted to disk |
+| `equipment_manifest` | EM.md cache | state, persisted to disk |
 | `heartbeat` | cursor node_id | field on Runtime directly |
 | `cron` | cursor per job in CRON.json | unchanged |
 | `web` | Playwright instance | field on Runtime |
@@ -346,11 +369,15 @@ Batch processor against KùzuDB. Not a conversational agent. Only change:
 - Update `add_node()` and `Node` dataclass.
 
 ### Phase 3 — Context: state delta replay + attachment reconstruction + multi-author formatting
-- `_load_state_from_db()` replays deltas from full ancestor walk.
+- `_load_state_from_db()` walks tip→root, stops at `_checkpoint` or root,
+  counts nodes visited.
+- `Runtime.push()` writes full checkpoint delta (with `_checkpoint: true`) on the
+  triggering node when walk depth exceeded threshold.
 - `_load_from_db()` re-hydrates attachments from paths.
 - `assemble()` prepends `[Name]: ` for multi-author branches.
-- New tests covering: delta replay across trimmed context, checkpoint snapshots,
-  state inherited across branch points.
+- New tests covering: delta replay with no checkpoint, replay stopping at
+  checkpoint, checkpoint written after deep walk, state inherited across branch
+  points, state correct after trimmed context window.
 
 ### Phase 4 — `CycleHooks` + `AgentCycle`
 - Write `cycle.py`.
@@ -359,7 +386,7 @@ Batch processor against KùzuDB. Not a conversational agent. Only change:
 
 ### Phase 5 — `Runtime`
 - Write `runtime.py` with semaphore-based task pool.
-- `push()` computes and writes state delta.
+- `push()` computes and writes state delta; handles checkpoint promotion.
 - Port module `register()` signatures.
 - Wire `main.py`.
 - Stub `router.py`.
@@ -387,24 +414,17 @@ Batch processor against KùzuDB. Not a conversational agent. Only change:
    state to diff against. Options: fetch the parent node's accumulated state by
    replaying ancestors at push time (a DB read per message); or trust the bridge
    to send only what changed (fragile). Push-time replay is correct and the read
-   is cheap for short trees.
+   is cheap for short trees — and may terminate early at a checkpoint.
 
-2. **Checkpoint frequency.** Every 20 nodes is a reasonable starting point but can
-   be tuned. `Runtime.push()` checks if the new node's depth (ancestor count) is a
-   multiple of N and if so writes the full merged state instead of just the delta.
-   Depth can be queried cheaply with a COUNT on the ancestor CTE.
+2. **Checkpoint threshold.** Default 20 nodes. Configurable via
+   `config.checkpoint_threshold`. Can be tuned without any schema change.
 
-3. **`enabled_tools` delta format.** Storing the full list on each change (not a
-   diff of the list) is simplest — lists are small and replace semantics are clear.
-   `["web", "filesystem"]` replaces whatever was there before. A null/absent
-   `enabled_tools` key in a delta means "no change", not "empty list".
-
-4. **Semaphore try-acquire for hard rejection.** Track `_active` count manually
+3. **Semaphore try-acquire for hard rejection.** Track `_active` count manually
    alongside the semaphore, checked before `create_task`.
 
-5. **`/v1/lane/open` name.** Stale but changing breaks existing clients. Keep it.
+4. **`/v1/lane/open` name.** Stale but changing breaks existing clients. Keep it.
 
-6. **Singleton module tasks (cron, heartbeat).** `Runtime.start()` creates these
+5. **Singleton module tasks (cron, heartbeat).** `Runtime.start()` creates these
    as plain `asyncio.Task`s. They push `InboundMessage(trigger=True)` with their
    stored cursor node_id. Whether they contend for the semaphore or get a reserved
    path is TBD — simplest is normal contention to start.
