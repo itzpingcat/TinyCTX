@@ -3,17 +3,17 @@ import json
 import re
 
 
-def register(agent, config=None):
+def register(runtime, config=None):
     if config is None:
         try:
             from TinyCTX.modules.ctx_tools import EXTENSION_META
             config = EXTENSION_META.get("default_config", {})
         except ImportError:
             config = {}
-    _register_dedup(agent.context, config)
-    _register_cot_strip(agent.context, config)
-    _register_trim(agent.context, config)
-    _register_tokenade(agent.context, config)
+    _register_dedup(runtime.context, config)
+    _register_cot_strip(runtime.context, config)
+    _register_trim(runtime.context, config)
+    _register_tokenade(runtime.context, config)
 
 
 def _register_dedup(context, config):

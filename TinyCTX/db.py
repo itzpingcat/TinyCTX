@@ -278,6 +278,14 @@ class ConversationDB:
         self._conn.commit()
         return cur.rowcount > 0
 
+    def update_node_state_delta(self, node_id: str, state_delta: str) -> bool:
+        """Update a node's state_delta in-place. Returns True if found."""
+        cur = self._conn.execute(
+            "UPDATE nodes SET state_delta = ? WHERE id = ?", (state_delta, node_id)
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
     def delete_node(self, node_id: str) -> bool:
         """Delete a single node row. Does NOT cascade — callers handle dependents."""
         cur = self._conn.execute("DELETE FROM nodes WHERE id = ?", (node_id,))

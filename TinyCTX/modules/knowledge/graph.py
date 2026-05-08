@@ -1,7 +1,8 @@
 """
 modules/knowledge/graph.py
 
-KùzuDB schema initialisation and low-level graph access helpers.
+LadybugDB schema initialisation and low-level graph access helpers.
+(LadybugDB is the community-maintained fork of KùzuDB.)
 
 Schema
 ------
@@ -13,7 +14,7 @@ Relation  — directional labelled edges between entities.
 
 Embedding notes
 ---------------
-kuzu FLOAT[N] arrays support HNSW indexing but require a fixed dimension N
+Ladybug FLOAT[N] arrays support HNSW indexing but require a fixed dimension N
 known at schema-creation time. Because the embedding dimension depends on the
 configured model (which may change), we use DOUBLE[] (variable-length list)
 for the embedding column. Cosine similarity is computed in Python at query
@@ -25,11 +26,11 @@ all nodes and only keyword search is available.
 
 Connection usage
 ----------------
-The librarian process uses kuzu.AsyncConnection (shared, writer).
-The main agent tools use kuzu.Connection (sync, reader — kuzu supports
+The librarian process uses ladybug.AsyncConnection (shared, writer).
+The main agent tools use ladybug.Connection (sync, reader — ladybug supports
 concurrent readers with one writer via its MVCC).
 
-Both callers open their own kuzu.Database handle; kuzu handles
+Both callers open their own ladybug.Database handle; ladybug handles
 coordination at the storage layer.
 """
 from __future__ import annotations
@@ -205,7 +206,7 @@ class GraphDB:
     """
 
     def __init__(self, graph_path: Path) -> None:
-        import kuzu
+        import ladybug as kuzu
         graph_path.mkdir(parents=True, exist_ok=True)
         self._db   = kuzu.Database(str(graph_path))
         self._conn = kuzu.Connection(self._db)

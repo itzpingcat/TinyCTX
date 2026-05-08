@@ -34,8 +34,8 @@ pair and handles graph writes itself.
 
 Write connection
 ----------------
-A single kuzu.AsyncConnection is shared across all coroutines in this
-process. kuzu handles internal concurrency; we serialise our own writes
+A single ladybug.AsyncConnection is shared across all coroutines in this
+process. ladybug handles internal concurrency; we serialise our own writes
 via an asyncio.Lock to keep semantics simple.
 """
 from __future__ import annotations

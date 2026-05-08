@@ -135,6 +135,15 @@ def _build_index_prompt(registry: dict[str, dict]) -> str | None:
 # ---------------------------------------------------------------------------
 
 def register(agent) -> None:
+    # Normalise: accept Runtime or legacy AgentLoop.
+    from TinyCTX.runtime import Runtime as _Runtime
+    if isinstance(agent, _Runtime):
+        _rt = agent
+        class _Shim:
+            config       = _rt.config
+            context      = _rt.context
+            tool_handler = _rt.tool_handler
+        agent = _Shim()
     try:
         from TinyCTX.modules.skills import EXTENSION_META
         cfg: dict = dict(EXTENSION_META.get("default_config", {}))

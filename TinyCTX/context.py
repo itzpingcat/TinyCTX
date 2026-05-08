@@ -498,21 +498,29 @@ class Context:
         """
         Walk the ancestor chain from _tail_node_id and convert DB nodes to
         HistoryEntry objects. Returns an empty list if no DB is wired.
+
+        For user nodes that have attachment_paths set, re-hydrates Attachment
+        objects from disk and calls build_content_blocks() so the LLM sees
+        the same content block list as on the original turn.
         """
         if self._db is None or self._tail_node_id is None:
             return []
 
         nodes = self._db.get_ancestors(self._tail_node_id)
 
+        # Lazy import to avoid circular deps — attachments.py imports from contracts/config only.
+        try:
+            from TinyCTX.utils.attachments import build_content_blocks as _build_blocks, classify as _classify
+            from TinyCTX.contracts import Attachment, AttachmentKind
+            import mimetypes as _mimetypes
+            _att_available = True
+        except ImportError:
+            _att_available = False
+
         entries: list[HistoryEntry] = []
         for i, node in enumerate(nodes):
             # Deserialise content: JSON → list if it was stored as list.
             # Only user messages store list content (attachments).
-            # Guard: only promote to list if every item is a recognised
-            # content block (type in text/image_url/image/document).
-            # Raw JSON pasted by users (e.g. eval fixtures) starts with "["
-            # but contains arbitrary dicts — those must stay as plain strings
-            # so llama.cpp never sees an unsupported content[].type.
             _VALID_BLOCK_TYPES = {"text", "image_url", "image", "document"}
             content: str | list = node.content
             if node.role == ROLE_USER and content.startswith("["):
@@ -531,6 +539,54 @@ class Context:
                         )
                 except (json.JSONDecodeError, ValueError):
                     pass  # leave as string
+
+            # Re-hydrate attachments from attachment_paths if content is still
+            # a plain string (i.e. the list content wasn't stored inline).
+            if (
+                node.role == ROLE_USER
+                and isinstance(content, str)
+                and node.attachment_paths
+                and _att_available
+            ):
+                try:
+                    paths: list[str] = json.loads(node.attachment_paths)
+                    atts: list = []
+                    for path_str in paths:
+                        from pathlib import Path as _Path
+                        p = _Path(path_str)
+                        if p.exists():
+                            data = p.read_bytes()
+                            mime = _mimetypes.guess_type(p.name)[0] or "application/octet-stream"
+                            kind = _classify(Attachment(filename=p.name, data=data, mime_type=mime))
+                            atts.append(Attachment(filename=p.name, data=data, mime_type=mime, kind=kind))
+                        else:
+                            logger.warning("[load_from_db] attachment path missing: %s", path_str)
+                    if atts and self._db is not None:
+                        # We need model/att config to rebuild blocks. Try to get from state.
+                        # Fall back to a best-effort text-only build if unavailable.
+                        from TinyCTX.config import AttachmentConfig, ModelConfig
+                        att_cfg = AttachmentConfig()
+                        # Use a dummy vision-disabled model config — the original
+                        # content blocks (with base64 images) are expensive to
+                        # reconstruct and the text/file references are sufficient
+                        # for history context. Vision content is re-sent fresh on
+                        # each new turn anyway.
+                        dummy_model = ModelConfig(
+                            model="dummy", base_url="http://localhost",
+                            vision=False, tokens_per_image=None,
+                        )
+                        import os as _os
+                        workspace = _Path(_os.getcwd())  # best-effort; overridden by caller if possible
+                        rebuilt = _build_blocks(
+                            text=content,
+                            attachments=tuple(atts),
+                            model_cfg=dummy_model,
+                            att_cfg=att_cfg,
+                            workspace=workspace,
+                        )
+                        content = rebuilt
+                except Exception:
+                    logger.exception("[load_from_db] failed to re-hydrate attachments for node %s", node.id)
 
             tool_calls: list[dict] = []
             if node.tool_calls:

@@ -238,13 +238,11 @@ consumer of `Runtime`. In-process event delivery is removed.
 - All added via `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` in `ensure_schema()`
   for compatibility with existing DBs.
 - Update `add_node()` signature and `Node` dataclass accordingly.
-- Add `get_ancestors_full()` — walks the complete ancestor chain to root,
   used exclusively by `_load_state_from_db()` for state delta replay.
 
 ### `context.py`
 
-- `_load_state_from_db()` — new method. Walks ancestors tip→root via
-  `db.get_ancestors_full()`, merging `state_delta` objects as it goes, filling in
+- `_load_state_from_db()` — new method. Walks ancestors tip→root, merging `state_delta` objects as it goes, filling in
   keys not yet seen. Stops at the first node with `"_checkpoint": true` in its
   delta, or at root if none is found. Counts nodes visited; if count exceeds
   `config.checkpoint_threshold` (default 20), signals `Runtime.push()` to write
@@ -365,7 +363,6 @@ Batch processor against KùzuDB. Not a conversational agent. Only change:
 
 ### Phase 2 — DB columns
 - Add `author_name`, `attachment_paths`, `state_delta` columns.
-- Add `get_ancestors_full()`.
 - Update `add_node()` and `Node` dataclass.
 
 ### Phase 3 — Context: state delta replay + attachment reconstruction + multi-author formatting

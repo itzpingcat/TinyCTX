@@ -119,6 +119,17 @@ def _format_results(results: list[dict], budget_tokens: int) -> str | None:
 # ---------------------------------------------------------------------------
 
 def register(agent) -> None:
+    # Normalise: accept Runtime or legacy AgentLoop.
+    from TinyCTX.runtime import Runtime as _Runtime
+    if isinstance(agent, _Runtime):
+        _rt = agent
+        class _Shim:
+            config       = _rt.config
+            context      = _rt.context
+            tool_handler = _rt.tool_handler
+            commands     = _rt.commands
+            def register_background_hook(self, fn): _rt.register_background_hook(fn)
+        agent = _Shim()
     # ------------------------------------------------------------------
     # Config resolution
     # ------------------------------------------------------------------
