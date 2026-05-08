@@ -13,10 +13,18 @@ ConversationDB(path)          — open (or create) the database
   .ensure_schema()            — idempotent; creates tables + root node
   .add_node(parent_id, ...)   — insert a node; returns Node
   .get_node(node_id)          — fetch one node or None
+  .get_parent(node_id)        — fetch parent node or None (one hop up)
   .get_ancestors(node_id)     — [root, ..., node] order
   .get_children(node_id)      — direct children (unordered)
   .get_root()                 — the single global root node
   .close()                    — close the connection
+
+Phase 2 additions
+-----------------
+  author_name      TEXT — display name of the message sender (group chats)
+  attachment_paths TEXT — JSON list of workspace-relative upload paths
+  state_delta      TEXT — JSON object of changed session-state keys; may
+                          include "_checkpoint": true for full snapshots
 """
 
 from __future__ import annotations
@@ -43,14 +51,17 @@ _VALID_ROLES = {"user", "assistant", "system", "tool"}
 
 @dataclass
 class Node:
-    id:           str
-    parent_id:    str | None
-    role:         str            # user | assistant | system | tool
-    content:      str            # JSON if list (attachment blocks), else plain str
-    created_at:   float          # unix timestamp
-    tool_calls:   str | None     # JSON or None
-    tool_call_id: str | None     # for tool-result nodes
-    author_id:    str | None     # group chat sender; None otherwise
+    id:               str
+    parent_id:        str | None
+    role:             str            # user | assistant | system | tool
+    content:          str            # JSON if list (attachment blocks), else plain str
+    created_at:       float          # unix timestamp
+    tool_calls:       str | None     # JSON or None
+    tool_call_id:     str | None     # for tool-result nodes
+    author_id:        str | None     # stable per-platform sender id; None for DMs
+    author_name:      str | None     # display name at send time; None for DMs
+    attachment_paths: str | None     # JSON list of upload paths, or None
+    state_delta:      str | None     # JSON state-delta object, or None
 
 
 # ---------------------------------------------------------------------------
@@ -59,14 +70,17 @@ class Node:
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS nodes (
-    id           TEXT PRIMARY KEY,
-    parent_id    TEXT,
-    role         TEXT NOT NULL,
-    content      TEXT NOT NULL,
-    created_at   REAL NOT NULL,
-    tool_calls   TEXT,
-    tool_call_id TEXT,
-    author_id    TEXT,
+    id               TEXT PRIMARY KEY,
+    parent_id        TEXT,
+    role             TEXT NOT NULL,
+    content          TEXT NOT NULL,
+    created_at       REAL NOT NULL,
+    tool_calls       TEXT,
+    tool_call_id     TEXT,
+    author_id        TEXT,
+    author_name      TEXT,
+    attachment_paths TEXT,
+    state_delta      TEXT,
     FOREIGN KEY (parent_id) REFERENCES nodes(id)
 );
 
@@ -78,26 +92,40 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 """
 
-_INSERT_NODE = """
-INSERT INTO nodes (id, parent_id, role, content, created_at, tool_calls, tool_call_id, author_id)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+# Columns added after the initial schema — applied to existing DBs via ALTER TABLE.
+_MIGRATIONS = [
+    "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS author_name      TEXT",
+    "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS attachment_paths TEXT",
+    "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS state_delta      TEXT",
+]
+
+_COLS = "id, parent_id, role, content, created_at, tool_calls, tool_call_id, author_id, author_name, attachment_paths, state_delta"
+
+_INSERT_NODE = f"""
+INSERT INTO nodes ({_COLS})
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
-_SELECT_NODE = "SELECT id, parent_id, role, content, created_at, tool_calls, tool_call_id, author_id FROM nodes WHERE id = ?"
+_SELECT_NODE = f"SELECT {_COLS} FROM nodes WHERE id = ?"
+
+_SELECT_PARENT = """
+SELECT {cols} FROM nodes WHERE id = (
+    SELECT parent_id FROM nodes WHERE id = ?
+)
+""".format(cols=_COLS)
 
 # Recursive CTE: walks from node up to root, then we reverse in Python.
-_ANCESTORS_CTE = """
+_ANCESTORS_CTE = f"""
 WITH RECURSIVE anc AS (
-    SELECT id, parent_id, role, content, created_at, tool_calls, tool_call_id, author_id
-    FROM nodes WHERE id = ?
+    SELECT {_COLS} FROM nodes WHERE id = ?
     UNION ALL
-    SELECT n.id, n.parent_id, n.role, n.content, n.created_at, n.tool_calls, n.tool_call_id, n.author_id
+    SELECT {', '.join('n.' + c for c in _COLS.split(', '))}
     FROM nodes n JOIN anc a ON n.id = a.parent_id
 )
-SELECT id, parent_id, role, content, created_at, tool_calls, tool_call_id, author_id FROM anc
+SELECT {_COLS} FROM anc
 """
 
-_CHILDREN = "SELECT id, parent_id, role, content, created_at, tool_calls, tool_call_id, author_id FROM nodes WHERE parent_id = ? ORDER BY created_at"
+_CHILDREN = f"SELECT {_COLS} FROM nodes WHERE parent_id = ? ORDER BY created_at"
 
 
 def _row_to_node(row: tuple) -> Node:
@@ -110,6 +138,9 @@ def _row_to_node(row: tuple) -> Node:
         tool_calls=row[5],
         tool_call_id=row[6],
         author_id=row[7],
+        author_name=row[8],
+        attachment_paths=row[9],
+        state_delta=row[10],
     )
 
 
@@ -122,19 +153,26 @@ class ConversationDB:
         self.ensure_schema()
 
     def ensure_schema(self) -> None:
-        """Create tables and the global root node if they don't exist yet."""
+        """Create tables, apply migrations, and insert the global root node if needed."""
         # Run schema DDL inside an explicit transaction rather than via
         # executescript(), which issues an implicit COMMIT first and would
         # disable the WAL/foreign-key PRAGMAs set in __init__.
         with self._conn:
             self._conn.executescript(_SCHEMA)
+        # Apply column migrations idempotently (IF NOT EXISTS is safe to re-run).
+        for stmt in _MIGRATIONS:
+            try:
+                self._conn.execute(stmt)
+            except sqlite3.OperationalError:
+                pass  # column already exists on SQLite versions without IF NOT EXISTS
+        self._conn.commit()
         # Insert root node if not already present
         row = self._conn.execute("SELECT value FROM meta WHERE key = 'root_id'").fetchone()
         if row is None:
             root_id = str(uuid.uuid4())
             self._conn.execute(
                 _INSERT_NODE,
-                (root_id, None, "system", "", time.time(), None, None, None),
+                (root_id, None, "system", "", time.time(), None, None, None, None, None, None),
             )
             self._conn.execute(
                 "INSERT INTO meta (key, value) VALUES ('root_id', ?)", (root_id,)
@@ -159,6 +197,9 @@ class ConversationDB:
         tool_calls: str | None = None,
         tool_call_id: str | None = None,
         author_id: str | None = None,
+        author_name: str | None = None,
+        attachment_paths: str | None = None,
+        state_delta: str | None = None,
     ) -> Node:
         # Validate role against the allowlist — all queries are already
         # parameterized so there is no SQLi risk, but an invalid role would
@@ -179,7 +220,8 @@ class ConversationDB:
         now = time.time()
         self._conn.execute(
             _INSERT_NODE,
-            (node_id, parent_id, role, content, now, tool_calls, tool_call_id, author_id),
+            (node_id, parent_id, role, content, now, tool_calls, tool_call_id,
+             author_id, author_name, attachment_paths, state_delta),
         )
         self._conn.commit()
         return Node(
@@ -191,10 +233,18 @@ class ConversationDB:
             tool_calls=tool_calls,
             tool_call_id=tool_call_id,
             author_id=author_id,
+            author_name=author_name,
+            attachment_paths=attachment_paths,
+            state_delta=state_delta,
         )
 
     def get_node(self, node_id: str) -> Node | None:
         row = self._conn.execute(_SELECT_NODE, (node_id,)).fetchone()
+        return _row_to_node(row) if row else None
+
+    def get_parent(self, node_id: str) -> Node | None:
+        """Return the immediate parent of node_id, or None if node_id is root."""
+        row = self._conn.execute(_SELECT_PARENT, (node_id,)).fetchone()
         return _row_to_node(row) if row else None
 
     def get_ancestors(self, node_id: str) -> list[Node]:
