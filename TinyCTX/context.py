@@ -19,6 +19,18 @@ When _db is None (old code path, tests), behaviour is unchanged — self.dialogu
 is the source of truth and no DB writes happen. This makes the refactor
 incrementally testable.
 
+Runtime refactor (Phase 3)
+--------------------------
+_load_state_from_db() walks the ancestor chain tip→root one hop at a time via
+db.get_parent(), merging state_delta JSON objects as it goes. The walk stops
+early when it hits a node whose state_delta contains "_checkpoint": true, or
+at the root if no checkpoint exists. The merged result is written to
+self.state["session"] before every assemble() call.
+
+assemble() detects multi-author branches (more than one distinct non-None
+author_id in the loaded history) and prepends "[author_name]: " to each user
+turn's content before rendering. This replaces GroupLane buffer formatting.
+
 Dialogue mutation:
   - add(entry)                  — append a new entry (writes to DB if wired)
   - edit(entry_id, new_content) — replace content in-place; no cascade
@@ -98,7 +110,8 @@ class HistoryEntry:
     index:        int            = 0     # position in dialogue; set by Context.add()
     tool_calls:   list[dict]     = field(default_factory=list)
     tool_call_id: str | None     = None
-    author_id:    str | None     = None  # set for group chat user turns; None for DM / assistant / tool / system
+    author_id:    str | None     = None  # stable per-platform sender id; None for DM/assistant/tool/system
+    author_name:  str | None     = None  # display name at send time; None for DM/assistant/tool/system
     parent_id:    str | None     = None  # tree refactor: DB node_id of parent node
 
     @staticmethod
@@ -312,6 +325,7 @@ class Context:
                 tool_calls=tool_calls_str,
                 tool_call_id=entry.tool_call_id,
                 author_id=entry.author_id,
+                author_name=entry.author_name,
             )
             entry.id        = node.id
             entry.parent_id = node.parent_id
@@ -430,6 +444,56 @@ class Context:
     # DB-backed history loading
     # ------------------------------------------------------------------
 
+    def _load_state_from_db(self) -> tuple[dict, int]:
+        """
+        Walk ancestors tip→root one hop at a time, merging state_delta JSON
+        objects to reconstruct current session state.
+
+        Stops early when it hits a node with "_checkpoint": true in its
+        state_delta (all keys guaranteed present). Walks to root otherwise.
+
+        Returns (state_dict, depth) where depth is the number of nodes visited.
+        The caller (Runtime.push) uses depth to decide whether to write a
+        full checkpoint on the triggering node.
+
+        Keys filled by earlier (tip-side) nodes win; we never overwrite a key
+        once it has been set (tip→root order = most-recent wins).
+        """
+        if self._db is None or self._tail_node_id is None:
+            return {}, 0
+
+        state: dict = {}
+        depth = 0
+        node_id = self._tail_node_id
+
+        while True:
+            node = self._db.get_node(node_id)
+            if node is None:
+                break
+            depth += 1
+
+            if node.state_delta:
+                try:
+                    delta: dict = json.loads(node.state_delta)
+                except (json.JSONDecodeError, ValueError):
+                    delta = {}
+                # Merge: only fill keys not yet seen (tip-wins).
+                for k, v in delta.items():
+                    if k not in state:
+                        state[k] = v
+                # Stop at a checkpoint — all keys present, no need to go further.
+                if delta.get("_checkpoint"):
+                    break
+
+            # Stop at root (no parent).
+            if node.parent_id is None:
+                break
+            node_id = node.parent_id
+
+        # Remove the internal marker from the consumer-facing state dict.
+        state.pop("_checkpoint", None)
+        return state, depth
+
     def _load_from_db(self) -> list[HistoryEntry]:
         """
         Walk the ancestor chain from _tail_node_id and convert DB nodes to
@@ -483,6 +547,7 @@ class Context:
                 tool_calls=tool_calls,
                 tool_call_id=node.tool_call_id,
                 author_id=node.author_id,
+                author_name=node.author_name,
                 parent_id=node.parent_id,
             )
             entries.append(entry)
@@ -563,6 +628,17 @@ class Context:
         """
         # Load from DB if wired; otherwise use in-memory dialogue.
         if self._db is not None and self._tail_node_id is not None:
+            # Reconstruct session state from delta chain before loading dialogue.
+            # This is independent of token-budget trimming — state is always
+            # fully replayed regardless of how many dialogue turns get dropped.
+            session_state, delta_depth = self._load_state_from_db()
+            self.state["session"] = session_state
+            self.state["session_delta_depth"] = delta_depth
+            logger.debug(
+                "[assemble] session state replayed (depth=%d, keys=%s)",
+                delta_depth, list(session_state.keys()),
+            )
+
             source = self._load_from_db()
             logger.debug(
                 "[assemble] loaded %d entries from DB (tail=%s)",
@@ -602,6 +678,16 @@ class Context:
             if slot.role != ROLE_SYSTEM:
                 messages.append({"role": slot.role, "content": content})
 
+        # Detect multi-author branches: if more than one distinct non-None
+        # author_id appears in the loaded history, prepend "[Name]: " to every
+        # user turn so the LLM can distinguish speakers. This replaces the old
+        # GroupLane buffer formatting without any in-memory buffering.
+        distinct_authors = {
+            e.author_id for e in source
+            if e.role == ROLE_USER and e.author_id is not None
+        }
+        is_multi_author = len(distinct_authors) > 1
+
         # 2 & 3. filter + transform per dialogue entry
         for entry in source:
             age = n - 1 - entry.index
@@ -618,6 +704,31 @@ class Context:
                 result = fn(entry, age, self)
                 if result is not None:
                     entry = result
+
+            # Multi-author formatting: prepend "[Name]: " to user turns.
+            # We work on a shallow copy so the original HistoryEntry is not mutated.
+            if is_multi_author and entry.role == ROLE_USER:
+                label = entry.author_name or entry.author_id or "unknown"
+                raw = entry.content
+                if isinstance(raw, str):
+                    labelled_content: str | list = f"[{label}]: {raw}"
+                else:
+                    # list[dict] content (attachments): prepend label to first text block
+                    # or insert a new text block at position 0.
+                    blocks = list(raw)
+                    first_text = next(
+                        (i for i, b in enumerate(blocks) if b.get("type") == "text"), None
+                    )
+                    if first_text is not None:
+                        blocks[first_text] = {
+                            **blocks[first_text],
+                            "text": f"[{label}]: {blocks[first_text]['text']}",
+                        }
+                    else:
+                        blocks.insert(0, {"type": "text", "text": f"[{label}]: "})
+                    labelled_content = blocks
+                from dataclasses import replace
+                entry = replace(entry, content=labelled_content)
 
             messages.append(self._render(entry))
 
