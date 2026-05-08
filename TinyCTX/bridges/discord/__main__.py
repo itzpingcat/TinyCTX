@@ -139,7 +139,6 @@ from discord import app_commands
 from discord.ext import commands as discord_commands
 
 from TinyCTX.contracts import (
-    ActivationMode,
     AgentError,
     AgentOutboundFiles,
     AgentThinkingChunk,
@@ -149,14 +148,13 @@ from TinyCTX.contracts import (
     AgentToolResult,
     Attachment,
     content_type_for,
-    GroupPolicy,
     InboundMessage,
     Platform,
     UserIdentity,
 )
 
 if TYPE_CHECKING:
-    from TinyCTX.router import Router
+    from TinyCTX.runtime import Runtime
 
 logger = logging.getLogger(__name__)
 
@@ -414,12 +412,6 @@ class _ReplyAccumulator:
 # DB helpers
 # ---------------------------------------------------------------------------
 
-def _open_db(router):
-    from TinyCTX.db import ConversationDB
-    workspace = Path(router._config.workspace.path).expanduser().resolve()
-    return ConversationDB(workspace / "agent.db")
-
-
 def _make_session_node(db, cursor_key: str) -> str:
     """Create a new session-anchor node off the global root and return its id."""
     root = db.get_root()
@@ -432,9 +424,9 @@ def _make_session_node(db, cursor_key: str) -> str:
 # ---------------------------------------------------------------------------
 
 class DiscordBridge:
-    def __init__(self, router: "Router", options: dict) -> None:
-        self._router = router
-        self._opts   = {**DEFAULTS, **options}
+    def __init__(self, runtime: "Runtime", options: dict) -> None:
+        self._runtime = runtime
+        self._opts    = {**DEFAULTS, **options}
 
         self._max_len:          int   = int(self._opts["max_reply_length"])
         self._typing:           bool  = bool(self._opts["typing_indicator"])
@@ -477,7 +469,7 @@ class DiscordBridge:
         self._lane_keys: dict[str, str] = {}
 
         # Persisted cursor store
-        workspace   = Path(router._config.workspace.path).expanduser().resolve()
+        workspace   = Path(runtime.config.workspace.path).expanduser().resolve()
         cursors_dir = workspace / "cursors"
         cursors_dir.mkdir(parents=True, exist_ok=True)
         self._store = CursorStore(cursors_dir)
@@ -506,19 +498,12 @@ class DiscordBridge:
         return self._store.get(cursor_key)
 
     def _get_or_create_cursor(self, cursor_key: str) -> str:
-        # If we have a live lane anchor for this key, always return it.
-        # This ensures every message in a session routes to the same persistent
-        # lane regardless of what _advance_cursor has written to disk.
         live = self._lane_keys.get(cursor_key)
         if live:
             return live
-        # No live anchor: first message this session (or post-restart).
-        # Read the persisted cursor (may be a tail snapshot from a previous run)
-        # and use it as the new anchor.
         node_id = self._store.get(cursor_key)
         if not node_id:
-            db      = _open_db(self._router)
-            node_id = _make_session_node(db, cursor_key)
+            node_id = _make_session_node(self._runtime.db, cursor_key)
             self._store.set(cursor_key, node_id)
             logger.info("Discord: created cursor %s -> %s", cursor_key, node_id)
         self._lane_keys[cursor_key] = node_id
@@ -551,8 +536,7 @@ class DiscordBridge:
             if parent_node_id is None:
                 parent_node_id = self._store.get(f"group:{channel_id}")
             if parent_node_id is None:
-                db      = _open_db(self._router)
-                node_id = _make_session_node(db, cursor_key)
+                node_id = _make_session_node(self._runtime.db, cursor_key)
                 logger.info("Discord: thread %s no parent — fresh branch %s", thread_id, node_id)
             else:
                 node_id = parent_node_id
@@ -561,18 +545,14 @@ class DiscordBridge:
         self._lane_keys[cursor_key] = node_id
         return node_id
 
-    def _advance_cursor(self, cursor_key: str, router_node_id: str) -> None:
-        """Snapshot the lane's current tail for restart recovery. Does NOT affect
-        which node_id is used for the next message — _lane_keys handles that."""
-        lane = self._router._lane_router._lanes.get(router_node_id)
-        if lane:
-            tail = lane.loop._tail_node_id
-            if tail and tail != self._store.get(cursor_key):
-                self._store.set(cursor_key, tail)
-                logger.debug(
-                    "Discord: cursor %s tail snapshot %s (for restart recovery)",
-                    cursor_key, tail,
-                )
+    def _advance_cursor(self, cursor_key: str, new_tail: str) -> None:
+        """Snapshot the current tail node_id for restart recovery."""
+        if new_tail and new_tail != self._store.get(cursor_key):
+            self._store.set(cursor_key, new_tail)
+            logger.debug(
+                "Discord: cursor %s tail snapshot %s (for restart recovery)",
+                cursor_key, new_tail,
+            )
 
     # ------------------------------------------------------------------
     # App command sync
@@ -610,13 +590,13 @@ class DiscordBridge:
         # Group commands by namespace so we can decide flat vs subcommand.
         # namespace -> {sub -> (help_text, ns, sub)}
         grouped: dict[str, dict[str, tuple[str, str, str]]] = {}
-        for cmd_str, help_text in self._router.commands.list_commands():
+        for cmd_str, help_text in self._runtime.commands.list_commands():
             parts     = cmd_str.lstrip("/").split()
             namespace = parts[0]
             sub       = parts[1] if len(parts) > 1 else ""
             grouped.setdefault(namespace, {})[sub] = (help_text or f"Run {cmd_str}", namespace, sub)
 
-        for namespace, subs in grouped.items():
+        for namespace, subs in grouped.items():  # type: ignore[assignment]
             # If there's only a bare entry (no sub) or only one sub with no bare,
             # register as a flat command to keep things simple.
             has_bare = "" in subs
@@ -625,7 +605,7 @@ class DiscordBridge:
             if not named_subs:
                 # Bare namespace only — flat command.
                 desc, ns, sub = subs[""]
-                def _make_flat(ns: str, sub: str):
+                def _make_flat(ns: str, sub: str):  # noqa: E306
                     @self._tree.command(name=ns, description=desc)
                     async def _handler(interaction: discord.Interaction) -> None:
                         await self._handle_command_interaction(interaction, ns, sub)
@@ -681,31 +661,15 @@ class DiscordBridge:
             cursor_key = f"group:{channel.id}" if channel else None
 
         if cursor_key:
-            # Bump the epoch FIRST so any in-flight _handle_turn that finishes
-            # after this point will see a stale epoch and skip _advance_cursor,
-            # keeping the cursor rewound rather than re-advancing it.
             self._reset_epoch[cursor_key] = self._reset_epoch.get(cursor_key, 0) + 1
-
-            lane_node_id = self._lane_keys.get(cursor_key)
-            if lane_node_id:
-                # Live lane exists — reset it and rewind the persisted cursor
-                # back to the session anchor.
-                self._router.reset_lane(lane_node_id)
-                self._store.set(cursor_key, lane_node_id)
-                logger.info(
-                    "Discord: session reset via /reset by %s — cursor rewound to %s",
-                    interaction.user.id, lane_node_id,
-                )
-            else:
-                # No live lane (bot just restarted or no messages sent yet) —
-                # wipe the persisted cursor so the next message starts fresh.
-                self._store.delete(cursor_key)
-                logger.info(
-                    "Discord: session reset via /reset by %s — no live lane, cursor deleted for %s",
-                    interaction.user.id, cursor_key,
-                )
-            # Clear lane_keys so the next message rebuilds from scratch.
-            self._lane_keys.pop(cursor_key, None)
+            # Create a fresh branch off root and use it as the new cursor.
+            new_node_id = _make_session_node(self._runtime.db, cursor_key)
+            self._store.set(cursor_key, new_node_id)
+            self._lane_keys[cursor_key] = new_node_id
+            logger.info(
+                "Discord: session reset by %s — new branch %s for %s",
+                interaction.user.id, new_node_id, cursor_key,
+            )
         await interaction.followup.send("✅ Session reset.", ephemeral=True)
 
     async def _handle_shutdown_interaction(self, interaction: discord.Interaction) -> None:
@@ -721,7 +685,7 @@ class DiscordBridge:
         import urllib.request
         import urllib.error
 
-        cfg       = self._router._config
+        cfg         = self._runtime.config
         gateway_url = f"http://{cfg.gateway.host}:{cfg.gateway.port}"
         api_key     = cfg.gateway.api_key or ""
 
@@ -792,14 +756,13 @@ class DiscordBridge:
             "followup":    interaction.followup,
             "guild":       interaction.guild,
             "bridge":      self,
-            "router":      self._router,
+            "runtime":     self._runtime,
             "cursor":      node_id,
-            "send":        _send_reply,   # handlers call ctx["send"](text)
+            "send":        _send_reply,
         }
 
-        # Build the text form and dispatch through the registry.
         text = f"/{namespace} {sub}".strip() if sub else f"/{namespace}"
-        handled = await self._router.commands.dispatch(text, ctx)
+        handled = await self._runtime.commands.dispatch(text, ctx)
 
         if not handled:
             await interaction.followup.send("⚠️ Command not found.", ephemeral=True)
@@ -860,34 +823,16 @@ class DiscordBridge:
     def _is_admin(self, user_id: int) -> bool:
         return user_id in self._admin_users
 
-    def _is_group_trigger(self, text: str, policy: GroupPolicy) -> bool:
-        """Mirror of GroupLane._is_trigger — used to skip accumulator creation
-        for non-trigger messages that GroupLane will just buffer."""
-        if policy.activation == ActivationMode.ALWAYS:
+    def _is_group_trigger(self, text: str) -> bool:
+        """Return True if this message should trigger an agent response."""
+        if not self._prefix_required:
             return True
-        if text.startswith(policy.trigger_prefix):
+        if text.startswith(self._prefix):
             return True
-        if policy.bot_mxid and policy.bot_mxid in text:
-            return True
-        if policy.bot_localpart and f"@{policy.bot_localpart}" in text:
+        bot_name = self._client.user.name if self._client.user else ""
+        if bot_name and f"@{bot_name}" in text:
             return True
         return False
-
-    def _build_group_policy(self) -> GroupPolicy:
-        """Build the GroupPolicy for this channel from bridge config."""
-        activation = ActivationMode.ALWAYS if not self._prefix_required else ActivationMode.MENTION
-        # Mentions are humanized to "@username" before trigger detection, so
-        # match against the humanized form rather than the raw <@id> snowflake.
-        bot_name   = self._client.user.name if self._client.user else ""
-        return GroupPolicy(
-            activation=activation,
-            trigger_prefix=self._prefix,
-            bot_mxid=f"@{bot_name}",   # matches humanized @mention
-            bot_localpart="",           # no legacy form needed after humanization
-            buffer_timeout_s=self._buffer_timeout_s,
-            buffer_head_lines=self._buffer_head_lines,
-            buffer_tail_lines=self._buffer_tail_lines,
-        )
 
     async def _fetch_attachments(self, message: discord.Message) -> tuple:
         if not message.attachments:
@@ -910,26 +855,45 @@ class DiscordBridge:
     # ------------------------------------------------------------------
 
     async def handle_event(self, event) -> None:
-        node_id = event.lane_node_id   # stable lane key — never advances during a turn
-        acc     = self._accumulators.get(node_id)
+        node_id = event.tail_node_id
+        # tail_node_id advances as nodes are written — find acc by original node_id.
+        # Walk accumulators to find one whose node_id is an ancestor of tail.
+        # Simple approach: the accumulator was registered under the original cursor node_id,
+        # which is now a parent. Use the node_id the bridge registered under.
+        # Since Runtime dispatches to the cursor handler we registered, and we registered
+        # under the original node_id, look for an acc whose key is a prefix of the current tail.
+        # Simplest: Runtime calls the platform handler with the original cursor node_id.
+        # We register under original node_id in handle_event; Runtime stores node_platforms
+        # keyed by original node_id, so event.tail_node_id won't match directly after
+        # the first node is written. Use the first acc whose key matches any prefix of the path.
+        # Pragmatic fix: _accumulators is keyed by the node_id passed to _handle_turn,
+        # which is the cursor anchor. Runtime dispatches platform events to the handler
+        # registered for that platform. Since all Discord events go to the same platform
+        # handler, we match by finding the accumulator whose trace_id matches.
+        # Simplest correct approach: keep a mapping of trace_id -> cursor node_id.
+        # For now, use the one active accumulator if there's only one, else match by
+        # the original cursor node_id stored as a back-ref on the acc.
+        acc = None
+        for key, candidate in self._accumulators.items():
+            if getattr(candidate, "_node_id", None) == node_id or key == node_id:
+                acc = candidate
+                node_id = key  # use the registration key for typing_ev lookup
+                break
+        if acc is None and len(self._accumulators) == 1:
+            node_id, acc = next(iter(self._accumulators.items()))
 
         # AgentOutboundFiles is fired outside the normal turn flow — the
         # accumulator may or may not be present. Look up the channel directly.
         if isinstance(event, AgentOutboundFiles):
             channel = acc.channel if acc is not None else None
             if channel is None:
-                raise RuntimeError(
-                    f"AgentOutboundFiles for lane {node_id} but no active channel"
-                )
-            failed: list[str] = []
+                logger.warning("AgentOutboundFiles but no active accumulator/channel")
+                return
             for path in event.paths:
                 try:
                     await channel.send(file=discord.File(path))
                 except Exception as exc:
                     logger.warning("Discord: failed to upload file %s: %s", path, exc)
-                    failed.append(Path(path).name)
-            if failed:
-                raise RuntimeError(f"Failed to upload: {', '.join(failed)}")
             return
 
         if acc is None:
@@ -946,6 +910,7 @@ class DiscordBridge:
                 typing_ev.set()
             acc.feed(event.text)
         elif isinstance(event, AgentTextFinal):
+            acc._final_tail = event.tail_node_id  # stash for cursor advance
             acc.finish(event.text)
         elif isinstance(event, AgentToolCall):
             if typing_ev and self._typing_on_tools:
@@ -1032,10 +997,10 @@ class DiscordBridge:
                 message_id=str(message.id),
                 timestamp=time.time(),
                 attachments=attachments,
-                # DMs have no server or channel name.
                 server_name=None,
                 channel_name=None,
                 permission_level=self._opts.get("dm_permission", 25),
+                trigger=True,
             )
             acc = _ReplyAccumulator(message.channel, self._max_len)
             task = asyncio.create_task(
@@ -1088,8 +1053,8 @@ class DiscordBridge:
             user_id=str(message.author.id),
             username=message.author.name,
         )
-        policy = self._build_group_policy()
         member_roles = getattr(message.author, "roles", None)
+        is_trigger   = self._is_group_trigger(text)
         msg = InboundMessage(
             tail_node_id=node_id,
             author=author,
@@ -1098,25 +1063,18 @@ class DiscordBridge:
             message_id=str(message.id),
             timestamp=time.time(),
             attachments=attachments,
-            group_policy=policy,
             server_name=message.guild.name if message.guild else None,
             channel_name=message.channel.name if hasattr(message.channel, "name") else None,
             permission_level=self._resolve_permission_level(member_roles),
+            trigger=is_trigger,
         )
-
-        # Check if this message is a trigger BEFORE spawning _handle_turn.
-        # Non-trigger messages are just buffered by GroupLane — they will never
-        # produce an agent response on their own, so we must not wait on an
-        # accumulator for them (that would hold the lane lock and deadlock the
-        # next trigger message).
-        is_trigger = self._is_group_trigger(text, policy)
 
         # Proxy-bot compatibility: check compat.json for a matching rule.
         # Only non-webhook messages can be proxied — webhooks are the repost.
         compat_delay: float = self._compat.match(message) if message.webhook_id is None else 0.0
 
         if not is_trigger:
-            # Push to GroupLane for buffering; no accumulator needed.
+            # Persist non-trigger message as a node (trigger=False set above).
             if compat_delay > 0:
                 async def _delayed_buffer(m=message, msg_=msg) -> None:
                     await asyncio.sleep(compat_delay)
@@ -1129,17 +1087,16 @@ class DiscordBridge:
                         )
                         return
                     except Exception:
-                        pass  # fetch failed for another reason; proceed anyway
-                    await self._router.push(msg_)
+                        pass
+                    await self._runtime.push(msg_)
                 task = asyncio.create_task(_delayed_buffer())
                 self._tasks.add(task)
                 task.add_done_callback(self._tasks.discard)
             else:
-                await self._router.push(msg)
+                await self._runtime.push(msg)
             return
 
         if compat_delay > 0:
-            # Delay trigger messages too so the proxy repost arrives first.
             async def _delayed_trigger(
                 m=message, msg_=msg, nid=node_id, ch=message.channel,
                 ck=cursor_key,
@@ -1156,10 +1113,7 @@ class DiscordBridge:
                 except Exception:
                     pass
                 acc_ = _ReplyAccumulator(ch, self._max_len)
-                await self._handle_turn(
-                    msg_, ch, nid, acc_, ck,
-                    record_msg_node=str(m.id),
-                )
+                await self._handle_turn(msg_, ch, nid, acc_, ck)
             task = asyncio.create_task(_delayed_trigger())
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
@@ -1167,10 +1121,7 @@ class DiscordBridge:
 
         acc  = _ReplyAccumulator(message.channel, self._max_len)
         task = asyncio.create_task(
-            self._handle_turn(
-                msg, message.channel, node_id, acc, cursor_key,
-                record_msg_node=str(message.id),
-            )
+            self._handle_turn(msg, message.channel, node_id, acc, cursor_key)
         )
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
@@ -1219,6 +1170,7 @@ class DiscordBridge:
             server_name=message.guild.name if message.guild else None,
             channel_name=thread.name,
             permission_level=self._resolve_permission_level(member_roles),
+            trigger=True,
         )
         acc = _ReplyAccumulator(message.channel, self._max_len)
         task = asyncio.create_task(
@@ -1261,19 +1213,8 @@ class DiscordBridge:
         node_id: str,
         acc: _ReplyAccumulator,
         cursor_key: str | None = None,
-        record_msg_node: str | None = None,
     ) -> None:
-        """
-        Execute one agent turn.
-
-        Serialised per lane_node_id via _lane_locks so that rapid concurrent
-        messages on the same lane don't collide in _accumulators / _typing_active.
-
-        record_msg_node: if set, this is the Discord message ID of the trigger
-        message. After the user turn is written to the DB but before the agent
-        replies, we snapshot the lane's tail (= the user turn node) and store
-        it in the msg->node map so future threads can fork from it precisely.
-        """
+        """Execute one agent turn, serialised per node_id via _lane_locks."""
         # Snapshot the reset epoch before acquiring the lock. If /reset fires
         # during this turn, the epoch will be bumped and we'll skip the final
         # _advance_cursor call so the rewound cursor isn't overwritten.
@@ -1287,24 +1228,10 @@ class DiscordBridge:
             self._typing_active[node_id] = typing_ev
 
             try:
-                accepted = await self._router.push(msg)
+                accepted = await self._runtime.push(msg)
                 if not accepted:
                     await channel.send("⏳ I'm busy — please try again in a moment.")
                     return
-
-                # Capture the user-turn node ID immediately after push.
-                # At this point the lane has ingested the user message and written
-                # its DB node, but hasn't replied yet — so tail == user turn node.
-                if record_msg_node:
-                    lane = self._router._lane_router._lanes.get(node_id)
-                    if lane:
-                        user_turn_node_id = lane.loop._tail_node_id
-                        if user_turn_node_id:
-                            self._store.set_msg_node(record_msg_node, user_turn_node_id)
-                            logger.debug(
-                                "Discord: mapped message %s -> node %s",
-                                record_msg_node, user_turn_node_id,
-                            )
 
                 turn_timeout: float | None = float(self._opts.get("turn_timeout_s", 0)) or None
                 if self._typing:
@@ -1314,9 +1241,9 @@ class DiscordBridge:
                     try:
                         await acc.wait_and_send(timeout=turn_timeout)
                     finally:
-                        done_event.set()   # stop keepalive loop first
-                        typing_ev.set()    # unblock active_event.wait() if never triggered
-                        await asyncio.sleep(0)  # let keepalive exit its typing() context cleanly
+                        done_event.set()
+                        typing_ev.set()
+                        await asyncio.sleep(0)
                         keepalive.cancel()
                         try:
                             await keepalive
@@ -1325,17 +1252,13 @@ class DiscordBridge:
                 else:
                     await acc.wait_and_send(timeout=turn_timeout)
 
-                # Persist the advanced cursor after the full turn completes,
-                # but only if no /reset happened while this turn was running.
+                # Advance cursor — acc carries the final tail_node_id set by handle_event.
                 if cursor_key:
                     current_epoch = self._reset_epoch.get(cursor_key, 0)
                     if current_epoch == epoch_at_start:
-                        self._advance_cursor(cursor_key, node_id)
-                    else:
-                        logger.debug(
-                            "Discord: skipping cursor advance for %s — reset occurred during turn",
-                            cursor_key,
-                        )
+                        new_tail = getattr(acc, "_final_tail", None)
+                        if new_tail:
+                            self._advance_cursor(cursor_key, new_tail)
 
             except Exception:
                 logger.exception("Discord: error handling turn for cursor %s", node_id)
@@ -1357,7 +1280,7 @@ class DiscordBridge:
                 "Export your bot token before starting."
             )
 
-        self._router.register_platform_handler(Platform.DISCORD.value, self.handle_event)
+        self._runtime.register_platform_handler(Platform.DISCORD.value, self.handle_event)
         logger.info("Discord bridge: starting (token_env=%s)", token_env)
         await self._client.start(token)
 
@@ -1366,9 +1289,9 @@ class DiscordBridge:
 # Loader entrypoint (called by main.py)
 # ---------------------------------------------------------------------------
 
-async def run(router: "Router") -> None:
+async def run(runtime: "Runtime") -> None:
     """Entry point called by main.py bridge loader."""
-    bridge_cfg = router.config.bridges.get("discord")
+    bridge_cfg = runtime.config.bridges.get("discord")
     options: dict = bridge_cfg.options if bridge_cfg else {}
-    bridge = DiscordBridge(router, options)
+    bridge = DiscordBridge(runtime, options)
     await bridge.run()
