@@ -10,7 +10,7 @@ Public API
 ----------
 Runtime(config)                    — construct; does not start background tasks
   await .start()                   — load modules, start cron/heartbeat tasks
-  await .push(msg) -> bool         — accept an InboundMessage; False = at capacity (429)
+  await .push(msg) -> str | None      — accept an InboundMessage; None = at capacity (429); str = new tail node_id
   .abort(node_id) -> bool          — signal abort for an in-flight cycle
   .register_sse_handler(node_id, handler)   — attach an SSE fanout for a node
   .unregister_sse_handler(node_id, handler) — detach; unregisters cursor when last one gone
@@ -85,6 +85,64 @@ logger = logging.getLogger(__name__)
 MODULES_DIR = Path(__file__).parent / "modules"
 
 EventHandler = Callable[[AgentEvent], Awaitable[None]]
+
+
+# ---------------------------------------------------------------------------
+# _ToolRegistry — collects registrations at startup; Runtime uses this to
+# build a fresh ToolCallHandler per cycle. Modules call
+# runtime.tool_handler.register_tool(...) as before; the proxy forwards
+# every call here so the template is complete by the time cycles start.
+# ---------------------------------------------------------------------------
+
+class _ToolRegistry:
+    """
+    Immutable-after-startup store of tool registrations.
+
+    register_tool() mirrors the ToolCallHandler signature exactly so modules
+    written against the old API continue to work without changes.
+    Registrations are stored as raw tuples and replayed onto each new
+    ToolCallHandler instance built by Runtime._make_tool_handler().
+    """
+
+    def __init__(self) -> None:
+        # (func, name_override, description_override, always_on, min_permission)
+        self._registrations: list[tuple] = []
+
+    def register_tool(
+        self,
+        func,
+        name: str | None = None,
+        description: str | None = None,
+        always_on: bool = False,
+        min_permission: int = 25,
+    ) -> None:
+        self._registrations.append((func, name, description, always_on, min_permission))
+
+    def build(self, enabled_tools: list[str] | None = None) -> ToolCallHandler:
+        """
+        Construct and return a new ToolCallHandler.
+
+        All registered tools are registered on the new instance.
+        tools_search is registered as an always-on bound method of the new instance.
+        The enabled set is: always_on tools ∪ (enabled_tools from session state).
+        If enabled_tools is None (no prior state), only always_on tools are enabled.
+        """
+        handler = ToolCallHandler()
+        # Register tools_search first as a bound method of this instance.
+        handler.register_tool(handler.tools_search, always_on=True)
+        for func, name, description, always_on, min_permission in self._registrations:
+            kwargs: dict = dict(always_on=always_on, min_permission=min_permission)
+            if name is not None:
+                kwargs["name"] = name
+            if description is not None:
+                kwargs["description"] = description
+            handler.register_tool(func, **kwargs)
+        # Overlay the persisted enabled set from session state.
+        if enabled_tools is not None:
+            for tool_name in enabled_tools:
+                if tool_name in handler.tools:
+                    handler.enabled.add(tool_name)
+        return handler
 
 
 # ---------------------------------------------------------------------------
@@ -164,9 +222,12 @@ class Runtime:
             if not mc.is_embedding
         }
 
-        # Shared tool handler and command registry
-        self.tool_handler = ToolCallHandler()
-        self.tool_handler.register_tool(self.tool_handler.tools_search, always_on=True)
+        # Tool registry: collects module tool registrations at startup.
+        # _make_tool_handler() builds a fresh ToolCallHandler per cycle from
+        # this template + session state. Exposed as self.tool_handler so
+        # existing module code (runtime.tool_handler.register_tool) works as-is.
+        self._tool_registry = _ToolRegistry()
+        self.tool_handler = self._tool_registry
         self.commands = CommandRegistry()
 
         # Inter-module shared namespace (e.g. librarian handle, playwright instance)
@@ -186,11 +247,6 @@ class Runtime:
         self._semaphore = asyncio.Semaphore(max_workers)
         self._active: int = 0  # tracked manually for fast capacity check
 
-        # Snapshot of always-on tools (registered before modules load).
-        # Used by _apply_enabled_tools_from_state to preserve them on restore.
-        self._initial_enabled_tools: frozenset[str] = frozenset(self.tool_handler.enabled)
-
-        # Abort signals: node_id → Event
         self._abort_events: dict[str, asyncio.Event] = {}
 
         # Background tasks spawned by push() / start()
@@ -226,8 +282,8 @@ class Runtime:
     async def start(self) -> None:
         """Load modules and start singleton background tasks."""
         self._load_modules()
-        logger.info("Runtime started (%d models, %d tools)",
-                    len(self.models), len(self.tool_handler.tools))
+        logger.info("Runtime started (%d models, %d tool registrations)",
+                    len(self.models), len(self._tool_registry._registrations))
 
     def _load_modules(self) -> None:
         """Scan modules/ and call register(runtime) on each."""
@@ -359,15 +415,20 @@ class Runtime:
     # push() — main entry point for bridges
     # ------------------------------------------------------------------
 
-    async def push(self, msg: InboundMessage) -> bool:
+    async def push(self, msg: InboundMessage) -> "str | None":
         """
         Accept an InboundMessage.
 
         Non-trigger messages (msg.trigger=False) are persisted as nodes
-        immediately and return True without spawning a cycle.
+        immediately and return the new tail node_id.
 
-        Trigger messages spawn an asyncio.Task if under capacity.
-        Returns False (429) if at capacity.
+        Trigger messages spawn an asyncio.Task if under capacity and return
+        the new tail node_id (the user node written here). Returns None on
+        429 (at capacity).
+
+        SSE subscribers MUST register their queue against the returned
+        node_id, not msg.tail_node_id — _run_cycle dispatches all events
+        to the new tail written by push().
         """
         # Record platform for event dispatch
         self._node_platforms[msg.tail_node_id] = msg.author.platform.value
@@ -404,14 +465,14 @@ class Runtime:
 
         if not msg.trigger:
             logger.debug("Non-trigger message persisted as node %s", new_tail)
-            return True
+            return new_tail
 
         # Capacity check
         max_workers = self._semaphore._value + self._active  # total slots
         if self._active >= max_workers:
             logger.warning("Runtime at capacity (%d/%d) — rejecting push for %s",
                            self._active, max_workers, new_tail)
-            return False
+            return None
 
         # Compute state delta and conditionally write checkpoint onto the user node
         self._maybe_write_checkpoint(new_tail, msg)
@@ -423,7 +484,13 @@ class Runtime:
         )
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
-        return True
+        return new_tail
+
+    def _make_tool_handler(self, session_state: dict) -> ToolCallHandler:
+        """Build a fresh per-cycle ToolCallHandler seeded from session state."""
+        return self._tool_registry.build(
+            enabled_tools=session_state.get("enabled_tools")
+        )
 
     def _compute_state_delta(self, msg: InboundMessage) -> dict:
         """
@@ -432,57 +499,30 @@ class Runtime:
         Only includes keys that differ from the previously assembled session
         state. On the very first message there is no prior state, so all
         identity fields are written (forming the implicit first checkpoint).
-
-        enabled_tools is included whenever the current set differs from what
-        the last delta recorded — it stores the full list on each change, not
-        a diff.
         """
-        # Read what the current branch's state looks like *before* this node
-        # is appended, by walking from the parent (msg.tail_node_id).
         ctx = self._make_context(msg.tail_node_id)
         prior_state, _ = ctx._load_state_from_db()
 
         delta: dict = {}
 
-        # Identity fields — only write when changed.
         def _maybe(key: str, value) -> None:
             if prior_state.get(key) != value:
                 delta[key] = value
 
-        _maybe("platform",       msg.author.platform.value)
-        _maybe("author_id",      msg.author.user_id)
-        _maybe("author_name",    msg.author.username)
+        _maybe("platform",        msg.author.platform.value)
+        _maybe("author_id",       msg.author.user_id)
+        _maybe("author_name",     msg.author.username)
         _maybe("permission_level", msg.permission_level)
         if msg.server_name is not None:
             _maybe("server_name", msg.server_name)
         if msg.channel_name is not None:
             _maybe("channel_name", msg.channel_name)
 
-        # enabled_tools — reflect current runtime state.
-        current_tools = sorted(self.tool_handler.enabled)
-        if sorted(prior_state.get("enabled_tools") or []) != current_tools:
-            delta["enabled_tools"] = current_tools
+        # enabled_tools is NOT written here. It is written by the cycle's
+        # post-turn hook after the handler has been mutated by tools_search,
+        # ensuring what's persisted reflects what the cycle actually used.
 
         return delta
-
-    def _apply_enabled_tools_from_state(self, state: dict) -> None:
-        """
-        Sync tool_handler.enabled from replayed session state.
-        Called inside _run_cycle() after context.assemble() has rebuilt state.
-
-        Preserves always_on tools (those registered with always_on=True are in
-        the initial enabled set and must never be removed).
-        """
-        tools_from_state = state.get("enabled_tools")
-        if tools_from_state is None:
-            return  # no prior record — leave current set unchanged
-        always_on = {
-            name for name, tool in self.tool_handler.tools.items()
-            if name in self.tool_handler.enabled
-            and name not in self._initial_enabled_tools
-        }
-        # Reconstruct: union of state list + always_on tools
-        self.tool_handler.enabled = set(tools_from_state) | self._initial_enabled_tools
 
     def _maybe_write_checkpoint(self, node_id: str, msg: InboundMessage) -> None:
         """
@@ -548,33 +588,39 @@ class Runtime:
         abort_event: asyncio.Event,
     ) -> None:
         ctx = self._make_context(tail_node_id)
-
-        # The user node was already written by push() — set tail to it so the
-        # cycle's context sees it as the branch tip.
         ctx.set_tail(tail_node_id)
 
-        # Replay session state to sync tool_handler.enabled from the branch.
-        # This makes enabled_tools durable and branchable: rewinding a cursor
-        # restores the exact tool set that was active at that point.
+        # Replay session state to build a per-cycle tool handler seeded with
+        # whatever enabled_tools the branch had at this point in history.
+        # This instance is private to this cycle — mutations (tools_search)
+        # cannot race with other concurrent cycles.
         session_state, _ = ctx._load_state_from_db()
-        self._apply_enabled_tools_from_state(session_state)
+        tool_handler = self._make_tool_handler(session_state)
+
+        # Post-turn hook: persist enabled_tools onto the final tail node so the
+        # next cycle on this branch is seeded with whatever tools_search enabled.
+        async def _persist_enabled_tools(tail_id: str) -> None:
+            enabled = sorted(tool_handler.enabled)
+            # Only write if it changed from what the branch had coming in.
+            if enabled != sorted(session_state.get("enabled_tools") or []):
+                delta = json.dumps({"enabled_tools": enabled}, ensure_ascii=False)
+                self.db.update_node_state_delta(tail_id, delta)
+
+        hooks = CycleHooks(post_turn=[*self._post_turn_hooks, _persist_enabled_tools])
 
         cycle = AgentCycle(
             tail_node_id=tail_node_id,
             context=ctx,
             models=self.models,
-            tool_handler=self.tool_handler,
+            tool_handler=tool_handler,
             config=self.config,
             abort_event=abort_event,
             permission_level=msg.permission_level,
-            hooks=CycleHooks(post_turn=list(self._post_turn_hooks)),
+            hooks=hooks,
             message_id=msg.message_id,
             trace_id=msg.trace_id,
         )
 
-        # Run the cycle, passing msg=None because push() already persisted the
-        # user node — the cycle should skip Stage 1 (intake) and go straight
-        # to assembly/inference.
         async for event in cycle.run(msg=None):
             await self._dispatch_event(tail_node_id, event)
 
@@ -624,15 +670,17 @@ class Runtime:
         abort_event: asyncio.Event,
     ) -> None:
         ctx = self._make_context(tail_node_id)
+        session_state, _ = ctx._load_state_from_db()
+        tool_handler = self._make_tool_handler(session_state)
         cycle = AgentCycle(
             tail_node_id=tail_node_id,
             context=ctx,
             models=self.models,
-            tool_handler=self.tool_handler,
+            tool_handler=tool_handler,
             config=self.config,
             abort_event=abort_event,
-            permission_level=100,           # background = full internal permission
-            hooks=CycleHooks(post_turn=[]), # no chaining
+            permission_level=100,
+            hooks=CycleHooks(post_turn=[]),
             message_id="synthetic",
             trace_id=str(uuid.uuid4()),
         )

@@ -236,14 +236,20 @@ async def handle_lane_message(request: web.Request) -> web.StreamResponse:
     )
 
     # Register SSE queue with Runtime before pushing so no events are missed.
+    # We register against msg.tail_node_id first as a placeholder, then
+    # immediately move the registration to the new tail returned by push().
+    # push() returns the new tail node_id (the user node it writes); all
+    # cycle events are dispatched to that id, not the original tail.
     q: asyncio.Queue = asyncio.Queue()
-    _add_subscriber(node_id, runtime, q)
+    # Tentatively register so we can unregister cleanly on 429.
+    # The real registration happens after push() returns the new tail.
 
-    accepted = await runtime.push(msg)
-    if not accepted:
-        _remove_subscriber(node_id, runtime, q)
+    new_tail = await runtime.push(msg)
+    if not new_tail:
         raise web.HTTPTooManyRequests(content_type="application/json",
                                       body=json.dumps({"error": "runtime at capacity"}))
+
+    _add_subscriber(new_tail, runtime, q)
 
     # Stream SSE response.
     response = web.StreamResponse(headers={
@@ -290,7 +296,7 @@ async def handle_lane_message(request: web.Request) -> web.StreamResponse:
         pass
 
     finally:
-        _remove_subscriber(node_id, runtime, q)
+        _remove_subscriber(new_tail, runtime, q)
 
     await response.write_eof()
     return response

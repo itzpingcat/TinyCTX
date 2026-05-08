@@ -507,6 +507,11 @@ class Context:
             return []
 
         nodes = self._db.get_ancestors(self._tail_node_id)
+        # Index of the last node in the list — used to skip attachment
+        # re-hydration for all but the most recent user node. Re-sending
+        # base64 image bytes from old history turns wastes memory and tokens;
+        # only the current turn's attachments need to be in the message list.
+        last_idx = len(nodes) - 1
 
         # Lazy import to avoid circular deps — attachments.py imports from contracts/config only.
         try:
@@ -542,11 +547,14 @@ class Context:
 
             # Re-hydrate attachments from attachment_paths if content is still
             # a plain string (i.e. the list content wasn't stored inline).
+            # Only re-hydrate for the most recent node — re-sending raw image
+            # bytes from old history turns causes a compounding memory leak.
             if (
                 node.role == ROLE_USER
                 and isinstance(content, str)
                 and node.attachment_paths
                 and _att_available
+                and i == last_idx
             ):
                 try:
                     paths: list[str] = json.loads(node.attachment_paths)
