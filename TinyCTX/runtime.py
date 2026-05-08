@@ -106,6 +106,22 @@ class _ContextProxy:
     def register_hook(self, stage: str, fn, *, priority: int = 0) -> None:
         self._rt._hook_registrations.append((stage, fn, priority))
 
+    # Modules that read agent.context.state / agent.context.dialogue at
+    # runtime (inside hooks, not at register time) get an empty fallback.
+    # The real state lives on each cycle's Context; these are only accessed
+    # during register() setup where no cycle is active.
+    @property
+    def state(self) -> dict:
+        return {}
+
+    @property
+    def dialogue(self) -> list:
+        return []
+
+    @property
+    def tail_node_id(self):
+        return None
+
 
 # ---------------------------------------------------------------------------
 # LLM construction helper

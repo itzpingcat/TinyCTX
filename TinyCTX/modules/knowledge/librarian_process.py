@@ -118,7 +118,7 @@ async def _run(
     from TinyCTX.modules.knowledge.graph import init_schema, GraphDB
 
     # Open the write connection
-    graph_path.mkdir(parents=True, exist_ok=True)
+    graph_path.parent.mkdir(parents=True, exist_ok=True)
     libbuffer_dir.mkdir(parents=True, exist_ok=True)
     sock_path.parent.mkdir(parents=True, exist_ok=True)
 

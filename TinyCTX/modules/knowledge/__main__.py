@@ -32,6 +32,16 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def register(agent) -> None:
+    # Normalise: accept Runtime or legacy AgentLoop.
+    from TinyCTX.runtime import Runtime as _Runtime
+    _rt = agent if isinstance(agent, _Runtime) else None
+    if _rt is not None:
+        class _Shim:
+            config       = _rt.config
+            context      = _rt.context
+            tool_handler = _rt.tool_handler
+            def register_background_hook(self, fn): _rt.register_background_hook(fn)
+        agent = _Shim()
     workspace = Path(agent.config.workspace.path).expanduser().resolve()
     workspace.mkdir(parents=True, exist_ok=True)
 
@@ -59,7 +69,7 @@ def register(agent) -> None:
     sock_path     = _resolve(cfg["ipc_socket"])
     pinned_prio   = int(cfg.get("pinned_priority", 5))
 
-    graph_path.mkdir(parents=True, exist_ok=True)
+    graph_path.parent.mkdir(parents=True, exist_ok=True)
     libbuffer_dir.mkdir(parents=True, exist_ok=True)
     sock_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -99,36 +109,51 @@ def register(agent) -> None:
 
     # Determine bridge name from context state (populated at intake)
     # Falls back to "cli" if not running under a bridge.
-    bridge_name = agent.context.state.get("platform", "cli")
+    bridge_name = "cli"
     session_buffer = SessionBuffer(libbuffer_dir, bridge_name)
 
-    async def _post_turn_hook(tail_node_id: str, config) -> None:
-        # Grab the last user message and last assistant message from dialogue
-        dialogue = agent.context.dialogue
-        if not dialogue:
+    async def _post_turn_hook(tail_node_id: str) -> None:
+        # Read the last two turns from the DB directly using tail_node_id.
+        # This avoids depending on agent.context which doesn't exist on Runtime.
+        db = _rt.db if _rt is not None else getattr(agent, '_db', None)
+        if db is None:
             return
 
+        nodes = db.get_ancestors(tail_node_id)
+        if not nodes:
+            return
+
+        # Replay session state for author_name
+        from TinyCTX.context import Context
+        ctx = Context()
+        ctx.set_db(db)
+        ctx.set_tail(tail_node_id)
+        state, _ = ctx._load_state_from_db()
+        user_name = state.get("author_name") or "user"
+
         user_text     = ""
-        user_name     = agent.context.state.get("author_name", "user")
         asst_text     = ""
         attachment_names: list[str] = []
 
-        for entry in reversed(dialogue):
-            if entry.role == "assistant" and not asst_text:
-                asst_text = str(entry.content) if isinstance(entry.content, str) else ""
-            elif entry.role == "user" and not user_text:
-                content = entry.content
-                if isinstance(content, list):
-                    # Extract text parts; note attachment blocks
-                    for block in content:
-                        if isinstance(block, dict):
-                            if block.get("type") == "text":
-                                user_text += block.get("text", "")
-                            elif block.get("type") in ("image_url", "image", "document"):
-                                # Try to get filename from context state
-                                attachment_names.append(block.get("type", "attachment"))
+        for node in reversed(nodes):
+            if node.role == "assistant" and not asst_text:
+                asst_text = node.content if isinstance(node.content, str) else ""
+            elif node.role == "user" and not user_text:
+                content = node.content
+                import json as _json
+                if content.startswith("["):
+                    try:
+                        blocks = _json.loads(content)
+                        for block in blocks:
+                            if isinstance(block, dict):
+                                if block.get("type") == "text":
+                                    user_text += block.get("text", "")
+                                elif block.get("type") in ("image_url", "image", "document"):
+                                    attachment_names.append(block.get("type", "attachment"))
+                    except Exception:
+                        user_text = content
                 else:
-                    user_text = str(content)
+                    user_text = content
             if user_text and asst_text:
                 break
 

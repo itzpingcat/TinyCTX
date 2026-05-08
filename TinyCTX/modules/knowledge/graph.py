@@ -207,7 +207,7 @@ class GraphDB:
 
     def __init__(self, graph_path: Path) -> None:
         import ladybug as kuzu
-        graph_path.mkdir(parents=True, exist_ok=True)
+        graph_path.parent.mkdir(parents=True, exist_ok=True)
         self._db   = kuzu.Database(str(graph_path))
         self._conn = kuzu.Connection(self._db)
         init_schema(self._conn)
