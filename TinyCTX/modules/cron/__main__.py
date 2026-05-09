@@ -41,7 +41,7 @@ Job schema (CRON.json):
 The agent edits CRON.json directly using edit_file / view / write_file.
 cron_list is the only tool registered — it validates and summarises jobs.
 
-Convention: register(agent) — no imports from gateway or bridges.
+Convention: register_agent(agent) — no imports from gateway or bridges.
 """
 from __future__ import annotations
 
@@ -618,7 +618,7 @@ async def _noop_reply_handler(reply) -> None:
 # register()
 # ---------------------------------------------------------------------------
 
-def register(agent) -> None:
+def register_agent(agent) -> None:
     try:
         from TinyCTX.modules.cron import EXTENSION_META
         cfg: dict = EXTENSION_META.get("default_config", {})

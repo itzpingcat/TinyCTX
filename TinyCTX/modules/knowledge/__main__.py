@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 # register()
 # ---------------------------------------------------------------------------
 
-def register(agent) -> None:
+def register_agent(agent) -> None:
     # Normalise: accept Runtime or legacy AgentLoop.
     from TinyCTX.runtime import Runtime as _Runtime
     _rt = agent if isinstance(agent, _Runtime) else None

@@ -478,10 +478,10 @@ def register_agent(cycle) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Backward-compat: register(agent) shim
+# Backward-compat: register_agent(agent) shim
 # ---------------------------------------------------------------------------
 
-def register(agent) -> None:
+def register_agent(agent) -> None:
     """Legacy shim — called by old code that passes an agent-like object."""
     from TinyCTX.runtime import Runtime as _Runtime
     if isinstance(agent, _Runtime):

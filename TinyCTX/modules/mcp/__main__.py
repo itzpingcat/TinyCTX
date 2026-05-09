@@ -158,7 +158,7 @@ def _tool_fn_name(server_name: str, tool_name: str) -> str:
 # register()
 # ---------------------------------------------------------------------------
 
-def register(agent) -> None:
+def register_agent(agent) -> None:
     # ------------------------------------------------------------------ config
     raw_cfg: dict = {}
     if hasattr(agent.config, "mcp") and agent.config.mcp:

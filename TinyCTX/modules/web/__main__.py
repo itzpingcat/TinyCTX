@@ -16,7 +16,7 @@ Registers web tools into the agent loop's tool_handler:
 One Playwright browser instance lives on the AgentLoop for the session lifetime.
 It is created lazily on first use and closed on reset() via a registered hook.
 
-Convention: register(agent) — no imports from contracts or gateway.
+Convention: register_agent(agent) — no imports from contracts or gateway.
 """
 from __future__ import annotations
 
@@ -564,7 +564,7 @@ def _web_prompt(_ctx) -> str:
 # register() — wires everything into agent
 # ---------------------------------------------------------------------------
 
-def register(agent) -> None:
+def register_agent(agent) -> None:
     # Normalise: accept Runtime or legacy AgentLoop.
     from TinyCTX.runtime import Runtime as _Runtime
     _runtime_ref = agent if isinstance(agent, _Runtime) else None

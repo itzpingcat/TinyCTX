@@ -62,7 +62,7 @@ def _format_todo_list(todos: list[dict[str, str]]) -> str:
     return "\n".join(lines)
 
 
-def register(agent) -> None:
+def register_agent(agent) -> None:
     # Normalise: accept Runtime or legacy AgentLoop.
     from TinyCTX.runtime import Runtime as _Runtime
     if isinstance(agent, _Runtime):

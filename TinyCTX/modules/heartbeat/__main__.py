@@ -27,7 +27,7 @@ outside the allowed window.
 Slash command:
   /heartbeat run  — fire one tick immediately (replaces /debug heartbeat)
 
-Convention: register(agent) — no imports from gateway or bridges.
+Convention: register_agent(agent) — no imports from gateway or bridges.
 """
 from __future__ import annotations
 
@@ -94,7 +94,7 @@ def _get_or_create_cursor(agent, branch_from: str) -> tuple[str, str]:
 # Module entry point
 # ---------------------------------------------------------------------------
 
-def register(agent) -> None:
+def register_agent(agent) -> None:
     try:
         from TinyCTX.modules.heartbeat import EXTENSION_META
         cfg: dict = EXTENSION_META.get("default_config", {})

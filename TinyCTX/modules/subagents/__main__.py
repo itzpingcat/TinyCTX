@@ -5,7 +5,7 @@ import json
 from TinyCTX.modules.subagents.subagents import spawn_subagent, wait_for_subagent
 
 
-def register(agent) -> None:
+def register_agent(agent) -> None:
     if getattr(agent, "is_subagent", False):
         return
 
