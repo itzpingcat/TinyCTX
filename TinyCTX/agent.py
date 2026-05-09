@@ -194,15 +194,60 @@ class AgentCycle:
         return [], [], error
 
     async def _execute_tool(self, call: ToolCall) -> ToolResult:
-        proxy = {"function": {"name": call.tool_name, "arguments": call.args}, "id": call.call_id}
-        res = await self.tool_handler.execute_tool_call(proxy, caller_level=self.permission_level)
+        proxy = {
+            "function": {"name": call.tool_name, "arguments": call.args},
+            "id": call.call_id,
+        }
         
-        raw = str(res.get("result", res.get("error", "[no output]")))
-        is_err = (not res.get("success", False))
+        result = await self.tool_handler.execute_tool_call(proxy, caller_level=self.permission_level)
+        raw_output = str(result.get("result", result.get("error", "[no output]")))
         
-        # Handle Image outputs
-        if not is_err and raw.startswith(IMAGE_BLOCK_PREFIX):
-            # ... (Existing image parsing logic) ...
-            pass
+        # Determine if the tool failed based on the result flag or content analysis
+        is_error = (not result.get("success", False)) or self._looks_like_failed_tool_output(raw_output)
 
-        return ToolResult(call.call_id, call.tool_name, output=raw, is_error=is_err)
+        # --- vision unwrap ---
+        # If the tool returned an IMAGE_BLOCK (e.g. from view()) and the model
+        # supports vision, stash the data in ToolResult. OpenAI-compat servers 
+        # don't support image content in tool-role messages, so we let the 
+        # higher-level run() loop inject a follow-up user turn with the image.
+        if not is_error and raw_output.startswith(IMAGE_BLOCK_PREFIX):
+            try:
+                payload = raw_output[len(IMAGE_BLOCK_PREFIX):]  # Format: "mime;base64data"
+                sep = payload.index(";")
+                mime = payload[:sep]
+                b64data = payload[sep + 1:]
+
+                primary_cfg = self.config.get_model_config(self.config.llm.primary)
+                
+                if primary_cfg.supports_vision:
+                    return ToolResult(
+                        call_id=call.call_id,
+                        tool_name=call.tool_name,
+                        output=f"[image/{mime} — see attached image below]",
+                        is_error=False,
+                        is_image=True,
+                        image_mime=mime,
+                        image_b64=b64data,
+                    )
+                else:
+                    # Fallback for non-vision models
+                    raw_output = (
+                        f"[Image file detected ({mime}) but the current model does not "
+                        "support vision. Use a vision-capable model to inspect this file.]"
+                    )
+            except (ValueError, IndexError) as e:
+                logger.error(f"[agent] Failed to parse image payload: {e}")
+                is_error = True
+                raw_output = f"Error parsing image block: {e}"
+
+        return ToolResult(
+            call_id=call.call_id,
+            tool_name=call.tool_name,
+            output=raw_output,
+            is_error=is_error,
+        )
+
+    def _looks_like_failed_tool_output(self, text: str) -> bool:
+        """Helper to catch common error strings in stdout."""
+        lowered = text.lower()
+        return any(x in lowered for x in ["traceback (most recent call last):", "exception: ", "error: "])
