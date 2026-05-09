@@ -17,8 +17,15 @@ ConversationDB(path)          — open (or create) the database
   .get_ancestors(node_id)     — [root, ..., node] order
   .get_children(node_id)      — direct children (unordered)
   .get_root()                 — the single global root node
+  .get_tail_nodes()           — all nodes with no children
   .load_session_state(node_id, threshold) — walk delta chain, return (state, depth)
   .write_checkpoint_if_needed(node_id, state, depth, threshold) — write checkpoint
+  .add_flag(node_id, flag)    — add a flag string to a node's flags list
+  .remove_flag(node_id, flag) — remove a flag string from a node's flags list
+  .has_flag(node_id, flag)    — check if a node has a flag
+  .get_flags(node_id)         — return the flags list for a node
+  .get_nodes_without_flag(flag) — all nodes missing the given flag
+  .flag_branch(node_id, flag) — walk parent chain, flag nodes until one already has it
   .close()                    — close the connection
 
 Phase 2 additions
@@ -27,6 +34,11 @@ Phase 2 additions
   attachment_paths TEXT — JSON list of workspace-relative upload paths
   state_delta      TEXT — JSON object of changed session-state keys; may
                           include "_checkpoint": true for full snapshots
+
+Phase 3 additions
+-----------------
+  flags            TEXT — JSON array of flag strings, e.g. '["librarian_visited"]'
+                          Generic module-use column; not specific to any one module.
 """
 
 from __future__ import annotations
@@ -36,9 +48,8 @@ import logging
 import sqlite3
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +76,7 @@ class Node:
     author_name:      str | None     # display name at send time; None for DMs
     attachment_paths: str | None     # JSON list of upload paths, or None
     state_delta:      str | None     # JSON state-delta object, or None
+    flags:            str = "[]"     # JSON array of flag strings
 
 
 # ---------------------------------------------------------------------------
@@ -84,6 +96,7 @@ CREATE TABLE IF NOT EXISTS nodes (
     author_name      TEXT,
     attachment_paths TEXT,
     state_delta      TEXT,
+    flags            TEXT NOT NULL DEFAULT '[]',
     FOREIGN KEY (parent_id) REFERENCES nodes(id)
 );
 
@@ -100,13 +113,14 @@ _MIGRATIONS = [
     "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS author_name      TEXT",
     "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS attachment_paths TEXT",
     "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS state_delta      TEXT",
+    "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS flags            TEXT NOT NULL DEFAULT '[]'",
 ]
 
-_COLS = "id, parent_id, role, content, created_at, tool_calls, tool_call_id, author_id, author_name, attachment_paths, state_delta"
+_COLS = "id, parent_id, role, content, created_at, tool_calls, tool_call_id, author_id, author_name, attachment_paths, state_delta, flags"
 
 _INSERT_NODE = f"""
 INSERT INTO nodes ({_COLS})
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 _SELECT_NODE = f"SELECT {_COLS} FROM nodes WHERE id = ?"
@@ -130,6 +144,11 @@ SELECT {_COLS} FROM anc
 
 _CHILDREN = f"SELECT {_COLS} FROM nodes WHERE parent_id = ? ORDER BY created_at"
 
+_TAIL_NODES = f"""
+SELECT {_COLS} FROM nodes
+WHERE id NOT IN (SELECT DISTINCT parent_id FROM nodes WHERE parent_id IS NOT NULL)
+"""
+
 
 def _row_to_node(row: tuple) -> Node:
     return Node(
@@ -144,7 +163,16 @@ def _row_to_node(row: tuple) -> Node:
         author_name=row[8],
         attachment_paths=row[9],
         state_delta=row[10],
+        flags=row[11] if row[11] is not None else "[]",
     )
+
+
+def _parse_flags(flags_json: str) -> list[str]:
+    try:
+        result = json.loads(flags_json or "[]")
+        return result if isinstance(result, list) else []
+    except (json.JSONDecodeError, ValueError):
+        return []
 
 
 class ConversationDB:
@@ -170,7 +198,7 @@ class ConversationDB:
             root_id = str(uuid.uuid4())
             self._conn.execute(
                 _INSERT_NODE,
-                (root_id, None, "system", "", time.time(), None, None, None, None, None, None),
+                (root_id, None, "system", "", time.time(), None, None, None, None, None, None, "[]"),
             )
             self._conn.execute(
                 "INSERT INTO meta (key, value) VALUES ('root_id', ?)", (root_id,)
@@ -214,7 +242,7 @@ class ConversationDB:
         self._conn.execute(
             _INSERT_NODE,
             (node_id, parent_id, role, content, now, tool_calls, tool_call_id,
-             author_id, author_name, attachment_paths, state_delta),
+             author_id, author_name, attachment_paths, state_delta, "[]"),
         )
         self._conn.commit()
         return Node(
@@ -229,6 +257,7 @@ class ConversationDB:
             author_name=author_name,
             attachment_paths=attachment_paths,
             state_delta=state_delta,
+            flags="[]",
         )
 
     def get_node(self, node_id: str) -> Node | None:
@@ -258,6 +287,11 @@ class ConversationDB:
         rows = self._conn.execute(_CHILDREN, (node_id,)).fetchall()
         return [_row_to_node(r) for r in rows]
 
+    def get_tail_nodes(self) -> list[Node]:
+        """Return all nodes that have no children (leaf nodes)."""
+        rows = self._conn.execute(_TAIL_NODES).fetchall()
+        return [_row_to_node(r) for r in rows]
+
     def update_node_content(self, node_id: str, content: str) -> bool:
         """Update a node's content in-place. Returns True if found."""
         cur = self._conn.execute(
@@ -281,7 +315,88 @@ class ConversationDB:
         return cur.rowcount > 0
 
     # ------------------------------------------------------------------
-    # Session state helpers (moved from Runtime / Context)
+    # Flag utilities
+    # ------------------------------------------------------------------
+
+    def get_flags(self, node_id: str) -> list[str]:
+        """Return the flags list for a node. Returns [] if node not found."""
+        row = self._conn.execute("SELECT flags FROM nodes WHERE id = ?", (node_id,)).fetchone()
+        if row is None:
+            return []
+        return _parse_flags(row[0])
+
+    def has_flag(self, node_id: str, flag: str) -> bool:
+        """Return True if the node has the given flag."""
+        return flag in self.get_flags(node_id)
+
+    def add_flag(self, node_id: str, flag: str) -> None:
+        """Add a flag to a node's flags list. No-op if already present."""
+        flags = self.get_flags(node_id)
+        if flag in flags:
+            return
+        flags.append(flag)
+        self._conn.execute(
+            "UPDATE nodes SET flags = ? WHERE id = ?",
+            (json.dumps(flags), node_id),
+        )
+        self._conn.commit()
+
+    def remove_flag(self, node_id: str, flag: str) -> None:
+        """Remove a flag from a node's flags list. No-op if not present."""
+        flags = self.get_flags(node_id)
+        if flag not in flags:
+            return
+        flags = [f for f in flags if f != flag]
+        self._conn.execute(
+            "UPDATE nodes SET flags = ? WHERE id = ?",
+            (json.dumps(flags), node_id),
+        )
+        self._conn.commit()
+
+    def get_nodes_without_flag(self, flag: str) -> list[Node]:
+        """
+        Return all nodes that do not have the given flag.
+        Uses a JSON search; suitable for moderate-sized DBs.
+        """
+        rows = self._conn.execute(
+            "SELECT " + _COLS + " FROM nodes WHERE flags NOT LIKE ?",
+            (f'%"{flag}"%',),
+        ).fetchall()
+        return [_row_to_node(r) for r in rows]
+
+    def flag_branch(self, node_id: str, flag: str) -> list[str]:
+        """
+        Walk the parent chain from node_id upward, adding flag to each node,
+        stopping at (and excluding) the first ancestor that already has the flag.
+
+        Returns the list of node_ids that were flagged (in tip → root order).
+        Returns [] if node_id itself already has the flag.
+        """
+        flagged: list[str] = []
+        current_id: str | None = node_id
+
+        while current_id is not None:
+            node = self.get_node(current_id)
+            if node is None:
+                break
+            existing = _parse_flags(node.flags)
+            if flag in existing:
+                break  # stop here; don't flag this node
+            existing.append(flag)
+            self._conn.execute(
+                "UPDATE nodes SET flags = ? WHERE id = ?",
+                (json.dumps(existing), current_id),
+            )
+            flagged.append(current_id)
+            current_id = node.parent_id
+
+        if flagged:
+            self._conn.commit()
+
+        return flagged
+
+    # ------------------------------------------------------------------
+    # Session state helpers
     # ------------------------------------------------------------------
 
     def load_session_state(self, node_id: str) -> tuple[dict, int]:
@@ -290,7 +405,6 @@ class ConversationDB:
         objects to reconstruct current session state.
 
         Stops early when it hits a node with "_checkpoint": true.
-        Calls write_checkpoint_if_needed automatically if threshold is supplied.
 
         Returns (state_dict, depth) where depth is the number of nodes visited.
         Keys filled by earlier (tip-side) nodes win (most-recent wins).

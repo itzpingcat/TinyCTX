@@ -3,19 +3,17 @@ EXTENSION_META = {
     "version": "0.1",
     "description": (
         "Long-term memory backed by a KùzuDB property graph. "
-        "A persistent sidecar librarian process watches libbuffer/, extracts "
-        "entities and relationships from conversation history, and writes them "
+        "A persistent sidecar librarian process watches agent.db for unvisited "
+        "conversation nodes, extracts entities and relationships, and writes them "
         "to the graph. The main agent reads via kg_search / kg_traverse tools "
         "and can trigger librarian agents on demand via call_librarian. "
         "Pinned entities are injected into the system prompt automatically."
     ),
     "default_config": {
         # Paths (relative to workspace)
-        "graph_path":    "knowledge/graph.db",
-        "libbuffer_dir": "libbuffer",
+        "graph_path": "knowledge/graph.lbug",
 
         # Librarian trigger config
-        "trigger_file_size_kb":   64,
         "trigger_interval_hours": 6,
         "batch_size":             20,
         "max_concurrent":         4,

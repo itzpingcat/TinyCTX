@@ -5,11 +5,10 @@ Registers the knowledge module into the agent.
 
 On load:
   1. Starts the librarian sidecar process
-  2. Registers a HOOK_POST_TURN buffer writer
-  3. Registers read tools on the main agent (kg_search, kg_traverse,
+  2. Registers read tools on the main agent (kg_search, kg_traverse,
      kg_get_entity, kg_list, kg_stats)
-  4. Registers call_librarian (always-on)
-  5. Registers a PromptProvider for pinned entity injection
+  3. Registers call_librarian (always-on)
+  4. Registers a PromptProvider for pinned entity injection
 
 The librarian process is the sole writer to the KùzuDB graph.
 The main agent tools are read-only.
@@ -43,9 +42,9 @@ def register_agent(agent) -> None:
             def register_background_hook(self, fn): _rt.register_background_hook(fn)
         agent = _Shim()
     else:
-        # AgentCycle — patch in register_background_hook via post_turn_hooks
         if not hasattr(agent, 'register_background_hook'):
             agent.register_background_hook = agent.post_turn_hooks.append
+
     workspace = Path(agent.config.workspace.path).expanduser().resolve()
     workspace.mkdir(parents=True, exist_ok=True)
 
@@ -68,13 +67,12 @@ def register_agent(agent) -> None:
         p = Path(rel)
         return p if p.is_absolute() else workspace / p
 
-    graph_path    = _resolve(cfg["graph_path"])
-    libbuffer_dir = _resolve(cfg["libbuffer_dir"])
-    sock_path     = _resolve(cfg["ipc_socket"])
-    pinned_prio   = int(cfg.get("pinned_priority", 5))
+    graph_path  = _resolve(cfg["graph_path"])
+    sock_path   = _resolve(cfg["ipc_socket"])
+    pinned_prio = int(cfg.get("pinned_priority", 5))
+    agent_db    = workspace / "agent.db"
 
     graph_path.parent.mkdir(parents=True, exist_ok=True)
-    libbuffer_dir.mkdir(parents=True, exist_ok=True)
     sock_path.parent.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
@@ -104,81 +102,10 @@ def register_agent(agent) -> None:
     # ------------------------------------------------------------------
     # 1. Start librarian sidecar process
     # ------------------------------------------------------------------
-    _start_librarian(cfg, agent, workspace, graph_path, libbuffer_dir, sock_path)
+    _start_librarian(cfg, agent, workspace, graph_path, sock_path, agent_db)
 
     # ------------------------------------------------------------------
-    # 2. HOOK_POST_TURN — buffer writer
-    # ------------------------------------------------------------------
-    from TinyCTX.modules.knowledge.buffer import SessionBuffer
-
-    # Determine bridge name from context state (populated at intake)
-    # Falls back to "cli" if not running under a bridge.
-    bridge_name = "cli"
-    session_buffer = SessionBuffer(libbuffer_dir, bridge_name)
-
-    async def _post_turn_hook(tail_node_id: str) -> None:
-        db = _rt.db if _rt is not None else getattr(agent, 'db', None)
-        if db is None:
-            return
-
-        nodes = db.get_ancestors(tail_node_id)
-        if not nodes:
-            return
-
-        import json as _json
-
-        # Collect the last assistant reply and all user nodes since the previous
-        # assistant turn — preserving per-author identity for multi-user convos.
-        asst_text = ""
-        # list of (username, user_text, attachment_names) in chronological order
-        user_turns: list[tuple[str, str, list[str]]] = []
-
-        for node in reversed(nodes):
-            if node.role == "assistant" and not asst_text:
-                asst_text = node.content if isinstance(node.content, str) else ""
-            elif node.role == "assistant" and asst_text:
-                # Hit the previous assistant turn — stop collecting user nodes
-                break
-            elif node.role == "user":
-                username = node.author_name or node.author_id or "user"
-                content  = node.content or ""
-                user_text: str = ""
-                attachment_names: list[str] = []
-                if isinstance(content, str) and content.startswith("["):
-                    try:
-                        blocks = _json.loads(content)
-                        for block in blocks:
-                            if isinstance(block, dict):
-                                if block.get("type") == "text":
-                                    user_text += block.get("text", "")
-                                elif block.get("type") in ("image_url", "image", "document"):
-                                    attachment_names.append(block.get("type", "attachment"))
-                    except Exception:
-                        user_text = content
-                else:
-                    user_text = content
-                if user_text or attachment_names:
-                    user_turns.append((username, user_text.strip(), attachment_names))
-
-        if not user_turns and not asst_text:
-            return
-
-        # Write chronologically: user turns were collected in reverse, flip them back.
-        user_turns.reverse()
-        # All user turns share the same assistant reply (written after the last user turn).
-        for i, (username, user_text, attachment_names) in enumerate(user_turns):
-            is_last = (i == len(user_turns) - 1)
-            session_buffer.append_turn(
-                username=username,
-                user_text=user_text,
-                assistant_text=asst_text if is_last else "",
-                attachment_names=attachment_names or None,
-            )
-
-    agent.register_background_hook(_post_turn_hook)
-
-    # ------------------------------------------------------------------
-    # 3. Read tools
+    # 2. Read tools
     # ------------------------------------------------------------------
 
     async def kg_search(query: str, top_k: int = 5, semantic: bool = True) -> str:
@@ -205,12 +132,10 @@ def register_agent(agent) -> None:
             query_vec = None
 
         if query_vec is not None:
-            # Cosine similarity over all stored embeddings
             all_embs = graph_db.all_entities_with_embeddings()
             top      = top_k_cosine(query_vec, all_embs, top_k)
             uids     = [uid for uid, _ in top]
         else:
-            # Keyword fallback
             results = graph_db.find_entity(name=query)
             uids = [r["uuid"] for r in results[:top_k]]
 
@@ -329,20 +254,19 @@ def register_agent(agent) -> None:
 
     for fn in [kg_search, kg_traverse, kg_get_entity, kg_list, kg_stats]:
         vis = fn.__name__
-        # kg_search always-on; others deferred (BM25-discoverable via tools_search)
         always = (vis == "kg_search")
         agent.tool_handler.register_tool(fn, always_on=always, min_permission=25)
 
     # ------------------------------------------------------------------
-    # 4. call_librarian (always-on)
+    # 3. call_librarian (always-on)
     # ------------------------------------------------------------------
 
     async def call_librarian(prompt: str = "") -> str:
         """
         Signal the librarian process to update the knowledge graph.
 
-        With no prompt: trigger normal buffer ingest immediately (processes
-        any pending conversation history in libbuffer/).
+        With no prompt: trigger normal node ingest immediately (processes
+        any unvisited conversation nodes).
 
         With a prompt: spawn a targeted agent to execute that specific
         graph-edit instruction (e.g. "remember that Kamie prefers async Python",
@@ -350,7 +274,7 @@ def register_agent(agent) -> None:
 
         Args:
             prompt: Optional instruction for the targeted librarian agent.
-                Leave empty to trigger buffer ingest.
+                Leave empty to trigger node ingest.
         """
         from TinyCTX.modules.knowledge.ipc import send_ipc, IPCError
 
@@ -363,7 +287,7 @@ def register_agent(agent) -> None:
             await send_ipc(sock_path, msg)
             if prompt.strip():
                 return f"[librarian: targeted agent queued — '{prompt[:60]}']"
-            return "[librarian: buffer ingest triggered]"
+            return "[librarian: node ingest triggered]"
         except IPCError as exc:
             logger.warning("[knowledge] call_librarian IPC failed: %s", exc)
             return f"[librarian: could not reach librarian process — {exc}]"
@@ -371,7 +295,7 @@ def register_agent(agent) -> None:
     agent.tool_handler.register_tool(call_librarian, always_on=True, min_permission=25)
 
     # ------------------------------------------------------------------
-    # 5. Pinned entity PromptProvider
+    # 4. Pinned entity PromptProvider
     # ------------------------------------------------------------------
 
     def _pinned_provider(_ctx) -> str | None:
@@ -392,8 +316,8 @@ def register_agent(agent) -> None:
     )
 
     logger.info(
-        "[knowledge] ready — graph: %s | libbuffer: %s | embedder: %s",
-        graph_path, libbuffer_dir, embedding_model or "none",
+        "[knowledge] ready — graph: %s | embedder: %s",
+        graph_path, embedding_model or "none",
     )
 
 
@@ -406,8 +330,8 @@ def _start_librarian(
     agent,
     workspace: Path,
     graph_path: Path,
-    libbuffer_dir: Path,
     sock_path: Path,
+    agent_db: Path,
 ) -> None:
     """
     Launch the librarian process as a subprocess. Checks PID file first to
@@ -419,19 +343,17 @@ def _start_librarian(
     if pid_file.exists():
         try:
             old_pid = int(pid_file.read_text().strip())
-            os.kill(old_pid, 0)  # raises ProcessLookupError if dead
+            os.kill(old_pid, 0)
             logger.info("[knowledge] librarian already running (PID %d)", old_pid)
             return
         except (ProcessLookupError, ValueError, PermissionError):
             pass  # stale PID
-        # Clean up stale socket
         if sock_path.exists():
             try:
                 sock_path.unlink()
             except OSError:
                 pass
 
-    # Build config dict to pass to librarian process
     primary_name = agent.config.llm.primary
     primary_mc   = agent.config.models.get(primary_name)
     try:
@@ -454,23 +376,22 @@ def _start_librarian(
         }
 
     librarian_cfg = {
-        "workspace":             str(workspace),
-        "graph_path":            str(graph_path.relative_to(workspace)),
-        "libbuffer_dir":         str(libbuffer_dir.relative_to(workspace)),
-        "ipc_socket":            str(sock_path.relative_to(workspace)),
-        "log_level":             agent.config.logging.level,
-        "trigger_file_size_kb":  cfg.get("trigger_file_size_kb", 64),
+        "workspace":              str(workspace),
+        "graph_path":             str(graph_path.relative_to(workspace)),
+        "agent_db":               str(agent_db.relative_to(workspace)),
+        "ipc_socket":             str(sock_path.relative_to(workspace)),
+        "log_level":              agent.config.logging.level,
         "trigger_interval_hours": cfg.get("trigger_interval_hours", 6),
-        "batch_size":            cfg.get("batch_size", 20),
-        "max_concurrent":        cfg.get("max_concurrent", 4),
-        "dedup_enabled":         cfg.get("dedup_enabled", True),
-        "dedup_interval_hours":  cfg.get("dedup_interval_hours", 24),
-        "similarity_threshold":  cfg.get("similarity_threshold", 0.85),
+        "batch_size":             cfg.get("batch_size", 20),
+        "max_concurrent":         cfg.get("max_concurrent", 4),
+        "dedup_enabled":          cfg.get("dedup_enabled", True),
+        "dedup_interval_hours":   cfg.get("dedup_interval_hours", 24),
+        "similarity_threshold":   cfg.get("similarity_threshold", 0.85),
         "primary_model": {
-            "model":      primary_mc.model if primary_mc else "",
-            "base_url":   primary_mc.base_url if primary_mc else "",
-            "api_key":    api_key,
-            "max_tokens": primary_mc.max_tokens if primary_mc else 2048,
+            "model":       primary_mc.model if primary_mc else "",
+            "base_url":    primary_mc.base_url if primary_mc else "",
+            "api_key":     api_key,
+            "max_tokens":  primary_mc.max_tokens if primary_mc else 2048,
             "temperature": primary_mc.temperature if primary_mc else 0.7,
         },
         "embed_model": embed_cfg,

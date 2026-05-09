@@ -8,10 +8,13 @@ event loop, separate from the main agent's event loop.
 
 Responsibilities
 ----------------
-- Poll libbuffer/ for session files and process them via buffer agents
+- Poll agent.db for unvisited tail nodes and process them via buffer agents
 - Listen on the IPC socket for on-demand triggers from the main agent
 - Run dedup cycles on a configurable schedule
-- Manage the meeseeks lifecycle: spawn, run, discard librarian agents
+- Manage the agent lifecycle: spawn, run, discard librarian agents
+
+All agent.db writes go through ConversationDB (db.py). The librarian process
+never writes raw SQL against agent.db directly.
 
 Process lifecycle
 -----------------
@@ -24,7 +27,7 @@ On startup the PID file is checked for a stale previous process:
 
 Agent types
 -----------
-buffer   — ingest a batch of messages from a buffer file
+buffer   — ingest a batch of nodes from agent.db for one conversation branch
 targeted — execute a specific graph-edit task from a prompt string
 
 Dedup
@@ -34,16 +37,21 @@ pair and handles graph writes itself.
 
 Write connection
 ----------------
-A single ladybug.AsyncConnection is shared across all coroutines in this
-process. ladybug handles internal concurrency; we serialise our own writes
+A single kuzu.AsyncConnection is shared across all coroutines in this
+process. kuzu handles internal concurrency; we serialise our own writes
 via an asyncio.Lock to keep semantics simple.
+
+Flag convention
+---------------
+The librarian uses "librarian_visited" on nodes in agent.db to track progress.
+Nodes are flagged (via db.flag_branch) before dispatch — no pending state needed
+since agents never write back to agent.db.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
-import math
 import os
 import signal
 import sys
@@ -64,11 +72,11 @@ def main() -> None:
     cfg = json.loads(sys.argv[1])
     _setup_logging(cfg.get("log_level", "INFO"))
 
-    workspace    = Path(cfg["workspace"]).expanduser().resolve()
-    graph_path   = workspace / cfg["graph_path"]
-    libbuffer_dir = workspace / cfg["libbuffer_dir"]
-    pid_file     = workspace / "knowledge" / "librarian.pid"
-    sock_path    = workspace / cfg["ipc_socket"]
+    workspace  = Path(cfg["workspace"]).expanduser().resolve()
+    graph_path = workspace / cfg["graph_path"]
+    pid_file   = workspace / "knowledge" / "librarian.pid"
+    sock_path  = workspace / cfg["ipc_socket"]
+    db_path    = workspace / cfg["agent_db"]
 
     # PID check — detect stale or duplicate
     pid_file.parent.mkdir(parents=True, exist_ok=True)
@@ -85,7 +93,7 @@ def main() -> None:
     logger.info("[librarian] started PID=%d", os.getpid())
 
     try:
-        asyncio.run(_run(cfg, workspace, graph_path, libbuffer_dir, sock_path))
+        asyncio.run(_run(cfg, workspace, graph_path, sock_path, db_path))
     finally:
         try:
             pid_file.unlink(missing_ok=True)
@@ -111,24 +119,28 @@ async def _run(
     cfg: dict,
     workspace: Path,
     graph_path: Path,
-    libbuffer_dir: Path,
     sock_path: Path,
+    db_path: Path,
 ) -> None:
     import ladybug as kuzu
-    from TinyCTX.modules.knowledge.graph import init_schema, GraphDB
+    from TinyCTX.modules.knowledge.graph import init_schema
+    from TinyCTX.db import ConversationDB
 
-    # Open the write connection
+    # Open agent.db for flag reads/writes
+    conv_db = ConversationDB(db_path)
+
+    # Open the graph write connection
     graph_path.parent.mkdir(parents=True, exist_ok=True)
-    libbuffer_dir.mkdir(parents=True, exist_ok=True)
     sock_path.parent.mkdir(parents=True, exist_ok=True)
 
     db   = kuzu.Database(str(graph_path))
-    conn = kuzu.AsyncConnection(db)
+    conn = kuzu.AsyncConnection(db, max_concurrent_queries=int(cfg.get("max_concurrent", 4)))
     await conn.execute("RETURN 1")  # warm up / validate
 
     # Ensure schema exists
     sync_conn = kuzu.Connection(db)
     init_schema(sync_conn)
+    sync_conn.close()
 
     write_lock = asyncio.Lock()
 
@@ -137,13 +149,10 @@ async def _run(
 
     # Timestamps of last runs
     state = {
-        "last_buffer_ts":  0.0,
-        "last_dedup_ts":   0.0,
-        "dedup_running":   False,
+        "last_poll_ts":  0.0,
+        "last_dedup_ts": 0.0,
+        "dedup_running": False,
     }
-
-    # Files currently being processed (avoid double-processing)
-    in_flight_files: set[Path] = set()
 
     # Build LLM client for librarian agents
     primary_model_cfg = cfg.get("primary_model", {})
@@ -198,9 +207,8 @@ async def _run(
     while not shutdown_event.is_set():
         try:
             await _poll_cycle(
-                cfg, conn, write_lock, llm, embedder,
-                libbuffer_dir, in_flight_files, active_tasks,
-                state, max_concurrent, batch_size, ipc_queue,
+                cfg, conv_db, conn, write_lock, llm, embedder,
+                active_tasks, state, max_concurrent, batch_size, ipc_queue,
             )
         except Exception:
             logger.exception("[librarian] poll cycle error")
@@ -216,7 +224,8 @@ async def _run(
         await asyncio.gather(*active_tasks, return_exceptions=True)
 
     ipc_server.close()
-    conn.close()
+    await conn.close()
+    conv_db.close()
     logger.info("[librarian] shutdown complete")
 
 
@@ -226,12 +235,11 @@ async def _run(
 
 async def _poll_cycle(
     cfg: dict,
+    conv_db,
     conn,
     write_lock: asyncio.Lock,
     llm,
     embedder,
-    libbuffer_dir: Path,
-    in_flight_files: set[Path],
     active_tasks: set[asyncio.Task],
     state: dict,
     max_concurrent: int,
@@ -258,41 +266,73 @@ async def _poll_cycle(
                 active_tasks.add(task)
             elif prompt:
                 logger.warning("[librarian] targeted agent queued but concurrency cap reached")
-        elif msg_type == "trigger":
-            pass  # fall through to buffer trigger logic below
+        # "trigger" type: fall through to the node walk below
 
-    # Buffer trigger logic
+    # Node walk trigger
     now = time.time()
-    file_size_limit = int(cfg.get("trigger_file_size_kb", 64)) * 1024
-    interval_hours  = float(cfg.get("trigger_interval_hours", 6))
-    interval_secs   = interval_hours * 3600
-    time_elapsed    = (now - state["last_buffer_ts"]) >= interval_secs
+    interval_secs = float(cfg.get("trigger_interval_hours", 6)) * 3600
+    if (now - state["last_poll_ts"]) < interval_secs:
+        # Check dedup even if not time for a poll yet
+        _maybe_start_dedup(cfg, conv_db, conn, write_lock, llm, embedder,
+                           active_tasks, state, max_concurrent, now)
+        return
 
-    buffer_files = sorted(libbuffer_dir.glob("session_*.txt"))
+    state["last_poll_ts"] = now
 
-    for bf in buffer_files:
-        if bf in in_flight_files:
+    # Find all tail nodes and walk unvisited branches under the lock
+    async with write_lock:
+        tail_nodes = conv_db.get_tail_nodes()
+        batches: list[tuple[list[str], str]] = []  # (node_ids, batch_text)
+
+        for tail in tail_nodes:
+            if len(active_tasks) + len(batches) >= max_concurrent:
+                break
+            # flag_branch returns [] if tail already has the flag
+            flagged_ids = conv_db.flag_branch(tail.id, "librarian_visited")
+            if not flagged_ids:
+                continue
+            # Build conversation text from flagged nodes (oldest first)
+            batch_text = _nodes_to_text(conv_db, list(reversed(flagged_ids)), batch_size)
+            batches.append((flagged_ids, batch_text))
+
+    for flagged_ids, batch_text in batches:
+        if not batch_text.strip():
             continue
-        if len(active_tasks) >= max_concurrent:
-            break
-        try:
-            size = bf.stat().st_size
-        except FileNotFoundError:
-            continue
-
-        should_trigger = size >= file_size_limit or (time_elapsed and size > 0)
-        if not should_trigger:
-            continue
-
-        in_flight_files.add(bf)
-        state["last_buffer_ts"] = now
-
         task = asyncio.create_task(
-            _process_buffer_file(cfg, conn, write_lock, llm, bf, batch_size, in_flight_files)
+            _run_buffer_agent(cfg, conn, write_lock, llm, batch_text)
         )
         active_tasks.add(task)
+        logger.info("[librarian] dispatched agent for %d node(s)", len(flagged_ids))
 
-    # Dedup trigger
+    _maybe_start_dedup(cfg, conv_db, conn, write_lock, llm, embedder,
+                       active_tasks, state, max_concurrent, now)
+
+
+def _nodes_to_text(conv_db, node_ids: list[str], batch_size: int) -> str:
+    """Render up to batch_size nodes as '[author]: content' lines."""
+    lines: list[str] = []
+    for node_id in node_ids[:batch_size]:
+        node = conv_db.get_node(node_id)
+        if node is None or node.role not in ("user", "assistant"):
+            continue
+        author = node.author_name or node.author_id or node.role
+        content = node.content or ""
+        # Unwrap JSON content blocks to plain text
+        if content.startswith("["):
+            try:
+                blocks = json.loads(content)
+                texts = [b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text"]
+                content = " ".join(texts)
+            except Exception:
+                pass
+        content = content.strip()
+        if content:
+            lines.append(f"[{author}]: {content}")
+    return "\n".join(lines)
+
+
+def _maybe_start_dedup(cfg, conv_db, conn, write_lock, llm, embedder,
+                       active_tasks, state, max_concurrent, now):
     dedup_enabled  = bool(cfg.get("dedup_enabled", True))
     dedup_interval = float(cfg.get("dedup_interval_hours", 24)) * 3600
     if (
@@ -300,6 +340,7 @@ async def _poll_cycle(
         and not state["dedup_running"]
         and (now - state["last_dedup_ts"]) >= dedup_interval
         and embedder is not None
+        and len(active_tasks) < max_concurrent
     ):
         state["dedup_running"] = True
         state["last_dedup_ts"] = now
@@ -314,50 +355,6 @@ async def _poll_cycle(
 # Buffer agent
 # ---------------------------------------------------------------------------
 
-async def _process_buffer_file(
-    cfg: dict,
-    conn,
-    write_lock: asyncio.Lock,
-    llm,
-    buffer_file: Path,
-    batch_size: int,
-    in_flight_files: set[Path],
-) -> None:
-    logger.info("[librarian] processing buffer file: %s", buffer_file.name)
-    try:
-        while True:
-            # Read oldest batch_size lines
-            try:
-                all_lines = buffer_file.read_text(encoding="utf-8").splitlines()
-            except FileNotFoundError:
-                break
-
-            if not all_lines:
-                break
-
-            batch = all_lines[:batch_size]
-            remaining = all_lines[batch_size:]
-
-            # Remove those lines from the file
-            if remaining:
-                buffer_file.write_text("\n".join(remaining) + "\n", encoding="utf-8")
-            else:
-                buffer_file.unlink(missing_ok=True)
-
-            # Spawn agent for this batch
-            batch_text = "\n".join(batch)
-            await _run_buffer_agent(cfg, conn, write_lock, llm, batch_text)
-
-            if not remaining:
-                break
-
-    except Exception:
-        logger.exception("[librarian] error processing buffer file %s", buffer_file.name)
-    finally:
-        in_flight_files.discard(buffer_file)
-    logger.info("[librarian] done with buffer file: %s", buffer_file.name)
-
-
 async def _run_buffer_agent(
     cfg: dict,
     conn,
@@ -365,7 +362,7 @@ async def _run_buffer_agent(
     llm,
     batch_text: str,
 ) -> None:
-    """Run a buffer librarian agent for one batch of conversation lines."""
+    """Run a buffer librarian agent for one batch of conversation nodes."""
     write_tools = _make_write_tools(conn, write_lock)
     read_tools  = _make_read_tools(conn)
     tools       = write_tools + read_tools
@@ -483,7 +480,6 @@ async def _run_dedup_cycle(
                             "model": embed_model_name, "content": txt, "hash": h,
                         },
                     )
-                    # Sync local copy
                     e["e.embedding"]    = vec
                     e["e.embed_model"]  = embed_model_name
                     e["e.embed_hash"]   = h
@@ -566,10 +562,8 @@ async def _dedup_pair(conn, write_lock: asyncio.Lock, llm, ea: dict, eb: dict) -
         if isinstance(event, TextDelta):
             response_text += event.text
 
-    # Parse JSON response
     import re as _re
     raw = response_text.strip()
-    # Strip markdown fences if model ignored instructions
     raw = _re.sub(r"^```json?\s*", "", raw)
     raw = _re.sub(r"\s*```$", "", raw)
 
@@ -597,26 +591,22 @@ async def _dedup_pair(conn, write_lock: asyncio.Lock, llm, ea: dict, eb: dict) -
     async with write_lock:
         if verdict == "duplicate":
             logger.info("[librarian] dedup: merging %s → %s", dup_uuid[:8], canonical_uuid[:8])
-            # Update canonical description
             await conn.execute(
                 "MATCH (e:Entity {uuid: $uid}) SET e.description = $desc, e.updated_at = $now, e.embed_hash = ''",
                 parameters={"uid": canonical_uuid, "desc": merged_desc, "now": now},
             )
-            # Re-home outgoing edges from duplicate
             await conn.execute(
                 "MATCH (dup:Entity {uuid: $dup})-[r:Relation]->(x:Entity) "
                 "WHERE r.superseded_at IS NULL AND x.uuid <> $canon "
                 "CREATE (c:Entity {uuid: $canon})-[:Relation {relation: r.relation, weight: r.weight, description: r.description, created_at: $now, superseded_at: null}]->(x)",
                 parameters={"dup": dup_uuid, "canon": canonical_uuid, "now": now},
             )
-            # Re-home incoming edges
             await conn.execute(
                 "MATCH (x:Entity)-[r:Relation]->(dup:Entity {uuid: $dup}) "
                 "WHERE r.superseded_at IS NULL AND x.uuid <> $canon "
                 "CREATE (x)-[:Relation {relation: r.relation, weight: r.weight, description: r.description, created_at: $now, superseded_at: null}]->(c:Entity {uuid: $canon})",
                 parameters={"dup": dup_uuid, "canon": canonical_uuid, "now": now},
             )
-            # Delete duplicate (cascades edges)
             await conn.execute(
                 "MATCH (e:Entity {uuid: $uid}) DETACH DELETE e",
                 parameters={"uid": dup_uuid},
@@ -624,12 +614,10 @@ async def _dedup_pair(conn, write_lock: asyncio.Lock, llm, ea: dict, eb: dict) -
 
         elif verdict == "alias":
             logger.info("[librarian] dedup: aliasing %s → %s", dup_uuid[:8], canonical_uuid[:8])
-            # Update alias description
             await conn.execute(
                 "MATCH (e:Entity {uuid: $uid}) SET e.description = $desc, e.updated_at = $now",
                 parameters={"uid": dup_uuid, "desc": merged_desc, "now": now},
             )
-            # Add ALIASED_TO edge
             await conn.execute(
                 "MATCH (a:Entity {uuid: $alias}), (c:Entity {uuid: $canon}) "
                 "CREATE (a)-[:Relation {relation: 'ALIASED_TO', weight: 1.0, description: 'alias', created_at: $now, superseded_at: null}]->(c)",
@@ -643,7 +631,7 @@ async def _dedup_pair(conn, write_lock: asyncio.Lock, llm, ea: dict, eb: dict) -
 
 def _make_write_tools(conn, write_lock: asyncio.Lock) -> list[dict]:
     """Build write tool definitions as dicts for the simple agent loop."""
-    from TinyCTX.modules.knowledge.graph import new_uuid, now_ts, embed_content_for
+    from TinyCTX.modules.knowledge.graph import new_uuid, now_ts
 
     tools = []
 
@@ -667,7 +655,6 @@ def _make_write_tools(conn, write_lock: asyncio.Lock) -> list[dict]:
             pinned: If true, inject into every system prompt.
         """
         now = now_ts()
-        # Check existing
         r = await conn.execute(
             "MATCH (e:Entity) WHERE e.name = $name AND e.entity_type = $et RETURN e.uuid LIMIT 1",
             parameters={"name": name, "et": entity_type},
@@ -775,7 +762,6 @@ def _make_write_tools(conn, write_lock: asyncio.Lock) -> list[dict]:
     ) -> str:
         """
         Mark an existing relationship as superseded and create a replacement.
-        The old edge is preserved (superseded_at set) for audit purposes.
 
         Args:
             src_uuid: Source entity UUID.
@@ -806,8 +792,7 @@ def _make_write_tools(conn, write_lock: asyncio.Lock) -> list[dict]:
 
     async def delete_entity(uuid: str) -> str:
         """
-        Hard-delete an entity and all its edges. Use sparingly — only for
-        entirely erroneous nodes (errors of fact, duplicates, test data).
+        Hard-delete an entity and all its edges. Use sparingly.
 
         Args:
             uuid: The entity UUID to delete.
@@ -903,7 +888,6 @@ def _make_read_tools(conn) -> list[dict]:
         row = r.get_next()
         cols = r.get_column_names()
         data = dict(zip(cols, row))
-        # Omit embedding blob from text output
         data.pop("e.embedding", None)
 
         edges_out = await conn.execute(
@@ -1017,12 +1001,10 @@ async def _agent_loop(
         response_text = "".join(text_chunks)
 
         if not tool_calls:
-            # Done
             if response_text:
                 logger.debug("[librarian/agent] completed: %s", response_text[:120])
             return
 
-        # Append assistant turn with tool calls
         messages.append({
             "role": "assistant",
             "content": response_text,
@@ -1039,7 +1021,6 @@ async def _agent_loop(
             ],
         })
 
-        # Execute each tool call
         for tc in tool_calls:
             fn = tool_map.get(tc["name"])
             if fn is None:
