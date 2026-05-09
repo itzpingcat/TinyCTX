@@ -3,7 +3,8 @@ FROM python:3.14-rc-slim
 
 # --- env -------------------------------------------------------------------
 # Force Playwright to install browsers in a shared path
-ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    HOME=/home/tinyctx
 
 # --- system deps -----------------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
