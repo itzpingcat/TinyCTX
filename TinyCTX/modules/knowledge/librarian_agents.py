@@ -23,6 +23,23 @@ def _prompt(filename: str) -> str:
     return (_PROMPTS_DIR / filename).read_text(encoding="utf-8")
 
 
+def _set(conn, uid: str, field: str, value):
+    """Issue a single-field SET via two-param query (uuid + value).
+    Ladybug's param binder works reliably for exactly 2 params."""
+    return conn.execute(
+        f"MATCH (e:Entity) WHERE e.uuid = $uid SET e.{field} = $v",
+        parameters={"uid": uid, "v": value},
+    )
+
+
+async def _aset(conn, uid: str, field: str, value):
+    """Async version of _set."""
+    return await conn.execute(
+        f"MATCH (e:Entity) WHERE e.uuid = $uid SET e.{field} = $v",
+        parameters={"uid": uid, "v": value},
+    )
+
+
 # ---------------------------------------------------------------------------
 # Conversation node → text
 # ---------------------------------------------------------------------------
@@ -150,16 +167,12 @@ async def run_dedup_cycle(
             vectors = await embedder.embed(texts)
             async with write_lock:
                 for e, vec, txt in zip(stale, vectors, texts):
-                    h = embed_hash(txt)
-                    await conn.execute(
-                        "MATCH (e:Entity {uuid: $uid}) "
-                        "SET e.embedding = $emb, e.embed_model = $model, "
-                        "    e.embed_content = $content, e.embed_hash = $hash",
-                        parameters={
-                            "uid": e["e.uuid"], "emb": vec,
-                            "model": embed_model_name, "content": txt, "hash": h,
-                        },
-                    )
+                    h   = embed_hash(txt)
+                    uid = e["e.uuid"]
+                    await _aset(conn, uid, "embedding",    vec)
+                    await _aset(conn, uid, "embed_model",  embed_model_name)
+                    await _aset(conn, uid, "embed_content", txt)
+                    await _aset(conn, uid, "embed_hash",   h)
                     e["e.embedding"]   = vec
                     e["e.embed_model"] = embed_model_name
                     e["e.embed_hash"]  = h
@@ -258,39 +271,41 @@ async def _dedup_pair(conn, write_lock: asyncio.Lock, llm, ea: dict, eb: dict, a
     async with write_lock:
         if verdict == "duplicate":
             logger.info("[knowledge/librarian] dedup: merging %s → %s", dup_uuid[:8], canonical_uuid[:8])
+            await _aset(conn, canonical_uuid, "description", merged_desc)
+            await _aset(conn, canonical_uuid, "updated_at",  now)
+            await _aset(conn, canonical_uuid, "embed_hash",  "")
+            # Copy outgoing edges from dup to canonical
             await conn.execute(
-                "MATCH (e:Entity {uuid: $uid}) SET e.description = $desc, e.updated_at = $now, e.embed_hash = ''",
-                parameters={"uid": canonical_uuid, "desc": merged_desc, "now": now},
+                "MATCH (dup:Entity)-[r:Relation]->(x:Entity), (c:Entity) "
+                "WHERE dup.uuid = $dup AND r.superseded_at IS NULL "
+                "AND x.uuid <> $canon AND c.uuid = $canon "
+                "CREATE (c)-[:Relation {relation: r.relation, weight: r.weight, "
+                "description: r.description, created_at: r.created_at, superseded_at: null}]->(x)",
+                parameters={"dup": dup_uuid, "canon": canonical_uuid},
             )
+            # Copy incoming edges from dup to canonical
             await conn.execute(
-                "MATCH (dup:Entity {uuid: $dup})-[r:Relation]->(x:Entity) "
-                "WHERE r.superseded_at IS NULL AND x.uuid <> $canon "
-                "CREATE (c:Entity {uuid: $canon})-[:Relation {relation: r.relation, weight: r.weight, "
-                "description: r.description, created_at: $now, superseded_at: null}]->(x)",
-                parameters={"dup": dup_uuid, "canon": canonical_uuid, "now": now},
-            )
-            await conn.execute(
-                "MATCH (x:Entity)-[r:Relation]->(dup:Entity {uuid: $dup}) "
-                "WHERE r.superseded_at IS NULL AND x.uuid <> $canon "
+                "MATCH (x:Entity)-[r:Relation]->(dup:Entity), (c:Entity) "
+                "WHERE dup.uuid = $dup AND r.superseded_at IS NULL "
+                "AND x.uuid <> $canon AND c.uuid = $canon "
                 "CREATE (x)-[:Relation {relation: r.relation, weight: r.weight, "
-                "description: r.description, created_at: $now, superseded_at: null}]->(c:Entity {uuid: $canon})",
-                parameters={"dup": dup_uuid, "canon": canonical_uuid, "now": now},
+                "description: r.description, created_at: r.created_at, superseded_at: null}]->(c)",
+                parameters={"dup": dup_uuid, "canon": canonical_uuid},
             )
             await conn.execute(
-                "MATCH (e:Entity {uuid: $uid}) DETACH DELETE e",
+                "MATCH (e:Entity) WHERE e.uuid = $uid DETACH DELETE e",
                 parameters={"uid": dup_uuid},
             )
         elif verdict == "alias":
             logger.info("[knowledge/librarian] dedup: aliasing %s → %s", dup_uuid[:8], canonical_uuid[:8])
+            await _aset(conn, dup_uuid, "description", merged_desc)
+            await _aset(conn, dup_uuid, "updated_at",  now)
             await conn.execute(
-                "MATCH (e:Entity {uuid: $uid}) SET e.description = $desc, e.updated_at = $now",
-                parameters={"uid": dup_uuid, "desc": merged_desc, "now": now},
-            )
-            await conn.execute(
-                "MATCH (a:Entity {uuid: $alias}), (c:Entity {uuid: $canon}) "
-                "CREATE (a)-[:Relation {relation: 'ALIASED_TO', weight: 1.0, description: 'alias', "
-                "created_at: $now, superseded_at: null}]->(c)",
-                parameters={"alias": dup_uuid, "canon": canonical_uuid, "now": now},
+                f"MATCH (a:Entity), (c:Entity) "
+                f"WHERE a.uuid = $alias AND c.uuid = $canon "
+                f"CREATE (a)-[:Relation {{relation: 'ALIASED_TO', weight: 1.0, "
+                f"description: 'alias', created_at: {now!r}, superseded_at: null}}]->(c)",
+                parameters={"alias": dup_uuid, "canon": canonical_uuid},
             )
 
 
@@ -329,25 +344,29 @@ def _make_write_tools(conn, write_lock: asyncio.Lock) -> list[dict]:
         if r.has_next():
             uid = r.get_next()[0]
             async with write_lock:
-                await conn.execute(
-                    "MATCH (e:Entity {uuid: $uid}) "
-                    "SET e.description = $desc, e.updated_at = $now, "
-                    "    e.priority = $pri, e.pinned = $pin, e.embed_hash = ''",
-                    parameters={"uid": uid, "desc": description, "now": now, "pri": priority, "pin": pinned},
-                )
+                await _aset(conn, uid, "description",  description)
+                await _aset(conn, uid, "updated_at",   now)
+                await _aset(conn, uid, "priority",     priority)
+                await _aset(conn, uid, "pinned",       pinned)
+                await _aset(conn, uid, "embed_hash",   "")
             return uid
         uid = new_uuid()
         async with write_lock:
             await conn.execute(
-                "CREATE (e:Entity {uuid: $uid, name: $name, entity_type: $et, "
-                "description: $desc, pinned: $pin, priority: $pri, mention_count: 0, "
-                "created_at: $now, updated_at: $now, embed_model: '', "
-                "embed_content: '', embed_hash: '', embedding: []})",
-                parameters={
-                    "uid": uid, "name": name, "et": entity_type,
-                    "desc": description, "pin": pinned, "pri": priority, "now": now,
-                },
+                "CREATE (e:Entity {uuid: $uid})",
+                parameters={"uid": uid},
             )
+            await _aset(conn, uid, "name",          name)
+            await _aset(conn, uid, "entity_type",   entity_type)
+            await _aset(conn, uid, "description",   description)
+            await _aset(conn, uid, "pinned",        pinned)
+            await _aset(conn, uid, "priority",      priority)
+            await _aset(conn, uid, "mention_count", 0)
+            await _aset(conn, uid, "created_at",    now)
+            await _aset(conn, uid, "updated_at",    now)
+            await _aset(conn, uid, "embed_model",   "")
+            await _aset(conn, uid, "embed_content", "")
+            await _aset(conn, uid, "embed_hash",    "")
         return uid
 
     async def update_entity(
@@ -366,25 +385,17 @@ def _make_write_tools(conn, write_lock: asyncio.Lock) -> list[dict]:
             pinned: New pinned flag (optional).
         """
         now  = now_ts()
-        sets = ["e.updated_at = $now"]
-        params: dict = {"uid": uuid, "now": now}
-        if description is not None:
-            sets.append("e.description = $desc")
-            sets.append("e.embed_hash = ''")
-            params["desc"] = description
-        if priority is not None:
-            sets.append("e.priority = $pri")
-            params["pri"] = priority
-        if pinned is not None:
-            sets.append("e.pinned = $pin")
-            params["pin"] = pinned
-        if len(sets) == 1:
+        if description is None and priority is None and pinned is None:
             return f"[no fields to update for {uuid}]"
         async with write_lock:
-            await conn.execute(
-                f"MATCH (e:Entity {{uuid: $uid}}) SET {', '.join(sets)}",
-                parameters=params,
-            )
+            if description is not None:
+                await _aset(conn, uuid, "description", description)
+                await _aset(conn, uuid, "embed_hash",  "")
+            if priority is not None:
+                await _aset(conn, uuid, "priority", priority)
+            if pinned is not None:
+                await _aset(conn, uuid, "pinned", pinned)
+            await _aset(conn, uuid, "updated_at", now)
         return f"updated {uuid}"
 
     async def add_relationship(
@@ -405,15 +416,14 @@ def _make_write_tools(conn, write_lock: asyncio.Lock) -> list[dict]:
             description: Optional explanation.
         """
         now = now_ts()
+        rel  = relation.upper().replace("'", "")
+        desc = description.replace("'", "''")
         async with write_lock:
             await conn.execute(
-                "MATCH (a:Entity {uuid: $src}), (b:Entity {uuid: $tgt}) "
-                "CREATE (a)-[:Relation {relation: $rel, weight: $w, "
-                "description: $desc, created_at: $now, superseded_at: null}]->(b)",
-                parameters={
-                    "src": source_uuid, "tgt": target_uuid, "rel": relation.upper(),
-                    "w": weight, "desc": description, "now": now,
-                },
+                f"MATCH (a:Entity), (b:Entity) WHERE a.uuid = $src AND b.uuid = $tgt "
+                f"CREATE (a)-[:Relation {{relation: '{rel}', weight: {weight!r}, "
+                f"description: '{desc}', created_at: {now!r}, superseded_at: null}}]->(b)",
+                parameters={"src": source_uuid, "tgt": target_uuid},
             )
         return f"added {relation} from {source_uuid[:8]} → {target_uuid[:8]}"
 
@@ -436,22 +446,23 @@ def _make_write_tools(conn, write_lock: asyncio.Lock) -> list[dict]:
             weight: Weight for the new relationship.
             description: Optional explanation.
         """
-        now = now_ts()
+        now  = now_ts()
+        old  = old_relation.upper().replace("'", "")
+        new  = new_relation.upper().replace("'", "")
+        desc = description.replace("'", "''")
         async with write_lock:
             await conn.execute(
-                "MATCH (a:Entity {uuid: $src})-[r:Relation]->(b:Entity {uuid: $tgt}) "
-                "WHERE r.relation = $old AND r.superseded_at IS NULL "
-                "SET r.superseded_at = $now",
-                parameters={"src": src_uuid, "tgt": tgt_uuid, "old": old_relation.upper(), "now": now},
+                f"MATCH (a:Entity)-[r:Relation]->(b:Entity) "
+                f"WHERE a.uuid = $src AND b.uuid = $tgt "
+                f"AND r.relation = '{old}' AND r.superseded_at IS NULL "
+                f"SET r.superseded_at = {now!r}",
+                parameters={"src": src_uuid, "tgt": tgt_uuid},
             )
             await conn.execute(
-                "MATCH (a:Entity {uuid: $src}), (b:Entity {uuid: $tgt}) "
-                "CREATE (a)-[:Relation {relation: $rel, weight: $w, "
-                "description: $desc, created_at: $now, superseded_at: null}]->(b)",
-                parameters={
-                    "src": src_uuid, "tgt": tgt_uuid, "rel": new_relation.upper(),
-                    "w": weight, "desc": description, "now": now,
-                },
+                f"MATCH (a:Entity), (b:Entity) WHERE a.uuid = $src AND b.uuid = $tgt "
+                f"CREATE (a)-[:Relation {{relation: '{new}', weight: {weight!r}, "
+                f"description: '{desc}', created_at: {now!r}, superseded_at: null}}]->(b)",
+                parameters={"src": src_uuid, "tgt": tgt_uuid},
             )
         return f"superseded {old_relation} → {new_relation} from {src_uuid[:8]} → {tgt_uuid[:8]}"
 
@@ -464,7 +475,7 @@ def _make_write_tools(conn, write_lock: asyncio.Lock) -> list[dict]:
         """
         async with write_lock:
             await conn.execute(
-                "MATCH (e:Entity {uuid: $uid}) DETACH DELETE e",
+                "MATCH (e:Entity) WHERE e.uuid = $uid DETACH DELETE e",
                 parameters={"uid": uuid},
             )
         return f"deleted entity {uuid[:8]}"
@@ -478,11 +489,13 @@ def _make_write_tools(conn, write_lock: asyncio.Lock) -> list[dict]:
             tgt_uuid: Target entity UUID.
             relation: The relation label to delete.
         """
+        rel = relation.upper().replace("'", "")
         async with write_lock:
             await conn.execute(
-                "MATCH (a:Entity {uuid: $src})-[r:Relation]->(b:Entity {uuid: $tgt}) "
-                "WHERE r.relation = $rel AND r.superseded_at IS NULL DELETE r",
-                parameters={"src": src_uuid, "tgt": tgt_uuid, "rel": relation.upper()},
+                f"MATCH (a:Entity)-[r:Relation]->(b:Entity) "
+                f"WHERE a.uuid = $src AND b.uuid = $tgt "
+                f"AND r.relation = '{rel}' AND r.superseded_at IS NULL DELETE r",
+                parameters={"src": src_uuid, "tgt": tgt_uuid},
             )
         return f"deleted {relation} from {src_uuid[:8]} → {tgt_uuid[:8]}"
 
