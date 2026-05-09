@@ -22,15 +22,18 @@ RUN groupadd -r tinyctx && useradd -r -g tinyctx -d /home/tinyctx -m -s /sbin/no
 WORKDIR /app
 
 # --- python deps -----------------------------------------------------------
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --upgrade pip && \
+    pip install \
         PyYAML aiohttp pyfiglet rich questionary requests mcp numpy \
-        tiktoken structlog tenacity ddgs playwright pdfplumber \
+        tiktoken structlog tenacity ddgs pdfplumber \
         python-docx sympy "antlr4-python3-runtime==4.13.2" jinja2 \
         croniter "discord.py" matrix-nio
 
-# --- install playwright browsers (GLOBAL PATH) -----------------------------
-RUN playwright install chromium
+# --- playwright (cached separately so browser install layer is isolated) ---
+RUN --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=cache,target=/root/.cache/ms-playwright \
+    pip install playwright && playwright install chromium
 
 # --- app source ------------------------------------------------------------
 COPY TinyCTX/ ./TinyCTX/

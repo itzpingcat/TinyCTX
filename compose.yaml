@@ -1,5 +1,12 @@
 name: tinyctx
 
+x-bake:
+  defaults:
+    cache-from:
+      - type=local,src=.docker-cache
+    cache-to:
+      - type=local,dest=.docker-cache,mode=max
+
 services:
 
   # ── agent ──────────────────────────────────────────────────────────────────
