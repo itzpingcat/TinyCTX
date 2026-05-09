@@ -44,7 +44,6 @@ literal braces in markdown content aren't corrupted.
 from __future__ import annotations
 
 import datetime
-from email.mime import text
 import logging
 import re
 from pathlib import Path
@@ -59,14 +58,14 @@ logger = logging.getLogger(__name__)
 _MACRO_RE = re.compile(r"\{(\w+)\}")
 
 
+# REPLACE the broken _read with:
 def _read(path: Path) -> str | None:
     """Return file text stripped of leading/trailing whitespace, or None."""
     if not path.exists():
+        logger.warning("[inject] prompt file missing or empty: %s", path)
         return None
     try:
-        if text is None:
-            logger.warning("[inject] prompt file missing or empty: %s", path)
-            return None
+        text = path.read_text(encoding="utf-8").strip()
         return text or None
     except Exception as exc:
         logger.warning("[inject] could not read %s: %s", path, exc)
