@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def register_agent(agent) -> None:
-    # Normalise: accept Runtime or legacy AgentLoop.
+    # Normalise: accept Runtime or AgentCycle.
     from TinyCTX.runtime import Runtime as _Runtime
     _rt = agent if isinstance(agent, _Runtime) else None
     if _rt is not None:
@@ -42,6 +42,10 @@ def register_agent(agent) -> None:
             tool_handler = _rt.tool_handler
             def register_background_hook(self, fn): _rt.register_background_hook(fn)
         agent = _Shim()
+    else:
+        # AgentCycle — patch in register_background_hook via post_turn_hooks
+        if not hasattr(agent, 'register_background_hook'):
+            agent.register_background_hook = agent.post_turn_hooks.append
     workspace = Path(agent.config.workspace.path).expanduser().resolve()
     workspace.mkdir(parents=True, exist_ok=True)
 
@@ -113,9 +117,7 @@ def register_agent(agent) -> None:
     session_buffer = SessionBuffer(libbuffer_dir, bridge_name)
 
     async def _post_turn_hook(tail_node_id: str) -> None:
-        # Read the last two turns from the DB directly using tail_node_id.
-        # This avoids depending on agent.context which doesn't exist on Runtime.
-        db = _rt.db if _rt is not None else getattr(agent, '_db', None)
+        db = _rt.db if _rt is not None else getattr(agent, 'db', None)
         if db is None:
             return
 
@@ -123,25 +125,20 @@ def register_agent(agent) -> None:
         if not nodes:
             return
 
-        # Replay session state for author_name
-        from TinyCTX.context import Context
-        ctx = Context()
-        ctx.set_db(db)
-        ctx.set_tail(tail_node_id)
-        state, _ = ctx._load_state_from_db()
+        state, _ = db.load_session_state(tail_node_id)
         user_name = state.get("author_name") or "user"
 
-        user_text     = ""
-        asst_text     = ""
+        user_text        = ""
+        asst_text        = ""
         attachment_names: list[str] = []
 
+        import json as _json
         for node in reversed(nodes):
             if node.role == "assistant" and not asst_text:
                 asst_text = node.content if isinstance(node.content, str) else ""
             elif node.role == "user" and not user_text:
-                content = node.content
-                import json as _json
-                if content.startswith("["):
+                content = node.content or ""
+                if isinstance(content, str) and content.startswith("["):
                     try:
                         blocks = _json.loads(content)
                         for block in blocks:
