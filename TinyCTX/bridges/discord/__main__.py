@@ -954,14 +954,20 @@ class DiscordBridge:
                     self._tasks.add(task)
                     task.add_done_callback(self._tasks.discard)
                 else:
-                    await self._runtime.push(msg_)
+                    node_id = self._get_or_create_cursor(ck)
+                    new_node_id = await self._runtime.push(dataclasses.replace(msg_, tail_node_id=node_id))
+                    self._advance_cursor(ck, new_node_id)
             task = asyncio.create_task(_delayed())
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
             return
 
         if not is_trigger:
-            await self._runtime.push(msg)
+            lock = self._lane_locks.setdefault(cursor_key, asyncio.Lock())
+            async with lock:
+                node_id = self._get_or_create_cursor(cursor_key)
+                new_node_id = await self._runtime.push(dataclasses.replace(msg, tail_node_id=node_id))
+                self._advance_cursor(cursor_key, new_node_id)
             return
 
         task = asyncio.create_task(

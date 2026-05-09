@@ -571,13 +571,6 @@ class Context:
             if slot.role != ROLE_SYSTEM:
                 messages.append({"role": slot.role, "content": content})
 
-        # Detect multi-author branches
-        distinct_authors = {
-            e.author_id for e in source
-            if e.role == ROLE_USER and e.author_id is not None
-        }
-        is_multi_author = len(distinct_authors) > 1
-
         # 2 & 3. filter + transform per dialogue entry
         for entry in source:
             age = n - 1 - entry.index
@@ -595,8 +588,8 @@ class Context:
                 if result is not None:
                     entry = result
 
-            if is_multi_author and entry.role == ROLE_USER:
-                label = entry.author_name or entry.author_id or "unknown"
+            if entry.role == ROLE_USER and entry.author_id is not None:
+                label = entry.author_name or entry.author_id
                 raw = entry.content
                 if isinstance(raw, str):
                     labelled_content: str | list = f"[{label}]: {raw}"
