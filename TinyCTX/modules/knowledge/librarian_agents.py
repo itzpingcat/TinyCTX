@@ -1,327 +1,39 @@
 """
-modules/knowledge/librarian_process.py
+modules/knowledge/librarian_agents.py
 
-Persistent sidecar process that manages all writes to the knowledge graph.
+Pure agent logic for the knowledge librarian: buffer ingestion, targeted
+edits, and dedup. No process management, no IPC, no event loop ownership.
 
-Launched by the knowledge module at agent startup. Runs its own asyncio
-event loop, separate from the main agent's event loop.
-
-Responsibilities
-----------------
-- Poll agent.db for unvisited tail nodes and process them via buffer agents
-- Listen on the IPC socket for on-demand triggers from the main agent
-- Run dedup cycles on a configurable schedule
-- Manage the agent lifecycle: spawn, run, discard librarian agents
-
-All agent.db writes go through ConversationDB (db.py). The librarian process
-never writes raw SQL against agent.db directly.
-
-Process lifecycle
------------------
-Writes knowledge/librarian.pid on startup. Reads the config dict from
-argv[1] as JSON. Exits cleanly on SIGTERM/SIGINT, draining in-flight agents.
-
-On startup the PID file is checked for a stale previous process:
-  - If the PID is alive: exit immediately (another instance is running).
-  - If the PID is dead (or file missing): overwrite and continue.
-
-Agent types
------------
-buffer   — ingest a batch of nodes from agent.db for one conversation branch
-targeted — execute a specific graph-edit task from a prompt string
-
-Dedup
------
-Not an agent. The librarian process makes direct LLM calls per candidate
-pair and handles graph writes itself.
-
-Write connection
-----------------
-A single kuzu.AsyncConnection is shared across all coroutines in this
-process. kuzu handles internal concurrency; we serialise our own writes
-via an asyncio.Lock to keep semantics simple.
-
-Flag convention
----------------
-The librarian uses "librarian_visited" on nodes in agent.db to track progress.
-Nodes are flagged (via db.flag_branch) before dispatch — no pending state needed
-since agents never write back to agent.db.
+Called by LibrarianRunner (_poll_cycle) in __main__.py.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
-import os
-import signal
-import sys
-import time
-from pathlib import Path
+import re as _re
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
-def main() -> None:
-    if len(sys.argv) < 2:
-        print("Usage: librarian_process.py <config_json>", file=sys.stderr)
-        sys.exit(1)
-
-    cfg = json.loads(sys.argv[1])
-    _setup_logging(cfg.get("log_level", "INFO"))
-
-    workspace  = Path(cfg["workspace"]).expanduser().resolve()
-    graph_path = workspace / cfg["graph_path"]
-    pid_file   = workspace / "knowledge" / "librarian.pid"
-    sock_path  = workspace / cfg["ipc_socket"]
-    db_path    = workspace / cfg["agent_db"]
-
-    # PID check — detect stale or duplicate
-    pid_file.parent.mkdir(parents=True, exist_ok=True)
-    if pid_file.exists():
-        try:
-            old_pid = int(pid_file.read_text().strip())
-            os.kill(old_pid, 0)  # raises if dead
-            logger.warning("[librarian] another instance is running (PID %d) — exiting", old_pid)
-            sys.exit(0)
-        except (ProcessLookupError, ValueError):
-            pass  # stale PID file
-
-    pid_file.write_text(str(os.getpid()))
-    logger.info("[librarian] started PID=%d", os.getpid())
-
-    try:
-        asyncio.run(_run(cfg, workspace, graph_path, sock_path, db_path))
-    finally:
-        try:
-            pid_file.unlink(missing_ok=True)
-        except Exception:
-            pass
-        logger.info("[librarian] exited")
-
-
-def _setup_logging(level: str) -> None:
-    logging.basicConfig(
-        level=getattr(logging, level.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-        datefmt="%H:%M:%S",
-        handlers=[logging.StreamHandler(sys.stderr)],
-    )
-
 
 # ---------------------------------------------------------------------------
-# Main async loop
+# Conversation node → text
 # ---------------------------------------------------------------------------
 
-async def _run(
-    cfg: dict,
-    workspace: Path,
-    graph_path: Path,
-    sock_path: Path,
-    db_path: Path,
-) -> None:
-    import ladybug as kuzu
-    from TinyCTX.modules.knowledge.graph import init_schema
-    from TinyCTX.db import ConversationDB
-
-    # Open agent.db for flag reads/writes
-    conv_db = ConversationDB(db_path)
-
-    # Open the graph write connection
-    graph_path.parent.mkdir(parents=True, exist_ok=True)
-    sock_path.parent.mkdir(parents=True, exist_ok=True)
-
-    db   = kuzu.Database(str(graph_path))
-    conn = kuzu.AsyncConnection(db, max_concurrent_queries=int(cfg.get("max_concurrent", 4)))
-    await conn.execute("RETURN 1")  # warm up / validate
-
-    # Ensure schema exists
-    sync_conn = kuzu.Connection(db)
-    init_schema(sync_conn)
-    sync_conn.close()
-
-    write_lock = asyncio.Lock()
-
-    # Active agent task set
-    active_tasks: set[asyncio.Task] = set()
-
-    # Timestamps of last runs
-    state = {
-        "last_poll_ts":  0.0,
-        "last_dedup_ts": 0.0,
-        "dedup_running": False,
-    }
-
-    # Build LLM client for librarian agents
-    primary_model_cfg = cfg.get("primary_model", {})
-    from TinyCTX.ai import LLM
-    llm = LLM(
-        base_url=primary_model_cfg.get("base_url", ""),
-        api_key=primary_model_cfg.get("api_key", ""),
-        model=primary_model_cfg.get("model", ""),
-        max_tokens=primary_model_cfg.get("max_tokens", 2048),
-        temperature=primary_model_cfg.get("temperature", 0.7),
-    )
-
-    # Embedder (optional)
-    embedder = None
-    embed_cfg = cfg.get("embed_model", {})
-    if embed_cfg.get("model"):
-        from TinyCTX.ai import Embedder
-        embedder = Embedder(
-            base_url=embed_cfg["base_url"],
-            api_key=embed_cfg.get("api_key", ""),
-            model=embed_cfg["model"],
-        )
-
-    # IPC server
-    from TinyCTX.modules.knowledge.ipc import IPCServer
-    ipc_queue: asyncio.Queue = asyncio.Queue()
-
-    def _on_ipc_message(msg: dict) -> None:
-        ipc_queue.put_nowait(msg)
-
-    ipc_server = IPCServer(sock_path, _on_ipc_message)
-    await ipc_server.start()
-
-    # Graceful shutdown event
-    shutdown_event = asyncio.Event()
-
-    def _handle_signal(*_) -> None:
-        shutdown_event.set()
-
-    loop = asyncio.get_event_loop()
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        try:
-            loop.add_signal_handler(sig, _handle_signal)
-        except NotImplementedError:
-            pass  # Windows
-
-    max_concurrent = int(cfg.get("max_concurrent", 4))
-    batch_size     = int(cfg.get("batch_size", 20))
-
-    logger.info("[librarian] polling loop started")
-
-    while not shutdown_event.is_set():
-        try:
-            await _poll_cycle(
-                cfg, conv_db, conn, write_lock, llm, embedder,
-                active_tasks, state, max_concurrent, batch_size, ipc_queue,
-            )
-        except Exception:
-            logger.exception("[librarian] poll cycle error")
-
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=60.0)
-        except asyncio.TimeoutError:
-            pass
-
-    # Drain in-flight agents
-    if active_tasks:
-        logger.info("[librarian] draining %d in-flight agent(s)…", len(active_tasks))
-        await asyncio.gather(*active_tasks, return_exceptions=True)
-
-    ipc_server.close()
-    await conn.close()
-    conv_db.close()
-    logger.info("[librarian] shutdown complete")
-
-
-# ---------------------------------------------------------------------------
-# Poll cycle
-# ---------------------------------------------------------------------------
-
-async def _poll_cycle(
-    cfg: dict,
-    conv_db,
-    conn,
-    write_lock: asyncio.Lock,
-    llm,
-    embedder,
-    active_tasks: set[asyncio.Task],
-    state: dict,
-    max_concurrent: int,
-    batch_size: int,
-    ipc_queue: asyncio.Queue,
-) -> None:
-    # Reap finished tasks
-    done = {t for t in active_tasks if t.done()}
-    for t in done:
-        if t.exception():
-            logger.error("[librarian] agent task raised: %s", t.exception())
-    active_tasks -= done
-
-    # Process IPC messages
-    while not ipc_queue.empty():
-        msg = ipc_queue.get_nowait()
-        msg_type = msg.get("type")
-        if msg_type == "targeted":
-            prompt = msg.get("prompt", "").strip()
-            if prompt and len(active_tasks) < max_concurrent:
-                task = asyncio.create_task(
-                    _run_targeted_agent(cfg, conn, write_lock, llm, prompt)
-                )
-                active_tasks.add(task)
-            elif prompt:
-                logger.warning("[librarian] targeted agent queued but concurrency cap reached")
-        # "trigger" type: fall through to the node walk below
-
-    # Node walk trigger
-    now = time.time()
-    interval_secs = float(cfg.get("trigger_interval_hours", 6)) * 3600
-    if (now - state["last_poll_ts"]) < interval_secs:
-        # Check dedup even if not time for a poll yet
-        _maybe_start_dedup(cfg, conv_db, conn, write_lock, llm, embedder,
-                           active_tasks, state, max_concurrent, now)
-        return
-
-    state["last_poll_ts"] = now
-
-    # Find all tail nodes and walk unvisited branches under the lock
-    async with write_lock:
-        tail_nodes = conv_db.get_tail_nodes()
-        batches: list[tuple[list[str], str]] = []  # (node_ids, batch_text)
-
-        for tail in tail_nodes:
-            if len(active_tasks) + len(batches) >= max_concurrent:
-                break
-            # flag_branch returns [] if tail already has the flag
-            flagged_ids = conv_db.flag_branch(tail.id, "librarian_visited")
-            if not flagged_ids:
-                continue
-            # Build conversation text from flagged nodes (oldest first)
-            batch_text = _nodes_to_text(conv_db, list(reversed(flagged_ids)), batch_size)
-            batches.append((flagged_ids, batch_text))
-
-    for flagged_ids, batch_text in batches:
-        if not batch_text.strip():
-            continue
-        task = asyncio.create_task(
-            _run_buffer_agent(cfg, conn, write_lock, llm, batch_text)
-        )
-        active_tasks.add(task)
-        logger.info("[librarian] dispatched agent for %d node(s)", len(flagged_ids))
-
-    _maybe_start_dedup(cfg, conv_db, conn, write_lock, llm, embedder,
-                       active_tasks, state, max_concurrent, now)
-
-
-def _nodes_to_text(conv_db, node_ids: list[str], batch_size: int) -> str:
+def nodes_to_text(conv_db, node_ids: list[str], batch_size: int) -> str:
     """Render up to batch_size nodes as '[author]: content' lines."""
     lines: list[str] = []
     for node_id in node_ids[:batch_size]:
         node = conv_db.get_node(node_id)
         if node is None or node.role not in ("user", "assistant"):
             continue
-        author = node.author_name or node.author_id or node.role
+        author  = node.author_name or node.author_id or node.role
         content = node.content or ""
-        # Unwrap JSON content blocks to plain text
         if content.startswith("["):
             try:
                 blocks = json.loads(content)
-                texts = [b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text"]
+                texts  = [b.get("text", "") for b in blocks
+                          if isinstance(b, dict) and b.get("type") == "text"]
                 content = " ".join(texts)
             except Exception:
                 pass
@@ -331,41 +43,20 @@ def _nodes_to_text(conv_db, node_ids: list[str], batch_size: int) -> str:
     return "\n".join(lines)
 
 
-def _maybe_start_dedup(cfg, conv_db, conn, write_lock, llm, embedder,
-                       active_tasks, state, max_concurrent, now):
-    dedup_enabled  = bool(cfg.get("dedup_enabled", True))
-    dedup_interval = float(cfg.get("dedup_interval_hours", 24)) * 3600
-    if (
-        dedup_enabled
-        and not state["dedup_running"]
-        and (now - state["last_dedup_ts"]) >= dedup_interval
-        and embedder is not None
-        and len(active_tasks) < max_concurrent
-    ):
-        state["dedup_running"] = True
-        state["last_dedup_ts"] = now
-        task = asyncio.create_task(
-            _run_dedup_cycle(cfg, conn, write_lock, llm, embedder)
-        )
-        task.add_done_callback(lambda _: state.__setitem__("dedup_running", False))
-        active_tasks.add(task)
-
-
 # ---------------------------------------------------------------------------
 # Buffer agent
 # ---------------------------------------------------------------------------
 
-async def _run_buffer_agent(
+async def run_buffer_agent(
     cfg: dict,
     conn,
     write_lock: asyncio.Lock,
     llm,
     batch_text: str,
 ) -> None:
-    """Run a buffer librarian agent for one batch of conversation nodes."""
+    """Ingest a batch of conversation nodes into the knowledge graph."""
     write_tools = _make_write_tools(conn, write_lock)
     read_tools  = _make_read_tools(conn)
-    tools       = write_tools + read_tools
 
     system_prompt = (
         "You are a knowledge extraction agent. Your task is to analyse conversation "
@@ -390,24 +81,23 @@ async def _run_buffer_agent(
         f"<conversation>\n{batch_text}\n</conversation>"
     )
 
-    await _agent_loop(llm, system_prompt, user_prompt, tools)
+    await _agent_loop(llm, system_prompt, user_prompt, write_tools + read_tools)
 
 
 # ---------------------------------------------------------------------------
 # Targeted agent
 # ---------------------------------------------------------------------------
 
-async def _run_targeted_agent(
+async def run_targeted_agent(
     cfg: dict,
     conn,
     write_lock: asyncio.Lock,
     llm,
     prompt: str,
 ) -> None:
-    """Run a targeted librarian agent for a specific graph-edit task."""
+    """Execute a specific graph-edit instruction."""
     write_tools = _make_write_tools(conn, write_lock)
     read_tools  = _make_read_tools(conn)
-    tools       = write_tools + read_tools
 
     system_prompt = (
         "You are a targeted knowledge graph editor. Execute the task in the prompt "
@@ -416,56 +106,54 @@ async def _run_targeted_agent(
         "unrelated entities. When done, stop calling tools."
     )
 
-    await _agent_loop(llm, system_prompt, prompt, tools)
+    await _agent_loop(llm, system_prompt, prompt, write_tools + read_tools)
 
 
 # ---------------------------------------------------------------------------
-# Dedup cycle (not an agent — direct code + one LLM call per pair)
+# Dedup cycle
 # ---------------------------------------------------------------------------
 
-async def _run_dedup_cycle(
+async def run_dedup_cycle(
     cfg: dict,
     conn,
     write_lock: asyncio.Lock,
     llm,
     embedder,
 ) -> None:
-    logger.info("[librarian] dedup cycle starting")
+    logger.info("[knowledge/librarian] dedup cycle starting")
     try:
-        from TinyCTX.modules.knowledge.graph import embed_content_for, embed_hash, cosine_similarity, now_ts
+        from TinyCTX.modules.knowledge.graph import (
+            embed_content_for, embed_hash, cosine_similarity, now_ts,
+        )
 
         threshold = float(cfg.get("similarity_threshold", 0.85))
 
-        # 1. Fetch all entities
         r = await conn.execute(
             "MATCH (e:Entity) RETURN e.uuid, e.name, e.description, e.entity_type, "
             "e.embed_model, e.embed_hash, e.embedding"
         )
         col_names = r.get_column_names()
-        entities = []
+        entities  = []
         while r.has_next():
-            row = r.get_next()
-            entities.append(dict(zip(col_names, row)))
+            entities.append(dict(zip(col_names, r.get_next())))
 
         if len(entities) < 2:
-            logger.info("[librarian] dedup: fewer than 2 entities, skipping")
+            logger.info("[knowledge/librarian] dedup: fewer than 2 entities, skipping")
             return
 
-        # 2. Refresh stale embeddings
         embed_model_name = getattr(embedder, "model", "")
         stale = []
         for e in entities:
             expected_hash = embed_hash(embed_content_for(e["e.name"], e["e.description"]))
-            is_stale = (
+            if (
                 not e["e.embedding"]
                 or e["e.embed_model"] != embed_model_name
                 or e["e.embed_hash"] != expected_hash
-            )
-            if is_stale:
+            ):
                 stale.append(e)
 
         if stale:
-            logger.info("[librarian] dedup: refreshing %d stale embedding(s)", len(stale))
+            logger.info("[knowledge/librarian] dedup: refreshing %d stale embedding(s)", len(stale))
             texts   = [embed_content_for(e["e.name"], e["e.description"]) for e in stale]
             vectors = await embedder.embed(texts)
             async with write_lock:
@@ -480,11 +168,10 @@ async def _run_dedup_cycle(
                             "model": embed_model_name, "content": txt, "hash": h,
                         },
                     )
-                    e["e.embedding"]    = vec
-                    e["e.embed_model"]  = embed_model_name
-                    e["e.embed_hash"]   = h
+                    e["e.embedding"]   = vec
+                    e["e.embed_model"] = embed_model_name
+                    e["e.embed_hash"]  = h
 
-        # 3. Find candidate pairs above threshold
         pairs_seen: set[frozenset] = set()
         candidates: list[tuple[dict, dict, float]] = []
 
@@ -505,12 +192,11 @@ async def _run_dedup_cycle(
                     candidates.append((ea, eb, score))
 
         if not candidates:
-            logger.info("[librarian] dedup: no candidate pairs above threshold %.2f", threshold)
+            logger.info("[knowledge/librarian] dedup: no candidate pairs above threshold %.2f", threshold)
             return
 
-        logger.info("[librarian] dedup: %d candidate pair(s) to evaluate", len(candidates))
+        logger.info("[knowledge/librarian] dedup: %d candidate pair(s) to evaluate", len(candidates))
 
-        # Skip pairs already aliased
         already_aliased: set[frozenset] = set()
         r = await conn.execute(
             "MATCH (a:Entity)-[r:Relation]->(b:Entity) "
@@ -521,20 +207,20 @@ async def _run_dedup_cycle(
             row = r.get_next()
             already_aliased.add(frozenset([row[0], row[1]]))
 
-        # 4. LLM call per pair, sequentially
-        for ea, eb, score in candidates:
+        for ea, eb, _score in candidates:
             pair_key = frozenset([ea["e.uuid"], eb["e.uuid"]])
             if pair_key in already_aliased:
                 continue
             await _dedup_pair(conn, write_lock, llm, ea, eb)
 
-        logger.info("[librarian] dedup cycle complete")
+        logger.info("[knowledge/librarian] dedup cycle complete")
     except Exception:
-        logger.exception("[librarian] dedup cycle error")
+        logger.exception("[knowledge/librarian] dedup cycle error")
 
 
 async def _dedup_pair(conn, write_lock: asyncio.Lock, llm, ea: dict, eb: dict) -> None:
     from TinyCTX.modules.knowledge.graph import now_ts
+    from TinyCTX.ai import TextDelta
 
     prompt = (
         "You are comparing two knowledge graph nodes to decide if they represent "
@@ -555,26 +241,23 @@ async def _dedup_pair(conn, write_lock: asyncio.Lock, llm, ea: dict, eb: dict) -
     )
 
     response_text = ""
-    async for event in llm.stream(
-        [{"role": "user", "content": prompt}], tools=None
-    ):
-        from TinyCTX.ai import TextDelta
+    async for event in llm.stream([{"role": "user", "content": prompt}], tools=None):
         if isinstance(event, TextDelta):
             response_text += event.text
 
-    import re as _re
-    raw = response_text.strip()
-    raw = _re.sub(r"^```json?\s*", "", raw)
+    raw = _re.sub(r"^```json?\s*", "", response_text.strip())
     raw = _re.sub(r"\s*```$", "", raw)
 
     try:
         verdict_data = json.loads(raw)
     except json.JSONDecodeError:
-        logger.warning("[librarian] dedup: could not parse verdict for %s/%s: %s",
-                       ea["e.uuid"][:8], eb["e.uuid"][:8], raw[:200])
+        logger.warning(
+            "[knowledge/librarian] dedup: could not parse verdict for %s/%s: %s",
+            ea["e.uuid"][:8], eb["e.uuid"][:8], raw[:200],
+        )
         return
 
-    verdict = verdict_data.get("verdict", "distinct")
+    verdict        = verdict_data.get("verdict", "distinct")
     canonical_uuid = verdict_data.get("canonical_uuid")
     merged_desc    = verdict_data.get("merged_description", "")
 
@@ -582,15 +265,15 @@ async def _dedup_pair(conn, write_lock: asyncio.Lock, llm, ea: dict, eb: dict) -
         return
 
     if not canonical_uuid or canonical_uuid not in {ea["e.uuid"], eb["e.uuid"]}:
-        logger.warning("[librarian] dedup: invalid canonical_uuid in verdict")
+        logger.warning("[knowledge/librarian] dedup: invalid canonical_uuid in verdict")
         return
 
     dup_uuid = eb["e.uuid"] if canonical_uuid == ea["e.uuid"] else ea["e.uuid"]
-    now = now_ts()
+    now      = now_ts()
 
     async with write_lock:
         if verdict == "duplicate":
-            logger.info("[librarian] dedup: merging %s → %s", dup_uuid[:8], canonical_uuid[:8])
+            logger.info("[knowledge/librarian] dedup: merging %s → %s", dup_uuid[:8], canonical_uuid[:8])
             await conn.execute(
                 "MATCH (e:Entity {uuid: $uid}) SET e.description = $desc, e.updated_at = $now, e.embed_hash = ''",
                 parameters={"uid": canonical_uuid, "desc": merged_desc, "now": now},
@@ -598,41 +281,41 @@ async def _dedup_pair(conn, write_lock: asyncio.Lock, llm, ea: dict, eb: dict) -
             await conn.execute(
                 "MATCH (dup:Entity {uuid: $dup})-[r:Relation]->(x:Entity) "
                 "WHERE r.superseded_at IS NULL AND x.uuid <> $canon "
-                "CREATE (c:Entity {uuid: $canon})-[:Relation {relation: r.relation, weight: r.weight, description: r.description, created_at: $now, superseded_at: null}]->(x)",
+                "CREATE (c:Entity {uuid: $canon})-[:Relation {relation: r.relation, weight: r.weight, "
+                "description: r.description, created_at: $now, superseded_at: null}]->(x)",
                 parameters={"dup": dup_uuid, "canon": canonical_uuid, "now": now},
             )
             await conn.execute(
                 "MATCH (x:Entity)-[r:Relation]->(dup:Entity {uuid: $dup}) "
                 "WHERE r.superseded_at IS NULL AND x.uuid <> $canon "
-                "CREATE (x)-[:Relation {relation: r.relation, weight: r.weight, description: r.description, created_at: $now, superseded_at: null}]->(c:Entity {uuid: $canon})",
+                "CREATE (x)-[:Relation {relation: r.relation, weight: r.weight, "
+                "description: r.description, created_at: $now, superseded_at: null}]->(c:Entity {uuid: $canon})",
                 parameters={"dup": dup_uuid, "canon": canonical_uuid, "now": now},
             )
             await conn.execute(
                 "MATCH (e:Entity {uuid: $uid}) DETACH DELETE e",
                 parameters={"uid": dup_uuid},
             )
-
         elif verdict == "alias":
-            logger.info("[librarian] dedup: aliasing %s → %s", dup_uuid[:8], canonical_uuid[:8])
+            logger.info("[knowledge/librarian] dedup: aliasing %s → %s", dup_uuid[:8], canonical_uuid[:8])
             await conn.execute(
                 "MATCH (e:Entity {uuid: $uid}) SET e.description = $desc, e.updated_at = $now",
                 parameters={"uid": dup_uuid, "desc": merged_desc, "now": now},
             )
             await conn.execute(
                 "MATCH (a:Entity {uuid: $alias}), (c:Entity {uuid: $canon}) "
-                "CREATE (a)-[:Relation {relation: 'ALIASED_TO', weight: 1.0, description: 'alias', created_at: $now, superseded_at: null}]->(c)",
+                "CREATE (a)-[:Relation {relation: 'ALIASED_TO', weight: 1.0, description: 'alias', "
+                "created_at: $now, superseded_at: null}]->(c)",
                 parameters={"alias": dup_uuid, "canon": canonical_uuid, "now": now},
             )
 
 
 # ---------------------------------------------------------------------------
-# Graph write tools (shared by buffer and targeted agents)
+# Graph write tools
 # ---------------------------------------------------------------------------
 
 def _make_write_tools(conn, write_lock: asyncio.Lock) -> list[dict]:
-    """Build write tool definitions as dicts for the simple agent loop."""
     from TinyCTX.modules.knowledge.graph import new_uuid, now_ts
-
     tools = []
 
     async def add_entity(
@@ -669,7 +352,6 @@ def _make_write_tools(conn, write_lock: asyncio.Lock) -> list[dict]:
                     parameters={"uid": uid, "desc": description, "now": now, "pri": priority, "pin": pinned},
                 )
             return uid
-
         uid = new_uuid()
         async with write_lock:
             await conn.execute(
@@ -692,15 +374,14 @@ def _make_write_tools(conn, write_lock: asyncio.Lock) -> list[dict]:
     ) -> str:
         """
         Update fields on an existing entity. Only provided fields are changed.
-        Marks embedding as stale (embed_hash cleared) when description changes.
 
         Args:
-            uuid: The entity UUID (from add_entity or find_entity).
+            uuid: The entity UUID.
             description: New description (optional).
             priority: New priority value (optional).
             pinned: New pinned flag (optional).
         """
-        now = now_ts()
+        now  = now_ts()
         sets = ["e.updated_at = $now"]
         params: dict = {"uid": uuid, "now": now}
         if description is not None:
@@ -735,9 +416,9 @@ def _make_write_tools(conn, write_lock: asyncio.Lock) -> list[dict]:
         Args:
             source_uuid: UUID of the source entity.
             target_uuid: UUID of the target entity.
-            relation: UPPER_SNAKE_CASE relation label (e.g. USES, KNOWS, CREATED).
-            weight: Strength of the relationship, 0.0-1.0 (default 0.5).
-            description: Optional human-readable explanation.
+            relation: UPPER_SNAKE_CASE relation label.
+            weight: Strength 0.0-1.0 (default 0.5).
+            description: Optional explanation.
         """
         now = now_ts()
         async with write_lock:
@@ -769,7 +450,7 @@ def _make_write_tools(conn, write_lock: asyncio.Lock) -> list[dict]:
             old_relation: The relation label to supersede.
             new_relation: The new relation label to create.
             weight: Weight for the new relationship.
-            description: Optional explanation for the new relationship.
+            description: Optional explanation.
         """
         now = now_ts()
         async with write_lock:
@@ -804,11 +485,7 @@ def _make_write_tools(conn, write_lock: asyncio.Lock) -> list[dict]:
             )
         return f"deleted entity {uuid[:8]}"
 
-    async def delete_relationship(
-        src_uuid: str,
-        tgt_uuid: str,
-        relation: str,
-    ) -> str:
+    async def delete_relationship(src_uuid: str, tgt_uuid: str, relation: str) -> str:
         """
         Delete all active edges of a given relation type between two entities.
 
@@ -834,8 +511,12 @@ def _make_write_tools(conn, write_lock: asyncio.Lock) -> list[dict]:
     return tools
 
 
+# ---------------------------------------------------------------------------
+# Graph read tools
+# ---------------------------------------------------------------------------
+
 def _make_read_tools(conn) -> list[dict]:
-    """Build read tool definitions for librarian agents."""
+    tools = []
 
     async def find_entity(name: str = "", entity_type: str = "") -> str:
         """
@@ -885,7 +566,7 @@ def _make_read_tools(conn) -> list[dict]:
         )
         if not r.has_next():
             return f"[entity {uuid[:8]} not found]"
-        row = r.get_next()
+        row  = r.get_next()
         cols = r.get_column_names()
         data = dict(zip(cols, row))
         data.pop("e.embedding", None)
@@ -903,19 +584,20 @@ def _make_read_tools(conn) -> list[dict]:
             parameters={"uid": uuid},
         )
 
-        out_lines = []
+        out_lines, in_lines = [], []
         while edges_out.has_next():
             row = edges_out.get_next()
             out_lines.append(f"  →[{row[2]}]→ {row[1]} ({row[0][:8]}) weight={row[3]}")
-        in_lines = []
         while edges_in.has_next():
             row = edges_in.get_next()
             in_lines.append(f"  ←[{row[2]}]← {row[1]} ({row[0][:8]}) weight={row[3]}")
 
-        lines = [f"Entity: {data.get('e.name')} [{data.get('e.entity_type')}]"]
-        lines.append(f"uuid: {uuid}")
-        lines.append(f"description: {data.get('e.description')}")
-        lines.append(f"pinned: {data.get('e.pinned')}  priority: {data.get('e.priority')}")
+        lines = [
+            f"Entity: {data.get('e.name')} [{data.get('e.entity_type')}]",
+            f"uuid: {uuid}",
+            f"description: {data.get('e.description')}",
+            f"pinned: {data.get('e.pinned')}  priority: {data.get('e.priority')}",
+        ]
         if out_lines:
             lines.append("outgoing:")
             lines.extend(out_lines)
@@ -924,14 +606,13 @@ def _make_read_tools(conn) -> list[dict]:
             lines.extend(in_lines)
         return "\n".join(lines)
 
-    tools = []
     for fn in [find_entity, get_entity]:
         tools.append({"fn": fn, "name": fn.__name__, "doc": fn.__doc__})
     return tools
 
 
 # ---------------------------------------------------------------------------
-# Simple agent loop for librarian agents
+# Minimal agent loop
 # ---------------------------------------------------------------------------
 
 async def _agent_loop(
@@ -941,30 +622,23 @@ async def _agent_loop(
     tools: list[dict],
     max_cycles: int = 20,
 ) -> None:
-    """
-    Minimal agent loop for librarian agents.
-    No Lane, no DB, no streaming output — just run to completion.
-    tools is a list of {"fn": coroutine_fn, "name": str, "doc": str}.
-    """
+    import inspect
     from TinyCTX.ai import TextDelta, ToolCallAssembled, LLMError
 
-    # Build OpenAI-compat tool definitions from docstrings
     tool_defs = []
     tool_map  = {}
     for t in tools:
-        import inspect
-        sig = inspect.signature(t["fn"])
+        sig   = inspect.signature(t["fn"])
         props: dict = {}
         required: list = []
         for pname, param in sig.parameters.items():
-            ptype = "string"
-            ann = param.annotation
-            if ann in (int,):
-                ptype = "integer"
-            elif ann in (float,):
-                ptype = "number"
-            elif ann in (bool,):
-                ptype = "boolean"
+            ann   = param.annotation
+            ptype = (
+                "integer" if ann is int else
+                "number"  if ann is float else
+                "boolean" if ann is bool else
+                "string"
+            )
             props[pname] = {"type": ptype, "description": ""}
             if param.default is inspect.Parameter.empty:
                 required.append(pname)
@@ -979,11 +653,11 @@ async def _agent_loop(
         tool_map[t["name"]] = t["fn"]
 
     messages = [
-        {"role": "system",  "content": system_prompt},
-        {"role": "user",    "content": user_prompt},
+        {"role": "system", "content": system_prompt},
+        {"role": "user",   "content": user_prompt},
     ]
 
-    for cycle in range(max_cycles):
+    for _cycle in range(max_cycles):
         text_chunks: list[str] = []
         tool_calls:  list[dict] = []
 
@@ -991,31 +665,26 @@ async def _agent_loop(
             if isinstance(event, TextDelta):
                 text_chunks.append(event.text)
             elif isinstance(event, ToolCallAssembled):
-                tool_calls.append({
-                    "id": event.call_id, "name": event.tool_name, "args": event.args
-                })
+                tool_calls.append({"id": event.call_id, "name": event.tool_name, "args": event.args})
             elif isinstance(event, LLMError):
-                logger.error("[librarian/agent] LLM error: %s", event.message)
+                logger.error("[knowledge/librarian] LLM error: %s", event.message)
                 return
 
         response_text = "".join(text_chunks)
 
         if not tool_calls:
             if response_text:
-                logger.debug("[librarian/agent] completed: %s", response_text[:120])
+                logger.debug("[knowledge/librarian] agent completed: %s", response_text[:120])
             return
 
         messages.append({
-            "role": "assistant",
+            "role":    "assistant",
             "content": response_text,
             "tool_calls": [
                 {
-                    "id": tc["id"],
+                    "id":   tc["id"],
                     "type": "function",
-                    "function": {
-                        "name":      tc["name"],
-                        "arguments": json.dumps(tc["args"]),
-                    },
+                    "function": {"name": tc["name"], "arguments": json.dumps(tc["args"])},
                 }
                 for tc in tool_calls
             ],
@@ -1030,7 +699,7 @@ async def _agent_loop(
                     result = await fn(**tc["args"])
                 except Exception as exc:
                     result = f"[error: {exc}]"
-                    logger.warning("[librarian/agent] tool %s error: %s", tc["name"], exc)
+                    logger.warning("[knowledge/librarian] tool %s error: %s", tc["name"], exc)
 
             messages.append({
                 "role":         "tool",
@@ -1038,12 +707,4 @@ async def _agent_loop(
                 "content":      str(result),
             })
 
-    logger.warning("[librarian/agent] hit max_cycles (%d)", max_cycles)
-
-
-# ---------------------------------------------------------------------------
-# Entry point guard
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    main()
+    logger.warning("[knowledge/librarian] hit max_cycles (%d)", max_cycles)

@@ -196,21 +196,18 @@ def top_k_cosine(
 
 
 # ---------------------------------------------------------------------------
-# GraphDB — thin wrapper around a kuzu.Database for the main agent (sync)
+# GraphDB — thin wrapper around a shared Connection for the main agent (sync)
 # ---------------------------------------------------------------------------
 
 class GraphDB:
     """
-    Sync read-only graph accessor for use in the main agent's tool implementations.
-    Opens its own kuzu.Database handle. The librarian process has the sole write handle.
+    Sync graph accessor for use in the main agent's tool implementations.
+    Receives a kuzu.Connection created from the single shared Database object
+    owned by the LibrarianRunner. Does NOT open its own Database.
     """
 
-    def __init__(self, graph_path: Path) -> None:
-        import ladybug as kuzu
-        graph_path.parent.mkdir(parents=True, exist_ok=True)
-        self._db   = kuzu.Database(str(graph_path))
-        self._conn = kuzu.Connection(self._db)
-        init_schema(self._conn)
+    def __init__(self, conn) -> None:
+        self._conn = conn
 
     # ------------------------------------------------------------------
     # Read operations
@@ -369,4 +366,4 @@ class GraphDB:
         return rows
 
     def close(self) -> None:
-        self._conn.close()
+        pass  # connection lifetime managed by LibrarianRunner

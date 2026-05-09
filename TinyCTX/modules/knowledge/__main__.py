@@ -4,14 +4,15 @@ modules/knowledge/__main__.py
 Registers the knowledge module into the agent.
 
 On load:
-  1. Starts the librarian sidecar process
+  1. Starts the LibrarianRunner in-process background task
   2. Registers read tools on the main agent (kg_search, kg_traverse,
      kg_get_entity, kg_list, kg_stats)
   3. Registers call_librarian (always-on)
   4. Registers a PromptProvider for pinned entity injection
 
-The librarian process is the sole writer to the KùzuDB graph.
-The main agent tools are read-only.
+The LibrarianRunner owns the single ladybug.Database object and is the sole
+writer to the graph. All connections (reader and writer) are created from
+that one Database object, satisfying Ladybug's one-READ_WRITE-Database rule.
 """
 from __future__ import annotations
 
@@ -19,11 +20,183 @@ import asyncio
 import atexit
 import json
 import logging
-import os
-import sys
+import time
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# LibrarianRunner — in-process background task (replaces sidecar subprocess)
+# ---------------------------------------------------------------------------
+
+class LibrarianRunner:
+    """
+    Owns the single ladybug.Database, vends connections, and runs the
+    librarian poll loop as an asyncio background task.
+
+    All graph writes go through the async_conn + write_lock held here.
+    Read connections (for GraphDB / main-agent tools) are also created
+    from the same db object.
+    """
+
+    def __init__(
+        self,
+        cfg: dict,
+        graph_path: Path,
+        conv_db,
+        llm,
+        embedder,
+    ) -> None:
+        import ladybug as kuzu
+        from TinyCTX.modules.knowledge.graph import init_schema
+
+        graph_path.parent.mkdir(parents=True, exist_ok=True)
+
+        self._db         = kuzu.Database(str(graph_path))
+        self._write_conn = kuzu.AsyncConnection(
+            self._db,
+            max_concurrent_queries=int(cfg.get("max_concurrent", 4)),
+        )
+        self._write_lock = asyncio.Lock()
+
+        # Initialise schema synchronously on a plain connection
+        sync_conn = kuzu.Connection(self._db)
+        init_schema(sync_conn)
+        sync_conn.close()
+
+        self._cfg      = cfg
+        self._conv_db  = conv_db
+        self._llm      = llm
+        self._embedder = embedder
+
+        # Queue replaces IPC socket: call_librarian puts messages here
+        self.queue: asyncio.Queue = asyncio.Queue()
+
+        self._task: asyncio.Task | None = None
+        self._state = {
+            "last_poll_ts":  0.0,
+            "last_dedup_ts": 0.0,
+            "dedup_running": False,
+        }
+        self._active_tasks: set[asyncio.Task] = set()
+
+    def new_read_connection(self):
+        """Return a new sync Connection from the shared Database for read tools."""
+        import ladybug as kuzu
+        return kuzu.Connection(self._db)
+
+    def start(self) -> None:
+        """Schedule the poll loop as a background asyncio task."""
+        self._task = asyncio.create_task(self._run(), name="knowledge-librarian")
+        logger.info("[knowledge] LibrarianRunner started")
+
+    def stop(self) -> None:
+        if self._task and not self._task.done():
+            self._task.cancel()
+
+    async def _run(self) -> None:
+        try:
+            while True:
+                try:
+                    await self._poll_cycle()
+                except Exception:
+                    logger.exception("[knowledge/librarian] poll cycle error")
+                await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            # Drain in-flight agent tasks
+            if self._active_tasks:
+                logger.info(
+                    "[knowledge/librarian] draining %d in-flight task(s)",
+                    len(self._active_tasks),
+                )
+                await asyncio.gather(*self._active_tasks, return_exceptions=True)
+            logger.info("[knowledge/librarian] stopped")
+
+    async def _poll_cycle(self) -> None:
+        from TinyCTX.modules.knowledge.librarian_agents import (
+            run_buffer_agent, run_targeted_agent, run_dedup_cycle,
+            nodes_to_text,
+        )
+
+        # Reap finished tasks
+        done = {t for t in self._active_tasks if t.done()}
+        for t in done:
+            if not t.cancelled() and t.exception():
+                logger.error("[knowledge/librarian] agent task raised: %s", t.exception())
+        self._active_tasks -= done
+
+        max_concurrent = int(self._cfg.get("max_concurrent", 4))
+        batch_size     = int(self._cfg.get("batch_size", 20))
+
+        # Drain queue messages
+        while not self.queue.empty():
+            msg = self.queue.get_nowait()
+            msg_type = msg.get("type")
+            if msg_type == "targeted":
+                prompt = msg.get("prompt", "").strip()
+                if prompt and len(self._active_tasks) < max_concurrent:
+                    t = asyncio.create_task(
+                        run_targeted_agent(
+                            self._cfg, self._write_conn, self._write_lock,
+                            self._llm, prompt,
+                        )
+                    )
+                    self._active_tasks.add(t)
+                elif prompt:
+                    logger.warning("[knowledge/librarian] concurrency cap reached, dropping targeted msg")
+            # "trigger" falls through to the node walk below
+
+        # Node walk on schedule
+        now = time.time()
+        interval_secs = float(self._cfg.get("trigger_interval_hours", 6)) * 3600
+        if (now - self._state["last_poll_ts"]) >= interval_secs:
+            self._state["last_poll_ts"] = now
+
+            async with self._write_lock:
+                tail_nodes = self._conv_db.get_tail_nodes()
+                batches: list[tuple[list, str]] = []
+                for tail in tail_nodes:
+                    if len(self._active_tasks) + len(batches) >= max_concurrent:
+                        break
+                    flagged_ids = self._conv_db.flag_branch(tail.id, "librarian_visited")
+                    if not flagged_ids:
+                        continue
+                    batch_text = nodes_to_text(self._conv_db, list(reversed(flagged_ids)), batch_size)
+                    batches.append((flagged_ids, batch_text))
+
+            for flagged_ids, batch_text in batches:
+                if not batch_text.strip():
+                    continue
+                t = asyncio.create_task(
+                    run_buffer_agent(
+                        self._cfg, self._write_conn, self._write_lock,
+                        self._llm, batch_text,
+                    )
+                )
+                self._active_tasks.add(t)
+                logger.info("[knowledge/librarian] dispatched agent for %d node(s)", len(flagged_ids))
+
+        # Dedup on schedule
+        dedup_enabled  = bool(self._cfg.get("dedup_enabled", True))
+        dedup_interval = float(self._cfg.get("dedup_interval_hours", 24)) * 3600
+        if (
+            dedup_enabled
+            and not self._state["dedup_running"]
+            and (now - self._state["last_dedup_ts"]) >= dedup_interval
+            and self._embedder is not None
+            and len(self._active_tasks) < max_concurrent
+        ):
+            self._state["dedup_running"] = True
+            self._state["last_dedup_ts"] = now
+            t = asyncio.create_task(
+                run_dedup_cycle(
+                    self._cfg, self._write_conn, self._write_lock,
+                    self._llm, self._embedder,
+                )
+            )
+            t.add_done_callback(lambda _: self._state.__setitem__("dedup_running", False))
+            self._active_tasks.add(t)
 
 
 # ---------------------------------------------------------------------------
@@ -68,19 +241,8 @@ def register_agent(agent) -> None:
         return p if p.is_absolute() else workspace / p
 
     graph_path  = _resolve(cfg["graph_path"])
-    sock_path   = _resolve(cfg["ipc_socket"])
     pinned_prio = int(cfg.get("pinned_priority", 5))
     agent_db    = workspace / "agent.db"
-
-    graph_path.parent.mkdir(parents=True, exist_ok=True)
-    sock_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # ------------------------------------------------------------------
-    # Open read-only graph handle for main agent tools
-    # ------------------------------------------------------------------
-    from TinyCTX.modules.knowledge.graph import GraphDB
-    graph_db = GraphDB(graph_path)
-    atexit.register(graph_db.close)
 
     # ------------------------------------------------------------------
     # Embedder for kg_search semantic mode
@@ -100,12 +262,49 @@ def register_agent(agent) -> None:
             )
 
     # ------------------------------------------------------------------
-    # 1. Start librarian sidecar process
+    # LLM for librarian agents
     # ------------------------------------------------------------------
-    _start_librarian(cfg, agent, workspace, graph_path, sock_path, agent_db)
+    primary_name = agent.config.llm.primary
+    librarian_model_key = cfg.get("librarian_model", "").strip() or primary_name
+    primary_mc = agent.config.models.get(librarian_model_key)
+    try:
+        api_key = primary_mc.api_key if primary_mc else ""
+    except EnvironmentError:
+        api_key = ""
+
+    from TinyCTX.ai import LLM
+    llm = LLM(
+        base_url=primary_mc.base_url if primary_mc else "",
+        api_key=api_key,
+        model=primary_mc.model if primary_mc else "",
+        max_tokens=primary_mc.max_tokens if primary_mc else 2048,
+        temperature=primary_mc.temperature if primary_mc else 0.7,
+    )
 
     # ------------------------------------------------------------------
-    # 2. Read tools
+    # ConversationDB for the librarian to read agent.db
+    # ------------------------------------------------------------------
+    from TinyCTX.db import ConversationDB
+    conv_db = ConversationDB(agent_db)
+    atexit.register(conv_db.close)
+
+    # ------------------------------------------------------------------
+    # 1. Start LibrarianRunner (owns the single Database object)
+    # ------------------------------------------------------------------
+    runner = LibrarianRunner(cfg, graph_path, conv_db, llm, embedder)
+    runner.start()
+    atexit.register(runner.stop)
+
+    # ------------------------------------------------------------------
+    # 2. GraphDB for read tools — connection from the shared Database
+    # ------------------------------------------------------------------
+    from TinyCTX.modules.knowledge.graph import GraphDB
+    read_conn = runner.new_read_connection()
+    graph_db  = GraphDB(read_conn)
+    atexit.register(read_conn.close)
+
+    # ------------------------------------------------------------------
+    # 3. Read tools
     # ------------------------------------------------------------------
 
     async def kg_search(query: str, top_k: int = 5, semantic: bool = True) -> str:
@@ -253,20 +452,18 @@ def register_agent(agent) -> None:
         return "\n".join(lines)
 
     for fn in [kg_search, kg_traverse, kg_get_entity, kg_list, kg_stats]:
-        vis = fn.__name__
-        always = (vis == "kg_search")
+        always = (fn.__name__ == "kg_search")
         agent.tool_handler.register_tool(fn, always_on=always, min_permission=25)
 
     # ------------------------------------------------------------------
-    # 3. call_librarian (always-on)
+    # 4. call_librarian (always-on) — puts directly onto runner.queue
     # ------------------------------------------------------------------
 
     async def call_librarian(prompt: str = "") -> str:
         """
-        Signal the librarian process to update the knowledge graph.
+        Signal the librarian to update the knowledge graph.
 
-        With no prompt: trigger normal node ingest immediately (processes
-        any unvisited conversation nodes).
+        With no prompt: trigger normal node ingest immediately.
 
         With a prompt: spawn a targeted agent to execute that specific
         graph-edit instruction (e.g. "remember that Kamie prefers async Python",
@@ -276,26 +473,17 @@ def register_agent(agent) -> None:
             prompt: Optional instruction for the targeted librarian agent.
                 Leave empty to trigger node ingest.
         """
-        from TinyCTX.modules.knowledge.ipc import send_ipc, IPCError
-
         if prompt.strip():
-            msg = {"type": "targeted", "prompt": prompt.strip()}
+            runner.queue.put_nowait({"type": "targeted", "prompt": prompt.strip()})
+            return f"[librarian: targeted agent queued — '{prompt[:60]}']"
         else:
-            msg = {"type": "trigger"}
-
-        try:
-            await send_ipc(sock_path, msg)
-            if prompt.strip():
-                return f"[librarian: targeted agent queued — '{prompt[:60]}']"
+            runner.queue.put_nowait({"type": "trigger"})
             return "[librarian: node ingest triggered]"
-        except IPCError as exc:
-            logger.warning("[knowledge] call_librarian IPC failed: %s", exc)
-            return f"[librarian: could not reach librarian process — {exc}]"
 
     agent.tool_handler.register_tool(call_librarian, always_on=True, min_permission=25)
 
     # ------------------------------------------------------------------
-    # 4. Pinned entity PromptProvider
+    # 5. Pinned entity PromptProvider
     # ------------------------------------------------------------------
 
     def _pinned_provider(_ctx) -> str | None:
@@ -319,111 +507,3 @@ def register_agent(agent) -> None:
         "[knowledge] ready — graph: %s | embedder: %s",
         graph_path, embedding_model or "none",
     )
-
-
-# ---------------------------------------------------------------------------
-# Librarian sidecar launcher
-# ---------------------------------------------------------------------------
-
-def _start_librarian(
-    cfg: dict,
-    agent,
-    workspace: Path,
-    graph_path: Path,
-    sock_path: Path,
-    agent_db: Path,
-) -> None:
-    """
-    Launch the librarian process as a subprocess. Checks PID file first to
-    avoid duplicate launches. Registers atexit cleanup.
-    """
-    pid_file = workspace / "knowledge" / "librarian.pid"
-
-    # Check if already running
-    if pid_file.exists():
-        try:
-            old_pid = int(pid_file.read_text().strip())
-            os.kill(old_pid, 0)
-            logger.info("[knowledge] librarian already running (PID %d)", old_pid)
-            return
-        except (ProcessLookupError, ValueError, PermissionError):
-            pass  # stale PID
-        if sock_path.exists():
-            try:
-                sock_path.unlink()
-            except OSError:
-                pass
-
-    primary_name = agent.config.llm.primary
-    primary_mc   = agent.config.models.get(primary_name)
-    try:
-        api_key = primary_mc.api_key if primary_mc else ""
-    except EnvironmentError:
-        api_key = ""
-
-    embed_cfg: dict = {}
-    embedding_model = cfg.get("embedding_model", "").strip()
-    if embedding_model and embedding_model in agent.config.models:
-        em = agent.config.models[embedding_model]
-        try:
-            emb_key = em.api_key
-        except EnvironmentError:
-            emb_key = ""
-        embed_cfg = {
-            "model":    em.model,
-            "base_url": em.base_url,
-            "api_key":  emb_key,
-        }
-
-    librarian_cfg = {
-        "workspace":              str(workspace),
-        "graph_path":             str(graph_path.relative_to(workspace)),
-        "agent_db":               str(agent_db.relative_to(workspace)),
-        "ipc_socket":             str(sock_path.relative_to(workspace)),
-        "log_level":              agent.config.logging.level,
-        "trigger_interval_hours": cfg.get("trigger_interval_hours", 6),
-        "batch_size":             cfg.get("batch_size", 20),
-        "max_concurrent":         cfg.get("max_concurrent", 4),
-        "dedup_enabled":          cfg.get("dedup_enabled", True),
-        "dedup_interval_hours":   cfg.get("dedup_interval_hours", 24),
-        "similarity_threshold":   cfg.get("similarity_threshold", 0.85),
-        "primary_model": {
-            "model":       primary_mc.model if primary_mc else "",
-            "base_url":    primary_mc.base_url if primary_mc else "",
-            "api_key":     api_key,
-            "max_tokens":  primary_mc.max_tokens if primary_mc else 2048,
-            "temperature": primary_mc.temperature if primary_mc else 0.7,
-        },
-        "embed_model": embed_cfg,
-    }
-
-    librarian_script = Path(__file__).parent / "librarian_process.py"
-    log_file_path    = workspace / "knowledge" / "librarian.log"
-
-    import subprocess
-    log_fh = open(log_file_path, "a", encoding="utf-8")
-
-    proc = subprocess.Popen(
-        [sys.executable, str(librarian_script), json.dumps(librarian_cfg)],
-        stdout=log_fh,
-        stderr=log_fh,
-        close_fds=True,
-    )
-    logger.info("[knowledge] librarian process started (PID %d)", proc.pid)
-
-    def _cleanup() -> None:
-        try:
-            proc.terminate()
-            proc.wait(timeout=10)
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-        try:
-            log_fh.close()
-        except Exception:
-            pass
-
-    import atexit
-    atexit.register(_cleanup)

@@ -1,9 +1,9 @@
 EXTENSION_META = {
     "name":    "knowledge",
-    "version": "0.1",
+    "version": "0.2",
     "description": (
-        "Long-term memory backed by a KùzuDB property graph. "
-        "A persistent sidecar librarian process watches agent.db for unvisited "
+        "Long-term memory backed by a LadybugDB property graph. "
+        "An in-process librarian runner watches agent.db for unvisited "
         "conversation nodes, extracts entities and relationships, and writes them "
         "to the graph. The main agent reads via kg_search / kg_traverse tools "
         "and can trigger librarian agents on demand via call_librarian. "
@@ -26,9 +26,6 @@ EXTENSION_META = {
         # Embedding model key from config.yaml models: (must be kind: embedding)
         # Leave empty to disable semantic search (keyword only)
         "embedding_model": "",
-
-        # IPC socket (Unix socket path or named pipe name on Windows)
-        "ipc_socket": "knowledge/librarian.sock",
 
         # Pinned entity injection priority in system prompt
         "pinned_priority": 5,
