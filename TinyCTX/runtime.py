@@ -56,9 +56,7 @@ class Runtime:
         """
         Accepts InboundMessage, persists to DB, and triggers AgentCycle if needed.
         """
-        # 1. Track platform for event routing
-        self._node_platforms[msg.tail_node_id] = msg.author.platform.value
-
+        # 1. Track platform for event routing — done after user node is written below.
         # 2. Persist Attachments
         attachment_json = None
         if msg.attachments:
@@ -73,7 +71,6 @@ class Runtime:
                 attachment_json = json.dumps(paths, ensure_ascii=False)
 
         # 3. Write User Node to DB
-        # This provides the node_id that AgentCycle.run() will start from.
         state_delta = self._compute_state_delta(msg)
         user_node = self.db.add_node(
             parent_id=msg.tail_node_id,
@@ -86,6 +83,9 @@ class Runtime:
         )
         
         new_tail_id = user_node.id
+
+        # Track platform under the new user node id so _dispatch_event can route it.
+        self._node_platforms[new_tail_id] = msg.author.platform.value
 
         # 4. Trigger Cycle if requested
         if not msg.trigger:
@@ -117,13 +117,14 @@ class Runtime:
         async with self._semaphore:
             self._active += 1
             try:
-                # AgentCycle is now lean; all complexity is in .run()
                 agent = AgentCycle(self.config, self.module_registry)
+                logger.debug("[runtime] cycle starting for node %s", node_id)
                 
-                # Stream events back to handlers
                 async for event in agent.run(node_id, permission_level, abort_event):
+                    logger.debug("[runtime] dispatching event %s for node %s", type(event).__name__, node_id)
                     await self._dispatch_event(node_id, event)
-                        
+                
+                logger.debug("[runtime] cycle complete for node %s", node_id)
             except Exception:
                 logger.exception("Cycle failed for node %s", node_id)
             finally:
@@ -150,14 +151,19 @@ class Runtime:
         return delta
 
     async def _dispatch_event(self, node_id: str, event: AgentEvent) -> None:
-        # 1. Direct SSE listeners
-        if node_id in self._cursor_handlers:
-            await self._cursor_handlers[node_id](event)
+        # Prefer the event's own tail_node_id for cursor resolution if present,
+        # falling back to the original node_id used to spawn the cycle.
+        event_node_id = getattr(event, 'tail_node_id', None) or node_id
+
+        # 1. Direct SSE listeners — try event node first, then original
+        handler = self._cursor_handlers.get(event_node_id) or self._cursor_handlers.get(node_id)
+        if handler:
+            await handler(event)
         
         # 2. Platform-wide listeners (e.g. Discord Bridge)
         platform = self._node_platforms.get(node_id)
-        if platform in self._platform_handlers:
-            await self._platform_handlers[platform](event)
+        for handler in self._platform_handlers.get(platform, []):
+            await handler(event)
 
     def _get_abort_event(self, node_id: str) -> asyncio.Event:
         ev = self._abort_events.get(node_id) or asyncio.Event()

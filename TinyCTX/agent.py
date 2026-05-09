@@ -104,31 +104,37 @@ class AgentCycle:
         streaming_active = False
 
         for cycle_num in range(max_cycles):
+            logger.debug("[agent] cycle %d, node %s", cycle_num + 1, node_id)
             if abort_event.is_set():
                 yield AgentError(message="[aborted]", **meta)
                 return
 
             # Context Assembly
+            logger.debug("[agent] running async hooks")
             await self.context.run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC)
             tools = self.tool_handler.get_tool_definitions(
                 caller_level=self.permission_level,
                 minimal_tokens=self.config.permissions.minimal_tokens,
             ) or None
-            
             messages, _ = self.context.assemble(tools=tools)
+            logger.debug("[agent] assembled %d messages, starting inference", len(messages))
 
             # Inference with Fallback logic
             text_chunks, tool_calls_list, error = [], [], None
-            async for _ev in self._stream_inference(messages, tools, model_chain, abort_event):
+            async for _ev in self._stream_inference(messages, tools, model_chain, abort_event, meta):
                 if isinstance(_ev, tuple):
                     # sentinel: (_chunks, _calls, _error)
                     text_chunks, tool_calls_list, error = _ev
+                    logger.debug("[agent] inference done — chunks=%d tools=%d error=%s", len(text_chunks), len(tool_calls_list), error)
                 elif isinstance(_ev, AgentThinkingChunk):
+                    logger.debug("[agent] thinking chunk (%d chars)", len(_ev.text))
                     yield AgentThinkingChunk(text=_ev.text, **meta)
                 elif isinstance(_ev, AgentTextChunk):
+                    logger.debug("[agent] text chunk (%d chars)", len(_ev.text))
                     streaming_active = True
                     yield AgentTextChunk(text=_ev.text, **meta)
 
+            logger.debug("[agent] post-inference: error=%s tool_calls=%d", error, len(tool_calls_list))
             if error:
                 yield AgentError(message=f"[LLM error: {error}]", **meta)
                 return
@@ -140,9 +146,11 @@ class AgentCycle:
                 tool_calls=tool_calls_list or None,
             ))
             meta["tail_node_id"] = self.context.tail_node_id
+            logger.debug("[agent] assistant node written, tail=%s", self.context.tail_node_id)
 
             if not tool_calls_list:
                 final_text = response_text
+                logger.debug("[agent] no tool calls, breaking loop")
                 break
 
             # Tool Execution
@@ -171,13 +179,17 @@ class AgentCycle:
                     **meta
                 )
 
+        logger.debug("[agent] yielding AgentTextFinal, streaming_active=%s", streaming_active)
+        final_tail = meta["tail_node_id"]  # assistant tail, for post-turn hooks
+        meta["tail_node_id"] = node_id     # reset to original so bridges resolve the accumulator
         yield AgentTextFinal(text=final_text if not streaming_active else "", **meta)
 
         # Fire post-turn hooks registered by modules via register_agent.
-        final_tail = meta["tail_node_id"]
         for hook in self.post_turn_hooks:
+            logger.debug("[agent] running post-turn hook '%s'", getattr(hook, '__name__', hook))
             try:
                 await hook(final_tail)
+                logger.debug("[agent] post-turn hook '%s' done", getattr(hook, '__name__', hook))
             except Exception:
                 logger.exception("[agent] post-turn hook '%s' raised", getattr(hook, '__name__', hook))
 
@@ -192,7 +204,7 @@ class AgentCycle:
             temperature=mc.temperature,
         )
 
-    async def _stream_inference(self, messages, tools, model_chain, abort_event):
+    async def _stream_inference(self, messages, tools, model_chain, abort_event, meta):
         """
         Async generator that yields raw AgentTextChunk / AgentThinkingChunk events
         (with placeholder ids — caller re-stamps them with current meta) as they
@@ -213,13 +225,15 @@ class AgentCycle:
 
                 if isinstance(ev, ThinkingDelta):
                     yield AgentThinkingChunk(text=ev.text,
-                                             tail_node_id="", trace_id="",
-                                             reply_to_message_id="")
+                                             tail_node_id=meta["tail_node_id"],
+                                             trace_id=meta["trace_id"],
+                                             reply_to_message_id=meta["reply_to_message_id"])
                 elif isinstance(ev, TextDelta):
                     chunks.append(ev.text)
                     yield AgentTextChunk(text=ev.text,
-                                         tail_node_id="", trace_id="",
-                                         reply_to_message_id="")
+                                         tail_node_id=meta["tail_node_id"],
+                                         trace_id=meta["trace_id"],
+                                         reply_to_message_id=meta["reply_to_message_id"])
                 elif isinstance(ev, ToolCallAssembled):
                     calls.append(ToolCall(ev.call_id, ev.tool_name, ev.args))
                 elif isinstance(ev, LLMError):
