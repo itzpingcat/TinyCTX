@@ -44,24 +44,26 @@ class LibrarianRunner:
         self,
         cfg: dict,
         graph_path: Path,
+        log_path: Path,
         conv_db,
         llm,
         embedder,
     ) -> None:
-        import ladybug as kuzu
+        import ladybug
         from TinyCTX.modules.knowledge.graph import init_schema
 
         graph_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
 
-        self._db         = kuzu.Database(str(graph_path))
-        self._write_conn = kuzu.AsyncConnection(
+        self._db         = ladybug.Database(str(graph_path))
+        self._write_conn = ladybug.AsyncConnection(
             self._db,
             max_concurrent_queries=int(cfg.get("max_concurrent", 4)),
         )
         self._write_lock = asyncio.Lock()
 
         # Initialise schema synchronously on a plain connection
-        sync_conn = kuzu.Connection(self._db)
+        sync_conn = ladybug.Connection(self._db)
         init_schema(sync_conn)
         sync_conn.close()
 
@@ -69,6 +71,18 @@ class LibrarianRunner:
         self._conv_db  = conv_db
         self._llm      = llm
         self._embedder = embedder
+
+        # Dedicated file logger for all librarian agent text output
+        self.agent_logger = logging.getLogger("knowledge.librarian.agent")
+        if not self.agent_logger.handlers:
+            fh = logging.FileHandler(log_path, encoding="utf-8")
+            fh.setFormatter(logging.Formatter(
+                "%(asctime)s %(levelname)s %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            ))
+            self.agent_logger.addHandler(fh)
+            self.agent_logger.setLevel(logging.DEBUG)
+            self.agent_logger.propagate = False
 
         # Queue replaces IPC socket: call_librarian puts messages here
         self.queue: asyncio.Queue = asyncio.Queue()
@@ -83,8 +97,8 @@ class LibrarianRunner:
 
     def new_read_connection(self):
         """Return a new sync Connection from the shared Database for read tools."""
-        import ladybug as kuzu
-        return kuzu.Connection(self._db)
+        import ladybug
+        return ladybug.Connection(self._db)
 
     def start(self) -> None:
         """Schedule the poll loop as a background asyncio task."""
@@ -139,7 +153,7 @@ class LibrarianRunner:
                     t = asyncio.create_task(
                         run_targeted_agent(
                             self._cfg, self._write_conn, self._write_lock,
-                            self._llm, prompt,
+                            self._llm, prompt, self.agent_logger,
                         )
                     )
                     self._active_tasks.add(t)
@@ -171,7 +185,7 @@ class LibrarianRunner:
                 t = asyncio.create_task(
                     run_buffer_agent(
                         self._cfg, self._write_conn, self._write_lock,
-                        self._llm, batch_text,
+                        self._llm, batch_text, self.agent_logger,
                     )
                 )
                 self._active_tasks.add(t)
@@ -192,7 +206,7 @@ class LibrarianRunner:
             t = asyncio.create_task(
                 run_dedup_cycle(
                     self._cfg, self._write_conn, self._write_lock,
-                    self._llm, self._embedder,
+                    self._llm, self._embedder, self.agent_logger,
                 )
             )
             t.add_done_callback(lambda _: self._state.__setitem__("dedup_running", False))
@@ -241,6 +255,7 @@ def register_agent(agent) -> None:
         return p if p.is_absolute() else workspace / p
 
     graph_path  = _resolve(cfg["graph_path"])
+    log_path    = _resolve(cfg.get("librarian_log", "knowledge/librarian.log"))
     pinned_prio = int(cfg.get("pinned_priority", 5))
     agent_db    = workspace / "agent.db"
 
@@ -291,7 +306,7 @@ def register_agent(agent) -> None:
     # ------------------------------------------------------------------
     # 1. Start LibrarianRunner (owns the single Database object)
     # ------------------------------------------------------------------
-    runner = LibrarianRunner(cfg, graph_path, conv_db, llm, embedder)
+    runner = LibrarianRunner(cfg, graph_path, log_path, conv_db, llm, embedder)
     runner.start()
     atexit.register(runner.stop)
 

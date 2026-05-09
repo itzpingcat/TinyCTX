@@ -12,8 +12,15 @@ import asyncio
 import json
 import logging
 import re as _re
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+_PROMPTS_DIR = Path(__file__).parent / "prompts"
+
+
+def _prompt(filename: str) -> str:
+    return (_PROMPTS_DIR / filename).read_text(encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -53,35 +60,19 @@ async def run_buffer_agent(
     write_lock: asyncio.Lock,
     llm,
     batch_text: str,
+    agent_logger: logging.Logger,
 ) -> None:
     """Ingest a batch of conversation nodes into the knowledge graph."""
     write_tools = _make_write_tools(conn, write_lock)
     read_tools  = _make_read_tools(conn)
 
-    system_prompt = (
-        "You are a knowledge extraction agent. Your task is to analyse conversation "
-        "excerpts and update a knowledge graph by extracting entities and relationships.\n\n"
-        "Rules:\n"
-        "- Extract only explicitly stated facts — never infer or speculate.\n"
-        "- Before inserting a new entity, use find_entity to check for existing matches. "
-        "Reuse existing nodes when names/types match closely.\n"
-        "- Resolve contradictions: if a new fact supersedes an old relationship, use "
-        "supersede_relationship. If a node description is outdated, update_entity.\n"
-        "- Keep descriptions concise and factual (1-3 sentences).\n"
-        "- Use exactly one entity_type from: "
-        "Person, Concept, Preference, Fact, Event, Location, Organization, "
-        "Project, Technology, Rule, Directive, Role\n"
-        "- Use UPPER_SNAKE_CASE for relation names.\n"
-        "- When done, stop calling tools and output a brief summary of what was extracted.\n"
+    await _agent_loop(
+        llm,
+        _prompt("buffer_system.txt"),
+        _prompt("buffer_user.txt").format(batch_text=batch_text),
+        write_tools + read_tools,
+        agent_logger,
     )
-
-    user_prompt = (
-        f"Extract entities and relationships from the following conversation excerpt "
-        f"and update the knowledge graph accordingly.\n\n"
-        f"<conversation>\n{batch_text}\n</conversation>"
-    )
-
-    await _agent_loop(llm, system_prompt, user_prompt, write_tools + read_tools)
 
 
 # ---------------------------------------------------------------------------
@@ -94,19 +85,19 @@ async def run_targeted_agent(
     write_lock: asyncio.Lock,
     llm,
     prompt: str,
+    agent_logger: logging.Logger,
 ) -> None:
     """Execute a specific graph-edit instruction."""
     write_tools = _make_write_tools(conn, write_lock)
     read_tools  = _make_read_tools(conn)
 
-    system_prompt = (
-        "You are a targeted knowledge graph editor. Execute the task in the prompt "
-        "precisely using the available graph tools. Be surgical — only touch nodes "
-        "and edges directly relevant to the task. Do not over-write or modify "
-        "unrelated entities. When done, stop calling tools."
+    await _agent_loop(
+        llm,
+        _prompt("targeted_system.txt"),
+        prompt,
+        write_tools + read_tools,
+        agent_logger,
     )
-
-    await _agent_loop(llm, system_prompt, prompt, write_tools + read_tools)
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +110,7 @@ async def run_dedup_cycle(
     write_lock: asyncio.Lock,
     llm,
     embedder,
+    agent_logger: logging.Logger,
 ) -> None:
     logger.info("[knowledge/librarian] dedup cycle starting")
     try:
@@ -211,39 +203,31 @@ async def run_dedup_cycle(
             pair_key = frozenset([ea["e.uuid"], eb["e.uuid"]])
             if pair_key in already_aliased:
                 continue
-            await _dedup_pair(conn, write_lock, llm, ea, eb)
+            await _dedup_pair(conn, write_lock, llm, ea, eb, agent_logger)
 
         logger.info("[knowledge/librarian] dedup cycle complete")
     except Exception:
         logger.exception("[knowledge/librarian] dedup cycle error")
 
 
-async def _dedup_pair(conn, write_lock: asyncio.Lock, llm, ea: dict, eb: dict) -> None:
+async def _dedup_pair(conn, write_lock: asyncio.Lock, llm, ea: dict, eb: dict, agent_logger: logging.Logger) -> None:
     from TinyCTX.modules.knowledge.graph import now_ts
     from TinyCTX.ai import TextDelta
 
-    prompt = (
-        "You are comparing two knowledge graph nodes to decide if they represent "
-        "the same real-world thing.\n\n"
-        f"Node A:\n  uuid: {ea['e.uuid']}\n  name: {ea['e.name']}\n"
-        f"  type: {ea['e.entity_type']}\n  description: {ea['e.description']}\n\n"
-        f"Node B:\n  uuid: {eb['e.uuid']}\n  name: {eb['e.name']}\n"
-        f"  type: {eb['e.entity_type']}\n  description: {eb['e.description']}\n\n"
-        "Respond with ONLY a JSON object (no markdown fences):\n"
-        "{\n"
-        '  "verdict": "duplicate" | "alias" | "distinct",\n'
-        '  "canonical_uuid": "<uuid of node to keep — required unless distinct>",\n'
-        '  "merged_description": "<consolidated description — required unless distinct>"\n'
-        "}\n"
-        "duplicate = same real-world entity (merge into one node).\n"
-        "alias = different names for the same underlying thing (keep both, add ALIASED_TO edge).\n"
-        "distinct = genuinely different entities."
+    prompt = _prompt("dedup_user.txt").format(
+        uuid_a=ea["e.uuid"], name_a=ea["e.name"],
+        type_a=ea["e.entity_type"], desc_a=ea["e.description"],
+        uuid_b=eb["e.uuid"], name_b=eb["e.name"],
+        type_b=eb["e.entity_type"], desc_b=eb["e.description"],
     )
 
     response_text = ""
     async for event in llm.stream([{"role": "user", "content": prompt}], tools=None):
         if isinstance(event, TextDelta):
             response_text += event.text
+
+    if response_text:
+        agent_logger.info("[dedup %s/%s] %s", ea["e.uuid"][:8], eb["e.uuid"][:8], response_text)
 
     raw = _re.sub(r"^```json?\s*", "", response_text.strip())
     raw = _re.sub(r"\s*```$", "", raw)
@@ -620,6 +604,7 @@ async def _agent_loop(
     system_prompt: str,
     user_prompt: str,
     tools: list[dict],
+    agent_logger: logging.Logger,
     max_cycles: int = 20,
 ) -> None:
     import inspect
@@ -657,7 +642,7 @@ async def _agent_loop(
         {"role": "user",   "content": user_prompt},
     ]
 
-    for _cycle in range(max_cycles):
+    for cycle in range(max_cycles):
         text_chunks: list[str] = []
         tool_calls:  list[dict] = []
 
@@ -672,9 +657,11 @@ async def _agent_loop(
 
         response_text = "".join(text_chunks)
 
+        if response_text:
+            label = "[final]" if not tool_calls else f"[cycle {cycle}]"
+            agent_logger.info("%s %s", label, response_text)
+
         if not tool_calls:
-            if response_text:
-                logger.debug("[knowledge/librarian] agent completed: %s", response_text[:120])
             return
 
         messages.append({
@@ -701,6 +688,7 @@ async def _agent_loop(
                     result = f"[error: {exc}]"
                     logger.warning("[knowledge/librarian] tool %s error: %s", tc["name"], exc)
 
+            agent_logger.debug("  tool %s → %s", tc["name"], result)
             messages.append({
                 "role":         "tool",
                 "tool_call_id": tc["id"],

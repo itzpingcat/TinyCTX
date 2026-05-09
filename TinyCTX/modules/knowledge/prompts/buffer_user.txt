@@ -1,0 +1,6 @@
+Extract entities and relationships from the following conversation excerpt
+and update the knowledge graph accordingly.
+
+<conversation>
+{batch_text}
+</conversation>

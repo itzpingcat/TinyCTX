@@ -11,7 +11,8 @@ EXTENSION_META = {
     ),
     "default_config": {
         # Paths (relative to workspace)
-        "graph_path": "knowledge/graph.lbug",
+        "graph_path":    "knowledge/graph.lbug",
+        "librarian_log": "knowledge/librarian.log",
 
         # Librarian trigger config
         "trigger_interval_hours": 6,

@@ -116,7 +116,7 @@ RELATION_VOCAB = {
 def init_schema(conn) -> None:
     """
     Create all tables if they don't exist. Safe to call on every startup.
-    conn may be a sync kuzu.Connection or async kuzu.AsyncConnection —
+    conn may be a sync ladybug.Connection or async ladybug.AsyncConnection —
     callers must await if async (handled externally).
     """
     for ddl in _SCHEMA_DDL:
@@ -202,7 +202,7 @@ def top_k_cosine(
 class GraphDB:
     """
     Sync graph accessor for use in the main agent's tool implementations.
-    Receives a kuzu.Connection created from the single shared Database object
+    Receives a ladybug.Connection created from the single shared Database object
     owned by the LibrarianRunner. Does NOT open its own Database.
     """
 
