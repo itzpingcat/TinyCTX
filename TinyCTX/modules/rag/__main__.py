@@ -1,24 +1,33 @@
 """
 modules/rag/__main__.py
 
-RAG pipeline wiring: indexing, hybrid search, auto-inject, memory_search tool,
-and the context-nudge / consolidation hook.
+RAG module wiring: databank discovery, per-databank indexing, rag_search tool,
+set_auto_rag_databanks tool, and auto-inject system prompt block.
 
-Singletons (store, indexer, embedder) are created once via module-level lazy
-state on the first register_agent call, so concurrent AgentCycles share the
-same read-only store/indexer without re-opening files on every turn.
+Architecture
+------------
+One DataStore + DataBankIndexer pair per discovered databank. Singletons are
+created once on the first register_agent call and shared across all cycles.
 
-register_runtime registers the /memory consolidate command and wires the
-post-turn consolidation hook.  It does NOT register tools — tools are
-registered per-cycle in register_agent.
+Auto-rag state is stored in session state under the key "rag_auto_targets"
+(a list of databank name strings). set_auto_rag_databanks writes this key
+via db.update_node_state_delta; the pre-assemble hook reads it each turn.
 
-Config is read from the memory module's EXTENSION_META defaults merged with
-workspace overrides under the "memory_search" key, keeping a single source of
-truth for all memory/rag settings.
+Databank layout (workspace/rag/):
+    lore/            <- FilesDataBank "lore"
+    characters/      <- FilesDataBank "characters"
+    my_world.json    <- WorldInfoDataBank "my_world" (stub until implemented)
+    .cache/          <- SQLite DBs, one per databank (excluded from discovery)
+
+Config is read from EXTENSION_META defaults merged with workspace overrides
+under the "rag" key in the workspace config.
+
+register_runtime is not used by this module (no commands or runtime hooks needed).
 """
 from __future__ import annotations
 
 import atexit
+import json
 import logging
 from pathlib import Path
 
@@ -30,15 +39,13 @@ logger = logging.getLogger(__name__)
 # Module-level singleton state — initialized once on first register_agent call
 # ---------------------------------------------------------------------------
 
-_initialized = False
-_store       = None
-_indexer     = None
-_embedder    = None
-_cfg: dict   = {}
+_initialized    = False
+_stores:  dict  = {}   # name -> DataStore
+_indexers: dict = {}   # name -> DataBankIndexer
+_databanks: dict = {}  # name -> DataBank
+_embedder       = None
+_cfg: dict      = {}
 _workspace: Path | None = None
-
-# Consolidation hook closure — set by register_runtime if nudge is configured.
-_consolidation_hook = None
 
 
 # ---------------------------------------------------------------------------
@@ -49,12 +56,32 @@ def _estimate_tokens(text: str) -> int:
     return len(text) // 4
 
 
-def _format_results(results: list[dict], budget_tokens: int) -> str | None:
+def _load_cfg(config) -> dict:
+    """Merge EXTENSION_META defaults with workspace overrides under 'rag' key."""
+    from TinyCTX.modules.rag import EXTENSION_META
+    defaults: dict = EXTENSION_META.get("default_config", {})
+    overrides: dict = {}
+    if hasattr(config, "extra") and isinstance(config.extra, dict):
+        overrides = config.extra.get("rag", {})
+    return {**defaults, **overrides}
+
+
+def _format_results(
+    results: list[dict],
+    budget_tokens: int,
+    databank_name: str | None = None,
+) -> str | None:
+    """
+    Format a list of search result dicts into a <rag_context> block.
+    Each result dict: {file, path, text, score}.
+    Returns None if results is empty.
+    """
     if not results:
         return None
 
-    header   = "<memory>"
-    footer   = "</memory>"
+    label   = f" databank={databank_name!r}" if databank_name else ""
+    header  = f"<rag_context{label}>"
+    footer  = "</rag_context>"
     overhead = _estimate_tokens(header + "\n\n" + footer)
 
     blocks:      list[str] = []
@@ -64,40 +91,56 @@ def _format_results(results: list[dict], budget_tokens: int) -> str | None:
     for i, r in enumerate(results):
         block = f"[{r['file']}]\n{r['text'].strip()}"
         cost  = _estimate_tokens(block + "\n\n")
-
         if i > 0 and budget_tokens > 0 and used_tokens + cost > budget_tokens:
             dropped += 1
             continue
-
         blocks.append(block)
         used_tokens += cost
 
     parts = [header] + blocks + [footer]
     if dropped:
-        parts.insert(-1, f"[{dropped} chunk(s) omitted — memory budget reached]")
-
+        parts.insert(-1, f"[{dropped} chunk(s) omitted — result budget reached]")
     return "\n\n".join(parts)
 
 
-def _load_cfg(config) -> dict:
-    """Merge EXTENSION_META defaults with workspace overrides."""
+async def _search_databank(
+    name: str,
+    query: str,
+    top_k: int,
+    bm25_weight: float,
+) -> list[dict]:
+    """Sync the named databank and run a hybrid search. Returns [] on any error."""
+    store   = _stores.get(name)
+    indexer = _indexers.get(name)
+    if store is None or indexer is None:
+        return []
     try:
-        from TinyCTX.modules.system_prompt import EXTENSION_META
-        defaults: dict = EXTENSION_META.get("default_config", {})
-    except ImportError:
-        defaults = {}
-    overrides: dict = {}
-    if hasattr(config, "extra") and isinstance(config.extra, dict):
-        overrides = config.extra.get("memory_search", {})
-    return {**defaults, **overrides}
+        await indexer.sync()
+    except Exception as exc:
+        logger.warning("[rag] sync failed for '%s': %s", name, exc)
+        return []
+
+    q_vec = None
+    if _embedder is not None:
+        try:
+            q_vec = await _embedder.embed_one(query)
+        except Exception as exc:
+            logger.warning("[rag] embed failed for '%s': %s — BM25 only", name, exc)
+
+    try:
+        return store.hybrid_search(query, q_vec, top_k, bm25_weight)
+    except Exception as exc:
+        logger.warning("[rag] search failed for '%s': %s", name, exc)
+        return []
 
 
 # ---------------------------------------------------------------------------
-# Singleton initialization (called once from register_agent)
+# Singleton initialization
 # ---------------------------------------------------------------------------
 
 def _init_singletons(config) -> None:
-    global _initialized, _store, _indexer, _embedder, _cfg, _workspace
+    global _initialized, _stores, _indexers, _databanks, _embedder, _cfg, _workspace
+
     if _initialized:
         return
 
@@ -107,176 +150,116 @@ def _init_singletons(config) -> None:
 
     _cfg = _load_cfg(config)
 
-    def _resolve(filename: str) -> Path:
-        p = Path(filename)
+    def _resolve(rel: str) -> Path:
+        p = Path(rel)
         return p if p.is_absolute() else workspace / p
 
-    memory_dir = _resolve(_cfg["memory_dir"])
-    db_path    = _resolve(_cfg["db_file"])
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+    rag_dir   = _resolve(_cfg["rag_dir"])
+    cache_dir = _resolve(_cfg["cache_dir"])
+    cache_dir.mkdir(parents=True, exist_ok=True)
 
-    from TinyCTX.modules.rag.store import MemoryStore
-    _store = MemoryStore(db_path)
-    atexit.register(_store.close)
+    extensions: set[str] = {
+        ext.lower() if ext.startswith(".") else f".{ext.lower()}"
+        for ext in _cfg.get("indexed_extensions", [".md", ".txt", ".rst"])
+    }
 
+    # Embedder (optional)
     embedding_model = _cfg.get("embedding_model", "").strip()
+    model_name_str  = ""
     if embedding_model:
         try:
             from TinyCTX.ai import Embedder
             emb_cfg   = config.get_embedding_model(embedding_model)
             _embedder = Embedder.from_config(emb_cfg)
+            model_name_str = (
+                config.models[embedding_model].model
+                if embedding_model in config.models
+                else ""
+            )
             logger.info("[rag] embedder: %s @ %s", emb_cfg.model, emb_cfg.base_url)
-        except (KeyError, ValueError) as exc:
+        except (KeyError, ValueError, AttributeError) as exc:
             logger.warning(
                 "[rag] embedding_model '%s' not usable (%s) — BM25 only",
                 embedding_model, exc,
             )
 
-    model_name_str = (
-        config.models[embedding_model].model
-        if embedding_model and embedding_model in config.models
-        else ""
-    )
-
+    # Chunking strategy
     from TinyCTX.modules.rag.chunkers import get_strategy
     chunk_kwargs: dict = _cfg.get("chunk_kwargs") or {}
     strategy = get_strategy(_cfg["chunk_strategy"], **chunk_kwargs)
 
-    from TinyCTX.modules.rag.indexer import MemoryIndexer
-    _indexer = MemoryIndexer(
-        store           = _store,
-        memory_dir      = memory_dir,
-        strategy        = strategy,
-        embedder        = _embedder,
-        embedding_model = model_name_str,
-    )
+    # Discover databanks
+    from TinyCTX.modules.rag.databanks import discover_databanks
+    _databanks = discover_databanks(rag_dir, extensions)
+    logger.info("[rag] discovered %d databank(s): %s", len(_databanks), list(_databanks))
+
+    # Build one store + indexer per databank
+    from TinyCTX.modules.rag.store import DataStore
+    from TinyCTX.modules.rag.indexer import DataBankIndexer
+
+    for name, bank in _databanks.items():
+        db_path = cache_dir / f"{name}.db"
+        store   = DataStore(db_path)
+        indexer = DataBankIndexer(
+            store           = store,
+            databank        = bank,
+            strategy        = strategy,
+            embedder        = _embedder,
+            embedding_model = model_name_str,
+        )
+        _stores[name]   = store
+        _indexers[name] = indexer
+        atexit.register(store.close)
 
     _initialized = True
     logger.info(
-        "[rag] singletons ready — dir: %s | db: %s | strategy: %s | embedder: %s",
-        memory_dir, db_path, _cfg["chunk_strategy"], model_name_str or "BM25 only",
+        "[rag] ready — dir: %s | strategy: %s | embedder: %s",
+        rag_dir, _cfg["chunk_strategy"], model_name_str or "BM25 only",
     )
 
 
 # ---------------------------------------------------------------------------
-# register_runtime — consolidation command + post-turn hook
+# register_runtime — not used by this module
 # ---------------------------------------------------------------------------
 
 def register_runtime(runtime) -> None:
-    global _consolidation_hook
-
-    cfg             = _load_cfg(runtime.config)
-    nudge_threshold = float(cfg.get("nudge_threshold", 0.80))
-    nudge_message   = cfg.get("nudge_message", "")
-    token_limit     = runtime.config.context
-
-    if nudge_threshold > 0.0 and nudge_message:
-        nudge_delta = int(nudge_threshold * token_limit)
-
-        async def _hook(tail_node_id: str) -> None:
-            import json, datetime, time as _time
-            from TinyCTX.contracts import InboundMessage, ContentType, UserIdentity, Platform
-
-            state, _ = runtime.db.load_session_state(tail_node_id)
-            tokens_now      = int(state.get("tokens_used", 0) or 0)
-            tokens_at_nudge = int(state.get("memory_nudge_tokens_at_last", 0) or 0)
-            if tokens_now - tokens_at_nudge < nudge_delta:
-                return
-
-            date_str = datetime.date.today().strftime("%d-%m-%Y")
-            msg_text = nudge_message.format(date=date_str)
-
-            opening = runtime.db.add_node(
-                parent_id=tail_node_id, role="user", content=msg_text,
-            )
-            await runtime.push(InboundMessage(
-                tail_node_id=opening.id,
-                author=UserIdentity(platform=Platform.SYSTEM, user_id="system", username="system"),
-                content_type=ContentType.TEXT,
-                text=msg_text,
-                message_id=f"consolidation-{_time.time_ns()}",
-                timestamp=_time.time(),
-                trigger=True,
-                permission_level=100,
-            ))
-            runtime.db.update_node_state_delta(
-                tail_node_id,
-                json.dumps({"memory_nudge_tokens_at_last": tokens_now}),
-            )
-            logger.info(
-                "[rag] consolidation spawned off tail=%s (delta %d/%d tokens)",
-                tail_node_id, tokens_now - tokens_at_nudge, nudge_delta,
-            )
-
-        _consolidation_hook = _hook
-        logger.info(
-            "[rag] consolidation hook configured — threshold %.0f%% delta (%d tokens)",
-            nudge_threshold * 100, nudge_delta,
-        )
-
-        async def _cmd_consolidate(args: list[str], context: dict) -> None:
-            import time as _time, datetime
-            from TinyCTX.contracts import InboundMessage, ContentType, UserIdentity, Platform
-            console = context.get("console")
-            c       = context.get("theme_c", lambda k: "")
-            tail    = context.get("tail_node_id")
-            if not tail:
-                if console:
-                    console.print(f"[{c('error')}]  ✗  rag: no active session[/{c('error')}]")
-                return
-            date_str = datetime.date.today().strftime("%d-%m-%Y")
-            msg_text = nudge_message.format(date=date_str)
-            opening  = runtime.db.add_node(parent_id=tail, role="user", content=msg_text)
-            await runtime.push(InboundMessage(
-                tail_node_id=opening.id,
-                author=UserIdentity(platform=Platform.SYSTEM, user_id="system", username="system"),
-                content_type=ContentType.TEXT,
-                text=msg_text,
-                message_id=f"consolidation-cmd-{_time.time_ns()}",
-                timestamp=_time.time(),
-                trigger=True,
-                permission_level=100,
-            ))
-            if console:
-                console.print(f"[{c('tool_ok')}]  ✓  consolidation started (tail={tail[:8]}…)[/{c('tool_ok')}]")
-
-        runtime.commands.register(
-            "memory", "consolidate", _cmd_consolidate,
-            help="Spawn a memory consolidation branch immediately",
-        )
-    else:
-        logger.info("[rag] consolidation disabled")
+    pass
 
 
 # ---------------------------------------------------------------------------
-# register_agent — RAG wiring per cycle
+# register_agent — tool and hook wiring per cycle
 # ---------------------------------------------------------------------------
 
 def register_agent(cycle) -> None:
     _init_singletons(cycle.config)
 
-    cfg                 = _cfg
-    store               = _store
-    indexer             = _indexer
-    embedder            = _embedder
-    budget_tokens       = int(cfg["memory_budget_tokens"])
-    top_k               = int(cfg["top_k"])
-    bm25_weight         = float(cfg["bm25_weight"])
-    decay_halflife_days = float(cfg.get("decay_halflife_days", 30.0))
-    decay_weight        = float(cfg.get("decay_weight", 0.0))
-    auto_inject         = bool(cfg["auto_inject"])
-    ms_vis = str(cfg.get("tools", {}).get("memory_search", "always_on")).lower().strip()
+    cfg          = _cfg
+    top_k        = int(cfg["top_k"])
+    bm25_weight  = float(cfg["bm25_weight"])
+    budget_tokens = int(cfg["result_budget_tokens"])
+    auto_priority = int(cfg["auto_inject_priority"])
 
-    # 1. Async pre-assemble hook — ephemeral results shared via closure
-    results: list = []
+    # Snapshot of auto-rag targets for this turn (populated in pre-assemble hook)
+    auto_results_by_bank: dict[str, list[dict]] = {}
+
+    # ------------------------------------------------------------------
+    # Pre-assemble hook: search auto-rag databanks, cache results for inject
+    # ------------------------------------------------------------------
 
     async def _pre_assemble_async(ctx) -> None:
-        if ctx.dialogue:
-            if ctx.dialogue[-1].role in ("tool", "assistant"):
-                return
+        auto_results_by_bank.clear()
 
-        await indexer.sync()
+        # Only run on user turns
+        if ctx.dialogue and ctx.dialogue[-1].role in ("tool", "assistant"):
+            return
 
+        # Read auto-rag targets from session state
+        state, _ = cycle.db.load_session_state(ctx.tail_node_id)
+        targets: list[str] = state.get("rag_auto_targets") or []
+        if not targets:
+            return
+
+        # Extract last user query
         query = ""
         for entry in reversed(ctx.dialogue):
             if entry.role == "user":
@@ -287,85 +270,137 @@ def register_agent(cycle) -> None:
                         if isinstance(p, dict) and p.get("type") == "text"
                     ).strip()
                 else:
-                    query = content
+                    query = str(content)
                 if query.strip():
                     break
 
         if not query.strip():
-            results[:] = []
             return
 
-        if budget_tokens > 0:
-            total = store.total_chunks_text_tokens()
-            if total <= budget_tokens:
-                found = store.hybrid_search(
-                    query, None, top_k=999, bm25_weight=1.0,
-                    decay_halflife_days=decay_halflife_days,
-                    decay_weight=decay_weight,
-                ) if total > 0 else []
-                results[:] = found
-                return
-
-        q_vec = None
-        if embedder is not None:
-            try:
-                q_vec = await embedder.embed_one(query)
-            except Exception as exc:
-                logger.warning("[rag] embed failed: %s — BM25 only", exc)
-
-        found = store.hybrid_search(
-            query, q_vec, top_k, bm25_weight,
-            decay_halflife_days=decay_halflife_days,
-            decay_weight=decay_weight,
-        )
-        results[:] = found
-        if found:
-            logger.debug("[rag] '%s…' → %d result(s)", query[:40], len(found))
+        for name in targets:
+            if name not in _stores:
+                logger.debug("[rag] auto-rag: unknown databank '%s'", name)
+                continue
+            results = await _search_databank(name, query, top_k, bm25_weight)
+            if results:
+                auto_results_by_bank[name] = results
+                logger.debug("[rag] auto-rag '%s': %d result(s)", name, len(results))
 
     cycle.context.register_hook(HOOK_PRE_ASSEMBLE_ASYNC, _pre_assemble_async, priority=0)
 
-    # 2. Auto-inject prompt
-    if auto_inject:
-        cycle.context.register_prompt(
-            "memory_search",
-            lambda ctx: _format_results(results, budget_tokens),
-            role="system",
-            priority=int(cfg["search_priority"]),
-        )
+    # ------------------------------------------------------------------
+    # Auto-inject prompt block
+    # ------------------------------------------------------------------
 
-    # 3. memory_search tool
-    async def memory_search(query: str) -> str:
+    def _auto_rag_prompt(_ctx) -> str:
+        if not auto_results_by_bank:
+            return ""
+        parts = []
+        for name, results in auto_results_by_bank.items():
+            block = _format_results(results, budget_tokens, databank_name=name)
+            if block:
+                parts.append(block)
+        return "\n\n".join(parts)
+
+    cycle.context.register_prompt(
+        "rag_auto_inject",
+        _auto_rag_prompt,
+        role="system",
+        priority=auto_priority,
+    )
+
+    # ------------------------------------------------------------------
+    # Tool: rag_search
+    # ------------------------------------------------------------------
+
+    async def rag_search(query: str, targets: list, max_results: int = 0) -> str:
         """
-        Search the memory store for information relevant to a query.
-        Use this to explicitly recall facts, notes, or context that may
-        not have been automatically injected into the current turn.
+        Search one or more databanks for information relevant to a query.
 
         Args:
-            query: The topic, question, or keywords to search for.
+            query:       The topic, question, or keywords to search for.
+            targets:     List of databank names to search (e.g. ["lore", "characters"]).
+                         Use rag_list_databanks() to see available names.
+            max_results: Maximum results to return per databank (0 = use module default).
         """
-        await indexer.sync()
-        q_vec = None
-        if embedder is not None:
-            try:
-                q_vec = await embedder.embed_one(query)
-            except Exception as exc:
-                logger.warning("[rag] tool embed failed: %s — BM25 only", exc)
-        found = store.hybrid_search(
-            query, q_vec, top_k, bm25_weight,
-            decay_halflife_days=decay_halflife_days,
-            decay_weight=decay_weight,
-        )
-        if not found:
-            return "[no memory found for that query]"
-        return _format_results(found, budget_tokens) or "[no memory found for that query]"
+        if not isinstance(targets, list) or not targets:
+            return "[rag_search error: targets must be a non-empty list of databank names]"
 
-    if ms_vis != "disabled":
-        cycle.tool_handler.register_tool(
-            memory_search,
-            always_on=(ms_vis != "deferred"),
-            min_permission=25,
+        k = int(max_results) if max_results and int(max_results) > 0 else top_k
+
+        unknown = [t for t in targets if t not in _stores]
+        if unknown:
+            available = sorted(_stores.keys()) or ["(none)"]
+            return (
+                f"[rag_search error: unknown databank(s) {unknown}. "
+                f"Available: {available}]"
+            )
+
+        all_parts: list[str] = []
+        for name in targets:
+            results = await _search_databank(name, query, k, bm25_weight)
+            block   = _format_results(results, budget_tokens, databank_name=name)
+            if block:
+                all_parts.append(block)
+
+        if not all_parts:
+            return "[rag_search: no results found in the specified databank(s)]"
+        return "\n\n".join(all_parts)
+
+    cycle.tool_handler.register_tool(rag_search, always_on=False, min_permission=25)
+
+    # ------------------------------------------------------------------
+    # Tool: set_auto_rag_databanks
+    # ------------------------------------------------------------------
+
+    def set_auto_rag_databanks(targets: list) -> str:
+        """
+        Set which databanks are automatically searched and injected into context each turn.
+        Call with an empty list to disable auto-injection entirely.
+
+        Args:
+            targets: List of databank names to auto-inject (e.g. ["lore"]).
+                     Pass [] to clear.
+        """
+        if not isinstance(targets, list):
+            return "[set_auto_rag_databanks error: targets must be a list]"
+
+        targets = [str(t) for t in targets]
+        unknown = [t for t in targets if t and t not in _stores]
+        if unknown:
+            available = sorted(_stores.keys()) or ["(none)"]
+            return (
+                f"[set_auto_rag_databanks error: unknown databank(s) {unknown}. "
+                f"Available: {available}]"
+            )
+
+        tail = cycle.context.tail_node_id
+        cycle.db.update_node_state_delta(
+            tail,
+            json.dumps({"rag_auto_targets": targets}),
         )
 
-    # 4. Post-turn consolidation hook (if configured by register_runtime)
-    if _consolidation_hook is not None:
-        cycle.post_turn_hooks.append(_consolidation_hook)
+        if not targets:
+            return "[auto-rag cleared — no databanks will be injected automatically]"
+        return f"[auto-rag set to: {targets}]"
+
+    cycle.tool_handler.register_tool(set_auto_rag_databanks, always_on=False, min_permission=25)
+
+    # ------------------------------------------------------------------
+    # Tool: rag_list_databanks
+    # ------------------------------------------------------------------
+
+    def rag_list_databanks() -> str:
+        """
+        List all available databanks and their types.
+
+        Args: (none)
+        """
+        if not _databanks:
+            return "[no databanks found — add folders or worldinfo JSON files to workspace/rag/]"
+        lines = ["Available databanks:"]
+        for name, bank in sorted(_databanks.items()):
+            lines.append(f"  {name}  ({bank.kind})")
+        return "\n".join(lines)
+
+    cycle.tool_handler.register_tool(rag_list_databanks, always_on=False, min_permission=25)

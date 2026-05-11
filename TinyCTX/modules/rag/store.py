@@ -1,7 +1,8 @@
 """
 modules/rag/store.py
 
-SQLite-backed chunk store for the rag module.
+SQLite-backed chunk store for the RAG module. One DataStore per databank,
+stored under workspace/rag/.cache/<databank_name>.db.
 
 Responsibilities:
   - Schema creation and migration
@@ -31,7 +32,7 @@ when numpy is absent.
 Schema
 ------
 files:
-    path            TEXT PK  — absolute resolved path
+    path            TEXT PK  — absolute resolved path (or synthetic key)
     content_hash    TEXT     — MD5 hex of file contents
     embedding_model TEXT     — model string used when embedding (for dirty check)
     mtime           REAL     — st_mtime at index time (informational)
@@ -231,10 +232,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
 # Store
 # ---------------------------------------------------------------------------
 
-class MemoryStore:
+class DataStore:
     """
-    Thread-safe (check_same_thread=False) SQLite store for memory chunks.
-    One instance is shared between MemoryIndexer and the retrieval code.
+    Thread-safe (check_same_thread=False) SQLite store for RAG chunks.
+    One DataStore instance per databank, opened and cached by the RAG module.
     """
 
     def __init__(self, db_path: Path) -> None:
@@ -485,10 +486,7 @@ class MemoryStore:
     # ------------------------------------------------------------------
 
     def total_chunks_text_tokens(self) -> int:
-        """
-        Return a fast token estimate for ALL chunks in the store.
-        Used to skip search entirely when everything already fits in context.
-        """
+        """Return a fast token estimate for ALL chunks in the store."""
         row = self._conn.execute("SELECT COALESCE(SUM(LENGTH(text)), 0) FROM chunks").fetchone()
         return (row[0] or 0) // 4
 
@@ -502,7 +500,7 @@ class MemoryStore:
     def close(self) -> None:
         self._conn.close()
 
-    def __enter__(self) -> MemoryStore:
+    def __enter__(self) -> DataStore:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:

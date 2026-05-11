@@ -1,28 +1,31 @@
 """
 modules/rag/indexer.py
 
-Async indexer — walks workspace/memory/**/*.md, detects dirty files via
-MemoryStore.is_dirty(), re-chunks and re-embeds them, then commits to the store.
+Async indexer — walks a DataBank's files, detects dirty entries via
+DataStore.is_dirty(), re-chunks and re-embeds them, then commits to the store.
+
+One DataBankIndexer instance per databank. The RAG __main__ creates and caches
+one indexer per (name, store) pair.
 
 Design notes
 ------------
 - Fully async: embedding calls go through ai.Embedder (aiohttp).
-- Lazy: sync() is a no-op until called. The pre_assemble hook in memory/__main__.py
-  calls sync() before every retrieval, so the first turn triggers indexing.
-- Embedder is optional: if None (no embedding model configured), chunks are
-  stored without vectors and only BM25 search is available.
-- Concurrency: files are embedded sequentially to avoid hammering the
-  embedding server. Per-file parallelism can be added later if needed.
-- The indexer never modifies .md files — read-only access to the memory dir.
+- Lazy: sync() is a no-op if nothing is dirty.
+- Embedder is optional: if None, chunks are stored without vectors and only
+  BM25 search is available.
+- Files that cannot be read are skipped with a warning (already handled by
+  DataBank.iter_files()).
+- WorldInfoDataBank raises NotImplementedError from iter_files(); the indexer
+  catches this and logs a skip so startup is not broken.
 
 Public API
 ----------
-    indexer = MemoryIndexer(
-        store           = store,           # MemoryStore instance
-        memory_dir      = Path("~/.tinyctx/memory"),
-        strategy        = get_strategy("markdown"),
+    indexer = DataBankIndexer(
+        store           = store,           # DataStore instance
+        databank        = databank,        # DataBank instance
+        strategy        = strategy,        # ChunkStrategy instance
         embedder        = embedder_or_none,
-        embedding_model = "nomic-embed-text",  # model name string for dirty check
+        embedding_model = "nomic-embed-text",
     )
     await indexer.sync()   # call before every retrieval
 """
@@ -33,36 +36,36 @@ import hashlib
 import logging
 from pathlib import Path
 
-from TinyCTX.modules.rag.store import MemoryStore
+from TinyCTX.modules.rag.store import DataStore
 from TinyCTX.modules.rag.chunkers import ChunkStrategy
+from TinyCTX.modules.rag.databanks import DataBank
 
 logger = logging.getLogger(__name__)
 
 
-class MemoryIndexer:
+class DataBankIndexer:
     """
-    Walks workspace/memory/**/*.md, detects dirty files, and (re-)indexes them.
+    Indexes a single DataBank into a DataStore.
 
     Args:
-        store:           MemoryStore instance to read/write.
-        memory_dir:      Root directory to scan recursively for *.md files.
+        store:           DataStore instance to read/write.
+        databank:        DataBank to index.
         strategy:        ChunkStrategy instance (from chunkers.get_strategy).
         embedder:        ai.Embedder instance, or None for BM25-only mode.
-        embedding_model: Model name string — stored per-file for dirty detection.
-                         Should match the `model` field of the ModelConfig used
-                         to build the embedder. Pass "" when embedder is None.
+        embedding_model: Model name string stored per-file for dirty detection.
+                         Pass "" when embedder is None.
     """
 
     def __init__(
         self,
-        store:           MemoryStore,
-        memory_dir:      Path,
+        store:           DataStore,
+        databank:        DataBank,
         strategy:        ChunkStrategy,
         embedder,                          # ai.Embedder | None
         embedding_model: str = "",
     ) -> None:
         self._store           = store
-        self._memory_dir      = memory_dir
+        self._databank        = databank
         self._strategy        = strategy
         self._embedder        = embedder
         self._embedding_model = embedding_model
@@ -77,64 +80,76 @@ class MemoryIndexer:
             await self._sync_inner()
 
     async def _sync_inner(self) -> None:
-        if not self._memory_dir.exists():
-            logger.debug("[rag/indexer] memory_dir does not exist yet: %s", self._memory_dir)
+        # Collect current files from the databank
+        try:
+            file_items = list(self._databank.iter_files())
+        except NotImplementedError:
+            logger.debug(
+                "[rag/indexer] skipping databank '%s' (not yet implemented)",
+                self._databank.name,
+            )
+            return
+        except Exception as exc:
+            logger.warning(
+                "[rag/indexer] error iterating databank '%s': %s",
+                self._databank.name, exc,
+            )
             return
 
-        # Collect all .md files recursively
-        disk_paths: set[str] = {
-            str(p.resolve())
-            for p in self._memory_dir.rglob("*.md")
-            if p.is_file()
-        }
+        disk_paths: set[str] = {path_str for path_str, _ in file_items}
 
         # Remove rows for files that were deleted from disk
         removed = self._store.remove_deleted_files(disk_paths)
         if removed:
-            logger.info("[rag/indexer] removed %d deleted file(s) from index", len(removed))
+            logger.info(
+                "[rag/indexer] [%s] removed %d deleted file(s)",
+                self._databank.name, len(removed),
+            )
             self._store.commit()
 
         # Index dirty files
-        dirty: list[tuple[Path, str, str]] = []
-        for path_str in sorted(disk_paths):
-            path = Path(path_str)
-            try:
-                content      = path.read_text(encoding="utf-8")
-                content_hash = _md5(content)
-                if self._store.is_dirty(path_str, content_hash, self._embedding_model):
-                    dirty.append((path, content, content_hash))
-            except Exception as exc:
-                logger.warning("[rag/indexer] could not read %s: %s", path, exc)
+        dirty: list[tuple[str, str, str]] = []
+        for path_str, content in file_items:
+            content_hash = _md5(content)
+            if self._store.is_dirty(path_str, content_hash, self._embedding_model):
+                dirty.append((path_str, content, content_hash))
 
         if not dirty:
-            logger.debug("[rag/indexer] all files up to date (%d total)", len(disk_paths))
+            logger.debug(
+                "[rag/indexer] [%s] all files up to date (%d total)",
+                self._databank.name, len(disk_paths),
+            )
             return
 
-        logger.info("[rag/indexer] indexing %d dirty file(s)", len(dirty))
-        for path, content, content_hash in dirty:
-            await self._index_file(path, content, content_hash)
+        logger.info(
+            "[rag/indexer] [%s] indexing %d dirty file(s)",
+            self._databank.name, len(dirty),
+        )
+        for path_str, content, content_hash in dirty:
+            await self._index_file(path_str, content, content_hash)
 
-    async def _index_file(self, path: Path, content: str, content_hash: str) -> None:
-        path_str = str(path.resolve())
-        mtime    = path.stat().st_mtime
-        chunks   = self._strategy.chunk(content)
+    async def _index_file(self, path_str: str, content: str, content_hash: str) -> None:
+        path   = Path(path_str)
+        mtime  = path.stat().st_mtime if path.exists() else 0.0
+        chunks = self._strategy.chunk(content)
 
         if not chunks:
-            logger.debug("[rag/indexer] no chunks produced for %s — skipping", path.name)
+            logger.debug(
+                "[rag/indexer] [%s] no chunks from %s — skipping",
+                self._databank.name, path_str,
+            )
             return
 
-        # Embed chunks if an embedder is configured
         embeddings: list[list[float]] | None = None
         if self._embedder is not None:
             try:
                 embeddings = await self._embedder.embed(chunks)
             except Exception as exc:
                 logger.warning(
-                    "[rag/indexer] embedding failed for %s: %s — storing without vectors",
-                    path.name, exc,
+                    "[rag/indexer] [%s] embedding failed for %s: %s — BM25 only",
+                    self._databank.name, path_str, exc,
                 )
 
-        # Atomically replace old data for this file
         self._store.delete_file(path_str)
         self._store.upsert_file(path_str, content_hash, self._embedding_model, mtime)
         self._store.insert_chunks(path_str, chunks, embeddings)
@@ -142,8 +157,8 @@ class MemoryIndexer:
 
         vec_status = f"{len(embeddings)} vectors" if embeddings is not None else "no vectors (BM25 only)"
         logger.info(
-            "[rag/indexer] indexed %s — %d chunk(s), %s",
-            path.name, len(chunks), vec_status,
+            "[rag/indexer] [%s] indexed %s — %d chunk(s), %s",
+            self._databank.name, Path(path_str).name, len(chunks), vec_status,
         )
 
 
