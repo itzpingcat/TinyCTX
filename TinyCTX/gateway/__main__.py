@@ -1,5 +1,5 @@
-"""
-gateway/__main__.py — HTTP/SSE API gateway (lane-based, node_id-keyed).
+"""                                                                         
+gateway/__main__.py — HTTP/SSE API gateway (runtime-backed, node_id-keyed).
 
 All endpoints except /v1/health require:
     Authorization: Bearer <api_key>
@@ -38,13 +38,12 @@ SSE event types
   {"type": "error",          "message": "..."}
   {"type": "done",           "node_id": "<new tail uuid>"}
 
-Fanout table
-------------
-The gateway maintains a per-node_id fanout table so that multiple concurrent
-SSE clients on the same node_id all receive every event. One persistent cursor
-handler is registered with the router per active node_id; it fans events out
-into per-request asyncio.Queue instances. When the last queue for a node_id
-is removed the cursor handler is unregistered.
+SSE fanout
+----------
+Runtime owns the fanout table (register_sse_handler / unregister_sse_handler).
+The gateway creates one asyncio.Queue per SSE connection and registers it with
+Runtime. Runtime fans every AgentEvent into all registered queues for a node_id.
+When the last queue for a node_id is removed, Runtime cleans up its cursor handler.
 """
 from __future__ import annotations
 
@@ -127,47 +126,17 @@ def _event_to_dict(event) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Fanout table management
+# SSE queue helpers  (Runtime owns the fanout; gateway just manages queues)
 # ---------------------------------------------------------------------------
 
-def _ensure_fanout(node_id: str, app: web.Application) -> None:
-    """Register a persistent cursor handler for node_id if not already present."""
-    fanout: dict[str, set[asyncio.Queue]] = app["fanout"]
-    router = app["router"]
-
-    if node_id in fanout:
-        return  # handler already registered
-
-    fanout[node_id] = set()
-
-    async def _handler(event) -> None:
-        payload = _event_to_dict(event)
-        if not payload:
-            return
-        is_terminal = isinstance(event, (AgentTextFinal, AgentError))
-        for q in list(fanout.get(node_id, [])):
-            await q.put(("event", payload))
-            if is_terminal:
-                await q.put(("done", event.tail_node_id))
-
-    router.register_cursor_handler(node_id, _handler)
-    logger.debug("gateway: registered fanout handler for node_id=%s", node_id)
+def _add_subscriber(node_id: str, runtime, queue: asyncio.Queue) -> None:
+    """Register queue with Runtime's fanout for node_id."""
+    runtime.register_sse_handler(node_id, queue)
 
 
-def _add_subscriber(node_id: str, app: web.Application) -> asyncio.Queue:
-    q: asyncio.Queue = asyncio.Queue()
-    app["fanout"][node_id].add(q)
-    return q
-
-
-def _remove_subscriber(node_id: str, q: asyncio.Queue, app: web.Application) -> None:
-    fanout: dict[str, set[asyncio.Queue]] = app["fanout"]
-    router = app["router"]
-    fanout.get(node_id, set()).discard(q)
-    if not fanout.get(node_id):
-        router.unregister_cursor_handler(node_id)
-        fanout.pop(node_id, None)
-        logger.debug("gateway: unregistered fanout handler for node_id=%s", node_id)
+def _remove_subscriber(node_id: str, runtime, queue: asyncio.Queue) -> None:
+    """Deregister queue from Runtime's fanout. Cleans up cursor handler when last."""
+    runtime.unregister_sse_handler(node_id, queue)
 
 
 # ---------------------------------------------------------------------------
@@ -179,8 +148,7 @@ async def handle_lane_open(request: web.Request) -> web.Response:
     Open (or no-op) a lane for node_id. If node_id is null/absent or
     unknown, create a fresh branch off DB root and return its id.
     """
-    router    = request.app["router"]
-    workspace = request.app["workspace"]
+    runtime   = request.app["runtime"]
 
     body = {}
     try:
@@ -190,18 +158,15 @@ async def handle_lane_open(request: web.Request) -> web.Response:
 
     node_id = (body.get("node_id") or "").strip() or None
 
-    from TinyCTX.db import ConversationDB
-    db = ConversationDB(workspace / "agent.db")
+    db = runtime.db
 
     if node_id and db.get_node(node_id) is not None:
-        router.open_lane(node_id, Platform.API.value)
-        logger.debug("gateway: opened existing lane node_id=%s", node_id)
+        logger.debug("gateway: lane open (existing) node_id=%s", node_id)
     else:
         root = db.get_root()
         node = db.add_node(parent_id=root.id, role="system", content="session:api")
         node_id = node.id
-        router.open_lane(node_id, Platform.API.value)
-        logger.info("gateway: created new lane node_id=%s", node_id)
+        logger.info("gateway: lane open (new) node_id=%s", node_id)
 
     return web.Response(
         content_type="application/json",
@@ -218,7 +183,7 @@ async def handle_lane_message(request: web.Request) -> web.StreamResponse:
     Push a user message for node_id and stream the reply via SSE.
     The final SSE event is {"type": "done", "node_id": "<new tail>"}.
     """
-    router    = request.app["router"]
+    runtime = request.app["runtime"]
 
     try:
         body = await request.json()
@@ -267,17 +232,24 @@ async def handle_lane_message(request: web.Request) -> web.StreamResponse:
         timestamp=time.time(),
         attachments=attachments,
         permission_level=permission_level,
+        trigger=True,
     )
 
-    # Set up fanout before pushing so no events are missed.
-    _ensure_fanout(node_id, request.app)
-    q = _add_subscriber(node_id, request.app)
+    # Register SSE queue with Runtime before pushing so no events are missed.
+    # We register against msg.tail_node_id first as a placeholder, then
+    # immediately move the registration to the new tail returned by push().
+    # push() returns the new tail node_id (the user node it writes); all
+    # cycle events are dispatched to that id, not the original tail.
+    q: asyncio.Queue = asyncio.Queue()
+    # Tentatively register so we can unregister cleanly on 429.
+    # The real registration happens after push() returns the new tail.
 
-    accepted = await router.push(msg)
-    if not accepted:
-        _remove_subscriber(node_id, q, request.app)
+    new_tail = await runtime.push(msg)
+    if not new_tail:
         raise web.HTTPTooManyRequests(content_type="application/json",
-                                      body=json.dumps({"error": "lane queue full"}))
+                                      body=json.dumps({"error": "runtime at capacity"}))
+
+    _add_subscriber(new_tail, runtime, q)
 
     # Stream SSE response.
     response = web.StreamResponse(headers={
@@ -289,26 +261,42 @@ async def handle_lane_message(request: web.Request) -> web.StreamResponse:
 
     try:
         while True:
-            kind, payload = await q.get()
-            if kind == "event":
-                try:
-                    await response.write(f"data: {json.dumps(payload)}\n\n".encode())
-                except (ConnectionResetError, Exception) as exc:
-                    logger.debug("gateway: client disconnected mid-stream for node_id=%s (%s)", node_id, exc)
-                    break
-            elif kind == "done":
-                new_tail = payload  # tail node_id from the terminal event
-                try:
+            kind, event_or_payload = await q.get()
+
+            if kind != "event":
+                continue
+
+            payload = _event_to_dict(event_or_payload)
+            if not payload:
+                continue
+
+            try:
+                await response.write(
+                    f"data: {json.dumps(payload)}\n\n".encode()
+                )
+
+                # Terminal event → emit final done frame
+                if payload["type"] in ("text_final", "error"):
+                    new_tail = event_or_payload.tail_node_id
+
                     await response.write(
                         f'data: {json.dumps({"type": "done", "node_id": new_tail})}\n\n'.encode()
                     )
-                except Exception:
-                    pass
+                    break
+
+            except (ConnectionResetError, Exception) as exc:
+                logger.debug(
+                    "gateway: client disconnected mid-stream for node_id=%s (%s)",
+                    node_id,
+                    exc,
+                )
                 break
+
     except asyncio.CancelledError:
         pass
+
     finally:
-        _remove_subscriber(node_id, q, request.app)
+        _remove_subscriber(new_tail, runtime, q)
 
     await response.write_eof()
     return response
@@ -361,7 +349,7 @@ async def handle_lane_branch(request: web.Request) -> web.Response:
 
 async def handle_lane_abort(request: web.Request) -> web.Response:
     """Abort in-flight generation for node_id. No-op if nothing is running."""
-    router = request.app["router"]
+    runtime = request.app["runtime"]
 
     body = {}
     try:
@@ -374,7 +362,7 @@ async def handle_lane_abort(request: web.Request) -> web.Response:
         raise web.HTTPBadRequest(content_type="application/json",
                                  body=json.dumps({"error": "node_id required"}))
 
-    router.abort_generation(node_id)
+    runtime.abort(node_id)
     return web.Response(status=204)
 
 
@@ -432,7 +420,7 @@ async def handle_lane_command(request: web.Request) -> web.Response:
     --------------
     { "error": "..." }   // missing field or text doesn't start with /
     """
-    router = request.app["router"]
+    runtime = request.app["runtime"]
 
     try:
         body = await request.json()
@@ -453,25 +441,17 @@ async def handle_lane_command(request: web.Request) -> web.Response:
         raise web.HTTPBadRequest(content_type="application/json",
                                  body=json.dumps({"error": "text must start with /"}))
 
-    # Build the context dict that command handlers expect.
     console = _StringConsole()
-
-    # Resolve the agent attached to this lane (if open) so handlers that
-    # need agent._db / agent.context work correctly.
-    lane = router._lane_router._lanes.get(node_id)
-    agent = lane.loop if lane is not None else None
 
     context: dict = {
         "node_id":   node_id,
         "console":   console,
-        "gateway":   router,
-        "agent":     agent,
-        # Neutral theme_c — returns empty string for all keys so handlers
-        # that call c("tool_ok") etc. get plain text from _StringConsole.
+        "runtime":   runtime,
+        "agent":     None,   # no per-lane agent in new arch
         "theme_c":   lambda _k: "",
     }
 
-    handled = await router.commands.dispatch(text, context)
+    handled = await runtime.commands.dispatch(text, context)
     output  = console.get_output()
 
     logger.info(
@@ -502,8 +482,8 @@ async def handle_commands_list(request: web.Request) -> web.Response:
         ]
     }
     """
-    router = request.app["router"]
-    rows = router.commands.list_commands()
+    runtime = request.app["runtime"]
+    rows = runtime.commands.list_commands()
     return web.Response(
         content_type="application/json",
         body=json.dumps({"commands": [{"command": cmd, "help": hlp} for cmd, hlp in rows]}),
@@ -609,15 +589,14 @@ async def handle_health(request: web.Request) -> web.Response:
 # App factory + entrypoint
 # ---------------------------------------------------------------------------
 
-def _make_app(router, cfg: GatewayConfig, shutdown_event: asyncio.Event) -> web.Application:
-    workspace = Path(router._config.workspace.path).expanduser().resolve()
+def _make_app(runtime, cfg: GatewayConfig, shutdown_event: asyncio.Event) -> web.Application:
+    workspace = Path(runtime.config.workspace.path).expanduser().resolve()
     workspace.mkdir(parents=True, exist_ok=True)
 
     app = web.Application(middlewares=[_auth_middleware(cfg.api_key)])
-    app["router"]         = router
+    app["runtime"]        = runtime
     app["workspace"]      = workspace
     app["start_time"]     = time.time()
-    app["fanout"]         = {}   # node_id -> set[asyncio.Queue]
     app["shutdown_event"] = shutdown_event
 
     # Lane API
@@ -643,9 +622,9 @@ def _make_app(router, cfg: GatewayConfig, shutdown_event: asyncio.Event) -> web.
     return app
 
 
-async def run(router, cfg: GatewayConfig) -> None:
+async def run(runtime, cfg: GatewayConfig) -> None:
     shutdown_event = asyncio.Event()
-    app    = _make_app(router, cfg, shutdown_event)
+    app    = _make_app(runtime, cfg, shutdown_event)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, cfg.host, cfg.port)

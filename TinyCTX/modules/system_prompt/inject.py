@@ -58,9 +58,11 @@ logger = logging.getLogger(__name__)
 _MACRO_RE = re.compile(r"\{(\w+)\}")
 
 
+# REPLACE the broken _read with:
 def _read(path: Path) -> str | None:
     """Return file text stripped of leading/trailing whitespace, or None."""
     if not path.exists():
+        logger.warning("[inject] prompt file missing or empty: %s", path)
         return None
     try:
         text = path.read_text(encoding="utf-8").strip()

@@ -3,25 +3,40 @@ import json
 import re
 
 
-def register(agent, config=None):
-    if config is None:
-        try:
-            from TinyCTX.modules.ctx_tools import EXTENSION_META
-            config = EXTENSION_META.get("default_config", {})
-        except ImportError:
-            config = {}
-    _register_dedup(agent.context, config)
-    _register_cot_strip(agent.context, config)
-    _register_trim(agent.context, config)
-    _register_tokenade(agent.context, config)
+def register_runtime(runtime) -> None:
+    """Register ctx_tools context hooks into the module registry."""
+    # ctx_tools only registers context hooks — no singletons, no tools.
+    # Nothing to do at runtime level; all wiring happens per-cycle.
+    pass
+
+
+def register_agent(cycle) -> None:
+    """Wire ctx_tools context hooks into this AgentCycle's context."""
+    try:
+        from TinyCTX.modules.ctx_tools import EXTENSION_META
+        config = EXTENSION_META.get("default_config", {})
+    except ImportError:
+        config = {}
+    _register_dedup(cycle.context, config)
+    _register_cot_strip(cycle.context, config)
+    _register_trim(cycle.context, config)
+    _register_tokenade(cycle.context, config)
+
+
+def register(runtime, config=None):
+    """Legacy shim."""
+    from TinyCTX.runtime import Runtime as _Runtime
+    if isinstance(runtime, _Runtime):
+        register_runtime(runtime)
+    else:
+        # Called with a cycle-like object
+        register_agent(runtime)
 
 
 def _register_dedup(context, config):
     dedup_after = config.get("same_call_dedup_after", 3)
 
-    # Maps suppressed entry index -> True (for tool result turns)
     suppressed_tool:  set[int] = set()
-    # Maps suppressed tool_call id -> True (for assistant tool_calls list)
     suppressed_calls: set[str] = set()
 
     def pre_assemble(ctx):
@@ -31,18 +46,12 @@ def _register_dedup(context, config):
         dialogue = ctx.dialogue
         n = len(dialogue)
 
-        # Build call_map from ALL assistant turns unconditionally.
-        # Keyed by tool_call id -> tool_call dict.
         call_map: dict[str, dict] = {}
         for entry in dialogue:
             for tc in entry.tool_calls:
                 call_map[tc["id"]] = tc
 
-        # Walk newest-to-oldest. First time we see a sig = canonical (keep).
-        # Subsequent occurrences beyond dedup_after turns = suppress.
-        # "age" here is the number of tool-result turns seen with the same sig
-        # before this one, i.e. how many newer copies already exist.
-        sig_last_seen: dict[str, int] = {}  # sig -> index of most recent occurrence
+        sig_last_seen: dict[str, int] = {}
 
         for i in reversed(range(n)):
             entry = dialogue[i]
@@ -50,19 +59,15 @@ def _register_dedup(context, config):
                 continue
             tc = call_map.get(entry.tool_call_id)
             if not tc:
-                # Orphaned tool result — its paired assistant call is missing.
-                # Suppress it so the model never sees a dangling result.
                 suppressed_tool.add(i)
                 continue
             sig = tc["name"] + "::" + json.dumps(tc["arguments"], sort_keys=True)
             if sig in sig_last_seen:
-                # A newer copy already exists; suppress this older one if it's
-                # far enough back (distance measured in dialogue entries).
                 distance = sig_last_seen[sig] - i
                 if distance > dedup_after:
                     suppressed_tool.add(i)
                     suppressed_calls.add(tc["id"])
-                    continue  # don't update sig_last_seen — newer copy stays canonical
+                    continue
             sig_last_seen[sig] = i
 
     def filter_turn(entry, age, ctx):
@@ -87,18 +92,11 @@ def _register_dedup(context, config):
     context.register_hook("transform_turn", transform_turn, priority=0)
 
 
-# ---------------------------------------------------------------------------
-# CoT strip — removes <think>…</think> from assistant turns
-# ---------------------------------------------------------------------------
-
-# Matches <think>…</think> (case-insensitive, dotall so newlines are included).
 _COT_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
 
 
 def _strip_cot(text: str) -> str:
-    """Remove all <think>…</think> blocks and collapse leftover blank lines."""
     stripped = _COT_RE.sub("", text)
-    # Collapse runs of 3+ newlines down to 2 (one blank line).
     stripped = re.sub(r"\n{3,}", "\n\n", stripped)
     return stripped.strip()
 
@@ -106,11 +104,6 @@ def _strip_cot(text: str) -> str:
 def _register_cot_strip(context, config):
     keep_recent = int(config.get("cot_keep_recent_turns", 0))
 
-    # We need to count only assistant turns, not all turns.
-    # age (passed by context) is turns-since-this-entry in the full dialogue,
-    # so we track assistant-turn age ourselves via a pre_assemble hook that
-    # builds a lookup: entry.index -> assistant_age
-    # (0 = most recent assistant turn, 1 = second most recent, …)
     assistant_age: dict[int, int] = {}
 
     def pre_assemble(ctx):
@@ -129,14 +122,13 @@ def _register_cot_strip(context, config):
 
         a_age = assistant_age.get(entry.index, 0)
         if a_age < keep_recent:
-            return None  # within the protected window — leave intact
+            return None
 
         new_content = _strip_cot(entry.content)
         if new_content == entry.content:
-            return None  # nothing to strip
+            return None
         return _copy(entry, content=new_content)
 
-    # priority=5 — after dedup (0), before trim (10)
     context.register_hook("pre_assemble",   pre_assemble,   priority=5)
     context.register_hook("transform_turn", transform_turn, priority=5)
 
@@ -146,9 +138,6 @@ def _register_trim(context, config):
     truncate_after = config.get("tool_output_truncate_after", 2)
     max_chars      = config.get("max_tool_output_chars", 2000)
 
-    # tool_call ids whose results are being hard-trimmed (not just truncated).
-    # Populated by pre_assemble, consumed by transform_turn to strip the
-    # matching tool_call from its assistant turn so no dangling calls remain.
     trimmed_calls: set[str] = set()
 
     def pre_assemble(ctx):
@@ -156,7 +145,6 @@ def _register_trim(context, config):
         dialogue = ctx.dialogue
         n = len(dialogue)
 
-        # Build call_map so we can look up the tool_call id from a tool result.
         call_map: dict[str, dict] = {}
         for entry in dialogue:
             for tc in entry.tool_calls:
@@ -168,13 +156,10 @@ def _register_trim(context, config):
                 continue
             age = n - 1 - i
             if age > trim_after:
-                # This result will be replaced with a stub — record the call id
-                # so the assistant turn gets its tool_call stripped too.
                 trimmed_calls.add(entry.tool_call_id)
 
     def transform_turn(entry, age, ctx):
         if entry.role == "assistant":
-            # Strip tool_calls whose results have been hard-trimmed.
             if not trimmed_calls:
                 return None
             surviving = [
@@ -205,30 +190,17 @@ def _register_trim(context, config):
 
         return None
 
-    # pre_assemble at priority=8 — after dedup (0) and CoT strip (5),
-    # before the transform (10) that actually rewrites the entries.
     context.register_hook("pre_assemble",   pre_assemble,   priority=8)
     context.register_hook("transform_turn", transform_turn, priority=10)
 
 
 def _register_tokenade(context, config):
-    """
-    Tokenade defense: replace any turn whose content exceeds `tokenade_threshold`
-    tokens with a stub message. Runs as a transform_turn hook at priority 1
-    (before dedup/trim) so oversized content never reaches the LLM.
-
-    The threshold is compared against the raw token count of the turn's text
-    content only (tool_calls JSON is not counted — those are structured and
-    bounded by the model). Only user and assistant text content is checked;
-    tool results are also checked since they are a common injection vector.
-    """
     import logging
     import tiktoken
 
     threshold = int(config.get("tokenade_threshold", 20000))
-    logger = logging.getLogger(__name__)
+    _logger = logging.getLogger(__name__)
 
-    # Reuse the same encoder strategy as context.py
     _enc = None
 
     def _get_enc():
@@ -247,13 +219,11 @@ def _register_tokenade(context, config):
         return len(enc.encode(text, disallowed_special=()))
 
     def transform_turn(entry, age, ctx):
-        # Only inspect roles that carry free-form user-supplied text.
         if entry.role not in ("user", "assistant", "tool"):
             return None
 
         content = entry.content
         if isinstance(content, list):
-            # Attachment block list — concatenate text parts for counting.
             text_parts = [
                 b.get("text", "") for b in content
                 if isinstance(b, dict) and b.get("type") == "text"
@@ -266,20 +236,17 @@ def _register_tokenade(context, config):
         if count < threshold:
             return None
 
-        logger.warning(
+        _logger.warning(
             "[tokenade] blocked turn (role=%s, index=%d, ~%d tokens > threshold %d)",
             entry.role, entry.index, count, threshold,
         )
         stub = f"[Suspected Tokenade Blocked. Blocked ~{count} tokens.]"
         return _copy(entry, content=stub, tool_calls=[])
 
-    # priority=1 — runs immediately after dedup pre_assemble (0) resolves
-    # suppressed sets, but before CoT strip (5) and trim (10).
     context.register_hook("transform_turn", transform_turn, priority=1)
 
 
 def _copy(entry, **overrides):
-    """Return a shallow copy of a HistoryEntry with fields overridden."""
     from TinyCTX.context import HistoryEntry
     return HistoryEntry(
         role=overrides.get("role", entry.role),

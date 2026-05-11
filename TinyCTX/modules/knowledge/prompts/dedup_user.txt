@@ -1,0 +1,25 @@
+You are comparing two knowledge graph nodes to decide if they represent
+the same real-world thing.
+
+Node A:
+  uuid: {uuid_a}
+  name: {name_a}
+  type: {type_a}
+  description: {desc_a}
+
+Node B:
+  uuid: {uuid_b}
+  name: {name_b}
+  type: {type_b}
+  description: {desc_b}
+
+Respond with ONLY a JSON object (no markdown fences):
+{
+  "verdict": "duplicate" | "alias" | "distinct",
+  "canonical_uuid": "<uuid of node to keep — required unless distinct>",
+  "merged_description": "<consolidated description — required unless distinct>"
+}
+
+duplicate = same real-world entity (merge into one node).
+alias = different names for the same underlying thing (keep both, add ALIASED_TO edge).
+distinct = genuinely different entities.

@@ -1,627 +1,308 @@
-"""
-agent.py — The 6-stage agent execution loop.
-One instance per session, owned by its Lane.
-Yields AgentEvent objects; never calls the gateway directly.
-
-Stages:
-  1. Intake           — add user message to Context  (skipped when msg is None)
-  2. Context Assembly — await async hooks, then build message list via Context.assemble()
-  3. Inference        — stream LLM, collect text + tool calls
-  4. Tool Execution   — dispatch ToolCalls via tool_handler
-  5. Result Backfill  — inject ToolResults back into Context
-  6. Streaming Reply  — yield AgentEvent objects to Lane
-
-Streaming behaviour:
-  Tool-call cycles buffer text. The final cycle streams AgentTextChunk events
-  live with a closing AgentTextFinal. Tool-use cycles yield AgentToolCall /
-  AgentToolResult so bridges can display tool activity live.
-
-Abort:
-  Lane passes its abort_event to run(). The loop checks it between every
-  inference cycle and inside the LLM stream. If set, yields AgentError and
-  exits cleanly.
-
-Tree refactor (Phase 2):
-  AgentLoop is initialised with tail_node_id (str cursor) instead of
-  session_key. The cursor points at the DB branch this agent is running on.
-  All context.add() calls write immediately to the DB; cursor is kept in sync
-  on disk after every node write.
-
-Background branches (Phase 3):
-  Modules register post-turn hooks via register_background_hook(fn). After
-  AgentTextFinal is yielded, each hook receives the current tail_node_id and
-  the agent's config. Hooks run as detached asyncio tasks — they must not
-  block the caller. The canonical use is memory consolidation: create an
-  opening node off the current tail via db.add_node(), construct a new
-  AgentLoop pointing at it, and run it to completion.
-
-  run_background(tail_node_id, config) — module-level helper that fires a
-  standalone AgentLoop in a detached task and discards all events.
-
-Model pool:
-  All named chat models from config.models are pre-instantiated.
-  Inference walks primary → fallback list per config.llm.fallback_on.
-  Modules call agent.get_model(name) to get a named LLM instance.
-
-Module loading:
-  Scans modules/ for packages exposing register(agent). No hardcoding.
-"""
-
 from __future__ import annotations
 
 import asyncio
-import importlib
-import json
 import logging
-import re
 import uuid
 from pathlib import Path
-from typing import AsyncIterator, Callable, Awaitable
+from typing import AsyncIterator
 
 from TinyCTX.contracts import (
-    InboundMessage, AgentEvent,
-    AgentThinkingChunk, AgentTextChunk, AgentTextFinal, AgentToolCall, AgentToolResult, AgentError,
-    ToolCall, ToolResult, IMAGE_BLOCK_PREFIX,
+    AgentError, AgentEvent, AgentTextChunk, AgentTextFinal,
+    AgentThinkingChunk, AgentToolCall, AgentToolResult,
+    ToolCall, ToolResult, IMAGE_BLOCK_PREFIX
 )
 from TinyCTX.context import Context, HistoryEntry, HOOK_PRE_ASSEMBLE_ASYNC
-from TinyCTX.config import Config, ModelConfig
 from TinyCTX.ai import LLM, TextDelta, ThinkingDelta, ToolCallAssembled, LLMError
 from TinyCTX.utils.tool_handler import ToolCallHandler
-from TinyCTX.utils.attachments import build_content_blocks
-from TinyCTX.utils.commands import CommandRegistry
-from TinyCTX.db import ConversationDB
 
 logger = logging.getLogger(__name__)
 
-MODULES_DIR = Path(__file__).parent / "modules"
-_EXIT_ERROR_RE = re.compile(r"(^|\n)\[exit \d+\](?=\n|$)")
-
-def _looks_like_failed_tool_output(output: str) -> bool:
-    lowered = (output or "").lstrip().lower()
-    if lowered.startswith("[error") or lowered.startswith("[blocked") or lowered.startswith("error:"):
-        return True
-    return bool(_EXIT_ERROR_RE.search(output or ""))
-
-
-def _build_llm(cfg: ModelConfig) -> LLM:
-    try:
-        api_key = cfg.api_key
-    except EnvironmentError:
-        api_key = "no-key"
-    return LLM(
-        base_url=cfg.base_url,
-        api_key=api_key,
-        model=cfg.model,
-        max_tokens=cfg.max_tokens,
-        temperature=cfg.temperature,
-        budget_tokens=cfg.budget_tokens,
-        reasoning_effort=cfg.reasoning_effort,
-        cache_prompts=cfg.cache_prompts,
-    )
-
-
-async def run_background(tail_node_id: str, config: Config) -> None:
+class AgentCycle:
     """
-    Run a standalone AgentLoop on tail_node_id as a synthetic turn, discarding
-    all events. Called as a detached asyncio task — never awaited by the caller.
-
-    Usage (from a background hook):
-        opening = db.add_node(parent_id=current_tail, role="user", content="...")
-        asyncio.create_task(run_background(opening.id, agent.config))
+    A single execution turn. 
+    Initializes with core config, but waits until .run() to load DB and state.
     """
-    try:
-        loop = AgentLoop(tail_node_id=tail_node_id, config=config, is_subagent=True)
-        async for _ in loop.run(msg=None):
-            pass  # events discarded
-    except Exception:
-        logger.exception("[background] AgentLoop on tail=%s raised", tail_node_id)
 
+    def __init__(self, config, module_registry) -> None:
+        self.config = config
+        self.module_registry = module_registry
+        self.trace_id = str(uuid.uuid4())
+        
+        # Post-turn hooks registered by modules via register_agent.
+        # Called by runtime after run() completes, with the final tail_node_id.
+        # Signature: async (tail_node_id: str) -> None
+        self.post_turn_hooks: list = []
 
-class AgentLoop:
-    def __init__(self, tail_node_id: str, config: Config, *, is_subagent: bool = False) -> None:
-        self.tail_node_id  = tail_node_id  # cursor — the DB node this agent runs from
-        self.lane_node_id  = tail_node_id  # original lane key — never changes
-        self.config        = config
-        self.is_subagent   = is_subagent
-        self.permission_level: int = 100 if is_subagent else 25  # overridden per-turn by Lane._drain
-        primary_mc         = config.models.get(config.llm.primary)
-        self.context       = Context(
-            token_limit=config.context,
-            image_tokens_per_block=primary_mc.tokens_per_image if primary_mc else 280,
-        )
-        self.tool_handler  = ToolCallHandler()
-        self.commands      = CommandRegistry()  # replaced by Lane with the shared router registry
-        self._turn_count   = 0
-        self.gateway       = None  # set by Lane after construction
-
-        # Open the shared agent.db and wire the cursor in.
-        self._db           = self._open_db()
-        self._tail_node_id = tail_node_id
-        self.context.set_db(self._db)
-        self.context.set_tail(self._tail_node_id)
-        self.context.set_cursor_callback(self._on_context_tail_advance)
-
-        # Background hooks: called after AgentTextFinal with (tail_node_id, config).
-        self._background_hooks: list[Callable[[str, Config], Awaitable[None]]] = []
-
-        self._models: dict[str, LLM] = {
-            name: _build_llm(mc)
-            for name, mc in config.models.items()
-            if not mc.is_embedding
-        }
-
-        self.tool_handler.register_tool(self.tool_handler.tools_search, always_on=True)
-        # NOTE: _load_modules() is NOT called here. Lane.__post_init__ wires
-        # self.commands = router.commands first, then calls load_modules() so
-        # modules register their commands into the shared registry.
-        # Exception: subagent loops (background branches) have no Lane and
-        # don't need commands — they load modules immediately.
-        if is_subagent:
-            self.load_modules()
-
-    # ------------------------------------------------------------------
-    # DB
-    # ------------------------------------------------------------------
-
-    def _open_db(self) -> ConversationDB:
-        """Open (or create) agent.db in the workspace directory."""
-        workspace = Path(self.config.workspace.path).expanduser().resolve()
-        workspace.mkdir(parents=True, exist_ok=True)
-        return ConversationDB(workspace / "agent.db")
-
-    def _on_context_tail_advance(self) -> None:
-        """
-        Called by Context.add() each time the tail node advances.
-        Keeps _tail_node_id in sync with the context so callers reading
-        agent._tail_node_id always see the latest cursor.
-        """
-        self._tail_node_id = self.context.tail_node_id
-        # Propagate the updated cursor back to the public attribute.
-        self.tail_node_id  = self._tail_node_id
-
-    # ------------------------------------------------------------------
-    # Public model accessor (for modules)
-    # ------------------------------------------------------------------
-
-    def get_model(self, name: str) -> LLM:
-        if name in self._models:
-            return self._models[name]
-        primary = self.config.llm.primary
-        logger.warning("get_model('%s') — not found, falling back to primary '%s'", name, primary)
-        return self._models[primary]
-
-    # ------------------------------------------------------------------
-    # Background hook registry (Phase 3)
-    # ------------------------------------------------------------------
-
-    def register_background_hook(
-        self, fn: Callable[[str, Config], Awaitable[None]]
-    ) -> None:
-        """Register an async hook called after each turn with (tail_node_id, config)."""
-        self._background_hooks.append(fn)
-
-    async def _fire_background_hooks(self, tail_node_id: str) -> None:
-        """Invoke all registered background hooks after a turn completes."""
-        for fn in self._background_hooks:
-            try:
-                await fn(tail_node_id, self.config)
-            except Exception:
-                logger.exception("[background] hook '%s' raised", getattr(fn, "__name__", fn))
-
-    # ------------------------------------------------------------------
-    # Module loader
-    # ------------------------------------------------------------------
-
-    def load_modules(self) -> None:
-        """Load per_lane modules. Singleton modules are skipped — they run on the system lane only."""
-        self._load_modules_filtered(singleton=False)
-
-    def load_singleton_modules(self) -> None:
-        """Load singleton modules. Called once on the system lane at gateway startup."""
-        self._load_modules_filtered(singleton=True)
-
-    def _load_modules_filtered(self, *, singleton: bool) -> None:
-        """Load modules whose module_type matches the requested kind."""
-        target_type = "singleton" if singleton else "per_lane"
-        if not MODULES_DIR.exists():
-            return
-        for entry in sorted(MODULES_DIR.iterdir()):
-            if not entry.is_dir():
-                continue
-            if not ((entry / "__main__.py").exists() or (entry / "__init__.py").exists()):
-                continue
-            module_name = f"TinyCTX.modules.{entry.name}"
-            try:
-                for suffix in (".__main__", ""):
-                    try:
-                        mod = importlib.import_module(module_name + suffix)
-                        if hasattr(mod, "register"):
-                            break
-                    except ModuleNotFoundError:
-                        continue
-                else:
-                    logger.warning("Module '%s' has no register() — skipping", entry.name)
-                    continue
-
-                # Determine module_type from EXTENSION_META in __init__.py
-                module_type = "per_lane"  # default
-                try:
-                    init_mod = importlib.import_module(module_name)
-                    meta = getattr(init_mod, "EXTENSION_META", {})
-                    module_type = meta.get("module_type", "per_lane")
-                except Exception:
-                    pass
-
-                if module_type != target_type:
-                    continue
-
-                mod.register(self)
-                logger.info("Loaded %s module '%s'", target_type, entry.name)
-            except Exception:
-                logger.exception("Failed to load module '%s'", entry.name)
-
-    # ------------------------------------------------------------------
-    # Main entry point
-    # ------------------------------------------------------------------
+        # Resources initialized during .run()
+        self.db = None
+        self.context = None
+        self.models: dict[str, LLM] = {}
+        self.tool_handler = None
+        self.permission_level = 0
 
     async def run(
         self,
-        msg: InboundMessage | None = None,
+        node_id: str,
+        permission_level: int,
         abort_event: asyncio.Event | None = None,
     ) -> AsyncIterator[AgentEvent]:
-        """
-        Run one agent turn.
+        if abort_event is None:
+            abort_event = asyncio.Event()
 
-        msg=None  — synthetic turn: skip Stage 1, generate against current
-                    context as-is (used by PUT /v1/sessions/{id}/generation).
-        msg=<msg> — normal turn: add user message to context, then generate.
+        self.permission_level = permission_level
 
-        After AgentTextFinal is yielded, any registered background hooks are
-        fired (Phase 3). Synthetic turns do not trigger background hooks —
-        they are themselves background work and should not spawn further
-        background branches.
-        """
-        self._turn_count += 1
-        is_synthetic = msg is None
-        logger.debug("[cursor=%s] turn %d (synthetic=%s)", self._tail_node_id, self._turn_count, is_synthetic)
+        # --- 1. Resource Setup (Lazy Loading) ---
+        if not self.db:
+            from TinyCTX.db import ConversationDB
+            workspace = Path(self.config.workspace.path).expanduser().resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            self.db = ConversationDB(workspace / "agent.db")
 
-        if msg is not None:
-            trace_id = msg.trace_id
-            msg_id   = msg.message_id
-        else:
-            trace_id = str(uuid.uuid4())
-            msg_id   = "synthetic"
+        # Load session state (model choice, enabled tools, etc.)
+        state, _ = self.db.load_session_state(node_id)
+        
+        # Build LLMs based on primary + fallbacks
+        primary_name = state.get("model") or self.config.llm.primary
+        model_chain = [primary_name] + list(self.config.llm.fallback)
+        
+        self.models = {
+            name: self._build_llm(self.config.models[name])
+            for name in model_chain if name in self.config.models
+        }
 
-        ev = dict(
-            tail_node_id=self._tail_node_id,
-            lane_node_id=self.lane_node_id,
-            trace_id=trace_id,
-            reply_to_message_id=msg_id,
+        # Build Tools
+        self.tool_handler = ToolCallHandler()
+        self.tool_handler.register_tool(self.tool_handler.tools_search, always_on=True)
+        enabled_tools = state.get("enabled_tools")
+        if enabled_tools:
+            for t in enabled_tools:
+                if t in self.tool_handler.tools:
+                    self.tool_handler.enabled.add(t)
+
+        # Build Context
+        primary_mc = self.config.models.get(primary_name)
+        self.context = Context(
+            db=self.db,
+            tail_node_id=node_id,
+            token_limit=self.config.context,
+            image_tokens_per_block=getattr(primary_mc, "tokens_per_image", 280),
         )
 
-        # Stage 1: Intake (skipped for synthetic turns)
-        if msg is not None:
-            # Persist message metadata in context.state so modules (e.g. equipment_manifest)
-            # can detect platform, DM vs group, etc. without importing bridge contracts.
-            # These are set on every turn so state always reflects the current lane's identity.
-            self.context.state["platform"]    = msg.author.platform.value
-            self.context.state["author_name"] = msg.author.username
-            self.context.state["author_id"]   = msg.author.user_id
-            if msg.group_policy is not None:
-                self.context.state["group_policy"] = msg.group_policy
-            else:
-                # Ensure key is absent for DM lanes (e.g. after a reset).
-                self.context.state.pop("group_policy", None)
-            # Server/channel identity — stable for the lifetime of a lane, safe
-            # to use in the cached EM.md block.  Absent for DMs and CLI.
-            if msg.server_name is not None:
-                self.context.state["server_name"] = msg.server_name
-            else:
-                self.context.state.pop("server_name", None)
-            if msg.channel_name is not None:
-                self.context.state["channel_name"] = msg.channel_name
-            else:
-                self.context.state.pop("channel_name", None)
-            if msg.attachments:
-                primary_cfg  = self.config.get_model_config(self.config.llm.primary)
-                user_content = build_content_blocks(
-                    text=msg.text,
-                    attachments=msg.attachments,
-                    model_cfg=primary_cfg,
-                    att_cfg=self.config.attachments,
-                    workspace=self.config.workspace.path,
-                )
-            else:
-                # Always treat msg.text as a plain string — never deserialise it.
-                # Users can paste arbitrary JSON (eval fixtures, config blobs, etc.)
-                # and we must not let it silently become a list of content blocks,
-                # which would produce unsupported content[].type errors at inference.
-                user_content = str(msg.text) if msg.text is not None else ""
-            self.context.add(HistoryEntry.user(user_content))
+        # Wire modules into this cycle turn
+        self.module_registry.register_agent(self)
 
-        max_cycles       = self.config.max_tool_cycles
-        final_text       = ""
+        # --- 2. Generation Loop ---
+        # Tracker for metadata yielded in events
+        meta = {
+            "trace_id": self.trace_id,
+            "reply_to_message_id": "synthetic",
+            "tail_node_id": node_id
+        }
+
+        max_cycles = self.config.max_tool_cycles
+        final_text = ""
         streaming_active = False
 
-        for cycle in range(max_cycles):
-            # Abort check between cycles
-            if abort_event and abort_event.is_set():
-                logger.info("[%s] aborted before cycle %d", self._tail_node_id, cycle)
-                yield AgentError(message="[generation aborted]", **{**ev, "tail_node_id": self._tail_node_id})
+        for cycle_num in range(max_cycles):
+            logger.debug("[agent] cycle %d, node %s", cycle_num + 1, node_id)
+            if abort_event.is_set():
+                yield AgentError(message="[aborted]", **meta)
                 return
 
-            # Stage 2: Context Assembly
+            # Context Assembly
+            logger.debug("[agent] running async hooks")
             await self.context.run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC)
-            minimal_tokens = self.config.permissions.minimal_tokens
-            tools    = self.tool_handler.get_tool_definitions(
+            tools = self.tool_handler.get_tool_definitions(
                 caller_level=self.permission_level,
-                minimal_tokens=minimal_tokens,
+                minimal_tokens=self.config.permissions.minimal_tokens,
             ) or None
-            messages = self.context.assemble(tools=tools)
+            messages, _ = self.context.assemble(tools=tools)
+            logger.debug("[agent] assembled %d messages, starting inference", len(messages))
 
-            # Token budget telemetry
-            tokens_used = int(self.context.state.get("tokens_used_pre_trim", 0) or 0)
-            active_tokens = int(self.context.state.get("tokens_used", 0) or 0)
-            token_limit = self.config.context
-            token_pct   = tokens_used / token_limit if token_limit else 0
-            if token_pct >= 0.80:
-                logger.info(
-                    "[cursor=%s] context at %.0f%% of token budget (%d/%d, active=%d)",
-                    self._tail_node_id, token_pct * 100, tokens_used, token_limit, active_tokens,
-                )
+            # Inference with Fallback logic
+            text_chunks, tool_calls_list, error = [], [], None
+            async for _ev in self._stream_inference(messages, tools, model_chain, abort_event, meta):
+                if isinstance(_ev, tuple):
+                    # sentinel: (_chunks, _calls, _error)
+                    text_chunks, tool_calls_list, error = _ev
+                    # logger.debug("[agent] inference done — chunks=%d tools=%d error=%s", len(text_chunks), len(tool_calls_list), error)
+                elif isinstance(_ev, AgentThinkingChunk):
+                    # logger.debug("[agent] thinking chunk (%d chars)", len(_ev.text))
+                    yield AgentThinkingChunk(text=_ev.text, **meta)
+                elif isinstance(_ev, AgentTextChunk):
+                    # logger.debug("[agent] text chunk (%d chars)", len(_ev.text))
+                    streaming_active = True
+                    yield AgentTextChunk(text=_ev.text, **meta)
 
-            # Stage 3: Inference — walk primary → fallback chain
-            text_chunks:      list[str]      = []
-            tool_calls:       list[ToolCall] = []
-            error:            str | None     = None
-            streaming_active                 = False
-            last_http_status: int | None     = None
-
-            model_chain = [self.config.llm.primary] + list(self.config.llm.fallback)
-
-            for model_name in model_chain:
-                llm              = self._models[model_name]
-                text_chunks      = []
-                tool_calls       = []
-                error            = None
-                streaming_active = False
-                last_http_status = None
-
-                async for llm_event in llm.stream(messages, tools=tools):
-                    if abort_event and abort_event.is_set():
-                        logger.info("[%s] aborted mid-stream", self._tail_node_id)
-                        yield AgentError(message="[generation aborted]", **{**ev, "tail_node_id": self._tail_node_id})
-                        return
-
-                    if isinstance(llm_event, ThinkingDelta):
-                        yield AgentThinkingChunk(text=llm_event.text, **ev)
-
-                    elif isinstance(llm_event, TextDelta):
-                        text_chunks.append(llm_event.text)
-                        if not tool_calls:
-                            streaming_active = True
-                            yield AgentTextChunk(text=llm_event.text, **ev)
-
-                    elif isinstance(llm_event, ToolCallAssembled):
-                        tool_calls.append(ToolCall(
-                            call_id=llm_event.call_id,
-                            tool_name=llm_event.tool_name,
-                            args=llm_event.args,
-                        ))
-
-                    elif isinstance(llm_event, LLMError):
-                        error = llm_event.message
-                        if llm_event.message.startswith("HTTP "):
-                            try:
-                                last_http_status = int(llm_event.message.split()[1].rstrip(":"))
-                            except (IndexError, ValueError):
-                                pass
-                        break
-
-                if not error:
-                    if model_name != self.config.llm.primary:
-                        logger.info(
-                            "[cursor=%s] inference succeeded on fallback model '%s'",
-                            self._tail_node_id, model_name,
-                        )
-                        # Sync image token cost to the model that actually ran.
-                        mc = self.config.models.get(model_name)
-                        self.context.set_image_tokens(mc.tokens_per_image if mc else None)
-                    break
-
-                fo = self.config.llm.fallback_on
-                should_fallback = fo.any_error or (
-                    last_http_status is not None and last_http_status in fo.http_codes
-                )
-                if should_fallback and model_name != model_chain[-1]:
-                    logger.warning(
-                        "[cursor=%s] model '%s' failed (%s) — trying next fallback",
-                        self._tail_node_id, model_name, error,
-                    )
-                    continue
-                break
-
+            logger.debug("[agent] post-inference: error=%s tool_calls=%d", error, len(tool_calls_list))
             if error:
-                logger.error("[cursor=%s] LLM error (all models exhausted): %s", self._tail_node_id, error)
-                yield AgentError(message=f"[LLM error: {error}]", **{**ev, "tail_node_id": self._tail_node_id})
+                yield AgentError(message=f"[LLM error: {error}]", **meta)
                 return
 
+            # Record Assistant response in Context
             response_text = "".join(text_chunks)
             self.context.add(HistoryEntry.assistant(
                 content=response_text,
-                tool_calls=tool_calls if tool_calls else None,
+                tool_calls=tool_calls_list or None,
             ))
+            meta["tail_node_id"] = self.context.tail_node_id
+            logger.debug("[agent] assistant node written, tail=%s", self.context.tail_node_id)
 
-            if not tool_calls:
+            if not tool_calls_list:
                 final_text = response_text
+                logger.debug("[agent] no tool calls, breaking loop")
                 break
 
-            # Stages 4 & 5: Tool execution + result backfill
-            logger.debug("[%s] cycle %d — %d tool call(s)", self._tail_node_id, cycle, len(tool_calls))
-
-            # On the last allowed cycle, execute tools normally but override
-            # every result with the limit warning so the agent sees it and
-            # (hopefully) stops calling tools on the next inference pass.
-            # If it still calls tools after the warning the for/else exhausts
-            # and the existing force-stop path fires.
-            is_last_cycle = (cycle == max_cycles - 1)
-            if is_last_cycle:
-                logger.warning(
-                    "[cursor=%s] tool limit warning — cycle %d of %d",
-                    self._tail_node_id, cycle, max_cycles,
-                )
-
-            for tc_idx, tc in enumerate(tool_calls):
-                yield AgentToolCall(call_id=tc.call_id, tool_name=tc.tool_name, args=tc.args, **ev)
+            # Tool Execution
+            is_last_cycle = (cycle_num == max_cycles - 1)
+            for tc in tool_calls_list:
+                yield AgentToolCall(call_id=tc.call_id, tool_name=tc.tool_name, args=tc.args, **meta)
+                
                 result = await self._execute_tool(tc)
-                if is_last_cycle and tc_idx == len(tool_calls) - 1:
+                
+                if is_last_cycle:
                     result = ToolResult(
                         call_id=result.call_id,
                         tool_name=result.tool_name,
-                        output="[Tool Limit Reached] You have used the maximum number of tool calls for this turn. Do not call any more tools — write your final reply now.",
+                        output="[Tool Limit Reached] Summarize now.",
                         is_error=True,
                     )
+
                 self.context.add(HistoryEntry.tool_result(result))
-                # For image results, inject a follow-up user message with the image_url
-                # block.  OpenAI-compat servers don't support list content in tool result
-                # messages, so a synthetic user turn is a shitty but ok workaround.
-                if result.is_image:
-                    image_content = [
-                        {"type": "text",      "text": "Here is the image from the tool result:"},
-                        {"type": "image_url", "image_url": {"url": f"data:{result.image_mime};base64,{result.image_b64}"}},
-                    ]
-                    self.context.add(HistoryEntry.user(image_content))
-                # For bridge display, show a tidy label instead of raw base64.
-                display_output = f"[image: {result.image_mime}]" if result.is_image else result.output
+                meta["tail_node_id"] = self.context.tail_node_id
+                
                 yield AgentToolResult(
                     call_id=result.call_id,
                     tool_name=result.tool_name,
-                    output=display_output,
+                    output="[image]" if result.is_image else result.output,
                     is_error=result.is_error,
-                    **ev,
+                    **meta
                 )
 
-        else:
-            logger.warning("[cursor=%s] hit max_tool_cycles (%d)", self._tail_node_id, max_cycles)
-            final_text = final_text or "[Tool cycle limit reached.]"
+        logger.debug("[agent] yielding AgentTextFinal, streaming_active=%s", streaming_active)
+        # meta["tail_node_id"] is the real assistant tail — yield it as-is so
+        # bridges can advance their cursor to the correct node.
+        final_tail = meta["tail_node_id"]
+        yield AgentTextFinal(text=final_text if not streaming_active else "", **meta)
 
-        yield AgentTextFinal(
-            text=final_text if not streaming_active else "",
-            **{**ev, "tail_node_id": self._tail_node_id},
+        # Fire post-turn hooks registered by modules via register_agent.
+        for hook in self.post_turn_hooks:
+            logger.debug("[agent] running post-turn hook '%s'", getattr(hook, '__name__', hook))
+            try:
+                await hook(final_tail)
+                logger.debug("[agent] post-turn hook '%s' done", getattr(hook, '__name__', hook))
+            except Exception:
+                logger.exception("[agent] post-turn hook '%s' raised", getattr(hook, '__name__', hook))
+
+    # --- Internal Helpers ---
+
+    def _build_llm(self, mc) -> LLM:
+        return LLM(
+            base_url=mc.base_url,
+            api_key=getattr(mc, "api_key", "no-key"),
+            model=mc.model,
+            max_tokens=mc.max_tokens,
+            temperature=mc.temperature,
         )
 
-        # Fire background hooks after the turn completes.
-        # Skipped for synthetic turns — they are themselves background work.
-        if not is_synthetic and self._background_hooks:
-            await self._fire_background_hooks(self._tail_node_id)
-
-    # ------------------------------------------------------------------
-    # Background branch runner
-    # ------------------------------------------------------------------
-
-    async def run_background(self, tail_node_id: str) -> None:
+    async def _stream_inference(self, messages, tools, model_chain, abort_event, meta):
         """
-        Run a synthetic agent turn on a detached branch. Events are discarded.
-        The branch writes its own nodes into agent.db; the caller's cursor is
-        never touched.
+        Async generator that yields raw AgentTextChunk / AgentThinkingChunk events
+        (with placeholder ids — caller re-stamps them with current meta) as they
+        stream, then yields a single tuple sentinel at the end:
+            (chunks: list[str], tool_calls: list[ToolCall], error: str | None)
+        The caller unpacks the tuple to get the final result.
         """
-        logger.debug("[background] starting branch tail=%s", tail_node_id)
-        try:
-            loop = AgentLoop(tail_node_id=tail_node_id, config=self.config, is_subagent=True)
-            async for _ in loop.run(msg=None):
-                pass  # discard events
-            logger.debug("[background] branch complete tail=%s", tail_node_id)
-        except Exception:
-            logger.exception("[background] branch failed tail=%s", tail_node_id)
+        for model_name in model_chain:
+            llm = self.models[model_name]
+            chunks: list[str] = []
+            calls: list[ToolCall] = []
+            error: str | None = None
 
-    def queue_background_branch(self, tail_node_id: str) -> None:
-        """
-        Deprecated — call asyncio.create_task(run_background(node_id, config)) directly.
-        Kept temporarily so old call sites fail loudly rather than silently.
-        """
-        raise RuntimeError(
-            "queue_background_branch() is removed. "
-            "Use asyncio.create_task(run_background(node_id, agent.config)) directly."
-        )
+            async for ev in llm.stream(messages, tools=tools):
+                if abort_event.is_set():
+                    yield ([], [], "aborted")
+                    return
 
-    # ------------------------------------------------------------------
-    # Tool execution
-    # ------------------------------------------------------------------
+                if isinstance(ev, ThinkingDelta):
+                    yield AgentThinkingChunk(text=ev.text,
+                                             tail_node_id=meta["tail_node_id"],
+                                             trace_id=meta["trace_id"],
+                                             reply_to_message_id=meta["reply_to_message_id"])
+                elif isinstance(ev, TextDelta):
+                    chunks.append(ev.text)
+                    yield AgentTextChunk(text=ev.text,
+                                         tail_node_id=meta["tail_node_id"],
+                                         trace_id=meta["trace_id"],
+                                         reply_to_message_id=meta["reply_to_message_id"])
+                elif isinstance(ev, ToolCallAssembled):
+                    calls.append(ToolCall(ev.call_id, ev.tool_name, ev.args))
+                elif isinstance(ev, LLMError):
+                    error = ev.message
+                    break
 
-    async def _execute_tool(
-        self,
-        call: ToolCall
-    ) -> ToolResult:
-        cache_key = None
+            if not error:
+                yield (chunks, calls, None)
+                return
+            logger.warning("Model %s failed: %s", model_name, error)
 
+        yield ([], [], error)
+
+    async def _execute_tool(self, call: ToolCall) -> ToolResult:
         proxy = {
             "function": {"name": call.tool_name, "arguments": call.args},
             "id": call.call_id,
         }
+        
         result = await self.tool_handler.execute_tool_call(proxy, caller_level=self.permission_level)
         raw_output = str(result.get("result", result.get("error", "[no output]")))
-        is_error    = (not result.get("success", False)) or _looks_like_failed_tool_output(raw_output)
+        
+        # Determine if the tool failed based on the result flag or content analysis
+        is_error = (not result.get("success", False)) or self._looks_like_failed_tool_output(raw_output)
 
         # --- vision unwrap ---
-        # If view() returned an IMAGE_BLOCK sentinel and the primary model
-        # supports vision, stash the image data in the ToolResult so the
-        # caller (run()) can inject a follow-up user message containing the
-        # image_url block.  OpenAI-compat servers don't support list content
-        # in tool result messages, so we use a separate user turn instead.
+        # If the tool returned an IMAGE_BLOCK (e.g. from view()) and the model
+        # supports vision, stash the data in ToolResult. OpenAI-compat servers 
+        # don't support image content in tool-role messages, so we let the 
+        # higher-level run() loop inject a follow-up user turn with the image.
         if not is_error and raw_output.startswith(IMAGE_BLOCK_PREFIX):
-            payload = raw_output[len(IMAGE_BLOCK_PREFIX):]  # "mime;base64data"
-            sep = payload.index(";")
-            mime    = payload[:sep]
-            b64data = payload[sep + 1:]
+            try:
+                payload = raw_output[len(IMAGE_BLOCK_PREFIX):]  # Format: "mime;base64data"
+                sep = payload.index(";")
+                mime = payload[:sep]
+                b64data = payload[sep + 1:]
 
-            primary_cfg = self.config.get_model_config(self.config.llm.primary)
-            if primary_cfg.supports_vision:
-                tool_result = ToolResult(
-                    call_id=call.call_id,
-                    tool_name=call.tool_name,
-                    output=f"[image/{mime} — see attached image below]",
-                    is_error=False,
-                    is_image=True,
-                    image_mime=mime,
-                    image_b64=b64data,
-                )
-                return tool_result
-            else:
-                # Model doesn't support vision — return a friendly stub.
-                raw_output = (
-                    f"[Image file detected ({mime}) but the current model does not "
-                    "support vision. Use a vision-capable model to inspect this file.]"
-                )
+                primary_cfg = self.config.get_model_config(self.config.llm.primary)
+                
+                if primary_cfg.supports_vision:
+                    return ToolResult(
+                        call_id=call.call_id,
+                        tool_name=call.tool_name,
+                        output=f"[image/{mime} — see attached image below]",
+                        is_error=False,
+                        is_image=True,
+                        image_mime=mime,
+                        image_b64=b64data,
+                    )
+                else:
+                    # Fallback for non-vision models
+                    raw_output = (
+                        f"[Image file detected ({mime}) but the current model does not "
+                        "support vision. Use a vision-capable model to inspect this file.]"
+                    )
+            except (ValueError, IndexError) as e:
+                logger.error(f"[agent] Failed to parse image payload: {e}")
+                is_error = True
+                raw_output = f"Error parsing image block: {e}"
 
-        tool_result = ToolResult(
+        return ToolResult(
             call_id=call.call_id,
             tool_name=call.tool_name,
             output=raw_output,
             is_error=is_error,
         )
-        return tool_result
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
-
-    def reset(self, rewind_to: str | None = None) -> None:
-        """
-        Clear in-memory context and rewind the cursor.
-
-        rewind_to: node_id to rewind the cursor to (e.g. the original lane
-                   anchor). If None, rewinds to lane_node_id (the node this
-                   AgentLoop was opened with). Does NOT touch agent.db — the
-                   tree is permanent; history is simply re-walked from the
-                   rewound cursor on the next assemble().
-        """
-        target = rewind_to if rewind_to is not None else self.lane_node_id
-        self.context.clear()
-        self._tail_node_id = target
-        self.tail_node_id  = target
-        self.context.set_tail(target)
-        self._turn_count = 0
-        logger.info(
-            "[cursor=%s] reset — rewound to %s",
-            target, target,
-        )
+    def _looks_like_failed_tool_output(self, text: str) -> bool:
+        """Helper to catch common error strings in stdout."""
+        lowered = text.lower()
+        return any(x in lowered for x in ["traceback (most recent call last):", "exception: ", "error: "])

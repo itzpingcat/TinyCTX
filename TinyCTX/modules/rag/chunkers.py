@@ -1,5 +1,5 @@
 """
-modules/memory/chunkers.py
+modules/rag/chunkers.py
 
 Pluggable chunking strategies for memory file indexing.
 
@@ -205,10 +205,10 @@ class MarkdownChunker:
 
 # name -> (class, default kwargs)
 _REGISTRY: dict[str, tuple[type, dict]] = {
-    "tokens":    (TokenChunker,    {"chunk_tokens": 256,  "overlap_tokens": 32}),
-    "chars":     (CharChunker,     {"chunk_size": 800,    "overlap": 100}),
-    "delimiter": (DelimiterChunker, {"delimiter": "\n\n", "strip": True}),
-    "markdown":  (MarkdownChunker, {"min_chunk_chars": 100}),
+    "tokens":    (TokenChunker,     {"chunk_tokens": 256,  "overlap_tokens": 32}),
+    "chars":     (CharChunker,      {"chunk_size": 800,    "overlap": 100}),
+    "delimiter": (DelimiterChunker, {"delimiter": "\n\n",  "strip": True}),
+    "markdown":  (MarkdownChunker,  {"min_chunk_chars": 100}),
 }
 
 

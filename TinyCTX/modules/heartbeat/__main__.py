@@ -27,7 +27,7 @@ outside the allowed window.
 Slash command:
   /heartbeat run  — fire one tick immediately (replaces /debug heartbeat)
 
-Convention: register(agent) — no imports from gateway or bridges.
+Convention: register_agent(agent) — no imports from gateway or bridges.
 """
 from __future__ import annotations
 
@@ -38,8 +38,8 @@ from datetime import datetime, time as dtime
 from pathlib import Path
 
 from TinyCTX.contracts import (
-    InboundMessage, ContentType,
-    UserIdentity, Platform,
+    InboundMessage, ContentType, UserIdentity, Platform,
+    AgentTextChunk, AgentTextFinal, AgentError
 )
 
 logger = logging.getLogger(__name__)
@@ -53,270 +53,146 @@ _HEARTBEAT_AUTHOR  = UserIdentity(
 _TOKEN = "HEARTBEAT_OK"
 
 
+class _HeartbeatRunner:
+    def __init__(self, runtime, cfg: dict) -> None:
+        self.runtime = runtime
+        self.cfg = cfg
+        self.interval_secs = int(cfg.get("every_minutes", 30)) * 60
+        self.cursor_node_id: str | None = None
+        self._running = False
+
+    def start(self):
+        if self.interval_secs <= 0: return
+        self._running = True
+        asyncio.create_task(self._loop())
+
+    async def _loop(self):
+        # Initial delay to let the system stabilize
+        await asyncio.sleep(10) 
+        
+        while self._running:
+            if self._in_active_window():
+                try:
+                    await self._tick()
+                except Exception:
+                    logger.exception("[heartbeat] tick failed")
+            
+            await asyncio.sleep(self.interval_secs)
+
+    async def _tick(self):
+        # 1. Determine starting cursor
+        if not self.cursor_node_id:
+            self.cursor_node_id = self.runtime.db.get_root().id
+
+        # 2. Continuation loop
+        current_prompt = self.cfg.get("prompt", "Read HEARTBEAT.md if it exists. If nothing needs attention, reply HEARTBEAT_OK.")
+
+        for _turn in range(int(self.cfg.get("max_continuations", 5))):
+            msg = InboundMessage(
+                tail_node_id=self.cursor_node_id,
+                author=_HEARTBEAT_AUTHOR,
+                content_type=ContentType.TEXT,
+                text=current_prompt,
+                message_id=f"heartbeat-{time.time()}",
+                timestamp=time.time(),
+                trigger=True,
+            )
+
+            reply_queue: asyncio.Queue = asyncio.Queue()
+            new_node_id = await self.runtime.push(msg, reply_queue=reply_queue)
+
+            full_text: list[str] = []
+            final_tail: str | None = None
+            timed_out = False
+
+            try:
+                while True:
+                    try:
+                        event = await asyncio.wait_for(reply_queue.get(), timeout=120)
+                    except asyncio.TimeoutError:
+                        logger.warning("[heartbeat] turn timed out")
+                        timed_out = True
+                        break
+
+                    if event is None:  # sentinel
+                        break
+
+                    if isinstance(event, AgentTextFinal):
+                        if event.text:
+                            full_text.append(event.text)
+                        final_tail = event.tail_node_id
+                    elif isinstance(event, AgentTextChunk):
+                        full_text.append(event.text)
+                    elif isinstance(event, AgentError):
+                        logger.error("[heartbeat] agent error: %s", event.message)
+                        timed_out = True
+                        break
+            except Exception:
+                logger.exception("[heartbeat] error draining reply queue")
+                break
+
+            if timed_out:
+                break
+
+            # Advance cursor to the real assistant tail
+            if final_tail:
+                self.cursor_node_id = final_tail
+            else:
+                self.cursor_node_id = new_node_id
+
+            # Parse reply
+            reply_content = "".join(full_text).strip()
+            is_ok, alert = _parse_reply(reply_content, int(self.cfg.get("ack_max_chars", 300)))
+
+            if is_ok:
+                break
+
+            logger.warning("[HEARTBEAT ALERT]\n%s", alert)
+            current_prompt = self.cfg.get("continuation_prompt", "Continue the task, or reply HEARTBEAT_OK when done.")
+
+    def _in_active_window(self) -> bool:
+        hours = self.cfg.get("active_hours")
+        if not hours: return True
+        now = datetime.now().time()
+        start = _parse_hhmm(hours["start"])
+        end = _parse_hhmm(hours["end"])
+        return start <= now <= end if start < end else now >= start or now <= end
+
 # ---------------------------------------------------------------------------
-# Cursor bootstrap
+# Registration
 # ---------------------------------------------------------------------------
 
-def _get_or_create_cursor(agent, branch_from: str) -> tuple[str, str]:
-    """
-    Return (lane_node_id, tail_node_id) for the heartbeat branch.
-    Both ids are stored on the agent instance so subsequent calls return cached values.
-    """
-    attr_lane = "_heartbeat_lane_node_id"
-    attr_tail = "_heartbeat_cursor_node_id"
-    if getattr(agent, attr_lane, None):
-        return getattr(agent, attr_lane), getattr(agent, attr_tail)
+_global_runner: _HeartbeatRunner | None = None
 
-    from TinyCTX.db import ConversationDB
-    workspace = Path(agent.config.workspace.path).expanduser().resolve()
-    db        = ConversationDB(workspace / "agent.db")
-
-    if branch_from == "session":
-        parent_id = agent._tail_node_id
-    else:
-        parent_id = db.get_root().id
-
-    node = db.add_node(
-        parent_id=parent_id,
-        role="system",
-        content="session:heartbeat",
-    )
-    setattr(agent, attr_lane, node.id)
-    setattr(agent, attr_tail, node.id)
-    logger.info(
-        "[heartbeat] created branch cursor %s (branch_from=%s, parent=%s)",
-        node.id, branch_from, parent_id,
-    )
-    return node.id, node.id
-
-
-# ---------------------------------------------------------------------------
-# Module entry point
-# ---------------------------------------------------------------------------
-
-def register(agent) -> None:
+def register_runtime(runtime) -> None:
+    global _global_runner
     try:
         from TinyCTX.modules.heartbeat import EXTENSION_META
-        cfg: dict = EXTENSION_META.get("default_config", {})
+        cfg = EXTENSION_META.get("default_config", {})
     except ImportError:
         cfg = {}
 
-    every_minutes = int(cfg.get("every_minutes", 30))
-
-    prompt              = cfg.get("prompt", "If nothing needs attention, reply HEARTBEAT_OK.")
-    continuation_prompt = cfg.get("continuation_prompt", "Continue the task, or reply HEARTBEAT_OK when you are done.")
-    ack_max             = int(cfg.get("ack_max_chars", 300))
-    max_continuations   = int(cfg.get("max_continuations", 5))
-    active_hours        = cfg.get("active_hours", None)
-    branch_from         = cfg.get("branch_from", "root")
-    interval_secs       = every_minutes * 60
-
-    # Guard: if HEARTBEAT.md is missing, this module is not configured for
-    # this workspace. Skip entirely rather than creating a branch and looping
-    # on an empty prompt.
-    workspace_path = Path(agent.config.workspace.path).expanduser().resolve()
-    if not (workspace_path / "HEARTBEAT.md").exists():
-        logger.info(
-            "[heartbeat] HEARTBEAT.md not found in %s — heartbeat disabled",
-            workspace_path,
-        )
+    # Guard: check for HEARTBEAT.md
+    workspace = Path(runtime.config.workspace.path).expanduser().resolve()
+    if not (workspace / "HEARTBEAT.md").exists():
+        logger.info("[heartbeat] HEARTBEAT.md missing, disabled.")
         return
 
-    # Bootstrap the branch cursor while agent's tail_node_id is fresh.
-    lane_node_id, tail_node_id = _get_or_create_cursor(agent, branch_from)
+    _global_runner = _HeartbeatRunner(runtime, cfg)
+    _global_runner.start()
 
-    # ------------------------------------------------------------------
-    # Register /heartbeat run command via the shared command registry.
-    # agent.commands is set by Lane.__post_init__ from router.commands;
-    # it's always available at register() time because Lane sets it before
-    # calling _load_modules().
-    # ------------------------------------------------------------------
+def register_agent(agent) -> None:
+    """
+    Commands move here to be available to the agent/user.
+    """
     registry = getattr(agent, "commands", None)
-    if registry is not None:
-        async def _cmd_run(args: list[str], context: dict) -> None:
-            """Fire one heartbeat tick immediately."""
-            console = context.get("console")
-            c       = context.get("theme_c", lambda k: "")
+    if registry and _global_runner:
+        async def _cmd_run(args, context):
+            asyncio.create_task(_global_runner._tick())
+            if "console" in context:
+                context["console"].print("[yellow]Heartbeat tick triggered manually.[/yellow]")
 
-            current_tail = getattr(agent, "_heartbeat_cursor_node_id", tail_node_id)
-            current_lane = getattr(agent, "_heartbeat_lane_node_id", lane_node_id)
-
-            if console:
-                console.print(f"[{c('tool_call')}]  ⏱  firing heartbeat tick (lane={current_lane[:8]}…)[/{c('tool_call')}]")
-
-            try:
-                new_tail = await _tick(
-                    agent, current_lane, current_tail,
-                    prompt, continuation_prompt,
-                    ack_max, max_continuations,
-                )
-                setattr(agent, "_heartbeat_cursor_node_id", new_tail)
-                if console:
-                    console.print(f"[{c('tool_ok')}]  ✓  heartbeat tick complete[/{c('tool_ok')}]")
-            except Exception as exc:
-                logger.exception("[heartbeat] /heartbeat run raised")
-                if console:
-                    console.print(f"[{c('error')}]  ✗  heartbeat tick raised: {exc}[/{c('error')}]")
-
-        registry.register(
-            "heartbeat", "run", _cmd_run,
-            help="Fire one heartbeat tick immediately",
-        )
-        logger.debug("[heartbeat] registered /heartbeat run command")
-
-    # Start the periodic background loop (skip if disabled).
-    if every_minutes <= 0:
-        logger.info("[heartbeat] periodic ticks disabled (every_minutes=0)")
-        return
-
-    task = asyncio.get_event_loop().create_task(
-        _heartbeat_loop(
-            agent, lane_node_id, tail_node_id, interval_secs,
-            prompt, continuation_prompt,
-            ack_max, max_continuations,
-            active_hours,
-        ),
-        name=f"heartbeat:{lane_node_id}",
-    )
-
-    logger.info(
-        "[heartbeat] started — every %dm, lane=%s, branch_from=%s, active_hours=%s",
-        every_minutes, lane_node_id, branch_from, active_hours,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Background loop
-# ---------------------------------------------------------------------------
-
-async def _heartbeat_loop(
-    agent,
-    lane_node_id: str,
-    tail_node_id: str,
-    interval_secs: int,
-    prompt: str,
-    continuation_prompt: str,
-    ack_max: int,
-    max_continuations: int,
-    active_hours: dict | None,
-) -> None:
-    while getattr(agent, "gateway", None) is None:
-        await asyncio.sleep(1)
-    await asyncio.sleep(interval_secs)
-
-    while True:
-        try:
-            if _in_active_window(active_hours):
-                tail_node_id = await _tick(
-                    agent, lane_node_id, tail_node_id,
-                    prompt, continuation_prompt,
-                    ack_max, max_continuations,
-                )
-                setattr(agent, "_heartbeat_cursor_node_id", tail_node_id)
-            else:
-                logger.debug("[heartbeat] outside active hours — skipping tick")
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("[heartbeat] unhandled error during tick")
-
-        await asyncio.sleep(interval_secs)
-
-
-# ---------------------------------------------------------------------------
-# Single tick
-# ---------------------------------------------------------------------------
-
-async def _tick(
-    agent,
-    lane_node_id: str,
-    tail_node_id: str,
-    prompt: str,
-    continuation_prompt: str,
-    ack_max: int,
-    max_continuations: int,
-) -> str:
-    """Run one heartbeat tick. Returns the updated tail_node_id."""
-    logger.debug("[heartbeat] tick start (lane=%s, tail=%s)", lane_node_id, tail_node_id)
-
-    reply, tail_node_id = await _run_turn(agent, lane_node_id, tail_node_id, prompt)
-
-    is_ok, alert = _parse_reply(reply, ack_max)
-    if is_ok:
-        logger.debug("[heartbeat] OK on initial turn")
-        return tail_node_id
-
-    _emit_alert(alert)
-
-    for turn in range(1, max_continuations + 1):
-        logger.debug("[heartbeat] continuation turn %d/%d", turn, max_continuations)
-        reply, tail_node_id = await _run_turn(agent, lane_node_id, tail_node_id, continuation_prompt)
-
-        is_ok, alert = _parse_reply(reply, ack_max)
-        if is_ok:
-            logger.debug("[heartbeat] OK after %d continuation turn(s)", turn)
-            return tail_node_id
-
-        _emit_alert(alert)
-
-    logger.warning(
-        "[heartbeat] max_continuations (%d) reached without HEARTBEAT_OK — giving up",
-        max_continuations,
-    )
-    return tail_node_id
-
-
-async def _run_turn(
-    agent,
-    lane_node_id: str,
-    tail_node_id: str,
-    text: str,
-) -> tuple[str, str]:
-    """Push a heartbeat message through the gateway. Returns (reply_text, tail_node_id)."""
-    from TinyCTX.contracts import AgentTextChunk, AgentTextFinal, AgentError
-
-    gateway = getattr(agent, "gateway", None)
-    if gateway is None:
-        logger.error("[heartbeat] agent.gateway not set — cannot run tick")
-        return "", tail_node_id
-
-    if not hasattr(gateway, "_heartbeat_agent"):
-        gateway._heartbeat_agent = agent
-
-    msg = InboundMessage(
-        tail_node_id=tail_node_id,
-        author=_HEARTBEAT_AUTHOR,
-        content_type=ContentType.TEXT,
-        text=text,
-        message_id=f"heartbeat-{int(time.time_ns())}",
-        timestamp=time.time(),
-    )
-
-    parts: list[str] = []
-    reply_event      = asyncio.Event()
-
-    async def _collect(event) -> None:
-        if isinstance(event, AgentTextChunk):
-            parts.append(event.text)
-        elif isinstance(event, AgentTextFinal):
-            if event.text:
-                parts.append(event.text)
-            reply_event.set()
-        elif isinstance(event, AgentError):
-            parts.append(event.message)
-            reply_event.set()
-
-    gateway.register_cursor_handler(lane_node_id, _collect)
-    try:
-        await gateway.push(msg)
-        await asyncio.wait_for(reply_event.wait(), timeout=120)
-    except asyncio.TimeoutError:
-        gateway.abort_generation(lane_node_id)
-        logger.error("[heartbeat] turn timed out after 120s")
-    finally:
-        gateway.unregister_cursor_handler(lane_node_id)
-
-    return "".join(parts).strip(), tail_node_id
+        registry.register("heartbeat", "run", _cmd_run, help="Manual heartbeat tick")
 
 
 # ---------------------------------------------------------------------------
@@ -338,11 +214,6 @@ def _parse_reply(reply: str, ack_max: int) -> tuple[bool, str]:
         matched = True
     return matched and len(text) <= ack_max, text
 
-
-def _emit_alert(text: str) -> None:
-    logger.warning("[HEARTBEAT ALERT]\n%s", text)
-
-
 # ---------------------------------------------------------------------------
 # Active hours
 # ---------------------------------------------------------------------------
@@ -350,37 +221,3 @@ def _emit_alert(text: str) -> None:
 def _parse_hhmm(s: str) -> dtime:
     h, m = s.strip().split(":")
     return dtime(int(h), int(m))
-
-
-def _in_active_window(active_hours: dict | None) -> bool:
-    if not active_hours:
-        return True
-    try:
-        start = _parse_hhmm(active_hours["start"])
-        end_  = _parse_hhmm(active_hours["end"])
-    except (KeyError, ValueError):
-        logger.warning("[heartbeat] invalid active_hours config — running anyway")
-        return True
-    if start == end_:
-        return False
-    now = datetime.now().time().replace(second=0, microsecond=0)
-    if start < end_:
-        return start <= now < end_
-    return now >= start or now < end_
-
-
-# ---------------------------------------------------------------------------
-# Reset hook
-# ---------------------------------------------------------------------------
-
-def _patch_reset(agent, task: asyncio.Task) -> None:
-    """Cancel the heartbeat task when agent.reset() is called."""
-    original_reset = agent.reset
-
-    def patched_reset(*args, **kwargs):
-        original_reset(*args, **kwargs)
-        if not task.done():
-            task.cancel()
-            logger.info("[heartbeat] task cancelled on session reset")
-
-    agent.reset = patched_reset

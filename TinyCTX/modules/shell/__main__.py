@@ -251,7 +251,7 @@ def _run_local(command: str, cwd: Path, timeout: int) -> str:
 # Module registration
 # ---------------------------------------------------------------------------
 
-def register(agent) -> None:
+def register_agent(agent) -> None:
     workspace = Path(agent.config.workspace.path).expanduser().resolve()
 
     _extra      = agent.config.extra.get("shell", {}) if hasattr(agent.config, "extra") else {}

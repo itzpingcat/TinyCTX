@@ -7,7 +7,7 @@ string as the tool result — no sentinel parsing, no structured return payload.
 """
 
 
-def register(agent) -> None:
+def register_agent(agent) -> None:
     from pathlib import Path
 
     workspace = Path(agent.config.workspace.path).expanduser().resolve()

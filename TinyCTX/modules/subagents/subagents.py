@@ -8,12 +8,18 @@ import weakref
 from dataclasses import dataclass, field
 from typing import Any
 
-from TinyCTX.contracts import AgentError, AgentTextChunk, AgentTextFinal
+from TinyCTX.contracts import AgentError, AgentTextChunk, AgentTextFinal, InboundMessage, ContentType, Platform, UserIdentity
 
 logger = logging.getLogger(__name__)
 
 _SUBAGENT_BRANCH_PREFIX = "session:subagent:"
 _AGENTS: "weakref.WeakSet[object]" = weakref.WeakSet()
+
+_SUBAGENT_AUTHOR = UserIdentity(
+    platform=Platform.CRON,
+    user_id="subagent-system",
+    username="subagent",
+)
 
 
 @dataclass
@@ -92,12 +98,13 @@ def _running_task_count(agent) -> int:
 
 async def spawn_subagent(
     agent,
+    runtime,
     prompt: str,
     *,
     max_concurrent: int = 4,
     completed_ttl_seconds: float = 900.0,
 ) -> dict[str, Any]:
-    """Create a detached child branch and start a background AgentLoop on it."""
+    """Create a detached child branch and start a background turn via runtime.push."""
     pruned = _prune_completed_tasks(agent, completed_ttl_seconds)
     running = _running_task_count(agent)
     if running >= max_concurrent:
@@ -110,17 +117,13 @@ async def spawn_subagent(
         }
 
     task_id = str(uuid.uuid4())
-    parent_tail_node_id = agent._tail_node_id
+    parent_tail_node_id = agent.context.tail_node_id
 
-    branch_anchor = agent._db.add_node(
+    # Create a branch anchor in the DB so the subagent lives on its own fork.
+    branch_anchor = runtime.db.add_node(
         parent_id=parent_tail_node_id,
         role="system",
         content=f"{_SUBAGENT_BRANCH_PREFIX}{task_id}",
-    )
-    branch_opening = agent._db.add_node(
-        parent_id=branch_anchor.id,
-        role="user",
-        content=prompt,
     )
 
     handle = SubagentTask(
@@ -128,10 +131,10 @@ async def spawn_subagent(
         prompt=prompt,
         parent_tail_node_id=parent_tail_node_id,
         branch_anchor_node_id=branch_anchor.id,
-        branch_tail_node_id=branch_opening.id,
+        branch_tail_node_id=branch_anchor.id,
     )
     handle.task = asyncio.create_task(
-        _run_subagent(handle, agent.config),
+        _run_subagent(handle, runtime),
         name=f"tinyctx-subagent-{task_id[:8]}",
     )
     _task_registry(agent)[task_id] = handle
@@ -177,33 +180,54 @@ def reset_subagent_tasks() -> None:
         registry.clear()
 
 
-async def _run_subagent(handle: SubagentTask, config) -> None:
-    from TinyCTX.agent import AgentLoop
+async def _run_subagent(handle: SubagentTask, runtime) -> None:
+    msg = InboundMessage(
+        tail_node_id=handle.branch_tail_node_id,
+        author=_SUBAGENT_AUTHOR,
+        content_type=ContentType.TEXT,
+        text=handle.prompt,
+        message_id=f"subagent-{handle.task_id}",
+        timestamp=time.time(),
+        trigger=True,
+    )
+
+    reply_queue: asyncio.Queue = asyncio.Queue()
 
     try:
-        loop = AgentLoop(
-            tail_node_id=handle.branch_tail_node_id,
-            config=config,
-            is_subagent=True,
-        )
+        await runtime.push(msg, reply_queue=reply_queue)
 
         text_parts: list[str] = []
-        async for event in loop.run(msg=None):
+        final_tail: str | None = None
+
+        while True:
+            try:
+                event = await asyncio.wait_for(reply_queue.get(), timeout=300)
+            except asyncio.TimeoutError:
+                logger.warning("[subagents] task %s timed out", handle.task_id)
+                break
+
+            if event is None:  # sentinel — turn complete
+                break
+
             if isinstance(event, AgentTextChunk):
                 text_parts.append(event.text)
-            elif isinstance(event, AgentTextFinal) and event.text:
-                text_parts.append(event.text)
+            elif isinstance(event, AgentTextFinal):
+                if event.text:
+                    text_parts.append(event.text)
+                if event.tail_node_id:
+                    final_tail = event.tail_node_id
             elif isinstance(event, AgentError):
                 handle.status = "failed"
                 handle.error = event.message
-                handle.final_tail_node_id = loop.tail_node_id
+                handle.final_tail_node_id = final_tail
                 handle.completed_at = time.time()
                 return
 
         handle.status = "completed"
         handle.result = "".join(text_parts).strip()
-        handle.final_tail_node_id = loop.tail_node_id
+        handle.final_tail_node_id = final_tail
         handle.completed_at = time.time()
+
     except asyncio.CancelledError:
         handle.status = "cancelled"
         handle.error = "Subagent task was cancelled."

@@ -94,7 +94,7 @@ def _image_mime(path: Path) -> str | None:
     return None
 
 
-def register(agent) -> None:
+def register_agent(agent) -> None:
     workspace = Path(agent.config.workspace.path).expanduser().resolve()
     source_root = Path.cwd().resolve()
     workspace.mkdir(parents=True, exist_ok=True)

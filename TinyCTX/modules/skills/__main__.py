@@ -34,7 +34,7 @@ Tools registered
 ----------------
   use_skill(name) — loads the full SKILL.md body on demand.
 
-Convention: register(agent) — no imports from gateway or bridges.
+Convention: register_agent(agent) — no imports from gateway or bridges.
 """
 from __future__ import annotations
 
@@ -134,7 +134,16 @@ def _build_index_prompt(registry: dict[str, dict]) -> str | None:
 # register()
 # ---------------------------------------------------------------------------
 
-def register(agent) -> None:
+def register_agent(agent) -> None:
+    # Normalise: accept Runtime or legacy AgentLoop.
+    from TinyCTX.runtime import Runtime as _Runtime
+    if isinstance(agent, _Runtime):
+        _rt = agent
+        class _Shim:
+            config       = _rt.config
+            context      = _rt.context
+            tool_handler = _rt.tool_handler
+        agent = _Shim()
     try:
         from TinyCTX.modules.skills import EXTENSION_META
         cfg: dict = dict(EXTENSION_META.get("default_config", {}))

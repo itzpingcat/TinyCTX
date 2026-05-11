@@ -8,6 +8,13 @@ SessionKey and ChatType are removed. Lanes are now keyed by node_id (str).
 InboundMessage.tail_node_id is required (promoted from optional).
 _AgentEventBase carries tail_node_id (str) instead of session_key.
 Platform is kept — bridges still have platform identity for event dispatch.
+
+Phase 1 runtime refactor
+------------------------
+GroupPolicy and ActivationMode removed — trigger detection is bridge-local.
+InboundMessage gains trigger: bool = True.
+_AgentEventBase loses lane_node_id — tail_node_id is the only cursor.
+Platform gains SYSTEM for internal/module-generated messages.
 """
 
 from __future__ import annotations
@@ -28,6 +35,7 @@ class Platform(str, Enum):
     MATRIX  = "matrix"
     CRON    = "cron"   # internal platform for scheduled cron jobs
     API     = "api"    # HTTP/SSE API bridge
+    SYSTEM  = "system" # internal platform for module/runtime-generated messages
 
 
 class ContentType(str, Enum):
@@ -44,44 +52,6 @@ def content_type_for(text: str, has_attachments: bool) -> "ContentType":
         return ContentType.ATTACHMENT_ONLY
     return ContentType.TEXT
 
-
-# ---------------------------------------------------------------------------
-# Group policy
-# ---------------------------------------------------------------------------
-
-class ActivationMode(str, Enum):
-    MENTION = "mention"   # respond only when @mentioned or prefix used (default)
-    PREFIX  = "prefix"    # respond only when command prefix is present
-    ALWAYS  = "always"    # respond to every message in the group
-
-
-@dataclass(frozen=True)
-class GroupPolicy:
-    """
-    Per-group activation and buffering policy.
-
-    Bridges attach this to InboundMessage for group sessions.
-    GroupLane in router.py enforces it — bridges pass raw message text.
-
-    activation:        MENTION | PREFIX | ALWAYS
-    trigger_prefix:    command prefix string (e.g. "!")
-    bot_mxid:          full @user:server MXID (Matrix) or empty string
-    bot_localpart:     @localpart derived from bot_mxid, or empty string
-    buffer_timeout_s:  seconds to wait before flushing buffered non-trigger
-                       messages without a trigger arriving. 0 = disabled.
-    buffer_head_lines: lines to keep from the START of the buffer when
-                       truncating (topic context). Default: 2.
-    buffer_tail_lines: lines to keep from the END of the buffer (closest
-                       to trigger). Default: 10. Omitted lines are replaced
-                       with "... [N messages not shown] ...".
-    """
-    activation:        ActivationMode = ActivationMode.MENTION
-    trigger_prefix:    str            = "!"
-    bot_mxid:          str            = ""
-    bot_localpart:     str            = ""
-    buffer_timeout_s:  float          = 0.0
-    buffer_head_lines: int            = 2
-    buffer_tail_lines: int            = 10
 
 
 class AttachmentKind(str, Enum):
@@ -150,10 +120,10 @@ class InboundMessage:
     text:         str
     message_id:   str
     timestamp:    float
+    trigger:      bool          = True          # bridge sets False for non-triggering group messages
     reply_to_id:  str | None    = None
     attachments:  tuple["Attachment", ...] = field(default_factory=tuple)
     trace_id:     str           = field(default_factory=lambda: str(uuid.uuid4()))
-    group_policy: "GroupPolicy | None" = None  # set by bridge for group messages
     server_name:  str | None    = None          # guild/server name (bridges populate when known)
     channel_name: str | None    = None          # channel/thread name (bridges populate when known)
     permission_level: int       = 25            # 0-100; bridge sets per triggering sender. CLI=100.
@@ -175,15 +145,8 @@ class InboundMessage:
 @dataclass(frozen=True, kw_only=True)
 class _AgentEventBase:
     tail_node_id:        str   # current cursor — advances as new DB nodes are written
-    lane_node_id:        str | None = None   # original lane key — stable for the lifetime of the lane
     trace_id:            str
     reply_to_message_id: str
-
-    def __post_init__(self) -> None:
-        # Back-compat for tests and older helper code that still constructs
-        # events with only tail_node_id.
-        if self.lane_node_id is None:
-            object.__setattr__(self, "lane_node_id", self.tail_node_id)
 
 
 @dataclass(frozen=True)

@@ -3,31 +3,35 @@ context.py — Conversation history types and context assembly pipeline.
 Imports only from contracts.py, db.py, and stdlib. Never imports from gateway or agent.
 
 The Context class owns:
-  - Dialogue history (backed by ConversationDB when _db + _tail_node_id are set)
+  - Dialogue history (backed by ConversationDB)
   - Prompt provider registry (SOUL.md, AGENTS.md, memory results, etc.)
   - Four-stage hook pipeline (filter, transform, compress, post-process)
-  - assemble() — produces a list[dict] ready to send to the LLM API
+  - assemble() — produces (list[dict], AssembleMeta) ready to send to the LLM API
 
-Tree refactor (Phase 1)
------------------------
-When a ConversationDB is injected via set_db() and a tail node is set via
-set_tail(), assemble() loads history by walking the ancestor chain from the
-DB instead of reading self.dialogue. Writes via add() write immediately to
-the DB and advance _tail_node_id.
+Constructor
+-----------
+Context(db, tail_node_id, token_limit, image_tokens_per_block)
 
-When _db is None (old code path, tests), behaviour is unchanged — self.dialogue
-is the source of truth and no DB writes happen. This makes the refactor
-incrementally testable.
+All required fields are supplied at construction time. db and tail_node_id
+must be provided — there is no lazy/optional wiring path.
 
-Dialogue mutation:
-  - add(entry)                  — append a new entry (writes to DB if wired)
-  - edit(entry_id, new_content) — replace content in-place; no cascade
-  - delete(entry_id)            — smart-delete: removes entry + dependents
-  - strip_tool_calls(entry_id)  — remove tool_calls from an assistant entry
-  - clear()                     — wipe entire dialogue
+set_tail(node_id) exists solely to advance the cursor as the cycle writes
+tool-call and tool-result nodes mid-turn.
 
-Modules (compression, dedup, RAG, etc.) are registered externally at startup.
-Context itself never loads modules — that is main.py's concern.
+assemble() returns (messages, AssembleMeta) where AssembleMeta is a small
+dataclass carrying tokens_pre_trim, tokens_used, and was_trimmed. Callers
+(AgentCycle) read meta.tokens_used directly — nothing is side-channelled
+through self.state.
+
+Session state is loaded by AgentCycle at construction time via
+db.load_session_state(); Context does not call it. _load_state_from_db()
+is removed from Context entirely. assemble() receives session state via
+a call to db.load_session_state() internally for backwards compatibility
+with hooks that read ctx.state["session"].
+
+Async hooks (HOOK_PRE_ASSEMBLE_ASYNC) are NOT run by assemble() — they
+must be awaited by the caller (AgentCycle) via run_async_hooks() before
+calling assemble(). This keeps assemble() synchronous and simple.
 """
 
 from __future__ import annotations
@@ -74,6 +78,17 @@ HOOK_POST_ASSEMBLE      = "post_assemble"        # fn(messages, ctx) -> list[dic
 
 
 # ---------------------------------------------------------------------------
+# AssembleMeta — returned alongside messages from assemble()
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AssembleMeta:
+    tokens_pre_trim: int
+    tokens_used:     int
+    was_trimmed:     bool
+
+
+# ---------------------------------------------------------------------------
 # HistoryEntry — typed dialogue record
 # ---------------------------------------------------------------------------
 
@@ -89,8 +104,7 @@ class HistoryEntry:
       list[dict] — OpenAI-compat content block list, used when the user
                    message includes image or file attachments.
 
-    parent_id is the DB node_id of this entry's parent. None for entries
-    that predate the tree refactor or were created without a DB wired.
+    parent_id is the DB node_id of this entry's parent.
     """
     role:         str
     content:      str | list     # str for most roles; list[dict] for user+attachments
@@ -98,8 +112,9 @@ class HistoryEntry:
     index:        int            = 0     # position in dialogue; set by Context.add()
     tool_calls:   list[dict]     = field(default_factory=list)
     tool_call_id: str | None     = None
-    author_id:    str | None     = None  # set for group chat user turns; None for DM / assistant / tool / system
-    parent_id:    str | None     = None  # tree refactor: DB node_id of parent node
+    author_id:    str | None     = None  # stable per-platform sender id; None for DM/assistant/tool/system
+    author_name:  str | None     = None  # display name at send time; None for DM/assistant/tool/system
+    parent_id:    str | None     = None  # DB node_id of parent node
 
     @staticmethod
     def user(content: str | list, author_id: str | None = None) -> HistoryEntry:
@@ -148,20 +163,27 @@ class Context:
     Assembles a list[dict] suitable for the LLM API from dialogue history
     and registered prompt providers, passing turns through a hook pipeline.
 
-    Async hooks (HOOK_PRE_ASSEMBLE_ASYNC) are NOT run by assemble() — they
-    must be awaited by the caller (AgentLoop) via run_async_hooks() before
-    calling assemble(). This keeps assemble() synchronous and simple.
+    Constructor: Context(db, tail_node_id, token_limit, image_tokens_per_block)
 
-    Tree refactor:
-      Call set_db(db) and set_tail(node_id) to switch Context into DB-backed
-      mode. In this mode:
-        - add() writes each entry to the DB immediately and advances _tail_node_id
-        - assemble() loads history by walking DB ancestors from _tail_node_id
-        - self.dialogue is kept in sync for hooks/modules that iterate it
-      Without a DB wired, old in-memory behaviour is preserved.
+    All fields are required at construction time — no post-construction wiring.
+    set_tail(node_id) is the only setter that exists, used mid-turn to advance
+    the cursor as the cycle writes tool-call and tool-result nodes.
+
+    assemble() returns (messages, AssembleMeta). Callers read meta directly.
     """
 
-    def __init__(self, token_limit: int = 16384, image_tokens_per_block: int = 280) -> None:
+    def __init__(
+        self,
+        db,                          # ConversationDB
+        tail_node_id: str,
+        token_limit: int = 16384,
+        image_tokens_per_block: int | None = 280,
+    ) -> None:
+        self._db = db
+        self._tail_node_id: str = tail_node_id
+        self.token_limit = token_limit
+        self._image_tokens_per_block: int | None = image_tokens_per_block
+
         self.dialogue: list[HistoryEntry] = []
 
         # pid -> (PromptSlot, provider callable)
@@ -171,64 +193,26 @@ class Context:
         self._hooks: dict[str, list] = defaultdict(list)
         self._hook_counter = 0
 
-        # Arbitrary state bag for hooks/modules to share data during assembly
+        # Arbitrary state bag for hooks/modules to share data during assembly.
+        # NOTE: tokens_used, tokens_pre_trim, was_trimmed are no longer written
+        # here — they are returned via AssembleMeta from assemble().
+        # ctx.state["session"] IS still written by assemble() for hook compat.
         self.state: dict[str, Any] = {}
 
-        self.token_limit = token_limit
-
-        # Flat token cost charged per image_url content block when estimating
-        # context usage.  image_url blocks carry raw base64 data which would
-        # produce wildly inflated byte counts if measured as text.  Instead we
-        # charge a flat cost matching the model's actual vision-encoder overhead.
-        # Sourced from ModelConfig.tokens_per_image in config.yaml.  None means
-        # the model has no vision support; _count_tokens treats it as 0 (no
-        # image_url blocks will appear in the message list for such models).
-        self._image_tokens_per_block: int | None = image_tokens_per_block
-
-        # Tree refactor: optional DB backing
-        self._db = None            # ConversationDB | None
-        self._tail_node_id: str | None = None
-        self._on_tail_advance = None  # optional callback; see set_cursor_callback()
-
     # ------------------------------------------------------------------
-    # Tree refactor wiring
+    # Cursor advance (only setter that exists post-construction)
     # ------------------------------------------------------------------
-
-    def set_db(self, db) -> None:
-        """
-        Wire a ConversationDB into this Context. Once set, add() writes to
-        the DB and assemble() reads from it. Call set_tail() after this.
-        """
-        self._db = db
 
     def set_tail(self, node_id: str) -> None:
-        """
-        Point this Context at a branch tail. assemble() will walk ancestors
-        from this node. add() will attach new nodes as children of this node
-        and advance it.
-        """
+        """Advance the cursor mid-turn as the cycle writes new nodes."""
         self._tail_node_id = node_id
 
     def set_image_tokens(self, tokens_per_image: int | None) -> None:
-        """
-        Update the per-image token cost used by _count_tokens().
-        Call this when the active model changes (e.g. fallback kicks in) so
-        the budget estimator reflects the new model's vision-encoder overhead.
-        None means the model has no vision support (image_url blocks cost 0).
-        """
+        """Update per-image token cost when active model changes (fallback)."""
         self._image_tokens_per_block = tokens_per_image
 
-    def set_cursor_callback(self, fn) -> None:
-        """
-        Register a zero-argument callable that is invoked every time add()
-        advances the tail. Used by AgentLoop to keep its cursor file in sync
-        with in-memory state even when run() is not called (e.g. direct
-        context mutations in tests or background tasks).
-        """
-        self._on_tail_advance = fn
-
     @property
-    def tail_node_id(self) -> str | None:
+    def tail_node_id(self) -> str:
         return self._tail_node_id
 
     # ------------------------------------------------------------------
@@ -236,11 +220,6 @@ class Context:
     # ------------------------------------------------------------------
 
     def register_hook(self, stage: str, fn: Callable, *, priority: int = 0) -> None:
-        """
-        Register a hook for a pipeline stage.
-        Lower priority = runs first.
-        For HOOK_PRE_ASSEMBLE_ASYNC, fn must be an async callable.
-        """
         self._hook_counter += 1
         self._hooks[stage].append((priority, self._hook_counter, fn))
         self._hooks[stage].sort(key=lambda x: (x[0], x[1]))
@@ -249,19 +228,11 @@ class Context:
         self._hooks[stage] = [e for e in self._hooks[stage] if e[2] is not fn]
 
     async def run_async_hooks(self, stage: str) -> None:
-        """
-        Await all hooks registered for an async stage in priority order.
-        Exceptions are caught and logged so one failing hook doesn't block
-        the rest.
-
-        Call this from AgentLoop before assemble():
-            await ctx.run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC)
-            messages = ctx.assemble()
-        """
+        """Await all hooks registered for an async stage in priority order."""
         for _, _, fn in self._hooks[stage]:
             try:
                 await fn(self)
-            except Exception as exc:
+            except Exception:
                 logger.exception("Async hook '%s' raised", fn.__name__)
 
     # ------------------------------------------------------------------
@@ -287,40 +258,32 @@ class Context:
 
     def add(self, entry: HistoryEntry) -> HistoryEntry:
         """
-        Append a new entry. If a DB is wired, writes to the DB immediately
-        and advances _tail_node_id. The entry's parent_id is set to the
-        current tail so the node lands on the correct branch.
+        Append a new entry. Writes to the DB immediately and advances
+        _tail_node_id. entry.parent_id is set to the current tail so
+        the node lands on the correct branch.
         """
-        if self._db is not None and self._tail_node_id is not None:
-            # Serialise content: list → JSON string for DB storage.
-            # This applies to user messages with attachments AND tool results
-            # with image blocks (both use list[dict] content).
-            content_str = (
-                json.dumps(entry.content, ensure_ascii=False)
-                if isinstance(entry.content, list)
-                else entry.content
-            )
-            tool_calls_str = (
-                json.dumps(entry.tool_calls, ensure_ascii=False)
-                if entry.tool_calls
-                else None
-            )
-            node = self._db.add_node(
-                parent_id=self._tail_node_id,
-                role=entry.role,
-                content=content_str,
-                tool_calls=tool_calls_str,
-                tool_call_id=entry.tool_call_id,
-                author_id=entry.author_id,
-            )
-            entry.id        = node.id
-            entry.parent_id = node.parent_id
-            self._tail_node_id = node.id
-            if self._on_tail_advance is not None:
-                try:
-                    self._on_tail_advance()
-                except Exception:
-                    pass  # cursor persistence failures must never interrupt add()
+        content_str = (
+            json.dumps(entry.content, ensure_ascii=False)
+            if isinstance(entry.content, list)
+            else entry.content
+        )
+        tool_calls_str = (
+            json.dumps(entry.tool_calls, ensure_ascii=False)
+            if entry.tool_calls
+            else None
+        )
+        node = self._db.add_node(
+            parent_id=self._tail_node_id,
+            role=entry.role,
+            content=content_str,
+            tool_calls=tool_calls_str,
+            tool_call_id=entry.tool_call_id,
+            author_id=entry.author_id,
+            author_name=entry.author_name,
+        )
+        entry.id        = node.id
+        entry.parent_id = node.parent_id
+        self._tail_node_id = node.id
 
         entry.index = len(self.dialogue)
         self.dialogue.append(entry)
@@ -329,46 +292,26 @@ class Context:
     def clear(self) -> None:
         self.dialogue.clear()
         self.state.clear()
-        # _tail_node_id is intentionally NOT reset here — clear() is a
-        # user-initiated wipe of in-memory state. The tree in agent.db is
-        # never mutated by clear(). The caller (bridge reset logic) is
-        # responsible for moving the cursor if needed.
 
     def edit(self, entry_id: str, new_content: str) -> bool:
-        """
-        Replace the content of a dialogue entry in-place.
-        Returns True if the entry was found and updated, False otherwise.
-        Writes through to DB if wired.
-        """
         for entry in self.dialogue:
             if entry.id == entry_id:
                 entry.content = new_content
-                if self._db is not None:
-                    self._db.update_node_content(entry_id, new_content)
+                self._db.update_node_content(entry_id, new_content)
                 return True
         return False
 
     def delete(self, entry_id: str) -> list[str]:
-        """
-        Remove an entry and all entries that depend on it, then re-index.
-        Returns the list of entry ids that were actually removed.
-        Deletes from DB if wired.
-        """
         ids_to_remove = self._dependents(entry_id)
         if not ids_to_remove:
             return []
         self.dialogue = [e for e in self.dialogue if e.id not in ids_to_remove]
         self._reindex()
-        if self._db is not None:
-            for nid in ids_to_remove:
-                self._db.delete_node(nid)
+        for nid in ids_to_remove:
+            self._db.delete_node(nid)
         return list(ids_to_remove)
 
     def _dependents(self, entry_id: str) -> set[str]:
-        """
-        Return the set of entry ids that must be removed together with
-        entry_id (including entry_id itself). Empty set = entry not found.
-        """
         by_id: dict[str, HistoryEntry] = {e.id: e for e in self.dialogue}
         if entry_id not in by_id:
             return set()
@@ -396,11 +339,6 @@ class Context:
         return group
 
     def strip_tool_calls(self, entry_id: str) -> list[str]:
-        """
-        Remove the tool_calls field from an assistant entry and delete all
-        downstream tool-result entries, while preserving the assistant's
-        text content. Returns the list of tool-result entry ids removed.
-        """
         target = next((e for e in self.dialogue if e.id == entry_id), None)
         if target is None or target.role != ROLE_ASSISTANT or not target.tool_calls:
             return []
@@ -413,8 +351,7 @@ class Context:
         for e in self.dialogue:
             if e.role == ROLE_TOOL and e.tool_call_id in call_ids:
                 removed.append(e.id)
-                if self._db is not None:
-                    self._db.delete_node(e.id)
+                self._db.delete_node(e.id)
             else:
                 kept.append(e)
         self.dialogue = kept
@@ -422,7 +359,6 @@ class Context:
         return removed
 
     def _reindex(self) -> None:
-        """Reassign .index on every entry to match its current position."""
         for i, entry in enumerate(self.dialogue):
             entry.index = i
 
@@ -433,22 +369,21 @@ class Context:
     def _load_from_db(self) -> list[HistoryEntry]:
         """
         Walk the ancestor chain from _tail_node_id and convert DB nodes to
-        HistoryEntry objects. Returns an empty list if no DB is wired.
+        HistoryEntry objects.
         """
-        if self._db is None or self._tail_node_id is None:
-            return []
-
         nodes = self._db.get_ancestors(self._tail_node_id)
+        last_idx = len(nodes) - 1
+
+        try:
+            from TinyCTX.utils.attachments import build_content_blocks as _build_blocks, classify as _classify
+            from TinyCTX.contracts import Attachment, AttachmentKind
+            import mimetypes as _mimetypes
+            _att_available = True
+        except ImportError:
+            _att_available = False
 
         entries: list[HistoryEntry] = []
         for i, node in enumerate(nodes):
-            # Deserialise content: JSON → list if it was stored as list.
-            # Only user messages store list content (attachments).
-            # Guard: only promote to list if every item is a recognised
-            # content block (type in text/image_url/image/document).
-            # Raw JSON pasted by users (e.g. eval fixtures) starts with "["
-            # but contains arbitrary dicts — those must stay as plain strings
-            # so llama.cpp never sees an unsupported content[].type.
             _VALID_BLOCK_TYPES = {"text", "image_url", "image", "document"}
             content: str | list = node.content
             if node.role == ROLE_USER and content.startswith("["):
@@ -466,7 +401,47 @@ class Context:
                             node.id,
                         )
                 except (json.JSONDecodeError, ValueError):
-                    pass  # leave as string
+                    pass
+
+            if (
+                node.role == ROLE_USER
+                and isinstance(content, str)
+                and node.attachment_paths
+                and _att_available
+                and i == last_idx
+            ):
+                try:
+                    paths: list[str] = json.loads(node.attachment_paths)
+                    atts: list = []
+                    for path_str in paths:
+                        from pathlib import Path as _Path
+                        p = _Path(path_str)
+                        if p.exists():
+                            data = p.read_bytes()
+                            mime = _mimetypes.guess_type(p.name)[0] or "application/octet-stream"
+                            kind = _classify(Attachment(filename=p.name, data=data, mime_type=mime))
+                            atts.append(Attachment(filename=p.name, data=data, mime_type=mime, kind=kind))
+                        else:
+                            logger.warning("[load_from_db] attachment path missing: %s", path_str)
+                    if atts:
+                        from TinyCTX.config import AttachmentConfig, ModelConfig
+                        att_cfg = AttachmentConfig()
+                        dummy_model = ModelConfig(
+                            model="dummy", base_url="http://localhost",
+                            vision=False, tokens_per_image=None,
+                        )
+                        import os as _os
+                        workspace = _Path(_os.getcwd())
+                        rebuilt = _build_blocks(
+                            text=content,
+                            attachments=tuple(atts),
+                            model_cfg=dummy_model,
+                            att_cfg=att_cfg,
+                            workspace=workspace,
+                        )
+                        content = rebuilt
+                except Exception:
+                    logger.exception("[load_from_db] failed to re-hydrate attachments for node %s", node.id)
 
             tool_calls: list[dict] = []
             if node.tool_calls:
@@ -483,6 +458,7 @@ class Context:
                 tool_calls=tool_calls,
                 tool_call_id=node.tool_call_id,
                 author_id=node.author_id,
+                author_name=node.author_name,
                 parent_id=node.parent_id,
             )
             entries.append(entry)
@@ -492,10 +468,6 @@ class Context:
     # Token counting
     # ------------------------------------------------------------------
 
-    # Lazy-loaded tiktoken encoder. o200k_base is a close enough tokenizer
-    # for most open-weight models served via llama.cpp (Llama, Mistral, Gemma,
-    # DeepSeek, Qwen, etc.). It won't be exact for every model but is far more
-    # accurate than the old chars//4 heuristic.
     _tiktoken_enc: "tiktoken.Encoding | None" = None
 
     @classmethod
@@ -504,11 +476,11 @@ class Context:
             try:
                 cls._tiktoken_enc = tiktoken.get_encoding("o200k_base")
             except Exception:
-                cls._tiktoken_enc = None  # fall back to heuristic on failure
+                cls._tiktoken_enc = None
         return cls._tiktoken_enc
 
     def _count_tokens(self, messages: list[dict], tools: list[dict] | None = None) -> int:
-        img_cost = self._image_tokens_per_block or 0  # 0 for non-vision models
+        img_cost = self._image_tokens_per_block or 0
         enc      = self._get_encoder()
 
         def _tokenize(text: str) -> int:
@@ -520,9 +492,6 @@ class Context:
             if isinstance(c, list):
                 total = 0
                 for b in c:
-                    # image_url blocks carry raw base64 — tokenizing those bytes
-                    # would wildly inflate the count. Charge the flat per-image
-                    # cost from ModelConfig.tokens_per_image instead.
                     if isinstance(b, dict) and b.get("type") == "image_url":
                         total += img_cost
                     else:
@@ -538,22 +507,18 @@ class Context:
             for m in messages
         ) + tool_tokens
 
-        # 1.05x fudge factor: tiktoken uses cl100k_base which won't match the
-        # model's actual tokenizer exactly. A 5% overhead means the trimmer
-        # fires slightly early rather than slightly late.
         return int(raw * 1.05)
 
     # ------------------------------------------------------------------
-    # Assembly (sync)
+    # Assembly (sync) — returns (messages, AssembleMeta)
     # ------------------------------------------------------------------
 
-    def assemble(self, tools: list[dict] | None = None) -> list[dict]:
+    def assemble(self, tools: list[dict] | None = None) -> tuple[list[dict], AssembleMeta]:
         """
-        Run the sync pipeline and return API-ready messages.
+        Run the sync pipeline and return (API-ready messages, AssembleMeta).
         Async hooks must have been awaited via run_async_hooks() beforehand.
 
-        When a DB is wired (_db + _tail_node_id set), history is loaded from
-        the DB ancestor walk. Otherwise self.dialogue is used directly.
+        History is always loaded from the DB ancestor walk.
 
         Stage order (sync):
           1. pre_assemble   — hooks may mutate self.dialogue or warm caches
@@ -561,18 +526,22 @@ class Context:
           3. transform_turn — replace/summarise turns
           4. post_assemble  — reshape final message list
         """
-        # Load from DB if wired; otherwise use in-memory dialogue.
-        if self._db is not None and self._tail_node_id is not None:
-            source = self._load_from_db()
-            logger.debug(
-                "[assemble] loaded %d entries from DB (tail=%s)",
-                len(source), self._tail_node_id,
-            )
-            # Keep self.dialogue in sync so hooks that iterate it see current state.
-            self.dialogue = source
-        else:
-            source = self.dialogue
-            logger.debug("[assemble] using in-memory dialogue (%d entries)", len(source))
+        # Load session state and put it in ctx.state["session"] for hook compat.
+        session_state, delta_depth = self._db.load_session_state(self._tail_node_id)
+        self.state["session"] = session_state
+        self.state["session_delta_depth"] = delta_depth
+        logger.debug(
+            "[assemble] session state replayed (depth=%d, keys=%s)",
+            delta_depth, list(session_state.keys()),
+        )
+
+        source = self._load_from_db()
+        logger.debug(
+            "[assemble] loaded %d entries from DB (tail=%s)",
+            len(source), self._tail_node_id,
+        )
+        # Keep self.dialogue in sync so hooks that iterate it see current state.
+        self.dialogue = source
 
         n = len(source)
 
@@ -587,7 +556,7 @@ class Context:
         ):
             try:
                 content = provider(self)
-            except Exception as exc:
+            except Exception:
                 content = None
                 logger.exception("Prompt provider '%s' raised", slot.pid)
             if content is not None:
@@ -619,6 +588,27 @@ class Context:
                 if result is not None:
                     entry = result
 
+            if entry.role == ROLE_USER and entry.author_id is not None:
+                label = entry.author_name or entry.author_id
+                raw = entry.content
+                if isinstance(raw, str):
+                    labelled_content: str | list = f"[{label}]: {raw}"
+                else:
+                    blocks = list(raw)
+                    first_text = next(
+                        (i for i, b in enumerate(blocks) if b.get("type") == "text"), None
+                    )
+                    if first_text is not None:
+                        blocks[first_text] = {
+                            **blocks[first_text],
+                            "text": f"[{label}]: {blocks[first_text]['text']}",
+                        }
+                    else:
+                        blocks.insert(0, {"type": "text", "text": f"[{label}]: "})
+                    labelled_content = blocks
+                from dataclasses import replace
+                entry = replace(entry, content=labelled_content)
+
             messages.append(self._render(entry))
 
         # 4. post_assemble
@@ -646,12 +636,12 @@ class Context:
                 merged.append(dict(m))
 
         # Token budget enforcement
-        self.state["tokens_used_pre_trim"] = self._count_tokens(merged, tools)
-        self.state["tokens_used"] = self.state["tokens_used_pre_trim"]
-        self.state["budget_trimmed"] = False
+        tokens_pre_trim = self._count_tokens(merged, tools)
+        tokens_used     = tokens_pre_trim
+        was_trimmed     = False
 
-        while self.state["tokens_used"] > self.token_limit:
-            self.state["budget_trimmed"] = True
+        while tokens_used > self.token_limit:
+            was_trimmed = True
             drop_idx = next(
                 (i for i, m in enumerate(merged) if m["role"] != ROLE_SYSTEM),
                 None,
@@ -678,16 +668,24 @@ class Context:
             else:
                 merged.pop(drop_idx)
 
-            self.state["tokens_used"] = self._count_tokens(merged, tools)
+            tokens_used = self._count_tokens(merged, tools)
 
-        return merged
+        # Write back into state for hooks that still read these keys (backwards compat).
+        self.state["tokens_used_pre_trim"] = tokens_pre_trim
+        self.state["tokens_used"]          = tokens_used
+        self.state["budget_trimmed"]       = was_trimmed
+
+        meta = AssembleMeta(
+            tokens_pre_trim=tokens_pre_trim,
+            tokens_used=tokens_used,
+            was_trimmed=was_trimmed,
+        )
+        return merged, meta
 
     def _render(self, entry: HistoryEntry) -> dict:
         if entry.role == ROLE_TOOL:
             content = entry.content
             if isinstance(content, list):
-                # Tool result content must be a plain string for API compatibility.
-                # Flatten list content (e.g. image blocks) to a JSON string.
                 content = json.dumps(content, ensure_ascii=False)
             return {
                 "role":         ROLE_TOOL,

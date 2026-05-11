@@ -24,7 +24,7 @@ from pathlib import Path
 
 from TinyCTX.config import load as load_config, apply_logging, resolve_log_level
 from TinyCTX.contracts import MANUAL_LAUNCH_ATTR
-from TinyCTX.router import Router
+from TinyCTX.runtime import Runtime
 
 logger = logging.getLogger(__name__)
 
@@ -42,10 +42,10 @@ async def main() -> None:
     apply_logging(cfg.logging, level_override=_startup_log_level(cfg))
     logger.debug("gateway.enabled=%s bridges=%s", cfg.gateway.enabled, list(cfg.bridges))
 
-    logger.debug("creating router")
-    gw = Router(config=cfg)
-    logger.debug("router created")
-    gw.open_system_lane()
+    logger.debug("creating runtime")
+    gw = Runtime(config=cfg)
+    logger.debug("runtime created")
+    await gw.start()
 
     tasks: list[asyncio.Task] = []
 

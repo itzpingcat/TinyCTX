@@ -1,0 +1,537 @@
+"""
+modules/knowledge/__main__.py
+
+Registers the knowledge module into the agent.
+
+On load:
+  1. Starts the LibrarianRunner in-process background task
+  2. Registers read tools on the main agent (kg_search, kg_traverse,
+     kg_get_entity, kg_list, kg_stats)
+  3. Registers call_librarian (always-on)
+  4. Registers a PromptProvider for pinned entity injection
+
+The LibrarianRunner owns the single ladybug.Database object and is the sole
+writer to the graph. All connections (reader and writer) are created from
+that one Database object, satisfying Ladybug's one-READ_WRITE-Database rule.
+"""
+from __future__ import annotations
+
+import asyncio
+import atexit
+import json
+import logging
+import time
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# LibrarianRunner — in-process background task (replaces sidecar subprocess)
+# ---------------------------------------------------------------------------
+
+class LibrarianRunner:
+    """
+    Owns the single ladybug.Database, vends connections, and runs the
+    librarian poll loop as an asyncio background task.
+
+    All graph writes go through the async_conn + write_lock held here.
+    Read connections (for GraphDB / main-agent tools) are also created
+    from the same db object.
+    """
+
+    def __init__(
+        self,
+        cfg: dict,
+        graph_path: Path,
+        log_path: Path,
+        conv_db,
+        llm,
+        embedder,
+    ) -> None:
+        import ladybug
+        from TinyCTX.modules.knowledge.graph import init_schema
+
+        graph_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            self._db = ladybug.Database(str(graph_path))
+        except Exception as exc:
+            logger.warning(
+                "[knowledge] graph DB failed to open (%s) — wiping corrupted files and retrying",
+                exc,
+            )
+            for suffix in ("", ".wal", ".shm"):
+                p = Path(str(graph_path) + suffix)
+                if p.exists():
+                    p.unlink()
+                    logger.info("[knowledge] deleted %s", p)
+            self._db = ladybug.Database(str(graph_path))
+
+        self._write_conn = ladybug.AsyncConnection(
+            self._db,
+            max_concurrent_queries=int(cfg.get("max_concurrent", 4)),
+        )
+        self._write_lock = asyncio.Lock()
+
+        # Initialise schema synchronously on a plain connection
+        sync_conn = ladybug.Connection(self._db)
+        init_schema(sync_conn)
+        sync_conn.close()
+
+        self._cfg      = cfg
+        self._conv_db  = conv_db
+        self._llm      = llm
+        self._embedder = embedder
+
+        # Dedicated file logger for all librarian agent text output
+        self.agent_logger = logging.getLogger("knowledge.librarian.agent")
+        if not self.agent_logger.handlers:
+            fh = logging.FileHandler(log_path, encoding="utf-8")
+            fh.setFormatter(logging.Formatter(
+                "%(asctime)s %(levelname)s %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            ))
+            self.agent_logger.addHandler(fh)
+            self.agent_logger.setLevel(logging.DEBUG)
+            self.agent_logger.propagate = False
+
+        # Queue replaces IPC socket: call_librarian puts messages here
+        self.queue: asyncio.Queue = asyncio.Queue()
+
+        self._task: asyncio.Task | None = None
+        self._state = {
+            "last_poll_ts":  0.0,
+            "last_dedup_ts": 0.0,
+            "dedup_running": False,
+        }
+        self._active_tasks: set[asyncio.Task] = set()
+
+    def new_read_connection(self):
+        """Return a new sync Connection from the shared Database for read tools."""
+        import ladybug
+        return ladybug.Connection(self._db)
+
+    def start(self) -> None:
+        """Schedule the poll loop as a background asyncio task."""
+        self._task = asyncio.create_task(self._run(), name="knowledge-librarian")
+        logger.info("[knowledge] LibrarianRunner started")
+
+    def stop(self) -> None:
+        if self._task and not self._task.done():
+            self._task.cancel()
+
+    async def _run(self) -> None:
+        try:
+            while True:
+                try:
+                    await self._poll_cycle()
+                except Exception:
+                    logger.exception("[knowledge/librarian] poll cycle error")
+                await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            # Drain in-flight agent tasks
+            if self._active_tasks:
+                logger.info(
+                    "[knowledge/librarian] draining %d in-flight task(s)",
+                    len(self._active_tasks),
+                )
+                await asyncio.gather(*self._active_tasks, return_exceptions=True)
+            logger.info("[knowledge/librarian] stopped")
+
+    async def _poll_cycle(self) -> None:
+        from TinyCTX.modules.knowledge.librarian_agents import (
+            run_buffer_agent, run_targeted_agent, run_dedup_cycle,
+            nodes_to_text,
+        )
+
+        # Reap finished tasks
+        done = {t for t in self._active_tasks if t.done()}
+        for t in done:
+            if not t.cancelled() and t.exception():
+                logger.error("[knowledge/librarian] agent task raised: %s", t.exception())
+        self._active_tasks -= done
+
+        max_concurrent = int(self._cfg.get("max_concurrent", 4))
+        batch_size     = int(self._cfg.get("batch_size", 20))
+
+        # Drain queue messages
+        while not self.queue.empty():
+            msg = self.queue.get_nowait()
+            msg_type = msg.get("type")
+            if msg_type == "targeted":
+                prompt = msg.get("prompt", "").strip()
+                if prompt and len(self._active_tasks) < max_concurrent:
+                    t = asyncio.create_task(
+                        run_targeted_agent(
+                            self._cfg, self._write_conn, self._write_lock,
+                            self._llm, prompt, self.agent_logger,
+                        )
+                    )
+                    self._active_tasks.add(t)
+                elif prompt:
+                    logger.warning("[knowledge/librarian] concurrency cap reached, dropping targeted msg")
+            # "trigger" falls through to the node walk below
+
+        # Node walk on schedule
+        now = time.time()
+        interval_secs = float(self._cfg.get("trigger_interval_hours", 6)) * 3600
+        if (now - self._state["last_poll_ts"]) >= interval_secs:
+            self._state["last_poll_ts"] = now
+
+            async with self._write_lock:
+                tail_nodes = self._conv_db.get_tail_nodes()
+                batches: list[tuple[list, str]] = []
+                for tail in tail_nodes:
+                    if len(self._active_tasks) + len(batches) >= max_concurrent:
+                        break
+                    flagged_ids = self._conv_db.flag_branch(tail.id, "librarian_visited")
+                    if not flagged_ids:
+                        continue
+                    batch_text = nodes_to_text(self._conv_db, list(reversed(flagged_ids)), batch_size)
+                    batches.append((flagged_ids, batch_text))
+
+            for flagged_ids, batch_text in batches:
+                if not batch_text.strip():
+                    continue
+                t = asyncio.create_task(
+                    run_buffer_agent(
+                        self._cfg, self._write_conn, self._write_lock,
+                        self._llm, batch_text, self.agent_logger,
+                    )
+                )
+                self._active_tasks.add(t)
+                logger.info("[knowledge/librarian] dispatched agent for %d node(s)", len(flagged_ids))
+
+        # Dedup on schedule
+        dedup_enabled  = bool(self._cfg.get("dedup_enabled", True))
+        dedup_interval = float(self._cfg.get("dedup_interval_hours", 24)) * 3600
+        if (
+            dedup_enabled
+            and not self._state["dedup_running"]
+            and (now - self._state["last_dedup_ts"]) >= dedup_interval
+            and self._embedder is not None
+            and len(self._active_tasks) < max_concurrent
+        ):
+            self._state["dedup_running"] = True
+            self._state["last_dedup_ts"] = now
+            t = asyncio.create_task(
+                run_dedup_cycle(
+                    self._cfg, self._write_conn, self._write_lock,
+                    self._llm, self._embedder, self.agent_logger,
+                )
+            )
+            t.add_done_callback(lambda _: self._state.__setitem__("dedup_running", False))
+            self._active_tasks.add(t)
+
+
+# ---------------------------------------------------------------------------
+# register()
+# ---------------------------------------------------------------------------
+
+def register_agent(agent) -> None:
+    # Normalise: accept Runtime or AgentCycle.
+    from TinyCTX.runtime import Runtime as _Runtime
+    _rt = agent if isinstance(agent, _Runtime) else None
+    if _rt is not None:
+        class _Shim:
+            config       = _rt.config
+            context      = _rt.context
+            tool_handler = _rt.tool_handler
+            def register_background_hook(self, fn): _rt.register_background_hook(fn)
+        agent = _Shim()
+    else:
+        if not hasattr(agent, 'register_background_hook'):
+            agent.register_background_hook = agent.post_turn_hooks.append
+
+    workspace = Path(agent.config.workspace.path).expanduser().resolve()
+    workspace.mkdir(parents=True, exist_ok=True)
+
+    # ------------------------------------------------------------------
+    # Config resolution
+    # ------------------------------------------------------------------
+    try:
+        from TinyCTX.modules.knowledge import EXTENSION_META
+        defaults: dict = EXTENSION_META.get("default_config", {})
+    except ImportError:
+        defaults = {}
+
+    overrides: dict = {}
+    if hasattr(agent.config, "extra") and isinstance(agent.config.extra, dict):
+        overrides = agent.config.extra.get("knowledge", {})
+
+    cfg: dict = {**defaults, **overrides}
+
+    def _resolve(rel: str) -> Path:
+        p = Path(rel)
+        return p if p.is_absolute() else workspace / p
+
+    graph_path  = _resolve(cfg["graph_path"])
+    log_path    = _resolve(cfg.get("librarian_log", "knowledge/librarian.log"))
+    pinned_prio = int(cfg.get("pinned_priority", 5))
+    agent_db    = workspace / "agent.db"
+
+    # ------------------------------------------------------------------
+    # Embedder for kg_search semantic mode
+    # ------------------------------------------------------------------
+    embedder        = None
+    embedding_model = cfg.get("embedding_model", "").strip()
+    if embedding_model:
+        try:
+            from TinyCTX.ai import Embedder
+            emb_cfg  = agent.config.get_embedding_model(embedding_model)
+            embedder = Embedder.from_config(emb_cfg)
+            logger.info("[knowledge] embedder: %s @ %s", emb_cfg.model, emb_cfg.base_url)
+        except (KeyError, ValueError) as exc:
+            logger.warning(
+                "[knowledge] embedding_model '%s' not usable (%s) — semantic search disabled",
+                embedding_model, exc,
+            )
+
+    # ------------------------------------------------------------------
+    # LLM for librarian agents
+    # ------------------------------------------------------------------
+    primary_name = agent.config.llm.primary
+    librarian_model_key = cfg.get("librarian_model", "").strip() or primary_name
+    primary_mc = agent.config.models.get(librarian_model_key)
+    try:
+        api_key = primary_mc.api_key if primary_mc else ""
+    except EnvironmentError:
+        api_key = ""
+
+    from TinyCTX.ai import LLM
+    llm = LLM(
+        base_url=primary_mc.base_url if primary_mc else "",
+        api_key=api_key,
+        model=primary_mc.model if primary_mc else "",
+        max_tokens=primary_mc.max_tokens if primary_mc else 2048,
+        temperature=primary_mc.temperature if primary_mc else 0.7,
+    )
+
+    # ------------------------------------------------------------------
+    # ConversationDB for the librarian to read agent.db
+    # ------------------------------------------------------------------
+    from TinyCTX.db import ConversationDB
+    conv_db = ConversationDB(agent_db)
+    atexit.register(conv_db.close)
+
+    # ------------------------------------------------------------------
+    # 1. Start LibrarianRunner (owns the single Database object)
+    # ------------------------------------------------------------------
+    runner = LibrarianRunner(cfg, graph_path, log_path, conv_db, llm, embedder)
+    runner.start()
+    atexit.register(runner.stop)
+
+    # ------------------------------------------------------------------
+    # 2. GraphDB for read tools — connection from the shared Database
+    # ------------------------------------------------------------------
+    from TinyCTX.modules.knowledge.graph import GraphDB
+    read_conn = runner.new_read_connection()
+    graph_db  = GraphDB(read_conn)
+    atexit.register(read_conn.close)
+
+    # ------------------------------------------------------------------
+    # 3. Read tools
+    # ------------------------------------------------------------------
+
+    async def kg_search(query: str, top_k: int = 5, semantic: bool = True) -> str:
+        """
+        Search the knowledge graph for entities relevant to a query.
+        Returns matching entities with their direct active relationships.
+        Bumps mention_count on returned nodes.
+
+        Args:
+            query: Natural language query or keywords to search for.
+            top_k: Maximum number of entities to return (default 5).
+            semantic: If true (default), use vector similarity search.
+                If false or no embedding model configured, uses keyword search.
+        """
+        from TinyCTX.modules.knowledge.graph import top_k_cosine
+
+        if semantic and embedder is not None:
+            try:
+                query_vec = await embedder.embed_one(query)
+            except Exception as exc:
+                logger.warning("[knowledge] kg_search embed failed: %s — falling back to keyword", exc)
+                query_vec = None
+        else:
+            query_vec = None
+
+        if query_vec is not None:
+            all_embs = graph_db.all_entities_with_embeddings()
+            top      = top_k_cosine(query_vec, all_embs, top_k)
+            uids     = [uid for uid, _ in top]
+        else:
+            results = graph_db.find_entity(name=query)
+            uids = [r["uuid"] for r in results[:top_k]]
+
+        if not uids:
+            return "[no matching entities found]"
+
+        graph_db.bump_mention_count(uids)
+
+        lines = []
+        for uid in uids:
+            entity = graph_db.get_entity(uid)
+            if not entity:
+                continue
+            name  = entity.get("e.name", "?")
+            etype = entity.get("e.entity_type", "?")
+            desc  = entity.get("e.description", "")
+            lines.append(f"[{etype}] {name} (uuid: {uid[:8]})\n  {desc}")
+            for edge in entity.get("edges_out", []):
+                lines.append(f"  →[{edge['relation']}]→ {edge['target_name']}")
+            for edge in entity.get("edges_in", []):
+                lines.append(f"  ←[{edge['relation']}]← {edge['source_name']}")
+
+        return "\n\n".join(lines) if lines else "[no entities found]"
+
+    async def kg_traverse(
+        uuid: str,
+        hops: int = 1,
+        relation_filter: str = "",
+    ) -> str:
+        """
+        Walk the graph from an entity outward up to N hops.
+        Returns all active edges encountered.
+
+        Args:
+            uuid: Starting entity UUID.
+            hops: Number of hops to traverse (default 1, max 3).
+            relation_filter: If provided, only follow edges with this relation label.
+        """
+        hops = min(int(hops), 3)
+        edges = graph_db.traverse(uuid, hops, relation_filter or None)
+        if not edges:
+            return f"[no edges found from {uuid[:8]}]"
+        lines = [f"Traversal from {uuid[:8]} ({hops} hop(s)):"]
+        for e in edges:
+            lines.append(f"  {e['source_uuid'][:8] if 'source_uuid' in e else uuid[:8]} "
+                         f"→[{e['relation']}]→ {e['target_name']} ({e['target_uuid'][:8]})")
+        return "\n".join(lines)
+
+    async def kg_get_entity(uuid: str) -> str:
+        """
+        Retrieve full details of a knowledge graph entity including all
+        active incoming and outgoing relationships.
+
+        Args:
+            uuid: The entity UUID to retrieve.
+        """
+        entity = graph_db.get_entity(uuid)
+        if not entity:
+            return f"[entity {uuid[:8]} not found]"
+
+        name  = entity.get("e.name", "?")
+        etype = entity.get("e.entity_type", "?")
+        desc  = entity.get("e.description", "")
+        pin   = entity.get("e.pinned", False)
+        pri   = entity.get("e.priority", 40)
+        mc    = entity.get("e.mention_count", 0)
+
+        lines = [
+            f"[{etype}] {name}",
+            f"uuid: {uuid}",
+            f"description: {desc}",
+            f"pinned: {pin}  priority: {pri}  mentions: {mc}",
+        ]
+        for e in entity.get("edges_out", []):
+            lines.append(f"  →[{e['relation']}]→ {e['target_name']} ({e['target_uuid'][:8]})"
+                         + (f" — {e['description']}" if e.get("description") else ""))
+        for e in entity.get("edges_in", []):
+            lines.append(f"  ←[{e['relation']}]← {e['source_name']} ({e['source_uuid'][:8]})"
+                         + (f" — {e['description']}" if e.get("description") else ""))
+
+        return "\n".join(lines)
+
+    async def kg_list(entity_type: str = "", pinned_only: bool = False) -> str:
+        """
+        List knowledge graph entities, optionally filtered by type or pinned status.
+
+        Args:
+            entity_type: Filter by type (e.g. Person, Project, Technology). Empty = all types.
+            pinned_only: If true, return only pinned entities.
+        """
+        entities = graph_db.list_entities(
+            entity_type=entity_type or None,
+            pinned_only=pinned_only,
+        )
+        if not entities:
+            return "[no entities found]"
+        lines = []
+        for e in entities:
+            pin = "📌 " if e.get("pinned") else ""
+            lines.append(f"{pin}[{e['entity_type']}] {e['name']} ({e['uuid'][:8]}) pri={e['priority']}\n  {e['description']}")
+        return "\n\n".join(lines)
+
+    async def kg_stats() -> str:
+        """
+        Show knowledge graph statistics: entity count, edge count, breakdown by type.
+        """
+        stats = graph_db.get_stats()
+        lines = [
+            f"Entities: {stats['entity_count']}",
+            f"Active edges: {stats['active_edge_count']}",
+            "By type:",
+        ]
+        for etype, count in stats["by_type"].items():
+            lines.append(f"  {etype}: {count}")
+        return "\n".join(lines)
+
+    for fn in [kg_search, kg_traverse, kg_get_entity, kg_list, kg_stats]:
+        always = (fn.__name__ == "kg_search")
+        agent.tool_handler.register_tool(fn, always_on=always, min_permission=25)
+
+    # ------------------------------------------------------------------
+    # 4. call_librarian (always-on) — puts directly onto runner.queue
+    # ------------------------------------------------------------------
+
+    async def call_librarian(prompt: str = "") -> str:
+        """
+        Signal the librarian to update the knowledge graph.
+
+        With no prompt: trigger normal node ingest immediately.
+
+        With a prompt: spawn a targeted agent to execute that specific
+        graph-edit instruction (e.g. "remember that Kamie prefers async Python",
+        "update the TinyCTX project description", "link TinyCTX to Python").
+
+        Args:
+            prompt: Optional instruction for the targeted librarian agent.
+                Leave empty to trigger node ingest.
+        """
+        if prompt.strip():
+            runner.queue.put_nowait({"type": "targeted", "prompt": prompt.strip()})
+            return f"[librarian: targeted agent queued — '{prompt[:60]}']"
+        else:
+            runner.queue.put_nowait({"type": "trigger"})
+            return "[librarian: node ingest triggered]"
+
+    agent.tool_handler.register_tool(call_librarian, always_on=True, min_permission=25)
+
+    # ------------------------------------------------------------------
+    # 5. Pinned entity PromptProvider
+    # ------------------------------------------------------------------
+
+    def _pinned_provider(_ctx) -> str | None:
+        entities = graph_db.get_pinned_entities()
+        if not entities:
+            return None
+        lines = ["--- Knowledge Graph (pinned) ---"]
+        for e in entities:
+            lines.append(f"[{e['entity_type']}] {e['name']} — {e['description']}")
+        lines.append("--------------------------------")
+        return "\n".join(lines)
+
+    agent.context.register_prompt(
+        "knowledge_pinned",
+        _pinned_provider,
+        role="system",
+        priority=pinned_prio,
+    )
+
+    logger.info(
+        "[knowledge] ready — graph: %s | embedder: %s",
+        graph_path, embedding_model or "none",
+    )

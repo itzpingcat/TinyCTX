@@ -41,7 +41,7 @@ Job schema (CRON.json):
 The agent edits CRON.json directly using edit_file / view / write_file.
 cron_list is the only tool registered — it validates and summarises jobs.
 
-Convention: register(agent) — no imports from gateway or bridges.
+Convention: register_agent(agent) — no imports from gateway or bridges.
 """
 from __future__ import annotations
 
@@ -49,13 +49,13 @@ import asyncio
 import json
 import logging
 import time
-import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from TinyCTX.contracts import (
+    AgentError, AgentTextFinal,
     InboundMessage, ContentType,
     UserIdentity, Platform,
 )
@@ -63,7 +63,6 @@ from TinyCTX.contracts import (
 logger = logging.getLogger(__name__)
 
 _CRON_USER_ID = "cron-system"
-_CRON_PLATFORM = Platform.CRON.value  # "cron" — used for platform handler slot
 
 _CRON_AUTHOR = UserIdentity(
     platform=Platform.CRON,
@@ -349,50 +348,35 @@ def _build_cron_list(path: Path) -> str:
 
     return "\n".join(lines)
 
-
-# ---------------------------------------------------------------------------
-# Cron runner
-# ---------------------------------------------------------------------------
-
 class _CronRunner:
     """
-    Watches CRON.json for changes and fires due jobs.
-    Each job is pushed through the gateway so it gets its own isolated Lane
-    and AgentLoop — job context never bleeds into the user's session.
-
-    Concurrency model: jobs within a single tick run sequentially under
-    _job_lock, so the shared _CRON_PLATFORM reply-handler slot is never
-    contested between jobs. Ticks themselves are serialised because _arm()
-    only schedules the next tick after _on_timer() completes.
+    Watches CRON.json and triggers turns via the Runtime.
     """
-
-    def __init__(self, agent, store_path: Path) -> None:
-        self._agent = agent
+    def __init__(self, runtime, store_path: Path) -> None:
+        self.runtime = runtime
         self._store_path = store_path
-        self._jobs:       list[CronJob] = []
-        self._version:    int           = 1
-        self._last_mtime: float         = 0.0
+        self._jobs: list[CronJob] = []
+        self._version: int = 1
+        self._last_mtime: float = 0.0
         self._timer_task: asyncio.Task | None = None
-        self._running     = False
-        # Serialises job execution so the cron reply-handler slot is never
-        # shared between two concurrently-running jobs.
-        self._job_lock    = asyncio.Lock()
+        self._running = False
+        self._job_lock = asyncio.Lock()
 
     def start(self) -> None:
         self._running = True
         self._reload_if_changed()
         self._recompute_next_runs()
         self._save()
-        self._ensure_noop_platform_handler()
+        
+        # Register a global sink for the CRON platform
+        if hasattr(self.runtime, "register_platform_handler"):
+            self.runtime.register_platform_handler(Platform.CRON.value, self._noop_handler)
+            
         self._arm()
-        logger.info("[cron] started with %d job(s)", len(self._jobs))
+        logger.info("[cron] runner started")
 
-    def stop(self) -> None:
-        self._running = False
-        if self._timer_task and not self._timer_task.done():
-            self._timer_task.cancel()
-
-    # ------------------------------------------------------------------
+    async def _noop_handler(self, event) -> None:
+        pass
 
     def _reload_if_changed(self) -> None:
         if self._store_path.exists():
@@ -400,29 +384,27 @@ class _CronRunner:
             if mtime != self._last_mtime:
                 self._jobs, self._version = _load_store(self._store_path)
                 self._last_mtime = mtime
-                logger.debug("[cron] reloaded CRON.json (%d jobs)", len(self._jobs))
         else:
-            self._jobs    = []
-            self._version = 1
+            self._jobs = []
 
     def _recompute_next_runs(self) -> None:
         now = _now_ms()
         for j in self._jobs:
-            if j.enabled:
+            if j.enabled and j.state.next_run_at_ms is None:
                 j.state.next_run_at_ms = _compute_next_run(j.schedule, now)
 
     def _save(self) -> None:
-        if self._jobs:
-            _save_store(self._store_path, self._jobs, self._version)
+        _save_store(self._store_path, self._jobs, self._version)
 
     def _next_wake_ms(self) -> int | None:
-        times = [
-            j.state.next_run_at_ms
-            for j in self._jobs
+        """Find the earliest next_run_at_ms among all enabled jobs."""
+        enabled_jobs = [
+            j.state.next_run_at_ms 
+            for j in self._jobs 
             if j.enabled and j.state.next_run_at_ms is not None
         ]
-        return min(times) if times else None
-
+        return min(enabled_jobs) if enabled_jobs else None
+    
     def _arm(self) -> None:
         if self._timer_task and not self._timer_task.done():
             self._timer_task.cancel()
@@ -431,213 +413,125 @@ class _CronRunner:
         if wake is None or not self._running:
             return
 
-        delay_s = max(0.0, (wake - _now_ms()) / 1000)
+        delay = max(0, (wake - _now_ms()) / 1000)
+        self._timer_task = asyncio.create_task(self._tick(delay))
 
-        async def _tick():
-            await asyncio.sleep(delay_s)
-            if self._running:
-                await self._on_timer()
-
-        self._timer_task = asyncio.get_event_loop().create_task(_tick())
-
-    def _ensure_noop_platform_handler(self) -> None:
-        gateway = getattr(self._agent, "gateway", None)
-        if gateway is None:
-            return
-
-        handlers = getattr(gateway, "_platform_handlers", None)
-        if not isinstance(handlers, dict):
-            return
-
-        if handlers.get(_CRON_PLATFORM) is None:
-            handlers[_CRON_PLATFORM] = _noop_reply_handler
-            register = getattr(gateway, "register_platform_handler", None)
-            if callable(register):
-                try:
-                    register(_CRON_PLATFORM, _noop_reply_handler)
-                except Exception:
-                    pass
-
-    async def _on_timer(self) -> None:
+    async def _tick(self, delay: float) -> None:
+        await asyncio.sleep(delay)
+        if not self._running: return
+        
         self._reload_if_changed()
         now = _now_ms()
-
-        due = [
-            j for j in self._jobs
-            if j.enabled
-            and j.state.next_run_at_ms is not None
-            and now >= j.state.next_run_at_ms
-        ]
+        due = [j for j in self._jobs if j.enabled and j.state.next_run_at_ms and now >= j.state.next_run_at_ms]
 
         for job in due:
             async with self._job_lock:
                 await self._run_job(job)
-
-        self._save()
+        
+        await asyncio.to_thread(self._save)
         self._arm()
 
-    def _get_or_create_job_cursor(self, job: CronJob, gateway) -> str:
-        """
-        Return the node_id for this job's branch cursor.
-        Creates a new child of the global root on first call and stores it
-        in job.cursor_node_id so subsequent runs resume where the last left off.
-        """
-        if job.cursor_node_id:
-            return job.cursor_node_id
-        from TinyCTX.db import ConversationDB
-        workspace = Path(self._agent.config.workspace.path).expanduser().resolve()
-        db   = ConversationDB(workspace / "agent.db")
-        root = db.get_root()
-        node = db.add_node(parent_id=root.id, role="system", content=f"session:cron:{job.id}")
-        job.cursor_node_id = node.id
-        logger.info("[cron] created cursor node %s for job '%s'", node.id, job.name)
-        return node.id
-
     async def _run_job(self, job: CronJob) -> None:
-        logger.info("[cron] running job '%s' (%s)", job.name, job.id)
+        logger.info("[cron] running job '%s' (reset=%s)", job.name, job.reset_after_run)
         start_ms = _now_ms()
 
+        # 1. Determine the starting cursor
+        if job.reset_after_run or not job.cursor_node_id:
+            parent_id = self.runtime.db.get_root().id
+        else:
+            parent_id = job.cursor_node_id
+
+        # 2. Prepare the turn
+        msg = InboundMessage(
+            tail_node_id=parent_id,
+            author=_CRON_AUTHOR,
+            content_type=ContentType.TEXT,
+            text=job.message,
+            trigger=True,
+        )
+
+        reply_queue: asyncio.Queue = asyncio.Queue()
+
         try:
-            gateway = getattr(self._agent, "gateway", None)
-            if gateway is None:
-                logger.error("[cron] agent.gateway not set — cannot run job '%s'", job.name)
-                job.state.last_status = "error"
-                job.state.last_error  = "agent.gateway not available"
-                return
+            # 3. Push — returns the user node id; events stream into reply_queue
+            await self.runtime.push(msg, reply_queue=reply_queue)
 
-            # Normal app startup sets agent.gateway after module registration,
-            # so keep a lazy path here even though start() also registers when
-            # the gateway is already available.
-            self._ensure_noop_platform_handler()
+            # 4. Drain the queue to find the final assistant tail
+            final_tail: str | None = None
+            while True:
+                try:
+                    event = await asyncio.wait_for(reply_queue.get(), timeout=300)
+                except asyncio.TimeoutError:
+                    logger.warning("[cron] job '%s' timed out", job.name)
+                    break
 
-            node_id = self._get_or_create_job_cursor(job, gateway)
+                if event is None:  # sentinel — turn complete
+                    break
 
-            msg = InboundMessage(
-                tail_node_id=node_id,
-                author=_CRON_AUTHOR,
-                content_type=ContentType.TEXT,
-                text=job.message,
-                message_id=f"cron-{job.id}-{int(time.time_ns())}",
-                timestamp=time.time(),
-            )
-
-            parts: list[str] = []
-            reply_event = asyncio.Event()
-
-            async def _collect(event) -> None:
-                from TinyCTX.contracts import AgentTextChunk, AgentTextFinal, AgentError
-                if isinstance(event, AgentTextChunk):
-                    parts.append(event.text)
-                elif isinstance(event, AgentTextFinal):
-                    if event.text:
-                        parts.append(event.text)
-                    reply_event.set()
+                if isinstance(event, AgentTextFinal) and event.tail_node_id:
+                    final_tail = event.tail_node_id
                 elif isinstance(event, AgentError):
-                    parts.append(event.message)
-                    reply_event.set()
+                    raise RuntimeError(event.message)
 
-            # Use per-cursor handler so concurrent jobs don't share a slot.
-            gateway.register_cursor_handler(node_id, _collect)
-
-            try:
-                await gateway.push(msg)
-                await asyncio.wait_for(reply_event.wait(), timeout=120)
-            except asyncio.TimeoutError:
-                # Abort the lane before unregistering the cursor handler so the
-                # AgentLoop stops emitting events.  Re-raise so the outer
-                # except block records the timeout status.
-                gateway.abort_generation(node_id)
-                raise
-            finally:
-                gateway.unregister_cursor_handler(node_id)
-
-            reply_text = "".join(parts).strip()
-            if reply_text:
-                logger.info("[cron] job '%s' reply:\n%s", job.name, reply_text)
-
-            # Advance the job cursor to the lane's latest tail so the next run
-            # continues from the updated branch head.
-            lane_router = getattr(gateway, "_lane_router", None)
-            lanes = getattr(lane_router, "_lanes", None)
-            if isinstance(lanes, dict):
-                lane = lanes.get(node_id)
-                loop_owner = lane
-                if getattr(loop_owner, "loop", None) is None:
-                    nested_lane = getattr(loop_owner, "_lane", None)
-                    if nested_lane is not None:
-                        loop_owner = nested_lane
-                loop = getattr(loop_owner, "loop", None)
-                tail = getattr(loop, "_tail_node_id", None)
-                if tail:
-                    job.cursor_node_id = tail
+            # 5. Advance cursor to real assistant tail
+            if final_tail:
+                job.cursor_node_id = final_tail
 
             job.state.last_status = "ok"
-            job.state.last_error  = None
-            logger.info("[cron] job '%s' completed", job.name)
+            job.state.last_error = None
 
-        except asyncio.TimeoutError:
+        except Exception as e:
             job.state.last_status = "error"
-            job.state.last_error  = "timed out after 120s"
-            logger.error("[cron] job '%s' timed out", job.name)
-        except Exception as exc:
-            job.state.last_status = "error"
-            job.state.last_error  = str(exc)
-            logger.error("[cron] job '%s' failed: %s", job.name, exc)
+            job.state.last_error = str(e)
+            logger.error("[cron] job '%s' failed: %s", job.name, e)
 
+        # 6. Housekeeping
         job.state.last_run_at_ms = start_ms
-        job.updated_at_ms        = _now_ms()
-
-        # reset_after_run: clear in-memory context (tree stays intact).
-        if job.reset_after_run:
-            gateway = getattr(self._agent, "gateway", None)
-            if gateway is not None and job.cursor_node_id:
-                gateway.reset_lane(job.cursor_node_id)
-                logger.debug("[cron] reset lane for job '%s'", job.name)
-
-        # One-shot cleanup
         if job.schedule.kind == "at":
-            if job.delete_after_run:
-                self._jobs = [j for j in self._jobs if j.id != job.id]
-            else:
-                job.enabled = False
-                job.state.next_run_at_ms = None
+            job.enabled = False
         else:
             job.state.next_run_at_ms = _compute_next_run(job.schedule, _now_ms())
 
-
 # ---------------------------------------------------------------------------
-# Module-level no-op handler — installed as the cron platform sentinel
-# so the slot is never empty between job runs.
+# register_runtime()
 # ---------------------------------------------------------------------------
 
-async def _noop_reply_handler(reply) -> None:
-    pass
+# module_registry manages these calls
+_STORE_PATH_CACHE: Path | None = None
 
+def register_runtime(runtime) -> None:
+    """
+    Called once at boot. 
+    Initializes the background 'watchdog' that triggers jobs.
+    """
+    global _STORE_PATH_CACHE
+    
+    workspace = Path(runtime.config.workspace.path).expanduser().resolve()
+    # Pull store_file from config if it exists, else default
+    store_path = workspace / "CRON.json"
+    _STORE_PATH_CACHE = store_path
 
-# ---------------------------------------------------------------------------
-# register()
-# ---------------------------------------------------------------------------
-
-def register(agent) -> None:
-    try:
-        from TinyCTX.modules.cron import EXTENSION_META
-        cfg: dict = EXTENSION_META.get("default_config", {})
-    except ImportError:
-        cfg = {}
-
-    workspace  = Path(agent.config.workspace.path).expanduser().resolve()
-    store_path = workspace / cfg.get("store_file", "CRON.json")
-
-    runner = _CronRunner(agent, store_path)
+    # Start the background runner
+    runner = _CronRunner(runtime, store_path)
     runner.start()
+    
+    logger.info("[cron] Background runner active via register_runtime")
+
+def register_agent(agent) -> None:
+    """
+    Called per-turn. 
+    Injects the tool that helps the agent interpret the CRON.json file.
+    """
+    # We use the cached path so the tool knows exactly where the runner is looking
+    store_path = _STORE_PATH_CACHE or (
+        Path(agent.config.workspace.path).expanduser().resolve() / "CRON.json"
+    )
 
     def cron_list() -> str:
         """
         List all scheduled cron jobs, validate their configuration, and show next/last run times.
-        To add, edit, or remove jobs, edit workspace/CRON.json directly using edit_file or view.
+        To add, edit, or remove jobs, use 'view' and 'edit_file' on workspace/CRON.json.
         """
         return _build_cron_list(store_path)
 
     agent.tool_handler.register_tool(cron_list)
-
-    logger.info("[cron] registered — store: %s", store_path)

@@ -16,7 +16,7 @@ Registers web tools into the agent loop's tool_handler:
 One Playwright browser instance lives on the AgentLoop for the session lifetime.
 It is created lazily on first use and closed on reset() via a registered hook.
 
-Convention: register(agent) — no imports from contracts or gateway.
+Convention: register_agent(agent) — no imports from contracts or gateway.
 """
 from __future__ import annotations
 
@@ -564,7 +564,17 @@ def _web_prompt(_ctx) -> str:
 # register() — wires everything into agent
 # ---------------------------------------------------------------------------
 
-def register(agent) -> None:
+def register_agent(agent) -> None:
+    # Normalise: accept Runtime or legacy AgentLoop.
+    from TinyCTX.runtime import Runtime as _Runtime
+    _runtime_ref = agent if isinstance(agent, _Runtime) else None
+    if _runtime_ref is not None:
+        _rt = agent
+        class _Shim:
+            config       = _rt.config
+            tool_handler = _rt.tool_handler
+            reset = None
+        agent = _Shim()
     try:
         from TinyCTX.modules.web import EXTENSION_META
         cfg: dict = EXTENSION_META.get("default_config", {})
@@ -593,19 +603,17 @@ def register(agent) -> None:
         "browse_user_agent":      str(cfg.get("browse_user_agent", "TinyCTX/1.1")),
     })
 
-    original_reset = agent.reset
+    original_reset = getattr(agent, 'reset', None)
 
-    def patched_reset(*args, **kwargs):
-        original_reset(*args, **kwargs)
-        # Use get_running_loop() — get_event_loop() is deprecated in 3.10+
-        # and may raise if called outside an async context.
-        try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(_close_browser(agent))
-        except RuntimeError:
-            pass  # no running loop at reset time — browser will be GC'd
-
-    agent.reset = patched_reset
+    if original_reset is not None:
+        def patched_reset(*args, **kwargs):
+            original_reset(*args, **kwargs)
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(_close_browser(agent))
+            except RuntimeError:
+                pass
+        agent.reset = patched_reset
 
     # ------------------------------------------------------------------
     # Tool definitions

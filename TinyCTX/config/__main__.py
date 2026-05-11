@@ -185,7 +185,11 @@ class WorkspaceConfig:
     path: Path = field(default_factory=lambda: Path("~/.tinyctx").expanduser())
 
     def __post_init__(self):
-        self.path = Path(self.path).expanduser().resolve()  # ~ → /home/tinyctx in container, %USERPROFILE% on Windows
+        override = os.environ.get("TINYCTX_WORKSPACE_PATH", "").strip()
+        if override:
+            self.path = Path(override).resolve()
+        else:
+            self.path = Path(self.path).expanduser().resolve()  # ~ → /home/tinyctx in container, %USERPROFILE% on Windows
 
 
 @dataclass
@@ -443,6 +447,9 @@ def apply_logging(cfg: LoggingConfig, *, level_override: str | int | None = None
         datefmt="%H:%M:%S",
     )
 
+    for _noisy in ("discord.gateway", "discord.client", "discord.http", "discord.state"):
+        logging.getLogger(_noisy).setLevel(logging.WARNING)
+        
     structlog.configure(
         processors=[
             structlog.stdlib.add_log_level,

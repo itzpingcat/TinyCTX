@@ -1,5 +1,12 @@
 name: tinyctx
 
+x-bake:
+  defaults:
+    cache-from:
+      - type=local,src=.docker-cache
+    cache-to:
+      - type=local,dest=.docker-cache,mode=max
+
 services:
 
   # ── agent ──────────────────────────────────────────────────────────────────
@@ -32,6 +39,7 @@ services:
 
     environment:
       TINYCTX_GATEWAY_HOST: "0.0.0.0"
+      TINYCTX_WORKSPACE_PATH: /home/tinyctx
       DISCORD_BOT_TOKEN:
       MATRIX_PASSWORD:
 
