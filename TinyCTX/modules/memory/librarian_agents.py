@@ -24,15 +24,21 @@ def _prompt(filename: str) -> str:
 
 
 async def get_relation_types(conn) -> str:
-    """Return a comma-separated string of distinct active relation labels in the graph."""
+    """Return a comma-separated string of relation types: defaults union live graph labels."""
+    defaults = [
+        t.strip()
+        for line in (_PROMPTS_DIR / "default_relation_types.txt").read_text(encoding="utf-8").splitlines()
+        for t in line.split(",")
+        if t.strip()
+    ]
     r = await conn.execute(
         "MATCH ()-[r:Relation]->() WHERE r.superseded_at IS NULL RETURN DISTINCT r.relation ORDER BY r.relation"
     )
-    labels = []
+    live = []
     while r.has_next():
-        labels.append(r.get_next()[0])
-    return ", ".join(labels) if labels else "(none yet)"
-
+        live.append(r.get_next()[0])
+    extras = [l for l in live if l not in defaults]
+    return ", ".join(defaults + extras)
 
 def _set(conn, uid: str, field: str, value):
     """Issue a single-field SET via two-param query (uuid + value).
