@@ -370,17 +370,14 @@ class Context:
         """
         Walk the ancestor chain from _tail_node_id and convert DB nodes to
         HistoryEntry objects.
+
+        Content is stored fully-formed by runtime.push() — plain text for
+        text-only messages, JSON-serialised content block list for messages
+        with inlined attachments, or text with a <files> reference note
+        appended for reference-only attachments.  No rehydration is needed
+        here; we just deserialise list content from JSON when present.
         """
         nodes = self._db.get_ancestors(self._tail_node_id)
-        last_idx = len(nodes) - 1
-
-        try:
-            from TinyCTX.utils.attachments import build_content_blocks as _build_blocks, classify as _classify
-            from TinyCTX.contracts import Attachment, AttachmentKind
-            import mimetypes as _mimetypes
-            _att_available = True
-        except ImportError:
-            _att_available = False
 
         entries: list[HistoryEntry] = []
         for i, node in enumerate(nodes):
@@ -402,46 +399,6 @@ class Context:
                         )
                 except (json.JSONDecodeError, ValueError):
                     pass
-
-            if (
-                node.role == ROLE_USER
-                and isinstance(content, str)
-                and node.attachment_paths
-                and _att_available
-                and i == last_idx
-            ):
-                try:
-                    paths: list[str] = json.loads(node.attachment_paths)
-                    atts: list = []
-                    for path_str in paths:
-                        from pathlib import Path as _Path
-                        p = _Path(path_str)
-                        if p.exists():
-                            data = p.read_bytes()
-                            mime = _mimetypes.guess_type(p.name)[0] or "application/octet-stream"
-                            kind = _classify(Attachment(filename=p.name, data=data, mime_type=mime))
-                            atts.append(Attachment(filename=p.name, data=data, mime_type=mime, kind=kind))
-                        else:
-                            logger.warning("[load_from_db] attachment path missing: %s", path_str)
-                    if atts:
-                        from TinyCTX.config import AttachmentConfig, ModelConfig
-                        att_cfg = AttachmentConfig()
-                        dummy_model = ModelConfig(
-                            model="dummy", base_url="http://localhost",
-                            vision=False, tokens_per_image=None,
-                        )
-                        import os as _os
-                        workspace = _Path(_os.getcwd())
-                        rebuilt = _build_blocks(
-                            text=content,
-                            attachments=tuple(atts),
-                            model_cfg=dummy_model,
-                            att_cfg=att_cfg,
-                            workspace=workspace,
-                        )
-                        content = rebuilt
-                except Exception:
-                    logger.exception("[load_from_db] failed to re-hydrate attachments for node %s", node.id)
 
             tool_calls: list[dict] = []
             if node.tool_calls:

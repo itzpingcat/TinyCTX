@@ -9,7 +9,7 @@ from typing import Any, Awaitable, Callable
 
 from TinyCTX.config import Config
 from TinyCTX.contracts import AgentEvent, InboundMessage
-from TinyCTX.utils.attachments import save_upload as _save_upload
+from TinyCTX.utils.attachments import save_upload as _save_upload, build_content_blocks as _build_content_blocks
 from TinyCTX.db import ConversationDB
 from TinyCTX.utils.commands import CommandRegistry
 from TinyCTX.module_registry import ModuleRegistry
@@ -59,29 +59,29 @@ class Runtime:
         If reply_queue is provided and msg.trigger is True, events are written into
         it as they arrive. A None sentinel is put when the turn is complete.
         """
-        # 1. Track platform for event routing — done after user node is written below.
-        # 2. Persist Attachments
-        attachment_json = None
-        if msg.attachments:
-            uploads_dir = Path(self.config.workspace.path).expanduser() / self.config.attachments.uploads_dir
-            paths = []
-            for att in msg.attachments:
-                try:
-                    paths.append(str(_save_upload(att, uploads_dir)))
-                except Exception:
-                    logger.exception("Failed to save attachment %s", att.filename)
-            if paths:
-                attachment_json = json.dumps(paths, ensure_ascii=False)
+        # 1. Build message content — inline attachments or append reference notes.
+        workspace = Path(self.config.workspace.path).expanduser().resolve()
+        primary_name = self.config.llm.primary
+        model_cfg = self.config.models.get(primary_name)
+        content = _build_content_blocks(
+            text=msg.text,
+            attachments=msg.attachments,
+            model_cfg=model_cfg,
+            att_cfg=self.config.attachments,
+            workspace=workspace,
+        ) if msg.attachments else msg.text
 
-        # 3. Write User Node to DB
+        # Serialise list content to JSON string for DB storage.
+        content_str = json.dumps(content, ensure_ascii=False) if isinstance(content, list) else content
+
+        # 2. Write User Node to DB
         state_delta = self._compute_state_delta(msg)
         user_node = self.db.add_node(
             parent_id=msg.tail_node_id,
             role="user",
-            content=msg.text,
+            content=content_str,
             author_id=msg.author.user_id,
             author_name=msg.author.username,
-            attachment_paths=attachment_json,
             state_delta=json.dumps(state_delta) if state_delta else None,
         )
         
