@@ -62,7 +62,7 @@ class LibrarianRunner:
                 "[memory] graph DB failed to open (%s) — wiping corrupted files and retrying",
                 exc,
             )
-            for suffix in ("", ".wal", ".shm"):
+            for suffix in (".wal", ".shm"):
                 p = Path(str(graph_path) + suffix)
                 if p.exists():
                     p.unlink()
@@ -315,10 +315,9 @@ def register_agent(agent) -> None:
     atexit.register(conv_db.close)
 
     # ------------------------------------------------------------------
-    # 1. Start LibrarianRunner (owns the single Database object)
+    # 1. Build LibrarianRunner (does NOT start the poll loop yet)
     # ------------------------------------------------------------------
     runner = LibrarianRunner(cfg, graph_path, log_path, conv_db, llm, embedder)
-    runner.start()
     atexit.register(runner.stop)
 
     # ------------------------------------------------------------------
@@ -331,10 +330,16 @@ def register_agent(agent) -> None:
     graph_db  = GraphDB(read_conn)
     atexit.register(read_conn.close)
 
+    # init BEFORE starting the runner so the poll loop never fires with _conn = None
     tools.init(runner._write_conn, runner._write_lock, graph_db, embedder)
 
     # ------------------------------------------------------------------
-    # 3. Register tools on the main agent
+    # 3. NOW start the runner — tools globals are live
+    # ------------------------------------------------------------------
+    runner.start()
+
+    # ------------------------------------------------------------------
+    # 4. Register tools on the main agent
     # ------------------------------------------------------------------
     for fn in [
         tools.kg_search,
@@ -347,12 +352,12 @@ def register_agent(agent) -> None:
         agent.tool_handler.register_tool(fn, always_on=always, min_permission=25)
 
     # ------------------------------------------------------------------
-    # 4. call_librarian (always-on) — puts directly onto runner.queue
+    # 5. call_librarian (always-on) — puts directly onto runner.queue
     # ------------------------------------------------------------------
 
     async def call_librarian(prompt: str = "") -> str:
         """
-        Signal the librarian to update the knowledge graph.
+        Signal the librarian to update the knowledge graph. Call with empty prompt if no specific fact to store, or there are many facts to store.
 
         With no prompt: trigger normal node ingest immediately.
 
@@ -374,7 +379,7 @@ def register_agent(agent) -> None:
     agent.tool_handler.register_tool(call_librarian, always_on=True, min_permission=25)
 
     # ------------------------------------------------------------------
-    # 5. Pinned entity PromptProvider
+    # 6. Pinned entity PromptProvider
     # ------------------------------------------------------------------
 
     def _pinned_provider(_ctx) -> str | None:
