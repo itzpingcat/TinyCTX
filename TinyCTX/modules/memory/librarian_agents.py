@@ -53,14 +53,21 @@ async def _aset(conn, uid: str, field: str, value):
 # Conversation node → text
 # ---------------------------------------------------------------------------
 
-def nodes_to_text(conv_db, node_ids: list[str], batch_size: int) -> str:
-    """Render up to batch_size nodes as '[author]: content' lines."""
+def nodes_to_text(conv_db, node_ids: list[str], batch_size: int) -> tuple[str, str]:
+    """
+    Render up to batch_size nodes as '[author]: content' lines.
+    Returns (batch_text, agent_name) where agent_name is the last assistant
+    author_name seen in the batch, or 'assistant' if none found.
+    """
     lines: list[str] = []
+    agent_name = "assistant"
     for node_id in node_ids[:batch_size]:
         node = conv_db.get_node(node_id)
         if node is None or node.role not in ("user", "assistant"):
             continue
         author  = node.author_name or node.author_id or node.role
+        if node.role == "assistant" and node.author_name:
+            agent_name = node.author_name
         content = node.content or ""
         if content.startswith("["):
             try:
@@ -73,7 +80,7 @@ def nodes_to_text(conv_db, node_ids: list[str], batch_size: int) -> str:
         content = content.strip()
         if content:
             lines.append(f"[{author}]: {content}")
-    return "\n".join(lines)
+    return "\n".join(lines), agent_name
 
 
 # ---------------------------------------------------------------------------
@@ -109,13 +116,17 @@ async def run_buffer_agent(
     write_lock: asyncio.Lock,
     llm,
     batch_text: str,
+    agent_name: str,
     agent_logger: logging.Logger,
 ) -> None:
     """Ingest a batch of conversation nodes into the knowledge graph."""
     relation_vocab = await get_relation_types(conn)
     await _agent_loop(
         llm,
-        _prompt("buffer_system.txt").format(relation_vocab=relation_vocab),
+        _prompt("buffer_system.txt").format(
+            relation_vocab=relation_vocab,
+            agent_name=agent_name,
+        ),
         _prompt("buffer_user.txt").format(batch_text=batch_text),
         _make_tool_handler(),
         agent_logger,

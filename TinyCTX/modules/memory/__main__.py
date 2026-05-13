@@ -180,23 +180,23 @@ class LibrarianRunner:
 
             async with self._write_lock:
                 tail_nodes = self._conv_db.get_tail_nodes()
-                batches: list[tuple[list, str]] = []
+                batches: list[tuple[list, str, str]] = []
                 for tail in tail_nodes:
                     if len(self._active_tasks) + len(batches) >= max_concurrent:
                         break
                     flagged_ids = self._conv_db.flag_branch(tail.id, "librarian_visited")
                     if not flagged_ids:
                         continue
-                    batch_text = nodes_to_text(self._conv_db, list(reversed(flagged_ids)), batch_size)
-                    batches.append((flagged_ids, batch_text))
+                    batch_text, agent_name = nodes_to_text(self._conv_db, list(reversed(flagged_ids)), batch_size)
+                    batches.append((flagged_ids, batch_text, agent_name))
 
-            for flagged_ids, batch_text in batches:
+            for flagged_ids, batch_text, agent_name in batches:
                 if not batch_text.strip():
                     continue
                 t = asyncio.create_task(
                     run_buffer_agent(
                         self._cfg, self._write_conn, self._write_lock,
-                        self._llm, batch_text, self.agent_logger,
+                        self._llm, batch_text, agent_name, self.agent_logger,
                     )
                 )
                 self._active_tasks.add(t)
