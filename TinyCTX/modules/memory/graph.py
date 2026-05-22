@@ -262,6 +262,34 @@ class GraphDB:
         )
         return self._rows_to_dicts(r, ["uuid", "name", "entity_type", "description"])
 
+    def get_pinned_entities_full(self) -> list[dict]:
+        """
+        Return full entity dicts (including edges) for all pinned entities,
+        ordered by priority descending. Used by the memory block assembler.
+        """
+        r = self._conn.execute(
+            "MATCH (e:Entity) WHERE e.pinned = true RETURN e.uuid ORDER BY e.priority DESC"
+        )
+        uuids = [row[0] for row in self._drain(r)]
+        results = []
+        for uid in uuids:
+            entity = self.get_entity(uid)
+            if entity:
+                results.append(entity)
+        return results
+
+    def get_entity_slim(self, uid: str) -> dict | None:
+        """Fetch name/type/description only — no edges. Used for linked-node rendering."""
+        r = self._conn.execute(
+            "MATCH (e:Entity {uuid: $uid}) "
+            "RETURN e.uuid, e.name, e.entity_type, e.description",
+            parameters={"uid": uid},
+        )
+        if not r.has_next():
+            return None
+        row = r.get_next()
+        return {"uuid": row[0], "name": row[1], "entity_type": row[2], "description": row[3]}
+
     def traverse(
         self,
         uid: str,
@@ -355,6 +383,13 @@ class GraphDB:
         rows = []
         while result.has_next():
             rows.append(dict(zip(col_names, result.get_next())))
+        return rows
+
+    @staticmethod
+    def _drain(result) -> list:
+        rows = []
+        while result.has_next():
+            rows.append(result.get_next())
         return rows
 
     def close(self) -> None:

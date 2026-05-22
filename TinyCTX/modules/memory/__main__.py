@@ -399,15 +399,93 @@ def register_agent(agent) -> None:
     # 6. Pinned entity PromptProvider
     # ------------------------------------------------------------------
 
-    def _pinned_provider(_ctx) -> str | None:
-        entities = graph_db.get_pinned_entities()
-        if not entities:
+    token_budget = int(cfg.get("memory_block_tokens", 4096))
+
+    def _build_memory_block(gdb, budget: int) -> str | None:
+        """
+        Assemble a <memory> block within the given token budget.
+
+        Phase 1 — pinned entities (always included, priority order):
+          Render name, type, description, and all active edges.
+
+        Phase 2 — linked neighbors (fill remaining budget, sorted by weight):
+          Collect every entity reachable via one hop from any pinned node.
+          Score each by max edge weight across all pinned->neighbor edges.
+          Render slim (name, type, description only) highest-weight-first.
+
+        Token estimate: len(text) // 4  (consistent with TinyCTX convention).
+        """
+        pinned = gdb.get_pinned_entities_full()
+        if not pinned:
             return None
-        lines = ["--- Knowledge Graph (pinned) ---"]
-        for e in entities:
-            lines.append(f"[{e['entity_type']}] {e['name']} — {e['description']}")
-        lines.append("--------------------------------")
-        return "\n".join(lines)
+
+        def _get(e: dict, field: str) -> str:
+            return str(e.get(f"e.{field}", e.get(field, "")) or "")
+
+        pinned_uuids: set[str] = {_get(e, "uuid") for e in pinned}
+
+        def _render_pinned(e: dict) -> str:
+            lines = [f"[{_get(e, 'entity_type')}] {_get(e, 'name')} — {_get(e, 'description')}"]
+            for edge in e.get("edges_out", []):
+                w = edge.get("weight", 0.0)
+                desc = f" — {edge['description']}" if edge.get("description") else ""
+                lines.append(f"  ->[{edge['relation']}]-> {edge['target_name']} (w={w:.2f}){desc}")
+            for edge in e.get("edges_in", []):
+                w = edge.get("weight", 0.0)
+                desc = f" — {edge['description']}" if edge.get("description") else ""
+                lines.append(f"  <-[{edge['relation']}]<- {edge['source_name']} (w={w:.2f}){desc}")
+            return "\n".join(lines)
+
+        def _render_neighbor(e: dict, score: float) -> str:
+            return (
+                f"[{_get(e, 'entity_type')}] {_get(e, 'name')} "
+                f"(linked, w={score:.2f}) — {_get(e, 'description')}"
+            )
+
+        def _tok(text: str) -> int:
+            return len(text) // 4
+
+        # --- Phase 1: pinned entities ---
+        sections: list[str] = []
+        used = _tok("<memory>\n\n</memory>")
+        for e in pinned:
+            block = _render_pinned(e)
+            used += _tok(block) + 1  # +1 for newline separator
+            sections.append(block)
+
+        # --- Phase 2: collect linked neighbors ---
+        # neighbor_uuid -> max_weight across all pinned->neighbor edges
+        neighbor_scores: dict[str, float] = {}
+        for e in pinned:
+            for edge in e.get("edges_out", []):
+                tgt = edge["target_uuid"]
+                if tgt not in pinned_uuids:
+                    w = float(edge.get("weight", 0.0))
+                    neighbor_scores[tgt] = max(neighbor_scores.get(tgt, 0.0), w)
+            for edge in e.get("edges_in", []):
+                src = edge["source_uuid"]
+                if src not in pinned_uuids:
+                    w = float(edge.get("weight", 0.0))
+                    neighbor_scores[src] = max(neighbor_scores.get(src, 0.0), w)
+
+        # sort neighbors by score descending, fill remaining budget
+        sorted_neighbors = sorted(neighbor_scores.items(), key=lambda x: x[1], reverse=True)
+        for uid, score in sorted_neighbors:
+            entity = gdb.get_entity_slim(uid)
+            if not entity:
+                continue
+            block = _render_neighbor(entity, score)
+            cost = _tok(block) + 1
+            if used + cost > budget:
+                break
+            used += cost
+            sections.append(block)
+
+        body = "\n\n".join(sections)
+        return f"<memory>\n{body}\n</memory>"
+
+    def _pinned_provider(_ctx) -> str | None:
+        return _build_memory_block(graph_db, token_budget)
 
     agent.context.register_prompt(
         "memory_pinned",
