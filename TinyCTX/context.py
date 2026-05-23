@@ -402,7 +402,7 @@ class Context:
         for i, node in enumerate(nodes):
             _VALID_BLOCK_TYPES = {"text", "image_url", "image", "document"}
             content: str | list = node.content
-            if node.role == ROLE_USER and content.startswith("["):
+            if node.role == ROLE_USER and isinstance(content, str) and content.startswith("["):
                 try:
                     parsed = json.loads(content)
                     if isinstance(parsed, list) and all(
@@ -447,7 +447,7 @@ class Context:
     _tiktoken_enc: "tiktoken.Encoding | None" = None
 
     @classmethod
-    def _get_encoder(cls) -> "tiktoken.Encoding":
+    def _get_encoder(cls) -> "tiktoken.Encoding | None":
         if cls._tiktoken_enc is None:
             try:
                 cls._tiktoken_enc = tiktoken.get_encoding("o200k_base")
@@ -575,9 +575,10 @@ class Context:
                         (i for i, b in enumerate(blocks) if b.get("type") == "text"), None
                     )
                     if first_text is not None:
-                        blocks[first_text] = {
-                            **blocks[first_text],
-                            "text": f"[{label}]: {blocks[first_text]['text']}",
+                        idx = first_text
+                        blocks[idx] = {
+                            **blocks[idx],
+                            "text": f"[{label}]: {blocks[idx]['text']}",
                         }
                     else:
                         blocks.insert(0, {"type": "text", "text": f"[{label}]: "})

@@ -29,6 +29,7 @@ import shlex
 import subprocess
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -112,7 +113,7 @@ def _last_cmd(command: str) -> str:
     return ""
 
 
-_EXIT_SEMANTICS: dict[str, callable] = {
+_EXIT_SEMANTICS: dict[str, Callable[[int], tuple[bool, str | None]]] = {
     "grep":  lambda c: (c >= 2, "no matches found" if c == 1 else None),
     "rg":    lambda c: (c >= 2, "no matches found" if c == 1 else None),
     "egrep": lambda c: (c >= 2, "no matches found" if c == 1 else None),
@@ -219,17 +220,23 @@ def _run_local(command: str, cwd: Path, timeout: int) -> str:
     effective = _normalize_windows(command)
     if _IS_WINDOWS:
         args = ["powershell", "-NoProfile", "-NonInteractive", "-Command", effective]
-        extra = {"creationflags": subprocess.CREATE_NO_WINDOW}
     else:
         args = ["bash", "-c", command]
-        extra = {}
     try:
-        result = subprocess.run(
-            args, cwd=cwd,
-            capture_output=True, text=True, timeout=timeout,
-            encoding="utf-8", errors="replace",
-            env=_LOCAL_ENV, **extra,
-        )
+        if _IS_WINDOWS:
+            result = subprocess.run(
+                args, cwd=cwd,
+                capture_output=True, text=True, timeout=timeout,
+                encoding="utf-8", errors="replace",
+                env=_LOCAL_ENV, creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        else:
+            result = subprocess.run(
+                args, cwd=cwd,
+                capture_output=True, text=True, timeout=timeout,
+                encoding="utf-8", errors="replace",
+                env=_LOCAL_ENV,
+            )
         parts = []
         if result.stdout:
             parts.append(result.stdout.rstrip())

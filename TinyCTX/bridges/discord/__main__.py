@@ -441,9 +441,9 @@ class DiscordBridge:
         self._client = discord_commands.Bot(command_prefix="\\", intents=intents)
         self._tree   = self._client.tree
 
-        # Assign directly by name (same reason as before — avoid __name__ prefix).
-        self._client.on_ready   = self._on_ready
-        self._client.on_message = self._on_message
+        # Register event handlers via the decorator API so discord.py picks them up.
+        self._client.event(self._on_ready)
+        self._client.event(self._on_message)
 
     # ------------------------------------------------------------------
     # Cursor management
@@ -930,7 +930,7 @@ class DiscordBridge:
             timestamp=time.time(),
             attachments=attachments,
             server_name=message.guild.name if message.guild else None,
-            channel_name=message.channel.name if hasattr(message.channel, "name") else None,
+            channel_name=getattr(message.channel, "name", None),
             permission_level=self._resolve_permission_level(member_roles),
             trigger=is_trigger,
         )
@@ -989,7 +989,7 @@ class DiscordBridge:
 
         thread     = message.channel
         thread_id  = str(thread.id)
-        channel_id = str(thread.parent_id) if thread.parent_id else ""
+        channel_id = str(thread.parent_id) if isinstance(thread, discord.Thread) and thread.parent_id else ""
         cursor_key = f"thread:{thread_id}"
 
         text        = message.content.strip()
@@ -1015,7 +1015,7 @@ class DiscordBridge:
             timestamp=time.time(),
             attachments=attachments,
             server_name=message.guild.name if message.guild else None,
-            channel_name=thread.name,
+            channel_name=getattr(thread, "name", None),
             permission_level=self._resolve_permission_level(member_roles),
             trigger=True,
         )
@@ -1067,6 +1067,7 @@ class DiscordBridge:
             typing_ev    = asyncio.Event()
             reply_queue: asyncio.Queue = asyncio.Queue()
 
+            keepalive: asyncio.Task | None = None
             if self._typing:
                 keepalive = asyncio.create_task(
                     self._typing_keepalive(channel, typing_ev, done_event)
@@ -1139,7 +1140,7 @@ class DiscordBridge:
                 typing_ev.set()
                 self._active_channels.pop(cursor_key, None)
                 self._node_to_cursor.pop(new_tail, None) if new_tail else None
-                if self._typing:
+                if self._typing and keepalive is not None:
                     keepalive.cancel()
                     try:
                         await keepalive

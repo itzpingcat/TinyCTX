@@ -178,7 +178,7 @@ def register_agent(agent) -> None:
             pass
         raise ValueError(f"Path escapes allowed directories: {raw}")
 
-    def view(path: str, view_range: list = None) -> str:
+    def view(path: str, view_range: list | None = None) -> str:
         """Read a file with line numbers, list a directory, or display an image.
 
         For image files (jpg, png, gif, webp) the raw image bytes are returned

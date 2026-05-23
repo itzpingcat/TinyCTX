@@ -185,15 +185,9 @@ def _resolve_em_path(em_path_cfg: str, module_dir: Path, workspace: Path) -> Pat
 # ---------------------------------------------------------------------------
 
 def register_agent(agent) -> None:
-    # Normalise: accept either an AgentLoop (legacy) or a Runtime.
+    # Normalise: accept an AgentCycle
     # Wrap Runtime in a minimal shim so the rest of register() is unchanged.
-    from TinyCTX.runtime import Runtime as _Runtime
-    if isinstance(agent, _Runtime):
-        _rt = agent
-        class _Shim:
-            config  = _rt.config
-            context = _rt.context
-        agent = _Shim()
+
     # Load config
     try:
         from TinyCTX.modules.equipment_manifest import EXTENSION_META
