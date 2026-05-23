@@ -1,14 +1,17 @@
 """
-modules/knowledge/__main__.py
+modules/memory/__main__.py
 
-Registers the knowledge module into the agent.
+Registers the memory module.
 
-On load:
-  1. Starts the LibrarianRunner in-process background task
-  2. Registers read tools on the main agent (kg_search, kg_traverse,
-     kg_get_entity, kg_list, kg_stats)
-  3. Registers call_librarian (always-on)
-  4. Registers a PromptProvider for pinned entity injection
+register_runtime(runtime) — called once at startup:
+  1. Resolves config, builds embedder, LLM, ConversationDB
+  2. Builds LibrarianRunner and starts the poll loop
+  3. Inits tools module globals (write_conn, graph_db, embedder)
+  4. Sets module-level singletons for register_agent to consume
+
+register_agent(cycle) — called per AgentCycle after tool_handler is ready:
+  1. Registers kg_* read tools + call_librarian on cycle.tool_handler
+  2. Registers pinned entity PromptProvider on cycle.context
 
 The LibrarianRunner owns the single ladybug.Database object and is the sole
 writer to the graph. All connections (reader and writer) are created from
@@ -18,16 +21,23 @@ from __future__ import annotations
 
 import asyncio
 import atexit
-import json
 import logging
 import time
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# Module-level singletons set by register_runtime.
+_runner:       "LibrarianRunner | None" = None
+_workspace:    Path | None = None
+_graph_db:     object | None = None
+_tools:        object | None = None
+_pinned_prio:  int = 5
+_token_budget: int = 4096
+
 
 # ---------------------------------------------------------------------------
-# LibrarianRunner — in-process background task (replaces sidecar subprocess)
+# LibrarianRunner — in-process background task
 # ---------------------------------------------------------------------------
 
 class LibrarianRunner:
@@ -225,30 +235,59 @@ class LibrarianRunner:
 
 
 # ---------------------------------------------------------------------------
-# register()
+# call_librarian — defined at module level, reads globals set by register_runtime
 # ---------------------------------------------------------------------------
 
-def register_agent(agent) -> None:
-    # Normalise: accept Runtime or AgentCycle.
-    from TinyCTX.runtime import Runtime as _Runtime
-    _rt = agent if isinstance(agent, _Runtime) else None
-    if _rt is not None:
-        class _Shim:
-            config       = _rt.config
-            context      = _rt.context
-            tool_handler = _rt.tool_handler
-            def register_background_hook(self, fn): _rt.register_background_hook(fn)
-        agent = _Shim()
+async def call_librarian(prompt: str = "", file_path: str = "") -> str:
+    """
+    Signal the librarian to update the knowledge graph.
+
+    With no arguments: trigger normal conversation node ingest immediately.
+
+    With prompt only: spawn a targeted agent for that specific graph-edit
+    instruction (e.g. "remember that Kamie prefers async Python").
+
+    With file_path: read that file and ingest its contents into the graph.
+    One file per call. Combine with prompt for extra instructions
+    (e.g. file_path="notes.md", prompt="focus on the people mentioned").
+
+    Args:
+        prompt: Optional instruction for the targeted librarian agent.
+        file_path: Optional path to a plain-text or markdown file to ingest.
+            Absolute, or relative to the workspace root.
+    """
+    if file_path.strip():
+        p = Path(file_path.strip())
+        if not p.is_absolute():
+            p = _workspace / p
+        try:
+            file_text = p.read_text(encoding="utf-8", errors="replace")
+        except Exception as exc:
+            return f"[librarian: could not read '{file_path}': {exc}]"
+        combined = f"<file name=\"{p.name}\">\n{file_text}\n</file>"
+        if prompt.strip():
+            combined = f"{combined}\n\n{prompt.strip()}"
+        _runner.queue.put_nowait({"type": "targeted", "prompt": combined})
+        return f"[librarian: file agent queued — '{p.name}']"
+    elif prompt.strip():
+        _runner.queue.put_nowait({"type": "targeted", "prompt": prompt.strip()})
+        return f"[librarian: targeted agent queued — '{prompt[:60]}']"
     else:
-        if not hasattr(agent, 'register_background_hook'):
-            agent.register_background_hook = agent.post_turn_hooks.append
+        _runner.queue.put_nowait({"type": "trigger"})
+        return "[librarian: node ingest triggered]"
 
-    workspace = Path(agent.config.workspace.path).expanduser().resolve()
-    workspace.mkdir(parents=True, exist_ok=True)
 
-    # ------------------------------------------------------------------
-    # Config resolution
-    # ------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# register_runtime — one-time startup
+# ---------------------------------------------------------------------------
+
+def register_runtime(runtime) -> None:
+    global _runner, _workspace, _graph_db, _tools, _pinned_prio, _token_budget
+
+    _workspace = Path(runtime.config.workspace.path).expanduser().resolve()
+    _workspace.mkdir(parents=True, exist_ok=True)
+
+    # Config
     try:
         from TinyCTX.modules.memory import EXTENSION_META
         defaults: dict = EXTENSION_META.get("default_config", {})
@@ -256,29 +295,29 @@ def register_agent(agent) -> None:
         defaults = {}
 
     overrides: dict = {}
-    if hasattr(agent.config, "extra") and isinstance(agent.config.extra, dict):
-        overrides = agent.config.extra.get("memory", {})
+    if hasattr(runtime.config, "extra") and isinstance(runtime.config.extra, dict):
+        overrides = runtime.config.extra.get("memory", {})
 
     cfg: dict = {**defaults, **overrides}
 
     def _resolve(rel: str) -> Path:
         p = Path(rel)
-        return p if p.is_absolute() else workspace / p
+        return p if p.is_absolute() else _workspace / p
 
-    graph_path  = _resolve(cfg["graph_path"])
-    log_path    = _resolve(cfg.get("librarian_log", "memory/librarian.log"))
-    pinned_prio = int(cfg.get("pinned_priority", 5))
-    agent_db    = workspace / "agent.db"
+    graph_path = _resolve(cfg["graph_path"])
+    log_path   = _resolve(cfg.get("librarian_log", "memory/librarian.log"))
+    agent_db   = _workspace / "agent.db"
 
-    # ------------------------------------------------------------------
-    # Embedder for kg_search semantic mode
-    # ------------------------------------------------------------------
+    _pinned_prio  = int(cfg.get("pinned_priority", 5))
+    _token_budget = int(cfg.get("memory_block_tokens", 4096))
+
+    # Embedder
     embedder        = None
     embedding_model = cfg.get("embedding_model", "").strip()
     if embedding_model:
         try:
             from TinyCTX.ai import Embedder
-            emb_cfg  = agent.config.get_embedding_model(embedding_model)
+            emb_cfg  = runtime.config.get_embedding_model(embedding_model)
             embedder = Embedder.from_config(emb_cfg)
             logger.info("[memory] embedder: %s @ %s", emb_cfg.model, emb_cfg.base_url)
         except (KeyError, ValueError) as exc:
@@ -287,12 +326,10 @@ def register_agent(agent) -> None:
                 embedding_model, exc,
             )
 
-    # ------------------------------------------------------------------
     # LLM for librarian agents
-    # ------------------------------------------------------------------
-    primary_name = agent.config.llm.primary
+    primary_name        = runtime.config.llm.primary
     librarian_model_key = cfg.get("librarian_model", "").strip() or primary_name
-    primary_mc = agent.config.models.get(librarian_model_key)
+    primary_mc          = runtime.config.models.get(librarian_model_key)
     try:
         api_key = primary_mc.api_key if primary_mc else ""
     except EnvironmentError:
@@ -307,114 +344,56 @@ def register_agent(agent) -> None:
         temperature=primary_mc.temperature if primary_mc else 0.7,
     )
 
-    # ------------------------------------------------------------------
-    # ConversationDB for the librarian to read agent.db
-    # ------------------------------------------------------------------
+    # ConversationDB
     from TinyCTX.db import ConversationDB
     conv_db = ConversationDB(agent_db)
     atexit.register(conv_db.close)
 
-    # ------------------------------------------------------------------
-    # 1. Build LibrarianRunner (does NOT start the poll loop yet)
-    # ------------------------------------------------------------------
-    runner = LibrarianRunner(cfg, graph_path, log_path, conv_db, llm, embedder)
-    atexit.register(runner.stop)
+    # LibrarianRunner
+    _runner = LibrarianRunner(cfg, graph_path, log_path, conv_db, llm, embedder)
+    atexit.register(_runner.stop)
 
-    # ------------------------------------------------------------------
-    # 2. GraphDB for read tools — connection from the shared Database
-    # ------------------------------------------------------------------
+    # GraphDB
     from TinyCTX.modules.memory.graph import GraphDB
-    import TinyCTX.modules.memory.tools as tools
+    import TinyCTX.modules.memory.tools as tools_mod
 
-    read_conn = runner.new_read_connection()
-    graph_db  = GraphDB(read_conn)
+    read_conn = _runner.new_read_connection()
+    _graph_db = GraphDB(read_conn)
     atexit.register(read_conn.close)
 
-    # init BEFORE starting the runner so the poll loop never fires with _conn = None
-    tools.init(runner._write_conn, runner._write_lock, graph_db, embedder)
+    _tools = tools_mod
+    _tools.init(_runner._write_conn, _runner._write_lock, _graph_db, embedder)
 
-    # ------------------------------------------------------------------
-    # 3. NOW start the runner — tools globals are live
-    # ------------------------------------------------------------------
-    runner.start()
+    _runner.start()
 
-    # ------------------------------------------------------------------
-    # 4. Register tools on the main agent
-    # ------------------------------------------------------------------
+    logger.info(
+        "[memory] ready — graph: %s | embedder: %s",
+        graph_path, embedding_model or "none",
+    )
+
+
+# ---------------------------------------------------------------------------
+# register_agent — per AgentCycle
+# ---------------------------------------------------------------------------
+
+def register_agent(cycle) -> None:
+    if _runner is None:
+        logger.error("[memory] register_agent called before register_runtime — skipping")
+        return
+
     for fn in [
-        tools.kg_search,
-        tools.kg_traverse,
-        tools.kg_get_entity,
-        tools.kg_list,
-        tools.kg_stats,
+        _tools.kg_search,
+        _tools.kg_traverse,
+        _tools.kg_get_entity,
+        _tools.kg_list,
+        _tools.kg_stats,
     ]:
         always = (fn.__name__ == "kg_search")
-        agent.tool_handler.register_tool(fn, always_on=always, min_permission=25)
+        cycle.tool_handler.register_tool(fn, always_on=always, min_permission=25)
 
-    # ------------------------------------------------------------------
-    # 5. call_librarian (always-on) — puts directly onto runner.queue
-    # ------------------------------------------------------------------
-
-    async def call_librarian(prompt: str = "", file_path: str = "") -> str:
-        """
-        Signal the librarian to update the knowledge graph.
-
-        With no arguments: trigger normal conversation node ingest immediately.
-
-        With prompt only: spawn a targeted agent for that specific graph-edit
-        instruction (e.g. "remember that Kamie prefers async Python").
-
-        With file_path: read that file and ingest its contents into the graph.
-        One file per call. Combine with prompt for extra instructions
-        (e.g. file_path="notes.md", prompt="focus on the people mentioned").
-
-        Args:
-            prompt: Optional instruction for the targeted librarian agent.
-            file_path: Optional path to a plain-text or markdown file to ingest.
-                Absolute, or relative to the workspace root.
-        """
-        if file_path.strip():
-            p = Path(file_path.strip())
-            if not p.is_absolute():
-                p = workspace / p
-            try:
-                file_text = p.read_text(encoding="utf-8", errors="replace")
-            except Exception as exc:
-                return f"[librarian: could not read '{file_path}': {exc}]"
-            combined = f"<file name=\"{p.name}\">\n{file_text}\n</file>"
-            if prompt.strip():
-                combined = f"{combined}\n\n{prompt.strip()}"
-            runner.queue.put_nowait({"type": "targeted", "prompt": combined})
-            return f"[librarian: file agent queued — '{p.name}']"
-        elif prompt.strip():
-            runner.queue.put_nowait({"type": "targeted", "prompt": prompt.strip()})
-            return f"[librarian: targeted agent queued — '{prompt[:60]}']"
-        else:
-            runner.queue.put_nowait({"type": "trigger"})
-            return "[librarian: node ingest triggered]"
-
-    agent.tool_handler.register_tool(call_librarian, always_on=True, min_permission=25)
-
-    # ------------------------------------------------------------------
-    # 6. Pinned entity PromptProvider
-    # ------------------------------------------------------------------
-
-    token_budget = int(cfg.get("memory_block_tokens", 4096))
+    cycle.tool_handler.register_tool(call_librarian, always_on=True, min_permission=25)
 
     def _build_memory_block(gdb, budget: int) -> str | None:
-        """
-        Assemble a <memory> block within the given token budget.
-
-        Phase 1 — pinned entities (always included, priority order):
-          Render name, type, description, and all active edges.
-
-        Phase 2 — linked neighbors (fill remaining budget, sorted by weight):
-          Collect every entity reachable via one hop from any pinned node.
-          Score each by max edge weight across all pinned->neighbor edges.
-          Render slim (name, type, description only) highest-weight-first.
-
-        Token estimate: len(text) // 4  (consistent with TinyCTX convention).
-        """
         pinned = gdb.get_pinned_entities_full()
         if not pinned:
             return None
@@ -445,16 +424,13 @@ def register_agent(agent) -> None:
         def _tok(text: str) -> int:
             return len(text) // 4
 
-        # --- Phase 1: pinned entities ---
         sections: list[str] = []
         used = _tok("<memory>\n\n</memory>")
         for e in pinned:
             block = _render_pinned(e)
-            used += _tok(block) + 1  # +1 for newline separator
+            used += _tok(block) + 1
             sections.append(block)
 
-        # --- Phase 2: collect linked neighbors ---
-        # neighbor_uuid -> max_weight across all pinned->neighbor edges
         neighbor_scores: dict[str, float] = {}
         for e in pinned:
             for edge in e.get("edges_out", []):
@@ -468,9 +444,7 @@ def register_agent(agent) -> None:
                     w = float(edge.get("weight", 0.0))
                     neighbor_scores[src] = max(neighbor_scores.get(src, 0.0), w)
 
-        # sort neighbors by score descending, fill remaining budget
-        sorted_neighbors = sorted(neighbor_scores.items(), key=lambda x: x[1], reverse=True)
-        for uid, score in sorted_neighbors:
+        for uid, score in sorted(neighbor_scores.items(), key=lambda x: x[1], reverse=True):
             entity = gdb.get_entity_slim(uid)
             if not entity:
                 continue
@@ -484,17 +458,9 @@ def register_agent(agent) -> None:
         body = "\n\n".join(sections)
         return f"<memory>\n{body}\n</memory>"
 
-    def _pinned_provider(_ctx) -> str | None:
-        return _build_memory_block(graph_db, token_budget)
-
-    agent.context.register_prompt(
+    cycle.context.register_prompt(
         "memory_pinned",
-        _pinned_provider,
+        lambda _ctx: _build_memory_block(_graph_db, _token_budget),
         role="system",
-        priority=pinned_prio,
-    )
-
-    logger.info(
-        "[memory] ready — graph: %s | embedder: %s",
-        graph_path, embedding_model or "none",
+        priority=_pinned_prio,
     )
