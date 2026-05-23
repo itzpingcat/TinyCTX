@@ -565,16 +565,6 @@ def _web_prompt(_ctx) -> str:
 # ---------------------------------------------------------------------------
 
 def register_agent(agent) -> None:
-    # Normalise: accept Runtime or legacy AgentLoop.
-    from TinyCTX.runtime import Runtime as _Runtime
-    _runtime_ref = agent if isinstance(agent, _Runtime) else None
-    if _runtime_ref is not None:
-        _rt = agent
-        class _Shim:
-            config       = _rt.config
-            tool_handler = _rt.tool_handler
-            reset = None
-        agent = _Shim()
     try:
         from TinyCTX.modules.web import EXTENSION_META
         cfg: dict = EXTENSION_META.get("default_config", {})

@@ -72,9 +72,11 @@ class LibrarianRunner:
                 "[memory] graph DB failed to open (%s) — wiping corrupted files and retrying",
                 exc,
             )
-            for suffix in (".wal", ".shm"):
-                p = Path(str(graph_path) + suffix)
-                if p.exists():
+            # Wipe all ladybug/kuzu auxiliary files next to the DB.
+            parent = graph_path.parent
+            stem   = graph_path.name
+            for p in parent.iterdir():
+                if p.name.startswith(stem) and p.name != stem:
                     p.unlink()
                     logger.info("[memory] deleted %s", p)
             self._db = ladybug.Database(str(graph_path))

@@ -1,30 +1,18 @@
 """
 module_registry.py — Module loading and per-cycle wiring.
 
-ModuleRegistry replaces the old runtime._load_modules() + _ContextProxy
-pattern. Modules now expose two optional functions:
+Modules expose two functions:
 
   def register_runtime(runtime: Runtime) -> None:
       # Called once at startup.
-      # Create singletons (store, indexer, embedder) as locals.
-      # Register tools on runtime's ToolCallHandler template.
-      # Register commands.
-      # Register background (post-turn) hooks via runtime.register_background_hook().
-      # Define register_agent as a closure over the singletons (see below).
+      # Build singletons, register commands, background hooks, etc.
 
   def register_agent(cycle: AgentCycle) -> None:
-      # Called per AgentCycle.__init__.
-      # Register prompt providers on cycle.context.
-      # Register pre-assemble hooks on cycle.context.
-      # Typically defined as a closure inside register_runtime so it can
-      # capture singletons (store, indexer, embedder) without module_env.
+      # Called per AgentCycle after tool_handler and context are live.
+      # Register tools, prompt providers, pre-assemble hooks.
 
-Backward compatibility
-----------------------
-Modules that still expose the old-style register(agent) function are
-wrapped automatically: register(runtime) is called at startup, and
-register(cycle) is called per cycle. This lets old modules continue to
-work without changes while new modules use the cleaner two-function API.
+Both are optional. A module with only register_agent does no startup work.
+A module with only register_runtime does no per-cycle wiring.
 """
 from __future__ import annotations
 
@@ -48,105 +36,102 @@ class ModuleRegistry:
     Usage:
         registry = ModuleRegistry()
         registry.load_modules(runtime)   # called once in Runtime.start()
-        ...
-        registry.register_agent(cycle)   # called in AgentCycle.__init__
+        registry.register_agent(cycle)   # called in AgentCycle.run()
     """
 
     def __init__(self) -> None:
-        # List of register_agent callables collected during load_modules().
-        # Each entry is called with the AgentCycle every time a new cycle starts.
         self._agent_registrations: list[callable] = []
 
     def load_modules(self, runtime) -> None:
-        """
-        Scan modules/ and call register_runtime (or legacy register) on each.
-        Collects register_agent functions for later per-cycle wiring.
-        """
+        """Scan modules/ and call register_runtime on each."""
         if not MODULES_DIR.exists():
+            print(f"[module_registry] WARNING: modules dir not found: {MODULES_DIR}")
+            logger.warning("[module_registry] modules dir not found: %s", MODULES_DIR)
             return
-        for entry in sorted(MODULES_DIR.iterdir()):
-            if not entry.is_dir():
+
+        entries = sorted(e for e in MODULES_DIR.iterdir() if e.is_dir())
+        print(f"[module_registry] scanning {len(entries)} candidate module(s)")
+        logger.info("[module_registry] scanning %d candidate module(s)", len(entries))
+
+        for entry in entries:
+            has_main = (entry / "__main__.py").exists()
+            has_init = (entry / "__init__.py").exists()
+            if not (has_main or has_init):
+                logger.debug("[module_registry] skipping '%s' (no __main__.py or __init__.py)", entry.name)
                 continue
-            if not ((entry / "__main__.py").exists() or (entry / "__init__.py").exists()):
-                continue
+
             module_name = f"TinyCTX.modules.{entry.name}"
+            print(f"[module_registry] loading '{entry.name}'")
+            logger.info("[module_registry] loading '%s'", entry.name)
             try:
                 mod = self._find_module(module_name, entry.name)
                 if mod is None:
                     continue
                 self._register_one(mod, runtime, entry.name)
             except Exception:
-                logger.exception("Failed to load module '%s'", entry.name)
+                print(f"[module_registry] ERROR: failed to load module '{entry.name}'")
+                logger.exception("[module_registry] failed to load module '%s'", entry.name)
+
+        print(f"[module_registry] done — {len(self._agent_registrations)} register_agent hook(s) queued")
+        logger.info(
+            "[module_registry] done — %d register_agent hook(s) queued",
+            len(self._agent_registrations),
+        )
 
     def _find_module(self, module_name: str, entry_name: str):
-        """Import the module object that has register_runtime, register_agent, or register."""
+        """Import __main__ then package; return first with register_runtime or register_agent."""
         for suffix in (".__main__", ""):
+            fqn = module_name + suffix
             try:
-                candidate = importlib.import_module(module_name + suffix)
-                if (
-                    hasattr(candidate, "register_runtime")
-                    or hasattr(candidate, "register_agent")
-                    or hasattr(candidate, "register")
-                ):
+                candidate = importlib.import_module(fqn)
+                has_rt = hasattr(candidate, "register_runtime")
+                has_ra = hasattr(candidate, "register_agent")
+                if has_rt or has_ra:
+                    print(f"[module_registry] '{entry_name}' found in {fqn} (register_runtime={has_rt}, register_agent={has_ra})")
+                    logger.debug(
+                        "[module_registry] '%s' found in %s (register_runtime=%s, register_agent=%s)",
+                        entry_name, fqn, has_rt, has_ra,
+                    )
                     return candidate
-            except ModuleNotFoundError:
+                else:
+                    logger.debug(
+                        "[module_registry] '%s' imported from %s but has no register_* — trying next",
+                        entry_name, fqn,
+                    )
+            except ModuleNotFoundError as e:
+                print(f"[module_registry] '{entry_name}' not importable as {fqn}: {e}")
+                logger.debug("[module_registry] '%s' not importable as %s: %s", entry_name, fqn, e)
                 continue
-        logger.warning("Module '%s' has no register_runtime/register_agent/register — skipping", entry_name)
+            except Exception:
+                print(f"[module_registry] ERROR importing '{entry_name}' as {fqn}")
+                logger.exception("[module_registry] error importing '%s' as %s", entry_name, fqn)
+                return None
+
+        print(f"[module_registry] '{entry_name}' has no register_runtime/register_agent — skipping")
+        logger.warning("[module_registry] '%s' has no register_runtime/register_agent — skipping", entry_name)
         return None
 
     def _register_one(self, mod, runtime, entry_name: str) -> None:
-        """Call register_runtime (or legacy register) and collect register_agent."""
-
         if hasattr(mod, "register_runtime"):
-            # New-style: register_runtime at startup, register_agent per cycle.
+            print(f"[module_registry] calling register_runtime for '{entry_name}'")
+            logger.info("[module_registry] calling register_runtime for '%s'", entry_name)
             mod.register_runtime(runtime)
-            logger.info("Loaded module '%s' (register_runtime)", entry_name)
+            print(f"[module_registry] register_runtime done for '{entry_name}'")
+            logger.info("[module_registry] register_runtime done for '%s'", entry_name)
             if hasattr(mod, "register_agent"):
                 self._agent_registrations.append(mod.register_agent)
-
-        elif hasattr(mod, "register"):
-            # Legacy: single register(agent) function.
-            # Call it now with the runtime for startup wiring.
-            # Also register a per-cycle shim that calls register(cycle) so
-            # old modules that register prompts/hooks also work per-cycle.
-            mod.register(runtime)
-            logger.info("Loaded module '%s' (legacy register)", entry_name)
-            # Register a per-cycle shim: call register(cycle) for modules
-            # that register prompts / context hooks (not singletons).
-            # We detect per-cycle intent by checking if the module registers
-            # any prompt or hook via the _ContextProxy during register(runtime)
-            # — but since we no longer have _ContextProxy, we rely on modules
-            # to expose register_agent. Legacy modules that only register tools
-            # (no context hooks) don't need per-cycle calls.
-            # For full backward compat, we call register(cycle) per cycle too.
-            # This is safe: tool_handler.register_tool() is idempotent (overwrites same key).
-            self._agent_registrations.append(
-                _make_legacy_per_cycle_shim(mod.register, entry_name)
-            )
-
+                logger.debug("[module_registry] queued register_agent for '%s'", entry_name)
         elif hasattr(mod, "register_agent"):
-            # Module has only register_agent (no startup work).
             self._agent_registrations.append(mod.register_agent)
-            logger.info("Loaded module '%s' (register_agent only)", entry_name)
+            print(f"[module_registry] queued register_agent (no runtime) for '{entry_name}'")
+            logger.info("[module_registry] queued register_agent (no runtime) for '%s'", entry_name)
 
     def register_agent(self, cycle: "AgentCycle") -> None:
-        """
-        Wire all modules into a newly constructed AgentCycle.
-        Called from AgentCycle.__init__.
-        """
+        """Wire all modules into a newly constructed AgentCycle."""
+        logger.debug("[module_registry] register_agent called, %d hook(s)", len(self._agent_registrations))
         for fn in self._agent_registrations:
             try:
+                logger.debug("[module_registry] calling %s", getattr(fn, "__name__", fn))
                 fn(cycle)
             except Exception:
-                logger.exception("register_agent raised for cycle (fn=%s)", getattr(fn, "__name__", fn))
-
-
-def _make_legacy_per_cycle_shim(register_fn, entry_name: str):
-    """Return a per-cycle function that calls the legacy register(agent) with a cycle."""
-    def _shim(cycle):
-        try:
-            register_fn(cycle)
-        except Exception:
-            logger.exception("Legacy per-cycle register raised for module '%s'", entry_name)
-    _shim.__name__ = f"_legacy_shim_{entry_name}"
-    return _shim
+                logger.exception("[module_registry] register_agent raised (fn=%s)", getattr(fn, "__name__", fn))
