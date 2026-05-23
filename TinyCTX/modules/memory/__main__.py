@@ -24,6 +24,10 @@ import atexit
 import logging
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from types import ModuleType
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +35,7 @@ logger = logging.getLogger(__name__)
 _runner:       "LibrarianRunner | None" = None
 _workspace:    Path | None = None
 _graph_db:     object | None = None
-_tools:        object | None = None
+_tools:        "ModuleType | None" = None
 _pinned_prio:  int = 5
 _token_budget: int = 4096
 
@@ -259,6 +263,8 @@ async def call_librarian(prompt: str = "", file_path: str = "") -> str:
             Absolute, or relative to the workspace root.
     """
     if file_path.strip():
+        assert _workspace is not None
+        assert _runner is not None
         p = Path(file_path.strip())
         if not p.is_absolute():
             p = _workspace / p
@@ -272,9 +278,11 @@ async def call_librarian(prompt: str = "", file_path: str = "") -> str:
         _runner.queue.put_nowait({"type": "targeted", "prompt": combined})
         return f"[librarian: file agent queued — '{p.name}']"
     elif prompt.strip():
+        assert _runner is not None
         _runner.queue.put_nowait({"type": "targeted", "prompt": prompt.strip()})
         return f"[librarian: targeted agent queued — '{prompt[:60]}']"
     else:
+        assert _runner is not None
         _runner.queue.put_nowait({"type": "trigger"})
         return "[librarian: node ingest triggered]"
 
@@ -302,13 +310,16 @@ def register_runtime(runtime) -> None:
 
     cfg: dict = {**defaults, **overrides}
 
+    ws = _workspace  # local binding so pylance knows it's non-None here
+    assert ws is not None
+
     def _resolve(rel: str) -> Path:
         p = Path(rel)
-        return p if p.is_absolute() else _workspace / p
+        return p if p.is_absolute() else ws / p
 
     graph_path = _resolve(cfg["graph_path"])
     log_path   = _resolve(cfg.get("librarian_log", "memory/librarian.log"))
-    agent_db   = _workspace / "agent.db"
+    agent_db   = ws / "agent.db"
 
     _pinned_prio  = int(cfg.get("pinned_priority", 5))
     _token_budget = int(cfg.get("memory_block_tokens", 4096))
@@ -383,6 +394,7 @@ def register_agent(cycle) -> None:
         logger.error("[memory] register_agent called before register_runtime — skipping")
         return
 
+    assert _tools is not None
     for fn in [
         _tools.kg_search,
         _tools.kg_traverse,

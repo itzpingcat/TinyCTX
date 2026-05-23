@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import AsyncIterator, Any
 import aiohttp
 from tenacity import (
@@ -18,6 +18,7 @@ from tenacity import (
     wait_exponential,
     before_sleep_log,
 )
+from TinyCTX.config import ModelConfig
 
 logger = logging.getLogger(__name__)
 

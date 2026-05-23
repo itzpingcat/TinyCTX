@@ -8,15 +8,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Any
 
 from TinyCTX.modules.memory.graph import new_uuid, now_ts, top_k_cosine
 
 logger = logging.getLogger(__name__)
 
-_conn       = None
-_write_lock = None
-_graph_db   = None
-_embedder   = None
+_conn:       Any = None
+_write_lock: Any = None
+_graph_db:   Any = None
+_embedder:   Any = None
 
 
 def init(conn, write_lock: asyncio.Lock, graph_db, embedder):

@@ -16,6 +16,7 @@ import argparse
 import sys
 import time
 import urllib.request
+import urllib.error
 from pathlib import Path
 
 _REPO_ROOT      = Path(__file__).resolve().parent.parent.parent
