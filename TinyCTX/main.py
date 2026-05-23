@@ -126,8 +126,7 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    import signal
-    import sys
+    import signal 
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)

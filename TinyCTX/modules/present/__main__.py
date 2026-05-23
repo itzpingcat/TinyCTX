@@ -39,7 +39,7 @@ def register_agent(agent) -> None:
         event = AgentOutboundFiles(
             paths=tuple(validated),
             tail_node_id=agent.tail_node_id,
-            lane_node_id=agent.lane_node_id,
+            # lane_node_id=agent.lane_node_id,
             trace_id="present",
             reply_to_message_id="",
         )

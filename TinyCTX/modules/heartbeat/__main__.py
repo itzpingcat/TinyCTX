@@ -89,7 +89,7 @@ class _HeartbeatRunner:
 
         for _turn in range(int(self.cfg.get("max_continuations", 5))):
             msg = InboundMessage(
-                tail_node_id=self.cursor_node_id,
+                tail_node_id=self.cursor_node_id or "",
                 author=_HEARTBEAT_AUTHOR,
                 content_type=ContentType.TEXT,
                 text=current_prompt,
@@ -187,8 +187,9 @@ def register_agent(agent) -> None:
     """
     registry = getattr(agent, "commands", None)
     if registry and _global_runner:
+        runner = _global_runner
         async def _cmd_run(args, context):
-            asyncio.create_task(_global_runner._tick())
+            asyncio.create_task(runner._tick())
             if "console" in context:
                 context["console"].print("[yellow]Heartbeat tick triggered manually.[/yellow]")
 

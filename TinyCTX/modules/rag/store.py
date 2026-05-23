@@ -63,8 +63,11 @@ from pathlib import Path
 _LN2 = math.log(2)
 
 # numpy is optional — used for fast vectorised cosine when present
-try:
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
     import numpy as np
+try:
+    import numpy as np  # type: ignore[no-redef]
     _NUMPY = True
 except ImportError:
     _NUMPY = False

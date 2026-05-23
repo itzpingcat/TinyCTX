@@ -31,6 +31,9 @@
         # Pinned entity injection priority in system prompt
         "pinned_priority": 5,
 
+        # Token budget for the <memory> block injected into system prompt
+        "memory_block_tokens": 4096,
+
         # LLM model key for librarian agents (defaults to primary)
         "librarian_model": "",
     },

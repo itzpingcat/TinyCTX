@@ -38,7 +38,6 @@ import base64
 import hashlib
 import json
 import logging
-import mimetypes
 from pathlib import Path
 
 from TinyCTX.contracts import Attachment, AttachmentKind

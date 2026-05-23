@@ -171,7 +171,7 @@ async def run_dedup_cycle(
     logger.info("[memory/librarian] dedup cycle starting")
     try:
         from TinyCTX.modules.memory.graph import (
-            embed_content_for, embed_hash, cosine_similarity, now_ts,
+            embed_content_for, embed_hash, cosine_similarity,
         )
 
         threshold = float(cfg.get("similarity_threshold", 0.85))
@@ -361,7 +361,7 @@ async def _agent_loop(
     from TinyCTX.ai import TextDelta, ToolCallAssembled, LLMError
 
     tool_defs = handler.get_tool_definitions(caller_level=25)
-    messages  = [
+    messages: list[dict] = [
         {"role": "system", "content": system_prompt},
         {"role": "user",   "content": user_prompt},
     ]

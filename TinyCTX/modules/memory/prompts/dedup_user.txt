@@ -14,11 +14,11 @@ Node B:
   description: {desc_b}
 
 Respond with ONLY a JSON object (no markdown fences):
-{
+{{
   "verdict": "duplicate" | "alias" | "distinct",
   "canonical_uuid": "<uuid of node to keep — required unless distinct>",
   "merged_description": "<consolidated description — required unless distinct>"
-}
+}}
 
 duplicate = same real-world entity (merge into one node).
 alias = different names for the same underlying thing (keep both, add ALIASED_TO edge).

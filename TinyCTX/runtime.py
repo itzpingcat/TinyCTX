@@ -3,13 +3,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import uuid
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Awaitable, Callable
 
 from TinyCTX.config import Config
 from TinyCTX.contracts import AgentEvent, InboundMessage
-from TinyCTX.utils.attachments import save_upload as _save_upload, build_content_blocks as _build_content_blocks
+from TinyCTX.utils.attachments import build_content_blocks as _build_content_blocks
 from TinyCTX.db import ConversationDB
 from TinyCTX.utils.commands import CommandRegistry
 from TinyCTX.module_registry import ModuleRegistry

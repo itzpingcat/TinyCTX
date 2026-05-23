@@ -447,6 +447,8 @@ class _CronRunner:
             author=_CRON_AUTHOR,
             content_type=ContentType.TEXT,
             text=job.message,
+            message_id=str(start_ms),
+            timestamp=start_ms / 1000,
             trigger=True,
         )
 

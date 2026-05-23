@@ -28,10 +28,13 @@ from __future__ import annotations
 import json
 import logging
 import os
-import pwd
 import subprocess
-import sys
 from pathlib import Path
+
+try:
+    import pwd as _pwd
+except ImportError:
+    _pwd = None  # type: ignore[assignment]
 
 from aiohttp import web
 
@@ -46,11 +49,11 @@ def drop_privileges(username: str = "tinyctx") -> None:
     """Drop from root to unprivileged user. No-op if already non-root.
     Requires no-new-privileges:false on the container.
     """
-    if os.getuid() != 0:
+    if os.getuid() != 0:  # type: ignore[attr-defined]
         return
-    pw = pwd.getpwnam(username)
-    os.setgid(pw.pw_gid)
-    os.setuid(pw.pw_uid)
+    pw = _pwd.getpwnam(username)  # type: ignore[union-attr]
+    os.setgid(pw.pw_gid)  # type: ignore[attr-defined]
+    os.setuid(pw.pw_uid)  # type: ignore[attr-defined]
     os.environ["HOME"] = pw.pw_dir
     log.info("privileges dropped to %s (uid=%d)", username, pw.pw_uid)
 

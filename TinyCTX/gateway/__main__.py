@@ -59,7 +59,7 @@ from aiohttp import web
 
 from TinyCTX.config import GatewayConfig
 from TinyCTX.contracts import (
-    Platform, ContentType, content_type_for,
+    Platform, content_type_for,
     UserIdentity, InboundMessage, Attachment,
     AgentThinkingChunk, AgentTextChunk, AgentTextFinal,
     AgentToolCall, AgentToolResult, AgentError, AgentOutboundFiles,

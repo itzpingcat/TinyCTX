@@ -23,16 +23,6 @@ def register_agent(cycle) -> None:
     _register_tokenade(cycle.context, config)
 
 
-def register(runtime, config=None):
-    """Legacy shim."""
-    from TinyCTX.runtime import Runtime as _Runtime
-    if isinstance(runtime, _Runtime):
-        register_runtime(runtime)
-    else:
-        # Called with a cycle-like object
-        register_agent(runtime)
-
-
 def _register_dedup(context, config):
     dedup_after = config.get("same_call_dedup_after", 3)
 

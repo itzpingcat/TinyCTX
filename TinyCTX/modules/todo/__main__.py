@@ -13,7 +13,6 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -63,15 +62,6 @@ def _format_todo_list(todos: list[dict[str, str]]) -> str:
 
 
 def register_agent(agent) -> None:
-    # Normalise: accept Runtime or legacy AgentLoop.
-    from TinyCTX.runtime import Runtime as _Runtime
-    if isinstance(agent, _Runtime):
-        _rt = agent
-        class _Shim:
-            config       = _rt.config
-            context      = _rt.context
-            tool_handler = _rt.tool_handler
-        agent = _Shim()
     workspace = Path(agent.config.workspace.path).expanduser().resolve()
     todo_path = workspace / "TODO.json"
 

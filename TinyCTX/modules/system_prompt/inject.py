@@ -81,7 +81,7 @@ def _expand(text: str, macros: dict[str, str]) -> str:
     """Replace {key} placeholders found in macros; leave unknown ones intact."""
     def replace(m: re.Match) -> str:
         key = m.group(1)
-        return macros.get(key, m.group(0))  # keep original if key unknown
+        return macros.get(key) or m.group(0)  # keep original if key unknown
     return _MACRO_RE.sub(replace, text)
 
 
@@ -132,7 +132,7 @@ def make_provider(
     path: Path,
     workspace: Path,
     extra_macros: dict[str, str] | MacroResolver | None = None,
-) -> Callable:
+) -> Callable[..., str | None]:
     """
     Return a prompt-provider callable compatible with Context.register_prompt().
 

@@ -11,9 +11,9 @@ import platform
 import subprocess
 import urllib.request
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal
 
-import questionary
+
 import yaml
 from questionary import Style
 from rich.console import Console
@@ -51,7 +51,7 @@ BUNDLED_MD = ["SOUL.md", "AGENTS.md", "MEMORY.md"]
 
 LOCAL_PROVIDERS = {"Ollama", "LMStudio", "vLLM", "llama-cpp", "Custom (local)"}
 
-Mode = Literal["quickstart", "standard"]
+Mode = Literal["quickstart", "standard", "advanced"]
 
 QSTYLE = Style([
     ("qmark",       "fg:#00cfff bold"),
