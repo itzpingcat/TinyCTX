@@ -441,9 +441,58 @@ class DiscordBridge:
         self._client = discord_commands.Bot(command_prefix="\\", intents=intents)
         self._tree   = self._client.tree
 
-        # Register event handlers via the decorator API so discord.py picks them up.
-        self._client.event(self._on_ready)
-        self._client.event(self._on_message)
+        # Register event handlers. discord.py's .event() dispatcher keyed on
+        # __name__, so we must expose plain `on_ready` / `on_message` names.
+        _bridge = self
+
+        async def on_ready() -> None:
+            await _bridge._on_ready()
+
+        async def on_message(message: discord.Message) -> None:
+            await _bridge._on_message(message)
+
+        self._client.event(on_ready)
+        self._client.event(on_message)
+
+        # Gracefully handle stale or unrecognised slash-command interactions.
+        # This fires when Discord sends an interaction for a command that exists
+        # in Discord's global registry but isn't (yet) registered in the local
+        # command tree — e.g. during the propagation delay after a sync, or
+        # on a cold restart before _sync_app_commands has finished.
+        @self._tree.error
+        async def _on_tree_error(
+            interaction: discord.Interaction,
+            error: app_commands.AppCommandError,
+        ) -> None:
+            if isinstance(error, app_commands.CommandNotFound):
+                logger.warning(
+                    "Discord: received interaction for unknown command %r "
+                    "(stale Discord registration or mid-sync). "
+                    "Sending ephemeral notice to user.",
+                    getattr(interaction.data, 'name', '?'),
+                )
+                try:
+                    if not interaction.response.is_done():
+                        await interaction.response.send_message(
+                            "⚠️ This command isn't available yet — "
+                            "the bot may still be starting up. Please try again in a moment.",
+                            ephemeral=True,
+                        )
+                    else:
+                        await interaction.followup.send(
+                            "⚠️ This command isn't available yet — "
+                            "the bot may still be starting up. Please try again in a moment.",
+                            ephemeral=True,
+                        )
+                except Exception:
+                    logger.debug("Discord: could not send CommandNotFound notice", exc_info=True)
+                return
+            # Re-raise anything else so it still surfaces in logs.
+            logger.error(
+                "Discord: unhandled app command error for %r",
+                getattr(interaction.data, 'name', '?'),
+                exc_info=error,
+            )
 
     # ------------------------------------------------------------------
     # Cursor management
@@ -502,17 +551,18 @@ class DiscordBridge:
 
         # Register /reset.
         reset_cmd_name = self._reset_command.lstrip("/").replace(" ", "_")
+        _bridge = self
 
         @self._tree.command(name=reset_cmd_name, description="Reset the current session")
-        async def _reset_slash(interaction: discord.Interaction) -> None:
-            await self._handle_reset_interaction(interaction)
+        async def _reset_slash(interaction: discord.Interaction) -> None:  # noqa: F841
+            await _bridge._handle_reset_interaction(interaction)
 
         # Register /shutdown.
         shutdown_cmd_name = self._shutdown_command.lstrip("/").replace(" ", "_")
 
         @self._tree.command(name=shutdown_cmd_name, description="Kill the TinyCTX gateway (admin only)")
-        async def _shutdown_slash(interaction: discord.Interaction) -> None:
-            await self._handle_shutdown_interaction(interaction)
+        async def _shutdown_slash(interaction: discord.Interaction) -> None:  # noqa: F841
+            await _bridge._handle_shutdown_interaction(interaction)
 
         # Group commands by namespace so we can decide flat vs subcommand.
         # namespace -> {sub -> (help_text, ns, sub)}
@@ -524,38 +574,33 @@ class DiscordBridge:
             grouped.setdefault(namespace, {})[sub] = (help_text or f"Run {cmd_str}", namespace, sub)
 
         for namespace, subs in grouped.items():  # type: ignore[assignment]
-            # If there's only a bare entry (no sub) or only one sub with no bare,
-            # register as a flat command to keep things simple.
             has_bare = "" in subs
             named_subs = {k: v for k, v in subs.items() if k}
 
             if not named_subs:
-                # Bare namespace only — flat command.
                 desc, ns, sub = subs[""]
                 def _make_flat(ns: str, sub: str):  # noqa: E306
                     @self._tree.command(name=ns, description=desc)
-                    async def _handler(interaction: discord.Interaction) -> None:
-                        await self._handle_command_interaction(interaction, ns, sub)
+                    async def _handler(interaction: discord.Interaction) -> None:  # noqa: F841
+                        await _bridge._handle_command_interaction(interaction, ns, sub)
                 _make_flat(ns, sub)
                 continue
 
-            # Has named subcommands — use a Group.
             group = app_commands.Group(name=namespace, description=f"{namespace} commands")
 
             for sub_name, (desc, ns, sub) in named_subs.items():
                 def _make_sub(ns: str, sub: str, desc: str):
                     @group.command(name=sub, description=desc)
-                    async def _sub_handler(interaction: discord.Interaction) -> None:
-                        await self._handle_command_interaction(interaction, ns, sub)
+                    async def _sub_handler(interaction: discord.Interaction) -> None:  # noqa: F841
+                        await _bridge._handle_command_interaction(interaction, ns, sub)
                 _make_sub(ns, sub_name, desc)
 
-            # If there's also a bare entry, add it as a subcommand named "run".
             if has_bare:
-                desc, ns, sub = subs[""]
+                desc, ns, _ = subs[""]
                 def _make_bare_as_run(ns: str, desc: str):
                     @group.command(name="run", description=desc)
-                    async def _run_handler(interaction: discord.Interaction) -> None:
-                        await self._handle_command_interaction(interaction, ns, "")
+                    async def _run_handler(interaction: discord.Interaction) -> None:  # noqa: F841
+                        await _bridge._handle_command_interaction(interaction, ns, "")
                 _make_bare_as_run(ns, desc)
 
             self._tree.add_command(group)
@@ -572,7 +617,7 @@ class DiscordBridge:
         """Handle the /reset slash command."""
         channel = interaction.channel
         is_dm   = isinstance(channel, discord.DMChannel)
-        await interaction.response.defer(ephemeral=False)
+        await interaction.response.defer(ephemeral=True)
         user_id = interaction.user.id
 
         if not is_dm and not self._is_admin(user_id):
