@@ -78,7 +78,7 @@ def _check_ssrf(url: str) -> Optional[str]:
         infos = socket.getaddrinfo(host, None)
         for info in infos:
             addr = info[4][0]
-            if _is_private_ip(addr):
+            if _is_private_ip(str(addr)):
                 return f"[error: hostname '{host}' resolves to a private address ({addr}) — request blocked]"
     except socket.gaierror:
         pass  # unresolvable host — let aiohttp handle it
@@ -343,7 +343,7 @@ class _DuckDuckGoResultParser(HTMLParser):
     def handle_endtag(self, tag: str) -> None:
         if self._capture_title and tag == "a":
             title = _normalise_inline_ws("".join(self._title_chunks))
-            href = _decode_search_result_href(self._current_href)
+            href = _decode_search_result_href(self._current_href or "")
             if title and href:
                 self.results.append({"title": title, "href": href, "body": ""})
             self._capture_title = False
@@ -498,7 +498,7 @@ async def _locate(agent, target: str, nth: int = 0, exact: Optional[bool] = None
         pass
 
     if t in _KNOWN_ROLES:
-        return page.get_by_role(t).nth(nth)
+        return page.get_by_role(t).nth(nth)  # type: ignore[arg-type]
 
     return page.locator(t).nth(nth)
 
@@ -646,10 +646,10 @@ def register_agent(agent) -> None:
     async def http_request(
         method: str,
         url: str,
-        params: dict = None,
-        data: dict = None,
-        json_data: dict = None,
-        headers: dict = None,
+        params: dict | None = None,
+        data: dict | None = None,
+        json_data: dict | None = None,
+        headers: dict | None = None,
     ) -> str:
         """
         Perform a generic HTTP request (GET, POST, PUT, DELETE, PATCH, HEAD).
@@ -690,7 +690,7 @@ def register_agent(agent) -> None:
     async def open_url(
         url: str,
         type: str = "text",
-        headless: bool = None,
+        headless: bool | None = None,
     ) -> str:
         """
         Open a URL in the browser and return its content.
@@ -764,7 +764,7 @@ def register_agent(agent) -> None:
         except Exception as e:
             return f"[error: {e}]"
 
-    async def click(target: str, nth: int = 0, exact: bool = None) -> str:
+    async def click(target: str, nth: int = 0, exact: bool | None = None) -> str:
         """
         Click an element on the current page.
 
@@ -786,7 +786,7 @@ def register_agent(agent) -> None:
         target: str,
         text: str,
         nth: int = 0,
-        exact: bool = None,
+        exact: bool | None = None,
         clear: bool = True,
     ) -> str:
         """
@@ -826,7 +826,7 @@ def register_agent(agent) -> None:
         except Exception as e:
             return f"[error: {e}]"
 
-    async def extract_text(target: str = "", nth: int = 0, exact: bool = None) -> str:
+    async def extract_text(target: str = "", nth: int = 0, exact: bool | None = None) -> str:
         """
         Get the visible text content from an element or the whole page.
 
@@ -848,7 +848,7 @@ def register_agent(agent) -> None:
         except Exception as e:
             return f"[error: {e}]"
 
-    async def extract_html(target: str = "", nth: int = 0, exact: bool = None) -> str:
+    async def extract_html(target: str = "", nth: int = 0, exact: bool | None = None) -> str:
         """
         Get the HTML markup from an element or the whole page.
 
@@ -868,7 +868,7 @@ def register_agent(agent) -> None:
         except Exception as e:
             return f"[error: {e}]"
 
-    async def screenshot_browser(target: str = None, filename: str = None, nth: int = 0, exact: bool = None) -> str:
+    async def screenshot_browser(target: str | None = None, filename: str | None = None, nth: int = 0, exact: bool | None = None) -> str:
         """
         Take a screenshot of a browser page or a specific element.
         Saved to workspace/downloads/<filename>.
@@ -907,7 +907,7 @@ def register_agent(agent) -> None:
         target: str,
         state: str = "visible",
         nth: int = 0,
-        exact: bool = None,
+        exact: bool | None = None,
     ) -> str:
         """
         Wait for an element to reach a given state before continuing.
@@ -921,12 +921,12 @@ def register_agent(agent) -> None:
         st = _state(agent)
         try:
             loc = await _locate(agent, target, nth=nth, exact=exact)
-            await loc.wait_for(state=state, timeout=st["settings"]["timeout_ms"])
+            await loc.wait_for(state=state, timeout=st["settings"]["timeout_ms"])  # type: ignore[arg-type]
             return f"Element {target!r} reached state '{state}' (nth={nth})"
         except Exception as e:
             return f"[error: {e}]"
 
-    async def manage_browser(action: str, key: str = None, value: str = None) -> str:
+    async def manage_browser(action: str, key: str | None = None, value: str | None = None) -> str:
         """
         Manage the Playwright browser session and settings.
 

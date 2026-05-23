@@ -125,7 +125,6 @@ class AgentCycle:
                 if isinstance(_ev, tuple):
                     # sentinel: (_chunks, _calls, _error)
                     text_chunks, tool_calls_list, error = _ev
-                    # logger.debug("[agent] inference done — chunks=%d tools=%d error=%s", len(text_chunks), len(tool_calls_list), error)
                 elif isinstance(_ev, AgentThinkingChunk):
                     # logger.debug("[agent] thinking chunk (%d chars)", len(_ev.text))
                     yield AgentThinkingChunk(text=_ev.text, **meta)
@@ -246,7 +245,7 @@ class AgentCycle:
                 return
             logger.warning("Model %s failed: %s", model_name, error)
 
-        yield ([], [], error)
+        yield ([], [], error or "all models failed")
 
     async def _execute_tool(self, call: ToolCall) -> ToolResult:
         proxy = {
@@ -254,6 +253,7 @@ class AgentCycle:
             "id": call.call_id,
         }
         
+        assert self.tool_handler is not None
         result = await self.tool_handler.execute_tool_call(proxy, caller_level=self.permission_level)
         raw_output = str(result.get("result", result.get("error", "[no output]")))
         

@@ -571,15 +571,12 @@ class Context:
                     labelled_content: str | list = f"[{label}]: {raw}"
                 else:
                     blocks = list(raw)
-                    first_text = next(
+                    first_text: int | None = next(
                         (i for i, b in enumerate(blocks) if b.get("type") == "text"), None
                     )
                     if first_text is not None:
-                        idx = first_text
-                        blocks[idx] = {
-                            **blocks[idx],
-                            "text": f"[{label}]: {blocks[idx]['text']}",
-                        }
+                        existing = blocks[first_text]
+                        blocks[first_text] = {**existing, "text": f"[{label}]: {existing['text']}"}  # type: ignore[index]
                     else:
                         blocks.insert(0, {"type": "text", "text": f"[{label}]: "})
                     labelled_content = blocks
