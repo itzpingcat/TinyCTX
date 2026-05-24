@@ -1,4 +1,4 @@
-﻿"""
+"""
 modules/memory/graph.py
 
 LadybugDB schema initialisation and low-level graph access helpers.
@@ -40,7 +40,7 @@ import logging
 import math
 import time
 import uuid
-from typing import Any
+from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -191,6 +191,19 @@ def top_k_cosine(
 
 
 # ---------------------------------------------------------------------------
+# WAL-error detection (kept here so graph.py is self-contained)
+# ---------------------------------------------------------------------------
+
+def _is_wal_error(exc: BaseException) -> bool:
+    """
+    Return True when *exc* looks like the 'Cannot read size of file … .wal'
+    IO error that ladybug raises when the WAL has been deleted mid-session.
+    """
+    msg = " ".join(str(a) for a in getattr(exc, "args", (str(exc),))).lower()
+    return ".wal" in msg and ("no such file" in msg or "cannot read" in msg or "error 2" in msg)
+
+
+# ---------------------------------------------------------------------------
 # GraphDB — thin wrapper around a shared Connection for the main agent (sync)
 # ---------------------------------------------------------------------------
 
@@ -199,17 +212,64 @@ class GraphDB:
     Sync graph accessor for use in the main agent's tool implementations.
     Receives a ladybug.Connection created from the single shared Database object
     owned by the LibrarianRunner. Does NOT open its own Database.
+
+    rebuild_callback — optional callable() → new ladybug.Connection.
+        When provided, safe_execute will call it on a mid-session WAL error,
+        swap in the fresh connection, and retry the query exactly once.
+        Supplied by register_runtime so this class stays free of any direct
+        ladybug / LibrarianRunner import.
     """
 
-    def __init__(self, conn) -> None:
+    def __init__(
+        self,
+        conn,
+        rebuild_callback: Callable[[], Any] | None = None,
+    ) -> None:
         self._conn = conn
+        self._rebuild_callback = rebuild_callback
+
+    # ------------------------------------------------------------------
+    # Safe execute — retries once after a mid-session WAL rebuild
+    # ------------------------------------------------------------------
+
+    def safe_execute(self, query: str, parameters: dict | None = None):
+        """
+        Execute *query* on the current connection.
+
+        If a WAL-missing error is raised and a rebuild_callback is registered,
+        the callback is invoked (which rebuilds the database and returns a new
+        connection), the stale connection is replaced, and the query is retried
+        once.  Any other exception propagates normally.
+        """
+        kwargs: dict = {}
+        if parameters:
+            kwargs["parameters"] = parameters
+
+        try:
+            return self._conn.execute(query, **kwargs)
+        except Exception as exc:
+            if self._rebuild_callback is not None and _is_wal_error(exc):
+                logger.warning(
+                    "[memory/graph] WAL error on read query — rebuilding connection: %s", exc
+                )
+                try:
+                    new_conn = self._rebuild_callback()
+                    self._conn = new_conn
+                    logger.info("[memory/graph] connection rebuilt; retrying query")
+                    return self._conn.execute(query, **kwargs)
+                except Exception as retry_exc:
+                    logger.error(
+                        "[memory/graph] query still failing after rebuild: %s", retry_exc
+                    )
+                    raise retry_exc from exc
+            raise
 
     # ------------------------------------------------------------------
     # Read operations
     # ------------------------------------------------------------------
 
     def get_entity(self, uid: str) -> dict | None:
-        r = self._conn.execute(
+        r = self.safe_execute(
             "MATCH (e:Entity {uuid: $uid}) RETURN e.*",
             parameters={"uid": uid},
         )
@@ -226,17 +286,17 @@ class GraphDB:
 
     def find_entity(self, name: str | None = None, entity_type: str | None = None) -> list[dict]:
         if name and entity_type:
-            r = self._conn.execute(
+            r = self.safe_execute(
                 "MATCH (e:Entity) WHERE e.name CONTAINS $name AND e.entity_type = $et RETURN e.uuid, e.name, e.entity_type, e.description LIMIT 10",
                 parameters={"name": name, "et": entity_type},
             )
         elif name:
-            r = self._conn.execute(
+            r = self.safe_execute(
                 "MATCH (e:Entity) WHERE e.name CONTAINS $name RETURN e.uuid, e.name, e.entity_type, e.description LIMIT 10",
                 parameters={"name": name},
             )
         elif entity_type:
-            r = self._conn.execute(
+            r = self.safe_execute(
                 "MATCH (e:Entity) WHERE e.entity_type = $et RETURN e.uuid, e.name, e.entity_type, e.description LIMIT 10",
                 parameters={"et": entity_type},
             )
@@ -253,14 +313,14 @@ class GraphDB:
         if pinned_only:
             clauses.append("e.pinned = true")
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-        r = self._conn.execute(
+        r = self.safe_execute(
             f"MATCH (e:Entity) {where} RETURN e.uuid, e.name, e.entity_type, e.description, e.pinned, e.priority ORDER BY e.priority DESC",
-            parameters=params,
+            parameters=params if params else None,
         )
         return self._rows_to_dicts(r, ["uuid", "name", "entity_type", "description", "pinned", "priority"])
 
     def get_pinned_entities(self) -> list[dict]:
-        r = self._conn.execute(
+        r = self.safe_execute(
             "MATCH (e:Entity) WHERE e.pinned = true RETURN e.uuid, e.name, e.entity_type, e.description ORDER BY e.priority DESC"
         )
         return self._rows_to_dicts(r, ["uuid", "name", "entity_type", "description"])
@@ -270,7 +330,7 @@ class GraphDB:
         Return full entity dicts (including edges) for all pinned entities,
         ordered by priority descending. Used by the memory block assembler.
         """
-        r = self._conn.execute(
+        r = self.safe_execute(
             "MATCH (e:Entity) WHERE e.pinned = true RETURN e.uuid ORDER BY e.priority DESC"
         )
         uuids = [row[0] for row in self._drain(r)]
@@ -283,7 +343,7 @@ class GraphDB:
 
     def get_entity_slim(self, uid: str) -> dict | None:
         """Fetch name/type/description only — no edges. Used for linked-node rendering."""
-        r = self._conn.execute(
+        r = self.safe_execute(
             "MATCH (e:Entity {uuid: $uid}) "
             "RETURN e.uuid, e.name, e.entity_type, e.description",
             parameters={"uid": uid},
@@ -322,11 +382,11 @@ class GraphDB:
         return all_edges
 
     def get_stats(self) -> dict:
-        entity_count = self._conn.execute("MATCH (e:Entity) RETURN count(e)").get_next()[0]
-        edge_count   = self._conn.execute(
+        entity_count = self.safe_execute("MATCH (e:Entity) RETURN count(e)").get_next()[0]
+        edge_count   = self.safe_execute(
             "MATCH ()-[r:Relation]->() WHERE r.superseded_at IS NULL RETURN count(r)"
         ).get_next()[0]
-        r = self._conn.execute(
+        r = self.safe_execute(
             "MATCH (e:Entity) RETURN e.entity_type, count(e) ORDER BY count(e) DESC"
         )
         by_type: dict[str, int] = {}
@@ -341,7 +401,7 @@ class GraphDB:
 
     def all_entities_with_embeddings(self) -> list[tuple[str, list[float]]]:
         """Return [(uuid, embedding)] for all entities that have embeddings."""
-        r = self._conn.execute(
+        r = self.safe_execute(
             "MATCH (e:Entity) WHERE e.embedding IS NOT NULL RETURN e.uuid, e.embedding"
         )
         results = []
@@ -354,7 +414,7 @@ class GraphDB:
 
     def bump_mention_count(self, uids: list[str]) -> None:
         for uid in uids:
-            self._conn.execute(
+            self.safe_execute(
                 "MATCH (e:Entity {uuid: $uid}) SET e.mention_count = e.mention_count + 1",
                 parameters={"uid": uid},
             )
@@ -364,7 +424,7 @@ class GraphDB:
     # ------------------------------------------------------------------
 
     def _active_edges_from(self, uid: str) -> list[dict]:
-        r = self._conn.execute(
+        r = self.safe_execute(
             "MATCH (a:Entity {uuid: $uid})-[r:Relation]->(b:Entity) "
             "WHERE r.superseded_at IS NULL "
             "RETURN b.uuid, b.name, r.relation, r.weight, r.description",
@@ -373,7 +433,7 @@ class GraphDB:
         return self._rows_to_dicts(r, ["target_uuid", "target_name", "relation", "weight", "description"])
 
     def _active_edges_to(self, uid: str) -> list[dict]:
-        r = self._conn.execute(
+        r = self.safe_execute(
             "MATCH (a:Entity)-[r:Relation]->(b:Entity {uuid: $uid}) "
             "WHERE r.superseded_at IS NULL "
             "RETURN a.uuid, a.name, r.relation, r.weight, r.description",

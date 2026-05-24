@@ -41,6 +41,20 @@ _token_budget: int = 4096
 
 
 # ---------------------------------------------------------------------------
+# WAL-error detection
+# ---------------------------------------------------------------------------
+
+def _is_wal_error(exc: BaseException) -> bool:
+    """
+    Return True when *exc* looks like the 'Cannot read size of file … .wal'
+    IO error that ladybug raises when the WAL has been deleted mid-session.
+    Matches both the original error and any RuntimeError/OSError wrapper.
+    """
+    msg = " ".join(str(a) for a in getattr(exc, "args", (str(exc),))).lower()
+    return ".wal" in msg and ("no such file" in msg or "cannot read" in msg or "error 2" in msg)
+
+
+# ---------------------------------------------------------------------------
 # LibrarianRunner — in-process background task
 # ---------------------------------------------------------------------------
 
@@ -69,21 +83,10 @@ class LibrarianRunner:
         graph_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
-        try:
-            self._db = ladybug.Database(str(graph_path))
-        except Exception as exc:
-            logger.warning(
-                "[memory] graph DB failed to open (%s) — wiping corrupted files and retrying",
-                exc,
-            )
-            # Wipe all ladybug/kuzu auxiliary files next to the DB.
-            parent = graph_path.parent
-            stem   = graph_path.name
-            for p in parent.iterdir():
-                if p.name.startswith(stem) and p.name != stem:
-                    p.unlink()
-                    logger.info("[memory] deleted %s", p)
-            self._db = ladybug.Database(str(graph_path))
+        self._graph_path = graph_path
+        self._cfg        = cfg
+
+        self._db = self._open_db(graph_path)
 
         self._write_conn = ladybug.AsyncConnection(
             self._db,
@@ -96,7 +99,6 @@ class LibrarianRunner:
         init_schema(sync_conn)
         sync_conn.close()
 
-        self._cfg      = cfg
         self._conv_db  = conv_db
         self._llm      = llm
         self._embedder = embedder
@@ -124,10 +126,95 @@ class LibrarianRunner:
         }
         self._active_tasks: set[asyncio.Task] = set()
 
-    def new_read_connection(self):
-        """Return a new sync Connection from the shared Database for read tools."""
+    # ------------------------------------------------------------------
+    # DB open / rebuild helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _open_db(graph_path: Path):
+        """
+        Open (or create) a ladybug.Database at *graph_path*.
+
+        On failure the auxiliary files adjacent to the DB (including any
+        stale .wal) are wiped and a fresh database is created, matching the
+        startup-recovery behaviour that already existed here.
+        """
         import ladybug
-        return ladybug.Connection(self._db)
+
+        try:
+            return ladybug.Database(str(graph_path))
+        except Exception as exc:
+            logger.warning(
+                "[memory] graph DB failed to open (%s) — wiping auxiliary files and retrying",
+                exc,
+            )
+            parent = graph_path.parent
+            stem   = graph_path.name
+            for p in parent.iterdir():
+                if p.name.startswith(stem) and p.name != stem:
+                    try:
+                        p.unlink()
+                        logger.info("[memory] deleted stale file %s", p)
+                    except OSError as del_exc:
+                        logger.warning("[memory] could not delete %s: %s", p, del_exc)
+            return ladybug.Database(str(graph_path))
+
+    def _rebuild_db(self) -> None:
+        """
+        Called when a mid-session WAL deletion is detected.
+
+        Closes the existing write connection, wipes stale auxiliary files,
+        and reopens the database + write connection in-place so that all
+        callers that hold a reference to *self* automatically get the new
+        connection on their next call.
+
+        Must be called from the thread/task that holds (or can safely acquire)
+        _write_lock, or at a point where no concurrent writes are in flight.
+        """
+        import ladybug
+        from TinyCTX.modules.memory.graph import init_schema
+
+        logger.warning("[memory] WAL missing mid-session — rebuilding database")
+
+        # Best-effort close of the stale write connection
+        try:
+            self._write_conn.close()
+        except Exception:
+            pass
+
+        self._db = self._open_db(self._graph_path)
+
+        self._write_conn = ladybug.AsyncConnection(
+            self._db,
+            max_concurrent_queries=int(self._cfg.get("max_concurrent", 4)),
+        )
+
+        # Re-apply schema (tables already exist; DDL uses IF NOT EXISTS)
+        sync_conn = ladybug.Connection(self._db)
+        init_schema(sync_conn)
+        sync_conn.close()
+
+        logger.info("[memory] database rebuilt successfully after WAL loss")
+
+    def new_read_connection(self):
+        """
+        Return a new sync Connection from the shared Database for read tools.
+
+        If the database has been lost (stale WAL), rebuild it first so the
+        caller always gets a valid connection.
+        """
+        import ladybug
+
+        try:
+            return ladybug.Connection(self._db)
+        except Exception as exc:
+            if _is_wal_error(exc):
+                logger.warning(
+                    "[memory] new_read_connection: WAL error (%s) — rebuilding", exc
+                )
+                self._rebuild_db()
+                return ladybug.Connection(self._db)
+            raise
 
     def start(self) -> None:
         """Schedule the poll loop as a background asyncio task."""
@@ -366,12 +453,19 @@ def register_runtime(runtime) -> None:
     _runner = LibrarianRunner(cfg, graph_path, log_path, conv_db, llm, embedder)
     atexit.register(_runner.stop)
 
-    # GraphDB
+    # GraphDB — pass a rebuild callback so GraphDB.safe_execute can trigger
+    # a live database rebuild when a mid-session WAL deletion is detected.
     from TinyCTX.modules.memory.graph import GraphDB
     import TinyCTX.modules.memory.tools as tools_mod
 
     read_conn = _runner.new_read_connection()
-    _graph_db = GraphDB(read_conn)
+
+    def _refresh_read_conn() -> object:
+        """Called by GraphDB when a WAL error is detected on a read query."""
+        new_conn = _runner.new_read_connection()
+        return new_conn
+
+    _graph_db = GraphDB(read_conn, rebuild_callback=_refresh_read_conn)
     atexit.register(read_conn.close)
 
     _tools = tools_mod
