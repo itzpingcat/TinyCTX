@@ -96,13 +96,11 @@ def _make_tool_handler():
         tools.kg_add_entity,
         tools.kg_update_entity,
         tools.kg_add_relationship,
-        tools.kg_supersede_relationship,
         tools.kg_delete_entity,
         tools.kg_delete_relationship,
-        tools.kg_find_entity,
-        tools.kg_get_entity,
+        tools.kg_get_entity
     ]:
-        handler.register_tool(fn, always_on=True, min_permission=25)
+        handler.register_tool(fn, always_on=True, min_permission=0)
     return handler
 
 

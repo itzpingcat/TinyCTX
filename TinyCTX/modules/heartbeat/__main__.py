@@ -181,19 +181,17 @@ def register_runtime(runtime) -> None:
     _global_runner = _HeartbeatRunner(runtime, cfg)
     _global_runner.start()
 
-def register_agent(agent) -> None:
-    """
-    Commands move here to be available to the agent/user.
-    """
-    registry = getattr(agent, "commands", None)
-    if registry and _global_runner:
-        runner = _global_runner
-        async def _cmd_run(args, context):
-            asyncio.create_task(runner._tick())
-            if "console" in context:
-                context["console"].print("[yellow]Heartbeat tick triggered manually.[/yellow]")
+    async def _cmd_run(args, context):
+        asyncio.create_task(_global_runner._tick())
+        send = context.get("send")
+        if callable(send):
+            await send("Heartbeat tick triggered manually.")
 
-        registry.register("heartbeat", "run", _cmd_run, help="Manual heartbeat tick")
+    runtime.commands.register("heartbeat", "run", _cmd_run, help="Manual heartbeat tick")
+
+
+def register_agent(agent) -> None:
+    pass
 
 
 # ---------------------------------------------------------------------------

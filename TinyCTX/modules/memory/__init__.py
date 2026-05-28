@@ -22,7 +22,7 @@
         # Dedup cycle
         "dedup_enabled":          True,
         "dedup_interval_hours":   24,
-        "similarity_threshold":   0.85,
+        "similarity_threshold":   0.90,
 
         # Embedding model key from config.yaml models: (must be kind: embedding)
         # Leave empty to disable semantic search (keyword only)

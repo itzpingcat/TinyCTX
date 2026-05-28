@@ -1,7 +1,8 @@
-﻿"""
+"""
 modules/memory/graph.py
 
-LadybugDB schema initialisation and low-level graph access helpers.
+LadybugDB schema initialisation, database lifetime management, and low-level
+graph access helpers.
 (LadybugDB is the community-maintained fork of KùzuDB.)
 
 Schema
@@ -26,12 +27,14 @@ all nodes and only keyword search is available.
 
 Connection usage
 ----------------
-The librarian process uses ladybug.AsyncConnection (shared, writer).
-The main agent tools use ladybug.Connection (sync, reader — ladybug supports
-concurrent readers with one writer via its MVCC).
+GraphDatabase owns the single ladybug.Database and is the only place that
+opens, checkpoints, or closes it.
 
-Both callers open their own ladybug.Database handle; ladybug handles
-coordination at the storage layer.
+The librarian uses an AsyncConnection vended by GraphDatabase for all writes.
+The main agent tools use a sync Connection vended by GraphDatabase for reads.
+
+Ladybug supports concurrent readers with one writer via MVCC; both connection
+types are created from the same underlying Database object.
 """
 from __future__ import annotations
 
@@ -40,7 +43,11 @@ import logging
 import math
 import time
 import uuid
-from typing import Any
+from pathlib import Path
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from typing import Any as _QueryResult  # placeholder for ladybug QueryResult
 
 logger = logging.getLogger(__name__)
 
@@ -139,10 +146,9 @@ def embed_content_for(name: str, description: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Cosine similarity (same pattern as memory/store.py)
+# Cosine similarity
 # ---------------------------------------------------------------------------
 
-from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import numpy as _np
 try:
@@ -191,25 +197,236 @@ def top_k_cosine(
 
 
 # ---------------------------------------------------------------------------
-# GraphDB — thin wrapper around a shared Connection for the main agent (sync)
+# WAL-error detection
+# ---------------------------------------------------------------------------
+
+def _is_wal_error(exc: BaseException) -> bool:
+    """
+    Return True when *exc* looks like the 'Cannot read size of file … .wal'
+    IO error that ladybug raises when the WAL has been deleted mid-session.
+    """
+    msg = " ".join(str(a) for a in getattr(exc, "args", (str(exc),))).lower()
+    return ".wal" in msg and ("no such file" in msg or "cannot read" in msg or "error 2" in msg)
+
+
+# ---------------------------------------------------------------------------
+# GraphDatabase — owns the ladybug.Database lifetime
+# ---------------------------------------------------------------------------
+
+class GraphDatabase:
+    """
+    Owns the single ladybug.Database for the memory module.
+
+    Responsibilities:
+      - Open (or recover) the database on construction
+      - Checkpoint and close cleanly on shutdown
+      - Rebuild mid-session if a WAL error is detected
+      - Vend sync and async connections to callers
+
+    All ladybug imports are local so the module can be imported without
+    ladybug installed (e.g. for type checking or testing stubs).
+    """
+
+    def __init__(self, graph_path: Path, max_concurrent: int = 4) -> None:
+        self._graph_path    = graph_path
+        self._max_concurrent = max_concurrent
+
+        graph_path.parent.mkdir(parents=True, exist_ok=True)
+        self._db = self._open_db(graph_path)
+
+        # Apply schema immediately so callers get a ready-to-use database.
+        self._apply_schema()
+
+    # ------------------------------------------------------------------
+    # Open / recover
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _open_db(graph_path: Path):
+        """
+        Open (or create) a ladybug.Database at *graph_path*.
+
+        On failure, wipe auxiliary files (including any stale .wal) adjacent
+        to the DB file and retry once with a fresh database.
+        """
+        import ladybug
+
+        try:
+            return ladybug.Database(str(graph_path))
+        except Exception as exc:
+            logger.warning(
+                "[memory/graph] DB failed to open (%s) — wiping auxiliary files and retrying",
+                exc,
+            )
+            parent = graph_path.parent
+            stem   = graph_path.name
+            for p in parent.iterdir():
+                if p.name.startswith(stem) and p.name != stem:
+                    try:
+                        p.unlink()
+                        logger.info("[memory/graph] deleted stale file %s", p)
+                    except OSError as del_exc:
+                        logger.warning("[memory/graph] could not delete %s: %s", p, del_exc)
+            return ladybug.Database(str(graph_path))
+
+    def _apply_schema(self) -> None:
+        """Run schema DDL on a fresh sync connection, then close it."""
+        import ladybug
+        conn = ladybug.Connection(self._db)
+        try:
+            init_schema(conn)
+        finally:
+            conn.close()
+
+    def rebuild(self, stale_write_conn=None) -> None:
+        """
+        Rebuild the database after a mid-session WAL error.
+
+        Closes *stale_write_conn* if provided (best-effort), wipes auxiliary
+        files, reopens the database, and re-applies the schema.  The caller
+        must discard any connections obtained before this call and request
+        fresh ones via new_read_conn() / new_async_write_conn().
+        """
+        logger.warning("[memory/graph] WAL missing mid-session — rebuilding database")
+
+        if stale_write_conn is not None:
+            try:
+                stale_write_conn.close()
+            except Exception:
+                pass
+
+        self._db = self._open_db(self._graph_path)
+        self._apply_schema()
+        logger.info("[memory/graph] database rebuilt successfully after WAL loss")
+
+    # ------------------------------------------------------------------
+    # Connection factories
+    # ------------------------------------------------------------------
+
+    def new_read_conn(self):
+        """
+        Return a new sync ladybug.Connection for read operations.
+
+        If a WAL error fires on open, rebuild the database first and retry.
+        """
+        import ladybug
+
+        try:
+            return ladybug.Connection(self._db)
+        except Exception as exc:
+            if _is_wal_error(exc):
+                logger.warning(
+                    "[memory/graph] new_read_conn: WAL error (%s) — rebuilding", exc
+                )
+                self.rebuild()
+                return ladybug.Connection(self._db)
+            raise
+
+    def new_async_write_conn(self):
+        """
+        Return a new ladybug.AsyncConnection for write operations (librarian).
+        """
+        import ladybug
+
+        return ladybug.AsyncConnection(
+            self._db,
+            max_concurrent_queries=self._max_concurrent,
+        )
+
+    # ------------------------------------------------------------------
+    # Shutdown
+    # ------------------------------------------------------------------
+
+    def checkpoint(self) -> None:
+        """
+        Flush the WAL into the main database files.
+
+        Call this before closing to ensure no committed writes are lost.
+        Safe to call multiple times.
+        """
+        import ladybug
+
+        try:
+            conn = ladybug.Connection(self._db)
+            conn.execute("CHECKPOINT")
+            conn.close()
+            logger.info("[memory/graph] checkpoint complete")
+        except Exception as exc:
+            logger.warning("[memory/graph] checkpoint failed: %s", exc)
+
+    def close(self) -> None:
+        """Checkpoint then close the database."""
+        self.checkpoint()
+        try:
+            self._db.close()
+        except Exception as exc:
+            logger.warning("[memory/graph] db close failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# GraphDB — sync read accessor for the main agent tools
 # ---------------------------------------------------------------------------
 
 class GraphDB:
     """
     Sync graph accessor for use in the main agent's tool implementations.
-    Receives a ladybug.Connection created from the single shared Database object
-    owned by the LibrarianRunner. Does NOT open its own Database.
+
+    Holds a sync ladybug.Connection obtained from a GraphDatabase.  On a
+    mid-session WAL error, safe_execute asks the owning GraphDatabase to
+    rebuild and then opens a fresh connection automatically.
     """
 
-    def __init__(self, conn) -> None:
-        self._conn = conn
+    def __init__(self, graph_database: GraphDatabase) -> None:
+        self._gdb  = graph_database
+        self._conn = graph_database.new_read_conn()
+
+    # ------------------------------------------------------------------
+    # Safe execute — retries once after a mid-session WAL rebuild
+    # ------------------------------------------------------------------
+
+    def safe_execute(self, query: str, parameters: dict | None = None) -> Any:
+        """
+        Execute *query* on the current connection.
+
+        On a WAL-missing error the GraphDatabase is rebuilt, a fresh
+        connection is opened, and the query is retried once.  Any other
+        exception propagates normally.
+        """
+        kwargs: dict = {}
+        if parameters:
+            kwargs["parameters"] = parameters
+
+        try:
+            return self._conn.execute(query, **kwargs)
+        except Exception as exc:
+            if _is_wal_error(exc):
+                logger.warning(
+                    "[memory/graph] WAL error on read query — rebuilding: %s", exc
+                )
+                try:
+                    self._gdb.rebuild()
+                    self._conn = self._gdb.new_read_conn()
+                    logger.info("[memory/graph] connection rebuilt; retrying query")
+                    return self._conn.execute(query, **kwargs)
+                except Exception as retry_exc:
+                    logger.error(
+                        "[memory/graph] query still failing after rebuild: %s", retry_exc
+                    )
+                    raise retry_exc from exc
+            raise
+
+    def close(self) -> None:
+        try:
+            self._conn.close()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Read operations
     # ------------------------------------------------------------------
 
     def get_entity(self, uid: str) -> dict | None:
-        r = self._conn.execute(
+        r = self.safe_execute(
             "MATCH (e:Entity {uuid: $uid}) RETURN e.*",
             parameters={"uid": uid},
         )
@@ -219,24 +436,23 @@ class GraphDB:
         col_names = r.get_column_names()
         entity = dict(zip(col_names, row))
 
-        # Attach active in/out edges
         entity["edges_out"] = self._active_edges_from(uid)
         entity["edges_in"]  = self._active_edges_to(uid)
         return entity
 
     def find_entity(self, name: str | None = None, entity_type: str | None = None) -> list[dict]:
         if name and entity_type:
-            r = self._conn.execute(
+            r = self.safe_execute(
                 "MATCH (e:Entity) WHERE e.name CONTAINS $name AND e.entity_type = $et RETURN e.uuid, e.name, e.entity_type, e.description LIMIT 10",
                 parameters={"name": name, "et": entity_type},
             )
         elif name:
-            r = self._conn.execute(
+            r = self.safe_execute(
                 "MATCH (e:Entity) WHERE e.name CONTAINS $name RETURN e.uuid, e.name, e.entity_type, e.description LIMIT 10",
                 parameters={"name": name},
             )
         elif entity_type:
-            r = self._conn.execute(
+            r = self.safe_execute(
                 "MATCH (e:Entity) WHERE e.entity_type = $et RETURN e.uuid, e.name, e.entity_type, e.description LIMIT 10",
                 parameters={"et": entity_type},
             )
@@ -253,14 +469,14 @@ class GraphDB:
         if pinned_only:
             clauses.append("e.pinned = true")
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-        r = self._conn.execute(
+        r = self.safe_execute(
             f"MATCH (e:Entity) {where} RETURN e.uuid, e.name, e.entity_type, e.description, e.pinned, e.priority ORDER BY e.priority DESC",
-            parameters=params,
+            parameters=params if params else None,
         )
         return self._rows_to_dicts(r, ["uuid", "name", "entity_type", "description", "pinned", "priority"])
 
     def get_pinned_entities(self) -> list[dict]:
-        r = self._conn.execute(
+        r = self.safe_execute(
             "MATCH (e:Entity) WHERE e.pinned = true RETURN e.uuid, e.name, e.entity_type, e.description ORDER BY e.priority DESC"
         )
         return self._rows_to_dicts(r, ["uuid", "name", "entity_type", "description"])
@@ -270,7 +486,7 @@ class GraphDB:
         Return full entity dicts (including edges) for all pinned entities,
         ordered by priority descending. Used by the memory block assembler.
         """
-        r = self._conn.execute(
+        r = self.safe_execute(
             "MATCH (e:Entity) WHERE e.pinned = true RETURN e.uuid ORDER BY e.priority DESC"
         )
         uuids = [row[0] for row in self._drain(r)]
@@ -283,7 +499,7 @@ class GraphDB:
 
     def get_entity_slim(self, uid: str) -> dict | None:
         """Fetch name/type/description only — no edges. Used for linked-node rendering."""
-        r = self._conn.execute(
+        r = self.safe_execute(
             "MATCH (e:Entity {uuid: $uid}) "
             "RETURN e.uuid, e.name, e.entity_type, e.description",
             parameters={"uid": uid},
@@ -322,26 +538,63 @@ class GraphDB:
         return all_edges
 
     def get_stats(self) -> dict:
-        entity_count = self._conn.execute("MATCH (e:Entity) RETURN count(e)").get_next()[0]
-        edge_count   = self._conn.execute(
+        entity_count = self.safe_execute(
+            "MATCH (e:Entity) RETURN count(e)"
+        ).get_next()[0]
+
+        edge_count = self.safe_execute(
             "MATCH ()-[r:Relation]->() WHERE r.superseded_at IS NULL RETURN count(r)"
         ).get_next()[0]
-        r = self._conn.execute(
+
+        superseded_edge_count = self.safe_execute(
+            "MATCH ()-[r:Relation]->() WHERE r.superseded_at IS NOT NULL RETURN count(r)"
+        ).get_next()[0]
+
+        pinned_count = self.safe_execute(
+            "MATCH (e:Entity) WHERE e.pinned = true RETURN count(e)"
+        ).get_next()[0]
+
+        avg_priority_row = self.safe_execute(
+            "MATCH (e:Entity) RETURN avg(e.priority)"
+        ).get_next()[0]
+        avg_priority = round(float(avg_priority_row), 1) if avg_priority_row is not None else 0.0
+
+        embedded_count = self.safe_execute(
+            "MATCH (e:Entity) WHERE e.embedding IS NOT NULL RETURN count(e)"
+        ).get_next()[0]
+
+        r = self.safe_execute(
             "MATCH (e:Entity) RETURN e.entity_type, count(e) ORDER BY count(e) DESC"
         )
         by_type: dict[str, int] = {}
         while r.has_next():
             row = r.get_next()
             by_type[row[0]] = row[1]
+
+        r2 = self.safe_execute(
+            "MATCH (e:Entity) WHERE e.mention_count > 0 "
+            "RETURN e.name, e.entity_type, e.mention_count "
+            "ORDER BY e.mention_count DESC LIMIT 5"
+        )
+        top_mentioned: list[dict] = []
+        while r2.has_next():
+            row = r2.get_next()
+            top_mentioned.append({"name": row[0], "entity_type": row[1], "mention_count": row[2]})
+
         return {
-            "entity_count": entity_count,
-            "active_edge_count": edge_count,
-            "by_type": by_type,
+            "entity_count":           entity_count,
+            "active_edge_count":      edge_count,
+            "superseded_edge_count":  superseded_edge_count,
+            "pinned_count":           pinned_count,
+            "avg_priority":           avg_priority,
+            "embedded_count":         embedded_count,
+            "by_type":                by_type,
+            "top_mentioned":          top_mentioned,
         }
 
     def all_entities_with_embeddings(self) -> list[tuple[str, list[float]]]:
         """Return [(uuid, embedding)] for all entities that have embeddings."""
-        r = self._conn.execute(
+        r = self.safe_execute(
             "MATCH (e:Entity) WHERE e.embedding IS NOT NULL RETURN e.uuid, e.embedding"
         )
         results = []
@@ -354,7 +607,7 @@ class GraphDB:
 
     def bump_mention_count(self, uids: list[str]) -> None:
         for uid in uids:
-            self._conn.execute(
+            self.safe_execute(
                 "MATCH (e:Entity {uuid: $uid}) SET e.mention_count = e.mention_count + 1",
                 parameters={"uid": uid},
             )
@@ -364,7 +617,7 @@ class GraphDB:
     # ------------------------------------------------------------------
 
     def _active_edges_from(self, uid: str) -> list[dict]:
-        r = self._conn.execute(
+        r = self.safe_execute(
             "MATCH (a:Entity {uuid: $uid})-[r:Relation]->(b:Entity) "
             "WHERE r.superseded_at IS NULL "
             "RETURN b.uuid, b.name, r.relation, r.weight, r.description",
@@ -373,7 +626,7 @@ class GraphDB:
         return self._rows_to_dicts(r, ["target_uuid", "target_name", "relation", "weight", "description"])
 
     def _active_edges_to(self, uid: str) -> list[dict]:
-        r = self._conn.execute(
+        r = self.safe_execute(
             "MATCH (a:Entity)-[r:Relation]->(b:Entity {uuid: $uid}) "
             "WHERE r.superseded_at IS NULL "
             "RETURN a.uuid, a.name, r.relation, r.weight, r.description",
@@ -394,6 +647,3 @@ class GraphDB:
         while result.has_next():
             rows.append(result.get_next())
         return rows
-
-    def close(self) -> None:
-        pass  # connection lifetime managed by LibrarianRunner

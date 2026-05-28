@@ -6,8 +6,9 @@ Agent Skills support — agentskills.io open standard.
 Discovery
 ---------
 On every assemble() the module rescans configured directories for folders
-containing a SKILL.md file. Only the YAML frontmatter (name + description) is
-parsed at discovery time — full content stays on disk until activated.
+containing a SKILL.md file (skills) or a DESCRIPTION.md file (categories).
+Categories can be nested arbitrarily deep. Only frontmatter is parsed at
+discovery time — full content stays on disk until activated.
 
 Scan order (first-found wins for duplicate names):
   1. Paths listed in default_config["skill_dirs"], resolved relative to workspace
@@ -15,29 +16,32 @@ Scan order (first-found wins for duplicate names):
   3. .agents/skills/    — cross-client project convention (cwd)
   4. ~/.tinyctx/skills/ — tinyctx-specific user fallback
 
+A folder with SKILL.md is a skill. A folder with DESCRIPTION.md is a category.
+If both exist, SKILL.md wins (logged as warning). Nesting is unlimited.
+
 System prompt injection
 -----------------------
-A compact XML skill index is injected as a system prompt every turn:
+A compact XML skill index is injected as a system prompt every turn.
+Top-level skills render in full. Categories render as collapsed stubs.
+A single <skill_category_hint> at the bottom explains how to expand them —
+one hint for all collapsed categories rather than a repeated note per entry.
 
-  <available_skills>
-    <skill>
-      <n>pdf-processing</n>
-      <description>Extract text and tables from PDF files…</description>
-      <location>/abs/path/to/pdf-processing/SKILL.md</location>
-    </skill>
-    …
-  </available_skills>
-
-The index already tells the LLM everything it needs to decide — no list tool needed.
+When ephemeral_categories=false (config), previously expanded categories are
+re-expanded inline in the system prompt every turn, using the
+"skills_expanded_categories" key stored in the conversation state_delta chain.
 
 Tools registered
 ----------------
-  use_skill(name) — loads the full SKILL.md body on demand.
+  use_skill(name)                    — always_on (configurable)
+      Loads a skill's SKILL.md body, OR expands a category listing.
+  collapse_skill_categories(paths)   — deferred
+      Removes one or more category paths from the expanded set (no-op when ephemeral).
 
 Convention: register_agent(agent) — no imports from gateway or bridges.
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 from pathlib import Path
@@ -47,7 +51,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# YAML frontmatter parser (stdlib only — frontmatter is always simple scalars)
+# YAML frontmatter parser (stdlib only — always simple scalars)
 # ---------------------------------------------------------------------------
 
 _FM_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
@@ -77,61 +81,286 @@ def _skill_body(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Discovery
+# Tree nodes
 # ---------------------------------------------------------------------------
 
-def _scan_dir(directory: Path, registry: dict[str, dict]) -> None:
+class SkillEntry:
+    __slots__ = ("name", "description", "skill_md", "category_path")
+
+    def __init__(self, name: str, description: str, skill_md: Path, category_path: str) -> None:
+        self.name          = name
+        self.description   = description
+        self.skill_md      = skill_md
+        self.category_path = category_path   # "" for top-level skills
+
+
+class CategoryNode:
+    __slots__ = ("name", "path", "description", "skills", "subcategories")
+
+    def __init__(self, name: str, path: str, description: str) -> None:
+        self.name          = name
+        self.path          = path            # slash-joined ancestor names, e.g. "agents/orchestration"
+        self.description   = description
+        self.skills:        list[SkillEntry]  = []
+        self.subcategories: list[CategoryNode] = []
+
+
+# ---------------------------------------------------------------------------
+# Discovery  (recursive, arbitrary depth)
+# ---------------------------------------------------------------------------
+
+def _scan_tree(
+    directory: Path,
+    skills: dict[str, SkillEntry],
+    categories: dict[str, CategoryNode],
+    parent_path: str = "",
+) -> list[SkillEntry | CategoryNode]:
+    """
+    Recursively scan *directory*. Returns the direct children (skills +
+    category nodes) found at this level, in sorted order.
+
+    *skills*     — flat registry: name → SkillEntry  (all depths)
+    *categories* — flat registry: path → CategoryNode (all depths)
+    """
     if not directory.is_dir():
-        return
+        return []
+
+    children: list[SkillEntry | CategoryNode] = []
+
     for entry in sorted(directory.iterdir()):
         if not entry.is_dir():
             continue
-        skill_md = entry / "SKILL.md"
-        if not skill_md.exists():
-            continue
-        try:
-            text = skill_md.read_text(encoding="utf-8")
-            fm   = _parse_frontmatter(text)
-            name = fm.get("name", entry.name).strip() or entry.name
-            if name in registry:
-                continue  # first-found wins
-            registry[name] = {
-                "name":        name,
-                "description": fm.get("description", "").strip(),
-                "skill_md":    skill_md,
-            }
-        except Exception as exc:
-            logger.warning("[skills] failed to parse %s: %s", skill_md, exc)
+
+        skill_md   = entry / "SKILL.md"
+        desc_md    = entry / "DESCRIPTION.md"
+        has_skill  = skill_md.exists()
+        has_desc   = desc_md.exists()
+
+        if has_skill and has_desc:
+            logger.warning(
+                "[skills] %s has both SKILL.md and DESCRIPTION.md — treating as skill",
+                entry,
+            )
+
+        if has_skill:
+            # ---- skill ----
+            try:
+                text = skill_md.read_text(encoding="utf-8")
+                fm   = _parse_frontmatter(text)
+                name = (fm.get("name", "") or entry.name).strip() or entry.name
+            except Exception as exc:
+                logger.warning("[skills] failed to parse %s: %s", skill_md, exc)
+                continue
+
+            if name in skills:
+                logger.warning(
+                    "[skills] duplicate skill name '%s' at %s — skipping (first-found wins)",
+                    name, skill_md,
+                )
+                continue
+
+            skill = SkillEntry(
+                name=name,
+                description=(fm.get("description", "") or "").strip(),
+                skill_md=skill_md,
+                category_path=parent_path,
+            )
+            skills[name] = skill
+            children.append(skill)
+
+        elif has_desc:
+            # ---- category ----
+            cat_path = f"{parent_path}/{entry.name}" if parent_path else entry.name
+
+            if cat_path in categories:
+                logger.warning(
+                    "[skills] duplicate category path '%s' at %s — skipping",
+                    cat_path, entry,
+                )
+                continue
+
+            try:
+                text = desc_md.read_text(encoding="utf-8")
+                fm   = _parse_frontmatter(text)
+                desc = (fm.get("description", "") or "").strip()
+            except Exception as exc:
+                logger.warning("[skills] failed to parse %s: %s", desc_md, exc)
+                desc = ""
+
+            node = CategoryNode(name=entry.name, path=cat_path, description=desc)
+            categories[cat_path] = node
+
+            # recurse
+            sub_children = _scan_tree(entry, skills, categories, parent_path=cat_path)
+            for child in sub_children:
+                if isinstance(child, SkillEntry):
+                    node.skills.append(child)
+                else:
+                    node.subcategories.append(child)
+
+            children.append(node)
+        # else: plain folder with neither — silently ignored
+
+    return children
 
 
-def _discover(scan_dirs: list[Path]) -> dict[str, dict]:
-    registry: dict[str, dict] = {}
+def _discover(scan_dirs: list[Path]) -> tuple[dict[str, SkillEntry], dict[str, CategoryNode], list]:
+    """
+    Returns:
+        skills     — flat dict: name → SkillEntry
+        categories — flat dict: path → CategoryNode
+        top_level  — ordered list of SkillEntry | CategoryNode at root level
+    """
+    skills:     dict[str, SkillEntry]   = {}
+    categories: dict[str, CategoryNode] = {}
+    top_level:  list                    = []
+
     for d in scan_dirs:
-        _scan_dir(d, registry)
-    return registry
+        for child in _scan_tree(d, skills, categories):
+            # top-level dedup: first-found wins for same name/path
+            if isinstance(child, SkillEntry):
+                if child in top_level:
+                    continue
+            else:
+                if any(isinstance(c, CategoryNode) and c.path == child.path for c in top_level):
+                    continue
+            top_level.append(child)
+
+    return skills, categories, top_level
 
 
 # ---------------------------------------------------------------------------
 # Prompt builder
 # ---------------------------------------------------------------------------
 
-def _build_index_prompt(registry: dict[str, dict]) -> str | None:
-    if not registry:
+def _render_category_expanded(node: CategoryNode, indent: int = 2) -> list[str]:
+    """Render a CategoryNode fully expanded (used inside system prompt when persistent)."""
+    pad = " " * indent
+    lines = [
+        f"{pad}<skill_category name={node.name!r} path={node.path!r}>",
+        f"{pad}  <description>{node.description or '(no description)'}</description>",
+    ]
+    for skill in node.skills:
+        lines += [
+            f"{pad}  <skill>",
+            f"{pad}    <n>{skill.name}</n>",
+            f"{pad}    <description>{skill.description or '(no description)'}</description>",
+            f"{pad}    <location>{skill.skill_md}</location>",
+            f"{pad}  </skill>",
+        ]
+    for sub in node.subcategories:
+        lines += _render_category_expanded(sub, indent + 2)
+    lines.append(f"{pad}</skill_category>")
+    return lines
+
+
+def _render_category_collapsed(node: CategoryNode, indent: int = 2) -> list[str]:
+    pad = " " * indent
+    return [
+        f"{pad}<skill_category name={node.name!r} path={node.path!r}>",
+        f"{pad}  <description>{node.description or '(no description)'}</description>",
+        f"{pad}</skill_category>",
+    ]
+
+
+def _build_index_prompt(
+    top_level: list,
+    expanded: set[str],
+    categories: dict[str, CategoryNode],
+) -> str | None:
+    if not top_level:
         return None
+
     lines = ["<available_skills>"]
-    for skill in registry.values():
-        lines.append("  <skill>")
-        lines.append(f"    <n>{skill['name']}</n>")
-        lines.append(f"    <description>{skill['description'] or '(no description)'}</description>")
-        lines.append(f"    <location>{skill['skill_md']}</location>")
-        lines.append("  </skill>")
+    has_collapsed = False
+
+    for child in top_level:
+        if isinstance(child, SkillEntry):
+            lines += [
+                "  <skill>",
+                f"    <n>{child.name}</n>",
+                f"    <description>{child.description or '(no description)'}</description>",
+                f"    <location>{child.skill_md}</location>",
+                "  </skill>",
+            ]
+        else:
+            if child.path in expanded:
+                lines += _render_category_expanded(child, indent=2)
+            else:
+                lines += _render_category_collapsed(child, indent=2)
+                has_collapsed = True
+
+    if has_collapsed:
+        lines.append("  <skill_category_hint>Call use_skill(path) on any skill_category to expand it and reveal its contents.</skill_category_hint>")
+
     lines.append("</available_skills>")
-    lines.append("\nUse the use_skill tool to load a skill's full instructions when relevant.")
+    lines.append("\nUse the use_skill tool to load a skill's full instructions or expand a category.")
     return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
-# register()
+# Category expansion renderer  (returned as tool output)
+# ---------------------------------------------------------------------------
+
+def _expand_category_text(node: CategoryNode, depth: int = 0) -> str:
+    """
+    Build a human/LLM-readable expansion of a category node.
+    Sub-categories are shown as stubs — call use_skill(path) to go deeper.
+    """
+    lines: list[str] = []
+    indent = "  " * depth
+
+    if depth == 0:
+        lines.append(f"# Category: {node.path}")
+        if node.description:
+            lines.append(node.description)
+        lines.append("")
+
+    for skill in node.skills:
+        lines.append(f"{indent}## {skill.name}")
+        if skill.description:
+            lines.append(f"{indent}{skill.description}")
+        lines.append(f"{indent}Location: {skill.skill_md}")
+        lines.append("")
+
+    for sub in node.subcategories:
+        lines.append(f"{indent}## {sub.name}  [category]")
+        if sub.description:
+            lines.append(f"{indent}{sub.description}")
+        lines.append(f"{indent}→ Call use_skill(\"{sub.path}\") to expand.")
+        lines.append("")
+
+    return "\n".join(lines).rstrip()
+
+
+# ---------------------------------------------------------------------------
+# State helpers  (skills_expanded_categories key in state_delta chain)
+# ---------------------------------------------------------------------------
+
+_STATE_KEY = "skills_expanded_categories"
+
+
+def _load_expanded(agent) -> set[str]:
+    try:
+        state, _ = agent.db.load_session_state(agent.context.tail_node_id)
+        raw = state.get(_STATE_KEY, "[]")
+        return set(json.loads(raw))
+    except Exception:
+        return set()
+
+
+def _save_expanded(agent, expanded: set[str]) -> None:
+    try:
+        agent.db.update_node_state_delta(
+            agent.context.tail_node_id,
+            json.dumps({_STATE_KEY: json.dumps(sorted(expanded))}),
+        )
+    except Exception as exc:
+        logger.warning("[skills] failed to persist expanded categories: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# register_agent
 # ---------------------------------------------------------------------------
 
 def register_agent(cycle) -> None:
@@ -141,10 +370,13 @@ def register_agent(cycle) -> None:
         cfg: dict = dict(EXTENSION_META.get("default_config", {}))
     except ImportError:
         cfg = {}
+
     # Merge config.yaml overrides (under top-level 'skills:' key)
     if hasattr(agent.config, "extra") and isinstance(agent.config.extra, dict):
         for k, v in agent.config.extra.get("skills", {}).items():
             cfg[k] = v
+
+    ephemeral: bool = bool(cfg.get("ephemeral_categories", True))
 
     workspace = Path(agent.config.workspace.path).expanduser().resolve()
 
@@ -162,20 +394,31 @@ def register_agent(cycle) -> None:
 
     configured[0].mkdir(parents=True, exist_ok=True)
 
-    _live: dict[str, dict[str, dict]] = {"registry": {}}
+    _live: dict[str, Any] = {
+        "skills":     {},   # name → SkillEntry
+        "categories": {},   # path → CategoryNode
+        "top_level":  [],   # ordered root-level items
+    }
 
-    def _refresh() -> dict[str, dict]:
-        reg = _discover(all_scan_dirs)
-        _live["registry"] = reg
-        return reg
+    def _refresh() -> tuple[dict, dict, list]:
+        skills, categories, top_level = _discover(all_scan_dirs)
+        _live["skills"]     = skills
+        _live["categories"] = categories
+        _live["top_level"]  = top_level
+        return skills, categories, top_level
 
     # ------------------------------------------------------------------
     # System prompt — injects skill index every turn
     # ------------------------------------------------------------------
 
+    def _build_prompt(_ctx) -> str | None:
+        _, categories, top_level = _refresh()
+        expanded = set() if ephemeral else _load_expanded(agent)
+        return _build_index_prompt(top_level, expanded, categories)
+
     agent.context.register_prompt(
         "skills_index",
-        lambda _ctx: _build_index_prompt(_refresh()),
+        _build_prompt,
         role="system",
         priority=int(cfg.get("index_priority", 5)),
     )
@@ -186,35 +429,128 @@ def register_agent(cycle) -> None:
 
     def use_skill(name: str) -> str:
         """
-        Load the full instructions for a skill into context.
-        Call this when you decide a skill is relevant for the current task.
+        Load the full instructions for a skill, or expand a skill category to
+        see what's inside it.
+
+        For skills: loads and returns the full SKILL.md body.
+        For categories: returns a listing of skills and sub-categories inside.
+        Use the path shown in <skill_category path="..."> to address a category,
+        e.g. use_skill("agents") or use_skill("agents/orchestration").
 
         Args:
-            name: The skill name exactly as shown in <available_skills>.
+            name: Skill name or category path as shown in <available_skills>.
         """
-        reg = _live["registry"]
-        if name not in reg:
-            matches = [k for k in reg if k.lower() == name.lower()]
-            if not matches:
-                available = ", ".join(sorted(reg.keys())) or "(none)"
-                return f"[error: skill '{name}' not found. Available: {available}]"
-            name = matches[0]
-        try:
-            text = reg[name]["skill_md"].read_text(encoding="utf-8")
-            body = _skill_body(text)
-            return f"# Skill: {name}\n\n{body}" if body else f"[skill '{name}' has no instructions body]"
-        except Exception as exc:
-            return f"[error reading skill '{name}': {exc}]"
+        skills     = _live["skills"]
+        categories = _live["categories"]
 
-    # Default: always_on. Override via config.yaml under skills.tools.use_skill: deferred|disabled
-    _sk_vis = str(
-        cfg.get("tools", {}).get("use_skill", "always_on")
-    ).lower().strip()
+        # --- category match (exact path) ---
+        if name in categories:
+            node   = categories[name]
+            result = _expand_category_text(node)
+
+            if not ephemeral:
+                expanded = _load_expanded(agent)
+                expanded.add(name)
+                _save_expanded(agent, expanded)
+
+            return result
+
+        # --- skill match ---
+        if name in skills:
+            skill = skills[name]
+            try:
+                text = skill.skill_md.read_text(encoding="utf-8")
+                body = _skill_body(text)
+                return f"# Skill: {name}\n\n{body}" if body else f"[skill '{name}' has no instructions body]"
+            except Exception as exc:
+                return f"[error reading skill '{name}': {exc}]"
+
+        # --- case-insensitive fallback ---
+        name_lower  = name.lower()
+        cat_match   = next((p for p in categories if p.lower() == name_lower), None)
+        if cat_match:
+            return use_skill(cat_match)
+        skill_match = next((n for n in skills if n.lower() == name_lower), None)
+        if skill_match:
+            return use_skill(skill_match)
+
+        # --- not found ---
+        available_skills = ", ".join(sorted(skills.keys())) or "(none)"
+        available_cats   = ", ".join(sorted(categories.keys())) or "(none)"
+        return (
+            f"[error: '{name}' not found.\n"
+            f"  Skills: {available_skills}\n"
+            f"  Categories: {available_cats}]"
+        )
+
+    _sk_vis = str(cfg.get("tools", {}).get("use_skill", "always_on")).lower().strip()
     if _sk_vis != "disabled":
-        agent.tool_handler.register_tool(use_skill, always_on=(_sk_vis != "deferred"), min_permission=25)
+        agent.tool_handler.register_tool(
+            use_skill,
+            always_on=(_sk_vis != "deferred"),
+            min_permission=25,
+        )
 
-    initial = _refresh()
-    if initial:
-        logger.info("[skills] discovered %d skill(s): %s", len(initial), ", ".join(sorted(initial.keys())))
+    # ------------------------------------------------------------------
+    # Tool: collapse_skill_categories  (deferred)
+    # ------------------------------------------------------------------
+
+    def collapse_skill_categories(paths: list[str]) -> str:
+        """
+        Remove one or more category paths from the expanded set so they return
+        to collapsed (stub) view in the system prompt.
+
+        Has no effect when ephemeral_categories=true (the default), since
+        categories are never persistently expanded in that mode.
+
+        Args:
+            paths: List of category paths to collapse, e.g. ["agents", "agents/orchestration"].
+                   Pass ["*"] to collapse all expanded categories at once.
+        """
+        if ephemeral:
+            return "[collapse_skill_categories: ephemeral mode is on — nothing to collapse]"
+
+        expanded = _load_expanded(agent)
+        if not expanded:
+            return "[collapse_skill_categories: no categories are currently expanded]"
+
+        if paths == ["*"]:
+            collapsed = sorted(expanded)
+            _save_expanded(agent, set())
+        else:
+            collapsed = sorted(p for p in paths if p in expanded)
+            unknown   = sorted(p for p in paths if p not in expanded)
+            _save_expanded(agent, expanded - set(collapsed))
+
+        parts = []
+        if collapsed:
+            parts.append(f"Collapsed: {', '.join(collapsed)}")
+        if unknown:
+            parts.append(f"Not expanded (ignored): {', '.join(unknown)}")
+        return "\n".join(parts) if parts else "[collapse_skill_categories: nothing changed]"
+
+    agent.tool_handler.register_tool(
+        collapse_skill_categories,
+        always_on=False,   # deferred
+        min_permission=25,
+    )
+
+    # ------------------------------------------------------------------
+    # Initial scan + logging
+    # ------------------------------------------------------------------
+
+    skills, categories, _ = _refresh()
+    n_skills = len(skills)
+    n_cats   = len(categories)
+
+    if n_skills or n_cats:
+        logger.info(
+            "[skills] discovered %d skill(s), %d categor%s: skills=[%s] categories=[%s]",
+            n_skills,
+            n_cats,
+            "y" if n_cats == 1 else "ies",
+            ", ".join(sorted(skills.keys())),
+            ", ".join(sorted(categories.keys())),
+        )
     else:
         logger.info("[skills] no skills found yet — place skills in %s", configured[0])

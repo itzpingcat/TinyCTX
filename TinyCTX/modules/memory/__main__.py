@@ -5,23 +5,31 @@ Registers the memory module.
 
 register_runtime(runtime) — called once at startup:
   1. Resolves config, builds embedder, LLM, ConversationDB
-  2. Builds LibrarianRunner and starts the poll loop
-  3. Inits tools module globals (write_conn, graph_db, embedder)
-  4. Sets module-level singletons for register_agent to consume
+  2. Creates GraphDatabase (owns the ladybug.Database lifetime)
+  3. Builds LibrarianRunner (gets write conn from GraphDatabase) and starts
+     the poll loop
+  4. Builds GraphDB (gets read conn from GraphDatabase) for agent tools
+  5. Inits tools module globals
 
 register_agent(cycle) — called per AgentCycle after tool_handler is ready:
   1. Registers kg_* read tools + call_librarian on cycle.tool_handler
   2. Registers pinned entity PromptProvider on cycle.context
 
-The LibrarianRunner owns the single ladybug.Database object and is the sole
-writer to the graph. All connections (reader and writer) are created from
-that one Database object, satisfying Ladybug's one-READ_WRITE-Database rule.
+GraphDatabase in graph.py is the single owner of the ladybug.Database and
+the only place that opens, checkpoints, or closes it.  LibrarianRunner is
+the sole writer; GraphDB is the sync reader.
+
+Shutdown order (enforced by _shutdown()):
+  1. Cancel the librarian background task (stop accepting new writes)
+  2. Close the GraphDB read connection
+  3. GraphDatabase.close() — checkpoints then closes the DB
 """
 from __future__ import annotations
 
 import asyncio
 import atexit
 import logging
+import signal
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -32,12 +40,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Module-level singletons set by register_runtime.
-_runner:       "LibrarianRunner | None" = None
-_workspace:    Path | None = None
-_graph_db:     object | None = None
-_tools:        "ModuleType | None" = None
-_pinned_prio:  int = 5
-_token_budget: int = 4096
+_graph_database: "GraphDatabase | None" = None   # owns the ladybug.Database
+_runner:         "LibrarianRunner | None" = None
+_workspace:      Path | None = None
+_graph_db:       object | None = None
+_tools:          "ModuleType | None" = None
+_pinned_prio:    int = 5
+_token_budget:   int = 4096
 
 
 # ---------------------------------------------------------------------------
@@ -46,57 +55,30 @@ _token_budget: int = 4096
 
 class LibrarianRunner:
     """
-    Owns the single ladybug.Database, vends connections, and runs the
-    librarian poll loop as an asyncio background task.
+    Runs the librarian poll loop as an asyncio background task.
 
-    All graph writes go through the async_conn + write_lock held here.
-    Read connections (for GraphDB / main-agent tools) are also created
-    from the same db object.
+    Receives a GraphDatabase from which it creates its AsyncConnection.
+    On a mid-session WAL error it asks GraphDatabase to rebuild and then
+    refreshes its own write connection.
     """
 
     def __init__(
         self,
         cfg: dict,
-        graph_path: Path,
+        graph_database: "GraphDatabase",
         log_path: Path,
         conv_db,
         llm,
         embedder,
     ) -> None:
-        import ladybug
-        from TinyCTX.modules.memory.graph import init_schema
-
-        graph_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
-        try:
-            self._db = ladybug.Database(str(graph_path))
-        except Exception as exc:
-            logger.warning(
-                "[memory] graph DB failed to open (%s) — wiping corrupted files and retrying",
-                exc,
-            )
-            # Wipe all ladybug/kuzu auxiliary files next to the DB.
-            parent = graph_path.parent
-            stem   = graph_path.name
-            for p in parent.iterdir():
-                if p.name.startswith(stem) and p.name != stem:
-                    p.unlink()
-                    logger.info("[memory] deleted %s", p)
-            self._db = ladybug.Database(str(graph_path))
+        self._cfg            = cfg
+        self._graph_database = graph_database
 
-        self._write_conn = ladybug.AsyncConnection(
-            self._db,
-            max_concurrent_queries=int(cfg.get("max_concurrent", 4)),
-        )
+        self._write_conn = graph_database.new_async_write_conn()
         self._write_lock = asyncio.Lock()
 
-        # Initialise schema synchronously on a plain connection
-        sync_conn = ladybug.Connection(self._db)
-        init_schema(sync_conn)
-        sync_conn.close()
-
-        self._cfg      = cfg
         self._conv_db  = conv_db
         self._llm      = llm
         self._embedder = embedder
@@ -124,10 +106,22 @@ class LibrarianRunner:
         }
         self._active_tasks: set[asyncio.Task] = set()
 
-    def new_read_connection(self):
-        """Return a new sync Connection from the shared Database for read tools."""
-        import ladybug
-        return ladybug.Connection(self._db)
+    # ------------------------------------------------------------------
+    # WAL rebuild — delegates to GraphDatabase, then refreshes write conn
+    # ------------------------------------------------------------------
+
+    def _rebuild_write_conn(self) -> None:
+        """
+        Called when a WAL error is detected on the write path.
+        Asks GraphDatabase to rebuild, then opens a fresh write connection.
+        """
+        self._graph_database.rebuild(stale_write_conn=self._write_conn)
+        self._write_conn = self._graph_database.new_async_write_conn()
+        logger.info("[memory/librarian] write connection refreshed after WAL rebuild")
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
     def start(self) -> None:
         """Schedule the poll loop as a background asyncio task."""
@@ -135,6 +129,7 @@ class LibrarianRunner:
         logger.info("[memory] LibrarianRunner started")
 
     def stop(self) -> None:
+        """Cancel the background task. Checkpoint is handled by _shutdown()."""
         if self._task and not self._task.done():
             self._task.cancel()
 
@@ -292,7 +287,7 @@ async def call_librarian(prompt: str = "", file_path: str = "") -> str:
 # ---------------------------------------------------------------------------
 
 def register_runtime(runtime) -> None:
-    global _runner, _workspace, _graph_db, _tools, _pinned_prio, _token_budget
+    global _graph_database, _runner, _workspace, _graph_db, _tools, _pinned_prio, _token_budget
 
     _workspace = Path(runtime.config.workspace.path).expanduser().resolve()
     _workspace.mkdir(parents=True, exist_ok=True)
@@ -310,19 +305,24 @@ def register_runtime(runtime) -> None:
 
     cfg: dict = {**defaults, **overrides}
 
-    ws = _workspace  # local binding so pylance knows it's non-None here
+    ws = _workspace
     assert ws is not None
 
     def _resolve(rel: str) -> Path:
         p = Path(rel)
         return p if p.is_absolute() else ws / p
 
-    graph_path = _resolve(cfg["graph_path"])
-    log_path   = _resolve(cfg.get("librarian_log", "memory/librarian.log"))
-    agent_db   = ws / "agent.db"
+    graph_path     = _resolve(cfg["graph_path"])
+    log_path       = _resolve(cfg.get("librarian_log", "memory/librarian.log"))
+    agent_db       = ws / "agent.db"
+    max_concurrent = int(cfg.get("max_concurrent", 4))
 
     _pinned_prio  = int(cfg.get("pinned_priority", 5))
     _token_budget = int(cfg.get("memory_block_tokens", 4096))
+
+    # GraphDatabase — single owner of the ladybug.Database
+    from TinyCTX.modules.memory.graph import GraphDatabase, GraphDB
+    _graph_database = GraphDatabase(graph_path, max_concurrent=max_concurrent)
 
     # Embedder
     embedder        = None
@@ -362,22 +362,58 @@ def register_runtime(runtime) -> None:
     conv_db = ConversationDB(agent_db)
     atexit.register(conv_db.close)
 
-    # LibrarianRunner
-    _runner = LibrarianRunner(cfg, graph_path, log_path, conv_db, llm, embedder)
-    atexit.register(_runner.stop)
+    # LibrarianRunner — gets write conn from GraphDatabase
+    _runner = LibrarianRunner(cfg, _graph_database, log_path, conv_db, llm, embedder)
 
-    # GraphDB
-    from TinyCTX.modules.memory.graph import GraphDB
+    # GraphDB — gets read conn from GraphDatabase
+    _graph_db = GraphDB(_graph_database)
+
+    # tools
     import TinyCTX.modules.memory.tools as tools_mod
-
-    read_conn = _runner.new_read_connection()
-    _graph_db = GraphDB(read_conn)
-    atexit.register(read_conn.close)
-
     _tools = tools_mod
     _tools.init(_runner._write_conn, _runner._write_lock, _graph_db, embedder)
 
+    # Shutdown: stop writer → close read conn → checkpoint + close DB.
+    # Registered on atexit and both termination signals so clean exits always
+    # flush the WAL regardless of how the process is stopped.
+    _shutdown_called = [False]
+
+    def _shutdown() -> None:
+        if _shutdown_called[0]:
+            return
+        _shutdown_called[0] = True
+        if _runner is not None:
+            _runner.stop()           # cancel background task
+        if _graph_db is not None:
+            _graph_db.close()        # close read connection
+        if _graph_database is not None:
+            _graph_database.close()  # checkpoint then close DB
+
+    atexit.register(_shutdown)
+    signal.signal(signal.SIGTERM, lambda *_: _shutdown())
+    signal.signal(signal.SIGINT,  lambda *_: _shutdown())
+
     _runner.start()
+
+    # Register /memory librarian slash command
+    async def _cmd_librarian(args: list, context: dict) -> None:
+        """
+        /memory librarian [prompt]
+
+        With no args: trigger an immediate node-ingest pass.
+        With args: queue a targeted agent with the joined args as the prompt.
+          e.g. /memory librarian remember that Alice prefers dark mode
+        """
+        prompt = " ".join(args).strip()
+        result = await call_librarian(prompt=prompt)
+        send = context.get("send")
+        if callable(send):
+            await send(result)
+
+    runtime.commands.register(
+        "memory", "librarian", _cmd_librarian,
+        help="Trigger the memory librarian. Optional: pass a prompt for a targeted update.",
+    )
 
     logger.info(
         "[memory] ready — graph: %s | embedder: %s",
