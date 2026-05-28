@@ -1,7 +1,8 @@
 """
 modules/memory/graph.py
 
-LadybugDB schema initialisation and low-level graph access helpers.
+LadybugDB schema initialisation, database lifetime management, and low-level
+graph access helpers.
 (LadybugDB is the community-maintained fork of KùzuDB.)
 
 Schema
@@ -26,21 +27,25 @@ all nodes and only keyword search is available.
 
 Connection usage
 ----------------
-The librarian process uses ladybug.AsyncConnection (shared, writer).
-The main agent tools use ladybug.Connection (sync, reader — ladybug supports
-concurrent readers with one writer via its MVCC).
+GraphDatabase owns the single ladybug.Database and is the only place that
+opens, checkpoints, or closes it.
 
-Both callers open their own ladybug.Database handle; ladybug handles
-coordination at the storage layer.
+The librarian uses an AsyncConnection vended by GraphDatabase for all writes.
+The main agent tools use a sync Connection vended by GraphDatabase for reads.
+
+Ladybug supports concurrent readers with one writer via MVCC; both connection
+types are created from the same underlying Database object.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import math
 import time
 import uuid
-from typing import Any, Callable
+from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -139,7 +144,7 @@ def embed_content_for(name: str, description: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Cosine similarity (same pattern as memory/store.py)
+# Cosine similarity
 # ---------------------------------------------------------------------------
 
 from typing import TYPE_CHECKING
@@ -191,7 +196,7 @@ def top_k_cosine(
 
 
 # ---------------------------------------------------------------------------
-# WAL-error detection (kept here so graph.py is self-contained)
+# WAL-error detection
 # ---------------------------------------------------------------------------
 
 def _is_wal_error(exc: BaseException) -> bool:
@@ -204,29 +209,175 @@ def _is_wal_error(exc: BaseException) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# GraphDB — thin wrapper around a shared Connection for the main agent (sync)
+# GraphDatabase — owns the ladybug.Database lifetime
+# ---------------------------------------------------------------------------
+
+class GraphDatabase:
+    """
+    Owns the single ladybug.Database for the memory module.
+
+    Responsibilities:
+      - Open (or recover) the database on construction
+      - Checkpoint and close cleanly on shutdown
+      - Rebuild mid-session if a WAL error is detected
+      - Vend sync and async connections to callers
+
+    All ladybug imports are local so the module can be imported without
+    ladybug installed (e.g. for type checking or testing stubs).
+    """
+
+    def __init__(self, graph_path: Path, max_concurrent: int = 4) -> None:
+        self._graph_path    = graph_path
+        self._max_concurrent = max_concurrent
+
+        graph_path.parent.mkdir(parents=True, exist_ok=True)
+        self._db = self._open_db(graph_path)
+
+        # Apply schema immediately so callers get a ready-to-use database.
+        self._apply_schema()
+
+    # ------------------------------------------------------------------
+    # Open / recover
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _open_db(graph_path: Path):
+        """
+        Open (or create) a ladybug.Database at *graph_path*.
+
+        On failure, wipe auxiliary files (including any stale .wal) adjacent
+        to the DB file and retry once with a fresh database.
+        """
+        import ladybug
+
+        try:
+            return ladybug.Database(str(graph_path))
+        except Exception as exc:
+            logger.warning(
+                "[memory/graph] DB failed to open (%s) — wiping auxiliary files and retrying",
+                exc,
+            )
+            parent = graph_path.parent
+            stem   = graph_path.name
+            for p in parent.iterdir():
+                if p.name.startswith(stem) and p.name != stem:
+                    try:
+                        p.unlink()
+                        logger.info("[memory/graph] deleted stale file %s", p)
+                    except OSError as del_exc:
+                        logger.warning("[memory/graph] could not delete %s: %s", p, del_exc)
+            return ladybug.Database(str(graph_path))
+
+    def _apply_schema(self) -> None:
+        """Run schema DDL on a fresh sync connection, then close it."""
+        import ladybug
+        conn = ladybug.Connection(self._db)
+        try:
+            init_schema(conn)
+        finally:
+            conn.close()
+
+    def rebuild(self, stale_write_conn=None) -> None:
+        """
+        Rebuild the database after a mid-session WAL error.
+
+        Closes *stale_write_conn* if provided (best-effort), wipes auxiliary
+        files, reopens the database, and re-applies the schema.  The caller
+        must discard any connections obtained before this call and request
+        fresh ones via new_read_conn() / new_async_write_conn().
+        """
+        logger.warning("[memory/graph] WAL missing mid-session — rebuilding database")
+
+        if stale_write_conn is not None:
+            try:
+                stale_write_conn.close()
+            except Exception:
+                pass
+
+        self._db = self._open_db(self._graph_path)
+        self._apply_schema()
+        logger.info("[memory/graph] database rebuilt successfully after WAL loss")
+
+    # ------------------------------------------------------------------
+    # Connection factories
+    # ------------------------------------------------------------------
+
+    def new_read_conn(self):
+        """
+        Return a new sync ladybug.Connection for read operations.
+
+        If a WAL error fires on open, rebuild the database first and retry.
+        """
+        import ladybug
+
+        try:
+            return ladybug.Connection(self._db)
+        except Exception as exc:
+            if _is_wal_error(exc):
+                logger.warning(
+                    "[memory/graph] new_read_conn: WAL error (%s) — rebuilding", exc
+                )
+                self.rebuild()
+                return ladybug.Connection(self._db)
+            raise
+
+    def new_async_write_conn(self):
+        """
+        Return a new ladybug.AsyncConnection for write operations (librarian).
+        """
+        import ladybug
+
+        return ladybug.AsyncConnection(
+            self._db,
+            max_concurrent_queries=self._max_concurrent,
+        )
+
+    # ------------------------------------------------------------------
+    # Shutdown
+    # ------------------------------------------------------------------
+
+    def checkpoint(self) -> None:
+        """
+        Flush the WAL into the main database files.
+
+        Call this before closing to ensure no committed writes are lost.
+        Safe to call multiple times.
+        """
+        import ladybug
+
+        try:
+            conn = ladybug.Connection(self._db)
+            conn.execute("CHECKPOINT")
+            conn.close()
+            logger.info("[memory/graph] checkpoint complete")
+        except Exception as exc:
+            logger.warning("[memory/graph] checkpoint failed: %s", exc)
+
+    def close(self) -> None:
+        """Checkpoint then close the database."""
+        self.checkpoint()
+        try:
+            self._db.close()
+        except Exception as exc:
+            logger.warning("[memory/graph] db close failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# GraphDB — sync read accessor for the main agent tools
 # ---------------------------------------------------------------------------
 
 class GraphDB:
     """
     Sync graph accessor for use in the main agent's tool implementations.
-    Receives a ladybug.Connection created from the single shared Database object
-    owned by the LibrarianRunner. Does NOT open its own Database.
 
-    rebuild_callback — optional callable() → new ladybug.Connection.
-        When provided, safe_execute will call it on a mid-session WAL error,
-        swap in the fresh connection, and retry the query exactly once.
-        Supplied by register_runtime so this class stays free of any direct
-        ladybug / LibrarianRunner import.
+    Holds a sync ladybug.Connection obtained from a GraphDatabase.  On a
+    mid-session WAL error, safe_execute asks the owning GraphDatabase to
+    rebuild and then opens a fresh connection automatically.
     """
 
-    def __init__(
-        self,
-        conn,
-        rebuild_callback: Callable[[], Any] | None = None,
-    ) -> None:
-        self._conn = conn
-        self._rebuild_callback = rebuild_callback
+    def __init__(self, graph_database: GraphDatabase) -> None:
+        self._gdb  = graph_database
+        self._conn = graph_database.new_read_conn()
 
     # ------------------------------------------------------------------
     # Safe execute — retries once after a mid-session WAL rebuild
@@ -236,10 +387,9 @@ class GraphDB:
         """
         Execute *query* on the current connection.
 
-        If a WAL-missing error is raised and a rebuild_callback is registered,
-        the callback is invoked (which rebuilds the database and returns a new
-        connection), the stale connection is replaced, and the query is retried
-        once.  Any other exception propagates normally.
+        On a WAL-missing error the GraphDatabase is rebuilt, a fresh
+        connection is opened, and the query is retried once.  Any other
+        exception propagates normally.
         """
         kwargs: dict = {}
         if parameters:
@@ -248,13 +398,13 @@ class GraphDB:
         try:
             return self._conn.execute(query, **kwargs)
         except Exception as exc:
-            if self._rebuild_callback is not None and _is_wal_error(exc):
+            if _is_wal_error(exc):
                 logger.warning(
-                    "[memory/graph] WAL error on read query — rebuilding connection: %s", exc
+                    "[memory/graph] WAL error on read query — rebuilding: %s", exc
                 )
                 try:
-                    new_conn = self._rebuild_callback()
-                    self._conn = new_conn
+                    self._gdb.rebuild()
+                    self._conn = self._gdb.new_read_conn()
                     logger.info("[memory/graph] connection rebuilt; retrying query")
                     return self._conn.execute(query, **kwargs)
                 except Exception as retry_exc:
@@ -263,6 +413,12 @@ class GraphDB:
                     )
                     raise retry_exc from exc
             raise
+
+    def close(self) -> None:
+        try:
+            self._conn.close()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Read operations
@@ -279,7 +435,6 @@ class GraphDB:
         col_names = r.get_column_names()
         entity = dict(zip(col_names, row))
 
-        # Attach active in/out edges
         entity["edges_out"] = self._active_edges_from(uid)
         entity["edges_in"]  = self._active_edges_to(uid)
         return entity
@@ -415,7 +570,6 @@ class GraphDB:
             row = r.get_next()
             by_type[row[0]] = row[1]
 
-        # Most-mentioned entities (top 5)
         r2 = self.safe_execute(
             "MATCH (e:Entity) WHERE e.mention_count > 0 "
             "RETURN e.name, e.entity_type, e.mention_count "
@@ -492,6 +646,3 @@ class GraphDB:
         while result.has_next():
             rows.append(result.get_next())
         return rows
-
-    def close(self) -> None:
-        pass  # connection lifetime managed by LibrarianRunner

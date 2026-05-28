@@ -5,7 +5,7 @@ debugdb.py — Dump all knowledge graph entities and their edges.
 Usage:
     python debugdb.py
     python debugdb.py --config path/to/config.yaml
-    python debugdb.py --db path/to/memory_graph
+    python debugdb.py --db path/to/graph.lbug
 """
 from __future__ import annotations
 
@@ -60,7 +60,7 @@ def dump(gdb) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Dump all KG entities and edges")
     parser.add_argument("--config", default="config.yaml")
-    parser.add_argument("--db", default="", help="Direct path to memory_graph directory")
+    parser.add_argument("--db", default="", help="Direct path to graph.lbug file")
     args = parser.parse_args()
 
     if args.db:
@@ -85,21 +85,24 @@ def main() -> None:
         sys.exit(1)
 
     try:
-        import ladybug  # type: ignore
-        db   = ladybug.Database(str(kg_path))
-        conn = ladybug.Connection(db)
-        from TinyCTX.modules.memory.graph import GraphDB, init_schema
-        init_schema(conn)
-        gdb = GraphDB(conn)
+        from TinyCTX.modules.memory.graph import GraphDatabase, GraphDB
     except ImportError:
         print("[error] ladybug not installed")
         sys.exit(1)
+
+    try:
+        graph_database = GraphDatabase(kg_path)
+        gdb = GraphDB(graph_database)
     except Exception as e:
         print(f"[error] Could not open graph DB: {e}")
         sys.exit(1)
 
     print(f"db: {kg_path}\n")
-    dump(gdb)
+    try:
+        dump(gdb)
+    finally:
+        gdb.close()
+        graph_database.close()
 
 
 if __name__ == "__main__":
