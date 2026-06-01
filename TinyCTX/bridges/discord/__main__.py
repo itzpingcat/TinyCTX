@@ -803,6 +803,54 @@ class DiscordBridge:
             return True
         return False
 
+    async def _extract_forwarded(self, message: discord.Message) -> tuple[str, tuple]:
+        """
+        Extract forwarded message content from message_snapshots.
+        Returns (text_block, attachments_tuple).
+        text_block is empty string if no snapshots present.
+        """
+        snapshots = getattr(message, "message_snapshots", None)
+        if not snapshots:
+            return "", ()
+
+        snap = snapshots[0]  # Discord only ever sends one snapshot
+        lines: list[str] = []
+        extra_attachments: list = []
+
+        for a in getattr(snap, "attachments", []):
+            try:
+                import aiohttp
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(a.url) as resp:
+                        if resp.status == 200:
+                            data = await resp.read()
+                            mime = a.content_type or "application/octet-stream"
+                            extra_attachments.append(
+                                Attachment(filename=a.filename, data=data, mime_type=mime)
+                            )
+                            lines.append(f"> [image: {a.filename}]")
+                        else:
+                            lines.append(f"> [attachment: {a.filename}]")
+            except Exception:
+                logger.warning("Discord: failed to download forwarded attachment %s", a.filename)
+                lines.append(f"> [attachment: {a.filename}]")
+
+        for embed in getattr(snap, "embeds", []):
+            lines.append("> [embed]")
+
+        for sticker in getattr(snap, "stickers", []):
+            lines.append(f"> [sticker: {sticker.name}]")
+
+        content = getattr(snap, "content", "") or ""
+        for line in content.splitlines():
+            lines.append(f"> {line}" if line else ">")
+
+        if not lines:
+            return "", ()
+
+        text_block = "[Forwarded message]\n" + "\n".join(lines)
+        return text_block, tuple(extra_attachments)
+
     async def _fetch_attachments(self, message: discord.Message) -> tuple:
         if not message.attachments:
             return ()
@@ -874,6 +922,10 @@ class DiscordBridge:
                 return
             text        = message.content.strip()
             attachments = await self._fetch_attachments(message)
+            fwd_text, fwd_attachments = await self._extract_forwarded(message)
+            if fwd_text:
+                text = f"{text}\n{fwd_text}".strip()
+                attachments = attachments + fwd_attachments
             if not text and not attachments:
                 return
 
@@ -936,6 +988,10 @@ class DiscordBridge:
         bot_id      = self._client.user.id if self._client.user else None
         text        = await _humanize_mentions(raw_text, self._client)
         attachments = await self._fetch_attachments(message)
+        fwd_text, fwd_attachments = await self._extract_forwarded(message)
+        if fwd_text:
+            text = f"{text}\n{fwd_text}".strip()
+            attachments = attachments + fwd_attachments
 
         bot_name = self._client.user.name if self._client.user else None
         if bot_id and bot_name:
@@ -1042,6 +1098,10 @@ class DiscordBridge:
 
         text        = message.content.strip()
         attachments = await self._fetch_attachments(message)
+        fwd_text, fwd_attachments = await self._extract_forwarded(message)
+        if fwd_text:
+            text = f"{text}\n{fwd_text}".strip()
+            attachments = attachments + fwd_attachments
         if not text and not attachments:
             return
 
