@@ -271,7 +271,8 @@ def register_agent(agent) -> None:
     workspace = Path(agent.config.workspace.path).expanduser().resolve()
 
     _extra      = agent.config.extra.get("shell", {}) if hasattr(agent.config, "extra") else {}
-    timeout     = int(_extra.get("timeout", 60))
+    default_timeout = int(_extra.get("default_timeout", 120))
+    max_timeout     = int(_extra.get("max_timeout", 1200))
     # Default to sandbox. Operators set null explicitly for bare-metal / dev.
     sandbox_url = _extra.get("sandbox_url", "http://tinyctx_sandbox:8700") or None
 
@@ -282,7 +283,7 @@ def register_agent(agent) -> None:
 
     blacklist = _load_blacklist()
 
-    def _dispatch(command: str, local: bool = False) -> str:
+    def _dispatch(command: str, local: bool = False, call_timeout: int | None = None) -> str:
         """Shared pipeline: blacklist → warning → dispatch."""
         hit = _check_blacklist(command, blacklist)
         if hit:
@@ -290,13 +291,14 @@ def register_agent(agent) -> None:
             return f"[blocked: command matched blacklist pattern '{hit}']"
         warn = _destructive_warning(command)
         prefix = f"[{warn}]\n" if warn else ""
+        effective_timeout = min(call_timeout, max_timeout) if call_timeout is not None else default_timeout
         if local or not sandbox_url:
-            output = _run_local(command, workspace, timeout)
+            output = _run_local(command, workspace, effective_timeout)
         else:
-            output = _run_sandbox(command, sandbox_url, timeout)
+            output = _run_sandbox(command, sandbox_url, effective_timeout)
         return prefix + output
 
-    def shell(command: str) -> str:
+    def shell(command: str, timeout: int | None = None) -> str:
         """Run a shell command in the isolated sandbox container.
 
         The sandbox has full internet access but cannot reach the local
@@ -306,10 +308,13 @@ def register_agent(agent) -> None:
 
         Args:
             command: The shell command to run.
+            timeout: Optional per-call timeout in seconds. Capped at the
+                     configured maximum (default 1200s). Use for long-running
+                     tasks like image generation that may exceed the default.
         """
-        return _dispatch(command)
+        return _dispatch(command, call_timeout=timeout)
 
-    def core_shell(command: str) -> str:
+    def core_shell(command: str, timeout: int | None = None) -> str:
         """Run a shell command directly on the core host (NOT sandboxed).
 
         Has full access to the local network, Tailscale, and host resources.
@@ -319,8 +324,10 @@ def register_agent(agent) -> None:
 
         Args:
             command: The shell command to run on the host.
+            timeout: Optional per-call timeout in seconds. Capped at the
+                     configured maximum (default 1200s).
         """
-        return _dispatch(command, local=True)
+        return _dispatch(command, local=True, call_timeout=timeout)
 
     agent.tool_handler.register_tool(shell,      always_on=True, min_permission=50)
     agent.tool_handler.register_tool(core_shell, always_on=False, min_permission=100)
