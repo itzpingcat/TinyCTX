@@ -43,9 +43,18 @@ _BLACKLIST_PATH = Path(__file__).parent / "blacklist.txt"
 # ---------------------------------------------------------------------------
 
 def _glob_to_regex(pattern: str) -> re.Pattern:
-    escaped = re.escape(pattern)
-    escaped = escaped.replace(r"\*", ".*").replace(r"\?", ".")
-    return re.compile(escaped, re.IGNORECASE)
+    # Translate glob wildcards to regex BEFORE escaping, so backslashes
+    # in patterns like *\\windows\\*\** don't interfere with wildcard
+    # expansion. Each literal character is escaped individually.
+    parts = []
+    for ch in pattern:
+        if ch == '*':
+            parts.append('.*')
+        elif ch == '?':
+            parts.append('.')
+        else:
+            parts.append(re.escape(ch))
+    return re.compile(''.join(parts), re.IGNORECASE)
 
 
 def _load_blacklist(path: Path = _BLACKLIST_PATH) -> list[re.Pattern]:
