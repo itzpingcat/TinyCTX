@@ -509,6 +509,70 @@ async def handle_commands_list(request: web.Request) -> web.Response:
 
 
 # ---------------------------------------------------------------------------
+# GET /v1/user/{username}  &  POST /v1/user/{username}/elevate
+# ---------------------------------------------------------------------------
+
+async def handle_user_get(request: web.Request) -> web.Response:
+    """
+    Return basic info about a user by username.
+
+    Response (200): { "username": "...", "permission_level": 25 }
+    Response (404): { "error": "user not found" }
+    """
+    runtime  = request.app["runtime"]
+    username = request.match_info["username"]
+    user     = runtime.users.get_user(username)
+    if user is None:
+        raise web.HTTPNotFound(
+            content_type="application/json",
+            body=json.dumps({"error": f"user {username!r} not found"}),
+        )
+    return web.Response(
+        content_type="application/json",
+        body=json.dumps({"username": user.username,
+                         "permission_level": user.permission_level}),
+    )
+
+
+async def handle_user_elevate(request: web.Request) -> web.Response:
+    """
+    Set a user's permission_level to the requested level (clamped 0-100).
+    Trusted endpoint — protected by the gateway api_key.
+
+    Body: { "permission_level": 100 }   (optional; defaults to 100)
+    Response (200): { "username": "...", "permission_level": 100 }
+    Response (404): { "error": "user not found" }
+    """
+    runtime  = request.app["runtime"]
+    username = request.match_info["username"]
+    user     = runtime.users.get_user(username)
+    if user is None:
+        raise web.HTTPNotFound(
+            content_type="application/json",
+            body=json.dumps({"error": f"user {username!r} not found"}),
+        )
+
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+
+    new_level = int(body.get("permission_level", 100))
+    new_level = max(0, min(100, new_level))
+
+    user.permission_level = new_level
+    runtime.users.update_user(user)
+    logger.info("gateway: elevated %r to permission_level %d", username, new_level)
+
+    return web.Response(
+        content_type="application/json",
+        body=json.dumps({"username": user.username,
+                         "permission_level": user.permission_level}),
+    )
+
+
+# ---------------------------------------------------------------------------
 # POST /v1/shutdown
 # ---------------------------------------------------------------------------
 
@@ -626,6 +690,10 @@ def _make_app(runtime, cfg: GatewayConfig, shutdown_event: asyncio.Event) -> web
 
     # Command discovery
     app.router.add_get(   "/v1/commands",                 handle_commands_list)
+
+    # User management
+    app.router.add_get(   "/v1/user/{username}",          handle_user_get)
+    app.router.add_post(  "/v1/user/{username}/elevate",  handle_user_elevate)
 
     # Shutdown
     app.router.add_post(  "/v1/shutdown",                 handle_shutdown)
