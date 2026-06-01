@@ -208,6 +208,9 @@ async def _humanize_mentions(text: str, client: discord.Client) -> str:
     return "".join(parts)
 
 
+_TINYCTX_MENTION_RE = re.compile(r'@([a-z0-9][a-z0-9_-]{1,31})')
+
+
 # ---------------------------------------------------------------------------
 # Compat rules — pattern-based per-message delay for proxy-bot compatibility
 # ---------------------------------------------------------------------------
@@ -803,6 +806,19 @@ class DiscordBridge:
             return True
         return False
 
+    def _dehumanize_mentions(self, text: str) -> str:
+        """Replace @tinyctx-username with <@discord_snowflake> in outbound text."""
+        def _replace(m: re.Match) -> str:
+            username = m.group(1)
+            user = self._runtime.users.get_user(username)
+            if user is None:
+                return m.group(0)
+            for ident in user.identities:
+                if ident.platform == Platform.DISCORD:
+                    return f"<@{ident.user_id}>"
+            return m.group(0)
+        return _TINYCTX_MENTION_RE.sub(_replace, text)
+
     async def _extract_forwarded(self, message: discord.Message) -> tuple[str, tuple]:
         """
         Extract forwarded message content from message_snapshots.
@@ -1255,7 +1271,7 @@ class DiscordBridge:
                         break
 
                 # Send accumulated text.
-                text = "".join(buf).strip()
+                text = self._dehumanize_mentions("".join(buf).strip())
                 if text:
                     for i in range(0, len(text), self._max_len):
                         await channel.send(text[i : i + self._max_len])
