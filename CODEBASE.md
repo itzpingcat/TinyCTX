@@ -32,7 +32,7 @@ TinyCTX/
 │
 ├── bridges/
 │   ├── cli/__main__.py      Interactive terminal UI (rich TUI, session restore)
-│   └── discord/__main__.py  Discord bridge (discord.py)
+│   └── discord/             Discord bridge (discord.py) — see below
 │
 ├── gateway/__main__.py      HTTP/SSE gateway (aiohttp, /v1/chat endpoint)
 │
@@ -235,10 +235,45 @@ Slash commands registered by `Runtime`:
 - Supports paste refs, slash commands, copy helpers
 - Provider presets for OpenAI, OpenRouter, Ollama, LM Studio, llama.cpp, custom
 
-### Discord (`bridges/discord/__main__.py`)
-- Full discord.py integration
-- `allowed_users` / `guild_ids` config for access control
-- `prefix_required` for group channel noise reduction
+### Discord (`bridges/discord/`)
+
+The Discord bridge is split across six modules:
+
+```
+bridges/discord/
+  __main__.py   Thin entry point — instantiates DiscordBridge and calls run()
+  bridge.py     DiscordBridge class — discord.py client setup, event routing
+                (on_message / on_ready), access-control checks, attachment
+                fetching, cursor wrappers, thread handling
+  turn.py       handle_turn() + typing_keepalive() — drains the reply_queue,
+                manages the typing indicator keepalive loop, chunks long replies
+  commands.py   sync_app_commands() — builds Discord slash commands from
+                CommandRegistry; handle_reset_interaction(),
+                handle_shutdown_interaction(), handle_command_interaction()
+  cursors.py    CursorStore — persists discord.json + discord_msg_nodes.json
+                under workspace/cursors/; make_session_node() helper
+  compat.py     CompatRules — hot-reloads compat.json, matches messages against
+                proxy-bot delay rules (e.g. Tupperbot)
+  mentions.py   humanize_mentions() — <@id> → @username (inbound)
+                dehumanize_mentions() — @username → <@id> (outbound)
+  compat.json   Per-pattern delay rules (not a Python file)
+```
+
+Key config options (under `bridges.discord.options`):
+- `token_env` — env var holding the bot token (default: `DISCORD_BOT_TOKEN`)
+- `allowed_users_dm` — allowlist of user IDs for DMs (empty = open)
+- `allowed_servers` — map of guild ID → list of channel IDs (empty list = all channels)
+- `admin_users` — user IDs permitted to use `/reset` and `/shutdown` in groups
+- `prefix_required` — only respond when @mentioned or message starts with `command_prefix`
+- `command_prefix` — trigger prefix for group channels (default: `!`)
+- `reset_command` / `shutdown_command` — slash command names
+- `max_reply_length` — Discord message chunk size cap (default: 1900)
+- `typing_indicator` / `typing_on_thinking` / `typing_on_tools` / `typing_on_reply`
+
+Thread branching: when a thread is created inside a tracked channel, the bot forks a
+new DB branch from the channel turn that spawned it. Both evolve independently.
+Cursors (`dm:<uid>`, `group:<cid>`, `thread:<tid>`) are persisted in
+`workspace/cursors/discord.json` so sessions survive restarts.
 
 ### Gateway (`gateway/__main__.py`)
 - aiohttp HTTP server exposing `/v1/chat` (OpenAI-compat SSE)
