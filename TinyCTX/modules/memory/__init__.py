@@ -1,4 +1,4 @@
-﻿EXTENSION_META = {
+EXTENSION_META = {
     "name":    "memory",
     "version": "0.2",
     "description": (
@@ -36,5 +36,14 @@
 
         # LLM model key for librarian agents (defaults to primary)
         "librarian_model": "",
+
+        # Pressure-based ingest: trigger a branch buffer-agent ingest after
+        # this fraction of the context window worth of new tokens has been
+        # written on a branch. 0.5 = half a context window. 0 = disabled.
+        "ingest_pressure_ratio": 0.5,
+
+        # Minimum new tokens required before pressure ingest can fire.
+        # Guards against triggering on very short threads.
+        "ingest_pressure_min_tokens": 500,
     },
 }

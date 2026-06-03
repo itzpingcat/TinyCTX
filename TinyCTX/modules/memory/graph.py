@@ -35,6 +35,17 @@ The main agent tools use a sync Connection vended by GraphDatabase for reads.
 
 Ladybug supports concurrent readers with one writer via MVCC; both connection
 types are created from the same underlying Database object.
+
+Checkpoint behaviour
+--------------------
+Ladybug's default CHECKPOINT_THRESHOLD is 16 MB, which a small knowledge
+graph never reaches, so the WAL would accumulate indefinitely and the main
+.lbug files would never be written during normal operation.
+
+We lower the threshold to 500 KB at schema-init time so automatic checkpointing
+fires frequently. LibrarianRunner also calls GraphDatabase.checkpoint() via a
+done-callback after each agent task completes, ensuring the WAL is flushed
+to disk promptly after every write batch.
 """
 from __future__ import annotations
 
@@ -98,6 +109,11 @@ _SCHEMA_DDL = [
     """,
 ]
 
+# Checkpoint threshold in bytes. Ladybug's default is 16 MB, which a small
+# knowledge graph never reaches. 500 KB ensures the WAL is flushed to the main
+# .lbug files after every modest write batch.
+_CHECKPOINT_THRESHOLD_BYTES = 500 * 1024  # 500 KB
+
 # ---------------------------------------------------------------------------
 # Valid entity types and suggested relation vocabulary
 # ---------------------------------------------------------------------------
@@ -114,12 +130,14 @@ ENTITY_TYPES = {
 
 def init_schema(conn) -> None:
     """
-    Create all tables if they don't exist. Safe to call on every startup.
+    Create all tables if they don't exist and lower the checkpoint threshold.
+    Safe to call on every startup.
     conn may be a sync ladybug.Connection or async ladybug.AsyncConnection —
     callers must await if async (handled externally).
     """
     for ddl in _SCHEMA_DDL:
         conn.execute(ddl.strip())
+
     logger.info("[memory/graph] schema initialised")
 
 
@@ -252,7 +270,7 @@ class GraphDatabase:
         import ladybug
 
         try:
-            return ladybug.Database(str(graph_path))
+            return ladybug.Database(str(graph_path), checkpoint_threshold=_CHECKPOINT_THRESHOLD_BYTES)
         except Exception as exc:
             logger.warning(
                 "[memory/graph] DB failed to open (%s) — wiping auxiliary files and retrying",
@@ -267,10 +285,10 @@ class GraphDatabase:
                         logger.info("[memory/graph] deleted stale file %s", p)
                     except OSError as del_exc:
                         logger.warning("[memory/graph] could not delete %s: %s", p, del_exc)
-            return ladybug.Database(str(graph_path))
+            return ladybug.Database(str(graph_path), checkpoint_threshold=_CHECKPOINT_THRESHOLD_BYTES)
 
     def _apply_schema(self) -> None:
-        """Run schema DDL on a fresh sync connection, then close it."""
+        """Run schema DDL and configuration on a fresh sync connection, then close it."""
         import ladybug
         conn = ladybug.Connection(self._db)
         try:
@@ -334,15 +352,16 @@ class GraphDatabase:
         )
 
     # ------------------------------------------------------------------
-    # Shutdown
+    # Checkpoint
     # ------------------------------------------------------------------
 
     def checkpoint(self) -> None:
         """
         Flush the WAL into the main database files.
 
-        Call this before closing to ensure no committed writes are lost.
-        Safe to call multiple times.
+        Opens a fresh sync connection so there is no active transaction
+        conflict. Safe to call at any time; logs a warning on failure rather
+        than raising (checkpoint is best-effort outside of shutdown).
         """
         import ladybug
 
@@ -350,9 +369,13 @@ class GraphDatabase:
             conn = ladybug.Connection(self._db)
             conn.execute("CHECKPOINT")
             conn.close()
-            logger.info("[memory/graph] checkpoint complete")
+            logger.debug("[memory/graph] checkpoint complete")
         except Exception as exc:
             logger.warning("[memory/graph] checkpoint failed: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Shutdown
+    # ------------------------------------------------------------------
 
     def close(self) -> None:
         """Checkpoint then close the database."""

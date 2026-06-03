@@ -14,6 +14,7 @@ register_runtime(runtime) — called once at startup:
 register_agent(cycle) — called per AgentCycle after tool_handler is ready:
   1. Registers kg_* read tools + call_librarian on cycle.tool_handler
   2. Registers pinned entity PromptProvider on cycle.context
+  3. Registers pressure-ingest post_turn_hook on cycle
 
 GraphDatabase in graph.py is the single owner of the ladybug.Database and
 the only place that opens, checkpoints, or closes it.  LibrarianRunner is
@@ -23,11 +24,34 @@ Shutdown order (enforced by _shutdown()):
   1. Cancel the librarian background task (stop accepting new writes)
   2. Close the GraphDB read connection
   3. GraphDatabase.close() — checkpoints then closes the DB
+
+Pressure-based ingest
+---------------------
+After each turn, tokens written to the DB on this branch (assistant +
+tool nodes) are accumulated in session state under the key
+'memory_tokens_since_ingest'. When the total crosses
+ingest_pressure_ratio * config.context (floored by ingest_pressure_min_tokens),
+a "branch" queue message is dispatched so the librarian ingests only this
+branch's unvisited nodes, and the counter resets to zero.
+
+WAL checkpointing
+-----------------
+Ladybug's default CHECKPOINT_THRESHOLD is 16 MB. A small knowledge graph
+never reaches this, so without intervention the WAL grows indefinitely and
+the main .lbug files are only written at shutdown.
+
+Two mitigations:
+  1. graph.py lowers the threshold to 1 MB at schema-init time so automatic
+     checkpoints fire after modest write batches.
+  2. Every agent task created in _poll_cycle has a done-callback that calls
+     GraphDatabase.checkpoint(), flushing the WAL as soon as the write lock
+     is released and the task has committed its transaction.
 """
 from __future__ import annotations
 
 import asyncio
 import atexit
+import json
 import logging
 import signal
 import time
@@ -150,6 +174,14 @@ class LibrarianRunner:
                 await asyncio.gather(*self._active_tasks, return_exceptions=True)
             logger.info("[memory/librarian] stopped")
 
+    def _checkpoint_callback(self, task: asyncio.Task) -> None:
+        """
+        Done-callback attached to every agent task.
+        Flushes the WAL to the main .lbug files once the task has committed
+        its writes and released the write lock.
+        """
+        self._graph_database.checkpoint()
+
     async def _poll_cycle(self) -> None:
         from TinyCTX.modules.memory.librarian_agents import (
             run_buffer_agent, run_targeted_agent, run_dedup_cycle,
@@ -170,6 +202,7 @@ class LibrarianRunner:
         while not self.queue.empty():
             msg = self.queue.get_nowait()
             msg_type = msg.get("type")
+
             if msg_type == "targeted":
                 prompt = msg.get("prompt", "").strip()
                 if prompt and len(self._active_tasks) < max_concurrent:
@@ -179,9 +212,41 @@ class LibrarianRunner:
                             self._llm, prompt, self.agent_logger,
                         )
                     )
+                    t.add_done_callback(self._checkpoint_callback)
                     self._active_tasks.add(t)
                 elif prompt:
                     logger.warning("[memory/librarian] concurrency cap reached, dropping targeted msg")
+
+            elif msg_type == "branch":
+                # Pressure-triggered ingest for a single branch tail.
+                # Flag and ingest only the unvisited nodes on this branch.
+                tail_id = msg.get("tail_node_id", "").strip()
+                if tail_id and len(self._active_tasks) < max_concurrent:
+                    async with self._write_lock:
+                        flagged_ids = self._conv_db.flag_branch(tail_id, "librarian_visited")
+                    if flagged_ids:
+                        batch_text, agent_name = nodes_to_text(
+                            self._conv_db, list(reversed(flagged_ids)), batch_size
+                        )
+                        if batch_text.strip():
+                            t = asyncio.create_task(
+                                run_buffer_agent(
+                                    self._cfg, self._write_conn, self._write_lock,
+                                    self._llm, batch_text, agent_name, self.agent_logger,
+                                )
+                            )
+                            t.add_done_callback(self._checkpoint_callback)
+                            self._active_tasks.add(t)
+                            logger.info(
+                                "[memory/librarian] pressure ingest: dispatched agent for %d node(s) on branch %s",
+                                len(flagged_ids), tail_id[:8],
+                            )
+                    else:
+                        logger.debug(
+                            "[memory/librarian] pressure ingest: no unvisited nodes on branch %s", tail_id[:8]
+                        )
+                elif tail_id:
+                    logger.warning("[memory/librarian] concurrency cap reached, dropping branch msg for %s", tail_id[:8])
 
         # Node walk on schedule
         now = time.time()
@@ -210,6 +275,7 @@ class LibrarianRunner:
                         self._llm, batch_text, agent_name, self.agent_logger,
                     )
                 )
+                t.add_done_callback(self._checkpoint_callback)
                 self._active_tasks.add(t)
                 logger.info("[memory/librarian] dispatched agent for %d node(s)", len(flagged_ids))
 
@@ -232,6 +298,7 @@ class LibrarianRunner:
                 )
             )
             t.add_done_callback(lambda _: self._state.__setitem__("dedup_running", False))
+            t.add_done_callback(self._checkpoint_callback)
             self._active_tasks.add(t)
 
 
@@ -280,6 +347,29 @@ async def call_librarian(prompt: str = "", file_path: str = "") -> str:
         assert _runner is not None
         _runner.queue.put_nowait({"type": "trigger"})
         return "[librarian: node ingest triggered]"
+
+
+# ---------------------------------------------------------------------------
+# _count_entry_tokens — token count for a single HistoryEntry
+# ---------------------------------------------------------------------------
+
+def _count_entry_tokens(entry) -> int:
+    """
+    Estimate tokens for a HistoryEntry using the same char-div-4 heuristic
+    used elsewhere in the codebase. Applied to content + serialised tool_calls.
+    """
+    content = entry.content
+    if isinstance(content, list):
+        text = json.dumps(content, ensure_ascii=False)
+    else:
+        text = str(content or "")
+
+    total = len(text) // 4
+
+    if entry.tool_calls:
+        total += len(json.dumps(entry.tool_calls, ensure_ascii=False)) // 4
+
+    return total
 
 
 # ---------------------------------------------------------------------------
@@ -442,6 +532,68 @@ def register_agent(cycle) -> None:
         cycle.tool_handler.register_tool(fn, always_on=always, min_permission=25)
 
     cycle.tool_handler.register_tool(call_librarian, always_on=True, min_permission=25)
+
+    # ------------------------------------------------------------------
+    # Pressure-based ingest hook
+    # ------------------------------------------------------------------
+
+    # Config values captured at registration time.
+    try:
+        from TinyCTX.modules.memory import EXTENSION_META
+        _cfg: dict = EXTENSION_META.get("default_config", {})
+    except ImportError:
+        _cfg = {}
+
+    overrides: dict = {}
+    if hasattr(cycle, "config") and hasattr(cycle.config, "extra") and isinstance(cycle.config.extra, dict):
+        overrides = cycle.config.extra.get("memory", {})
+    _cfg = {**_cfg, **overrides}
+
+    pressure_ratio     = float(_cfg.get("ingest_pressure_ratio", 0.5))
+    pressure_min       = int(_cfg.get("ingest_pressure_min_tokens", 500))
+    token_limit        = cycle.context.token_limit
+    trigger_threshold  = int(pressure_ratio * token_limit)
+
+    # Snapshot of dialogue length before the turn's new nodes are appended.
+    # Entries added during the turn (assistant + tool results) sit beyond this index.
+    pre_turn_dialogue_len = len(cycle.context.dialogue)
+
+    async def _pressure_hook(final_tail: str) -> None:
+        if pressure_ratio <= 0:
+            return
+
+        # Count tokens on entries written during this turn only.
+        new_entries = cycle.context.dialogue[pre_turn_dialogue_len:]
+        turn_tokens = sum(_count_entry_tokens(e) for e in new_entries)
+
+        if turn_tokens == 0:
+            return
+
+        # Load accumulated counter from session state (already parsed by cycle start).
+        session      = cycle.context.state.get("session", {})
+        tokens_since = int(session.get("memory_tokens_since_ingest", 0))
+        tokens_since += turn_tokens
+
+        if tokens_since >= max(trigger_threshold, pressure_min):
+            tokens_since = 0
+            assert _runner is not None
+            _runner.queue.put_nowait({"type": "branch", "tail_node_id": final_tail})
+            logger.info(
+                "[memory] pressure ingest queued for branch %s (threshold=%d)",
+                final_tail[:8], trigger_threshold,
+            )
+
+        # Persist updated counter as a state_delta on the final tail node.
+        cycle.db.update_node_state_delta(
+            final_tail,
+            json.dumps({"memory_tokens_since_ingest": tokens_since}),
+        )
+
+    cycle.post_turn_hooks.append(_pressure_hook)
+
+    # ------------------------------------------------------------------
+    # Pinned entity memory block
+    # ------------------------------------------------------------------
 
     def _build_memory_block(gdb, budget: int) -> str | None:
         pinned = gdb.get_pinned_entities_full()
