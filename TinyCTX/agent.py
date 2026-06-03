@@ -40,6 +40,10 @@ class AgentCycle:
         self.tool_handler = None
         self.permission_level = 0
 
+        # Extra events enqueued by tools (e.g. present()) to be yielded
+        # immediately after the AgentToolResult for that tool call.
+        self.outbound_events: list = []
+
     async def run(
         self,
         node_id: str,
@@ -169,7 +173,7 @@ class AgentCycle:
 
                 self.context.add_tool_result(result)
                 meta["tail_node_id"] = self.context.tail_node_id
-                
+
                 yield AgentToolResult(
                     call_id=result.call_id,
                     tool_name=result.tool_name,
@@ -177,6 +181,10 @@ class AgentCycle:
                     is_error=result.is_error,
                     **meta
                 )
+
+                for extra in self.outbound_events:
+                    yield extra
+                self.outbound_events.clear()
 
         logger.debug("[agent] yielding AgentTextFinal, streaming_active=%s", streaming_active)
         # meta["tail_node_id"] is the real assistant tail — yield it as-is so

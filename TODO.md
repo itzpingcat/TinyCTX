@@ -8,6 +8,12 @@ Telegram bridge
 
 Replace the memory all-fits top_k=999 path with a real full-store retrieval path that does not silently depend on BM25 query matches.
 
+fix slash commands for permission management
+
+automatic cross-platform linking (linking is manual via `merge_users`).
+knowledge module uses `User` to curate per-user context (memory graph
+keyed on `User.username` rather than raw platform ID, shared across linked identities).
+
 weChat bridge 
 Line bridge
 

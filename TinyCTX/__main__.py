@@ -44,6 +44,10 @@ def main() -> None:
     p_launch = sub.add_parser("launch", help="Launch a bridge client")
     p_launch.add_argument("target", nargs="?", default="cli",
                           help="Bridge to launch (default: cli)")
+    p_launch.add_argument("--user", metavar="USERNAME",
+                          help="TinyCTX username to log in as")
+    p_launch.add_argument("--config", metavar="PATH",
+                          help="Path to config.yaml")
 
     args = parser.parse_args()
 

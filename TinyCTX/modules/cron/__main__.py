@@ -57,18 +57,12 @@ from typing import Any
 from TinyCTX.contracts import (
     AgentError, AgentTextFinal,
     InboundMessage, ContentType,
-    UserIdentity, Platform,
+    Platform,
 )
 
 logger = logging.getLogger(__name__)
 
 _CRON_USER_ID = "cron-system"
-
-_CRON_AUTHOR = UserIdentity(
-    platform=Platform.CRON,
-    user_id=_CRON_USER_ID,
-    username="cron",
-)
 
 
 # ---------------------------------------------------------------------------
@@ -361,8 +355,15 @@ class _CronRunner:
         self._timer_task: asyncio.Task | None = None
         self._running = False
         self._job_lock = asyncio.Lock()
+        self._cron_author = None  # resolved in start() once runtime.users is available
 
     def start(self) -> None:
+        self._cron_author = self.runtime.users.resolve_user(
+            platform=Platform.CRON,
+            user_id=_CRON_USER_ID,
+            username="cron",
+            display_name="Cron Scheduler",
+        )
         self._running = True
         self._reload_if_changed()
         self._recompute_next_runs()
@@ -444,7 +445,7 @@ class _CronRunner:
         # 2. Prepare the turn
         msg = InboundMessage(
             tail_node_id=parent_id,
-            author=_CRON_AUTHOR,
+            author=self._cron_author,
             content_type=ContentType.TEXT,
             text=job.message,
             message_id=str(start_ms),

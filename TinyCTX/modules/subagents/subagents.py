@@ -8,18 +8,12 @@ import weakref
 from dataclasses import dataclass, field
 from typing import Any
 
-from TinyCTX.contracts import AgentError, AgentTextChunk, AgentTextFinal, InboundMessage, ContentType, Platform, UserIdentity
+from TinyCTX.contracts import AgentError, AgentTextChunk, AgentTextFinal, InboundMessage, ContentType, Platform
 
 logger = logging.getLogger(__name__)
 
 _SUBAGENT_BRANCH_PREFIX = "session:subagent:"
 _AGENTS: "weakref.WeakSet[object]" = weakref.WeakSet()
-
-_SUBAGENT_AUTHOR = UserIdentity(
-    platform=Platform.CRON,
-    user_id="subagent-system",
-    username="subagent",
-)
 
 
 @dataclass
@@ -181,9 +175,15 @@ def reset_subagent_tasks() -> None:
 
 
 async def _run_subagent(handle: SubagentTask, runtime) -> None:
+    author = runtime.users.resolve_user(
+        platform=Platform.CRON,
+        user_id="subagent-system",
+        username="subagent",
+        display_name="Subagent",
+    )
     msg = InboundMessage(
         tail_node_id=handle.branch_tail_node_id,
-        author=_SUBAGENT_AUTHOR,
+        author=author,
         content_type=ContentType.TEXT,
         text=handle.prompt,
         message_id=f"subagent-{handle.task_id}",

@@ -30,6 +30,7 @@ from .helpers import (
     write_config,
 )
 from . import providers_setup, bridges_setup, workspace_setup, gateway_setup
+from .fix_permissions import elevate_user, list_users
 
 
 # ── Step 0a: detect existing config ──────────────────────────────────────────
@@ -155,6 +156,72 @@ That's it! Re-run `python -m onboard` at any time to reconfigure.
         c.print(Panel(body, title=title, border_style="green"))
 
 
+# ── optional: bootstrap admin user ──────────────────────────────────────────
+
+def step_bootstrap_admin() -> None:
+    """
+    After a fresh install, offer to elevate one existing user to level 100.
+
+    If no users exist yet (gateway just launched, nobody has sent a message),
+    we skip this step silently — the user can run `tinyctx launch cli` without
+    a --user flag and will be prompted to elevate at that point instead.
+    """
+    section("Admin User (optional)")
+
+    try:
+        from TinyCTX.users import UserStore
+        store = UserStore()
+        users = list_users(store)
+    except Exception as exc:
+        warn(f"Could not open users.db: {exc}")
+        return
+
+    if not users:
+        c.print(
+            "  No users found yet — they are created automatically when someone"
+            " first sends a message.\n"
+            "  Run [bold]tinyctx launch cli --user USERNAME[/] after your first"
+            " message to elevate your user to admin."
+        )
+        return
+
+    already_admin = [u for u in users if u.permission_level >= 100]
+    if already_admin:
+        success(
+            "Admin already set: "
+            + ", ".join(f"[bold]{u.username}[/] (level {u.permission_level})" for u in already_admin)
+        )
+        return
+
+    c.print("  Elevate a user to level 100 to grant full admin access.\n")
+    choices = [
+        questionary.Choice(
+            title=f"{u.username}  (level {u.permission_level})",
+            value=u.username,
+        )
+        for u in users
+    ] + [questionary.Choice(title="Skip for now", value=None)]
+
+    chosen = questionary.select(
+        "Which user should be the admin?",
+        choices=choices,
+        style=QSTYLE,
+    ).ask()
+
+    if not chosen:
+        c.print(
+            "  Skipped. Run [bold]tinyctx launch cli --user USERNAME[/]"
+            " to elevate later."
+        )
+        return
+
+    try:
+        elevate_user(chosen, 100, store)
+        success(f"[bold]{chosen}[/] elevated to level 100.")
+    except Exception as exc:
+        warn(f"Could not elevate user: {exc}")
+
+
 # ── wizard runner (with GoBack support) ──────────────────────────────────────
 
 def run_wizard(providers: dict, beginner_providers: dict, existing: dict | None, modify: bool = False) -> None:
@@ -251,6 +318,13 @@ def run_wizard(providers: dict, beginner_providers: dict, existing: dict | None,
     # ── Launch gateway AFTER config is on disk (only if gateway was reconfigured) ──
     if not modify or "gateway" in steps:
         gateway_setup.launch(results["gateway"])
+
+    # ── Bootstrap admin user ───────────────────────────────────────────────────
+    # Only on fresh setup (not modify). Lists all known users and asks which
+    # one to elevate to level 100. Skipped if users.db has no users yet
+    # (first-ever launch — users appear after the first message is sent).
+    if not modify:
+        step_bootstrap_admin()
 
     step_summary(mode, results["gateway"])
 

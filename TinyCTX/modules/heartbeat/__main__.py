@@ -38,18 +38,13 @@ from datetime import datetime, time as dtime
 from pathlib import Path
 
 from TinyCTX.contracts import (
-    InboundMessage, ContentType, UserIdentity, Platform,
+    InboundMessage, ContentType, Platform,
     AgentTextChunk, AgentTextFinal, AgentError
 )
 
 logger = logging.getLogger(__name__)
 
 _HEARTBEAT_USER_ID = "heartbeat-system"
-_HEARTBEAT_AUTHOR  = UserIdentity(
-    platform=Platform.CRON,
-    user_id=_HEARTBEAT_USER_ID,
-    username="heartbeat",
-)
 _TOKEN = "HEARTBEAT_OK"
 
 
@@ -60,6 +55,17 @@ class _HeartbeatRunner:
         self.interval_secs = int(cfg.get("every_minutes", 30)) * 60
         self.cursor_node_id: str | None = None
         self._running = False
+        self._author = None  # resolved on first tick once runtime.users is available
+
+    def _get_author(self):
+        if self._author is None:
+            self._author = self.runtime.users.resolve_user(
+                platform=Platform.CRON,
+                user_id=_HEARTBEAT_USER_ID,
+                username="heartbeat",
+                display_name="Heartbeat",
+            )
+        return self._author
 
     def start(self):
         if self.interval_secs <= 0: return
@@ -90,7 +96,7 @@ class _HeartbeatRunner:
         for _turn in range(int(self.cfg.get("max_continuations", 5))):
             msg = InboundMessage(
                 tail_node_id=self.cursor_node_id or "",
-                author=_HEARTBEAT_AUTHOR,
+                author=self._get_author(),
                 content_type=ContentType.TEXT,
                 text=current_prompt,
                 message_id=f"heartbeat-{time.time()}",

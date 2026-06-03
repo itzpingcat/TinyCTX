@@ -28,7 +28,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         PyYAML aiohttp pyfiglet rich questionary requests mcp numpy \
         tiktoken structlog tenacity ddgs pdfplumber ladybug\
         python-docx sympy "antlr4-python3-runtime==4.13.2" jinja2 \
-        croniter "discord.py" matrix-nio
+        platformdirs croniter "discord.py" matrix-nio
 
 # --- playwright (cached separately so browser install layer is isolated) ---
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -40,6 +40,9 @@ COPY TinyCTX/ ./TinyCTX/
 COPY pyproject.toml ./
 
 RUN pip install --no-cache-dir --no-deps -e .
+
+# --- config dir (users.db lives here, outside the workspace mount) --------
+RUN mkdir -p /etc/tinyctx && chown tinyctx:tinyctx /etc/tinyctx
 
 # --- permissions -----------------------------------------------------------
 RUN chown -R tinyctx:tinyctx /home/tinyctx /ms-playwright

@@ -60,14 +60,12 @@ from aiohttp import web
 from TinyCTX.config import GatewayConfig
 from TinyCTX.contracts import (
     Platform, content_type_for,
-    UserIdentity, InboundMessage, Attachment,
+    InboundMessage, Attachment,
     AgentThinkingChunk, AgentTextChunk, AgentTextFinal,
     AgentToolCall, AgentToolResult, AgentError, AgentOutboundFiles,
 )
 
 logger = logging.getLogger(__name__)
-
-_API_AUTHOR = UserIdentity(platform=Platform.API, user_id="api-client", username="api")
 
 
 # ---------------------------------------------------------------------------
@@ -123,20 +121,6 @@ def _event_to_dict(event) -> dict:
     if isinstance(event, AgentError):
         return {"type": "error", "message": event.message, "node_id": event.tail_node_id}
     return {}
-
-
-# ---------------------------------------------------------------------------
-# SSE queue helpers  (Runtime owns the fanout; gateway just manages queues)
-# ---------------------------------------------------------------------------
-
-def _add_subscriber(node_id: str, runtime, queue: asyncio.Queue) -> None:
-    """Register queue with Runtime's fanout for node_id."""
-    runtime.register_sse_handler(node_id, queue)
-
-
-def _remove_subscriber(node_id: str, runtime, queue: asyncio.Queue) -> None:
-    """Deregister queue from Runtime's fanout. Cleans up cursor handler when last."""
-    runtime.unregister_sse_handler(node_id, queue)
 
 
 # ---------------------------------------------------------------------------
@@ -223,16 +207,39 @@ async def handle_lane_message(request: web.Request) -> web.StreamResponse:
     permission_level = int(body.get("permission_level", 25))
     permission_level = max(0, min(100, permission_level))  # clamp to 0-100
 
+    # If a cli_username is present, the request came from a CLI session.
+    # Resolve the named user from users.db and author the message as them.
+    # The gateway trusts this field because CLI access requires the gateway
+    # api_key — same physical-access trust model as the launch command.
+    cli_username = (body.get("cli_username") or "").strip()
+    if cli_username:
+        cli_user = runtime.users.get_user(cli_username)
+        if cli_user is None:
+            raise web.HTTPBadRequest(
+                content_type="application/json",
+                body=json.dumps({"error": f"cli_username {cli_username!r} not found"}),
+            )
+        author = cli_user
+    else:
+        author = runtime.users.resolve_user(
+            platform=Platform.API,
+            user_id="api-client",
+            username="api",
+            display_name="API Client",
+        )
+
+    reply_to_author = (body.get("reply_to_author") or "").strip() or None
+
     msg = InboundMessage(
         tail_node_id=node_id,
-        author=_API_AUTHOR,
+        author=author,
         content_type=content_type_for(text, bool(attachments)),
         text=text,
         message_id=str(time.time_ns()),
         timestamp=time.time(),
         attachments=attachments,
-        permission_level=permission_level,
         trigger=True,
+        reply_to_author=reply_to_author,
     )
 
     # Register SSE queue with Runtime before pushing so no events are missed.
@@ -248,8 +255,6 @@ async def handle_lane_message(request: web.Request) -> web.StreamResponse:
     if not new_tail:
         raise web.HTTPTooManyRequests(content_type="application/json",
                                       body=json.dumps({"error": "runtime at capacity"}))
-
-    _add_subscriber(new_tail, runtime, q)
 
     # Stream SSE response.
     response = web.StreamResponse(headers={
@@ -294,9 +299,6 @@ async def handle_lane_message(request: web.Request) -> web.StreamResponse:
 
     except asyncio.CancelledError:
         pass
-
-    finally:
-        _remove_subscriber(new_tail, runtime, q)
 
     await response.write_eof()
     return response
@@ -491,6 +493,70 @@ async def handle_commands_list(request: web.Request) -> web.Response:
 
 
 # ---------------------------------------------------------------------------
+# GET /v1/user/{username}  &  POST /v1/user/{username}/elevate
+# ---------------------------------------------------------------------------
+
+async def handle_user_get(request: web.Request) -> web.Response:
+    """
+    Return basic info about a user by username.
+
+    Response (200): { "username": "...", "permission_level": 25 }
+    Response (404): { "error": "user not found" }
+    """
+    runtime  = request.app["runtime"]
+    username = request.match_info["username"]
+    user     = runtime.users.get_user(username)
+    if user is None:
+        raise web.HTTPNotFound(
+            content_type="application/json",
+            body=json.dumps({"error": f"user {username!r} not found"}),
+        )
+    return web.Response(
+        content_type="application/json",
+        body=json.dumps({"username": user.username,
+                         "permission_level": user.permission_level}),
+    )
+
+
+async def handle_user_elevate(request: web.Request) -> web.Response:
+    """
+    Set a user's permission_level to the requested level (clamped 0-100).
+    Trusted endpoint — protected by the gateway api_key.
+
+    Body: { "permission_level": 100 }   (optional; defaults to 100)
+    Response (200): { "username": "...", "permission_level": 100 }
+    Response (404): { "error": "user not found" }
+    """
+    runtime  = request.app["runtime"]
+    username = request.match_info["username"]
+    user     = runtime.users.get_user(username)
+    if user is None:
+        raise web.HTTPNotFound(
+            content_type="application/json",
+            body=json.dumps({"error": f"user {username!r} not found"}),
+        )
+
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+
+    new_level = int(body.get("permission_level", 100))
+    new_level = max(0, min(100, new_level))
+
+    user.permission_level = new_level
+    runtime.users.update_user(user)
+    logger.info("gateway: elevated %r to permission_level %d", username, new_level)
+
+    return web.Response(
+        content_type="application/json",
+        body=json.dumps({"username": user.username,
+                         "permission_level": user.permission_level}),
+    )
+
+
+# ---------------------------------------------------------------------------
 # POST /v1/shutdown
 # ---------------------------------------------------------------------------
 
@@ -608,6 +674,10 @@ def _make_app(runtime, cfg: GatewayConfig, shutdown_event: asyncio.Event) -> web
 
     # Command discovery
     app.router.add_get(   "/v1/commands",                 handle_commands_list)
+
+    # User management
+    app.router.add_get(   "/v1/user/{username}",          handle_user_get)
+    app.router.add_post(  "/v1/user/{username}/elevate",  handle_user_elevate)
 
     # Shutdown
     app.router.add_post(  "/v1/shutdown",                 handle_shutdown)

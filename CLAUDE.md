@@ -1,4 +1,6 @@
-# CLAUDE.md
+# CLAUDE.md (aka AGENTS.md)
+
+This is the LLM entrypoint for the TinyCTX project. It lists behavioral rules for agents contributing to the project. If you are looking for the overview of the codebase, it is in `CODEBASE.md`.
 
 Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-specific instructions as needed.
 
@@ -63,3 +65,17 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 ---
 
 **These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
+
+## Other Tool Specifics
+- Use edit_file instead of write_file if you are changing less than 50% of a file.
+- Use read_multiple_files when reading multiple files.
+- Use powershell to grep for uses of functions, variables, etc.
+- If you do not see these tools, try using tools_search or a utility that surfaces them.
+
+## CODEBASE.md
+- If this file is missing, explore the codebase and autogenerate it.
+    - when you autogenerate it: Write a TODO: list of functions not yet explored (get a directory tree)
+    - Then start reading general files, before specific files.
+    - Every ~8 files you read, write to the CODEBASE.md file, and mark off items in the TODO as done.
+- Always update CODEBASE.md when you make changes to the code.
+- Read CODEBASE.md to find where things are, it's faster than manually searching.

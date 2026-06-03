@@ -43,9 +43,18 @@ _BLACKLIST_PATH = Path(__file__).parent / "blacklist.txt"
 # ---------------------------------------------------------------------------
 
 def _glob_to_regex(pattern: str) -> re.Pattern:
-    escaped = re.escape(pattern)
-    escaped = escaped.replace(r"\*", ".*").replace(r"\?", ".")
-    return re.compile(escaped, re.IGNORECASE)
+    # Translate glob wildcards to regex BEFORE escaping, so backslashes
+    # in patterns like *\\windows\\*\** don't interfere with wildcard
+    # expansion. Each literal character is escaped individually.
+    parts = []
+    for ch in pattern:
+        if ch == '*':
+            parts.append('.*')
+        elif ch == '?':
+            parts.append('.')
+        else:
+            parts.append(re.escape(ch))
+    return re.compile(''.join(parts), re.IGNORECASE)
 
 
 def _load_blacklist(path: Path = _BLACKLIST_PATH) -> list[re.Pattern]:
@@ -262,7 +271,8 @@ def register_agent(agent) -> None:
     workspace = Path(agent.config.workspace.path).expanduser().resolve()
 
     _extra      = agent.config.extra.get("shell", {}) if hasattr(agent.config, "extra") else {}
-    timeout     = int(_extra.get("timeout", 60))
+    default_timeout = int(_extra.get("default_timeout", 120))
+    max_timeout     = int(_extra.get("max_timeout", 1200))
     # Default to sandbox. Operators set null explicitly for bare-metal / dev.
     sandbox_url = _extra.get("sandbox_url", "http://tinyctx_sandbox:8700") or None
 
@@ -273,7 +283,7 @@ def register_agent(agent) -> None:
 
     blacklist = _load_blacklist()
 
-    def _dispatch(command: str, local: bool = False) -> str:
+    def _dispatch(command: str, local: bool = False, call_timeout: int | None = None) -> str:
         """Shared pipeline: blacklist → warning → dispatch."""
         hit = _check_blacklist(command, blacklist)
         if hit:
@@ -281,37 +291,52 @@ def register_agent(agent) -> None:
             return f"[blocked: command matched blacklist pattern '{hit}']"
         warn = _destructive_warning(command)
         prefix = f"[{warn}]\n" if warn else ""
+        effective_timeout = min(call_timeout, max_timeout) if call_timeout is not None else default_timeout
         if local or not sandbox_url:
-            output = _run_local(command, workspace, timeout)
+            output = _run_local(command, workspace, effective_timeout)
         else:
-            output = _run_sandbox(command, sandbox_url, timeout)
+            output = _run_sandbox(command, sandbox_url, effective_timeout)
         return prefix + output
 
-    def shell(command: str) -> str:
+    def shell(command: str, timeout: int | None = None) -> str:
         """Run a shell command in the isolated sandbox container.
 
-        The sandbox has full internet access but cannot reach the local
-        network, Tailscale, or the host. Use this for the vast majority
-        of shell work: building, running scripts, calling APIs, git, etc.
+        The sandbox has outbound internet access (HTTP/S, git, pip, npm, etc.)
+        but is NETWORK-ISOLATED: it cannot reach the local LAN, Tailscale
+        peers, internal services, or the host. Use this for the vast majority
+        of shell work: building, running scripts, calling public APIs, git, etc.
         Blocked commands return an error string without executing.
+
+        For anything that needs to reach a private/local address (e.g.
+        Tailscale IPs, LAN services, ComfyUI, internal APIs) use core_shell.
 
         Args:
             command: The shell command to run.
+            timeout: Optional per-call timeout in seconds. Capped at the
+                     configured maximum (default 1200s). Use for long-running
+                     tasks like image generation that may exceed the default.
         """
-        return _dispatch(command)
+        return _dispatch(command, call_timeout=timeout)
 
-    def core_shell(command: str) -> str:
-        """Run a shell command directly on the core host (NOT sandboxed).
+    def core_shell(command: str, timeout: int | None = None) -> str:
+        """Run a shell command in the main TinyCTX container (NOT the sandbox).
 
-        Has full access to the local network, Tailscale, and host resources.
-        Reserved for operations that specifically require host-level access:
-        managing services, writing to host paths, Tailscale operations, etc.
+        Has full network access: LAN, Tailscale peers, internal services, and
+        the host. Use this whenever the command needs to reach a private or
+        local address — for example:
+          - Tailscale IPs (100.x.x.x)
+          - LAN services (192.168.x.x, 10.x.x.x)
+          - Internal APIs (ComfyUI, local databases, self-hosted services)
+          - Docker host or sibling containers by hostname
+
         Requires permission level 100. Blacklist still applies.
 
         Args:
-            command: The shell command to run on the host.
+            command: The shell command to run.
+            timeout: Optional per-call timeout in seconds. Capped at the
+                     configured maximum (default 1200s).
         """
-        return _dispatch(command, local=True)
+        return _dispatch(command, local=True, call_timeout=timeout)
 
     agent.tool_handler.register_tool(shell,      always_on=True, min_permission=50)
-    agent.tool_handler.register_tool(core_shell, always_on=False, min_permission=100)
+    agent.tool_handler.register_tool(core_shell, always_on=True, min_permission=80)

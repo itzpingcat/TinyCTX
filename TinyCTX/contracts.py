@@ -65,12 +65,13 @@ class AttachmentKind(str, Enum):
 # User identity
 # ---------------------------------------------------------------------------
 
+# NOTE: UserIdentity is deprecated. Use TinyCTX.users.User instead.
+# Kept here temporarily so existing imports don't break during transition.
 @dataclass(frozen=True)
 class UserIdentity:
     """
-    Who sent the message.
-    user_id is the stable per-platform identifier.
-    Bridges are responsible for supplying a consistent user_id.
+    Deprecated. Bridges now receive a User from UserStore.resolve_user().
+    TODO: remove once all bridges are migrated.
     """
     platform: Platform
     user_id:  str
@@ -115,18 +116,19 @@ class InboundMessage:
     channel_name  — human-readable channel or thread name; None for DMs
     """
     tail_node_id: str
-    author:       UserIdentity
+    author:       Any             # TinyCTX.users.User; typed as Any to avoid circular import
     content_type: ContentType
     text:         str
     message_id:   str
     timestamp:    float
     trigger:      bool          = True          # bridge sets False for non-triggering group messages
     reply_to_id:  str | None    = None
+    reply_to_author: str | None = None          # display name of replied-to message author; None if replying to the assistant
     attachments:  tuple["Attachment", ...] = field(default_factory=tuple)
     trace_id:     str           = field(default_factory=lambda: str(uuid.uuid4()))
     server_name:  str | None    = None          # guild/server name (bridges populate when known)
     channel_name: str | None    = None          # channel/thread name (bridges populate when known)
-    permission_level: int       = 25            # 0-100; bridge sets per triggering sender. CLI=100.
+    # permission_level removed — permissions live on User only (phase 2 enforcement)
 
 
 # ---------------------------------------------------------------------------
@@ -196,10 +198,10 @@ class AgentError(_AgentEventBase):
 @dataclass(frozen=True)
 class AgentOutboundFiles(_AgentEventBase):
     """
-    Emitted directly by the present() tool when the agent wants to deliver
-    files to the user. Bridges send each path as a file attachment.
-    Fired as a detached asyncio task from within the tool — agent.py is
-    never aware of it and receives a plain success string as the tool result.
+    Emitted by the present() tool when the agent wants to deliver files to
+    the user. Appended to agent.outbound_events and yielded immediately after
+    the AgentToolResult for that tool call, flowing through the normal event
+    stream like any other event. Bridges send each path as a file attachment.
     """
     paths: tuple[str, ...]
 

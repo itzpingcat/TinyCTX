@@ -57,16 +57,23 @@ move-item*\**
 # ------------------------------------------------------------
 # PROCESS / SERVICE / EXECUTION
 # ------------------------------------------------------------
-stop-process*
-kill*
-taskkill*
+# stop-process with no filter args (kills broadly); allow with -id/-name for targeted use
+stop-process -force*
+get-process * | stop-process*
+taskkill /f*
+taskkill /im *
+taskkill /pid *
 stop-service*
 restart-service*
 set-service*
 new-service*
 remove-service*
 start-process*
-iex*
+# iex / invoke-expression: remote code execution vector
+iex *http*
+iex *http*
+iex(*http*
+invoke-expression*http*
 invoke-expression*
 start-job*
 new-object system.diagnostics*
@@ -161,15 +168,22 @@ wipe *
 # ------------------------------------------------------------
 # SHELL INJECTION / REMOTE CODE EXECUTION
 # ------------------------------------------------------------
-*| bash*
-*| sh*
-*| python*
-*| perl*
-*| ruby*
-curl * bash*
-wget * bash*
-eval *
-exec *
+# Pipe to shell from a network fetch — the classic RCE pattern
+curl *|*bash*
+curl *|*sh*
+wget *|*bash*
+wget *|*sh*
+curl *| bash*
+curl *| sh*
+wget *| bash*
+wget *| sh*
+# eval/exec with remote or encoded input are dangerous; bare eval/exec in scripts is fine
+eval *$(curl*
+eval *$(wget*
+eval *`curl*
+eval *`wget*
+exec *$(curl*
+exec *$(wget*
 bash -c *
 sh -c *
 
@@ -185,6 +199,20 @@ chmod +s*
 chown root*
 chmod 4*
 chmod 6*
+
+# ------------------------------------------------------------
+# PROCESS KILLING
+# ------------------------------------------------------------
+# by-name kills are bulk/imprecise — always block
+killall *
+pkill *
+# kill -9 / SIGKILL is forceful; block it
+kill -9 *
+kill -SIGKILL *
+# kill -KILL (alternate spelling)
+kill -KILL *
+# killall5 (sysvinit broadcast killer)
+killall5*
 
 # ------------------------------------------------------------
 # PERSISTENCE / INIT

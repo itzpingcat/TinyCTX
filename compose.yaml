@@ -29,6 +29,9 @@ services:
         source: ${TINYCTX_WORKSPACE:-~/.tinyctx}
         target: /home/tinyctx
       - type: bind
+        source: ${TINYCTX_CONFIG:-~/.config/tinyctx}
+        target: /etc/tinyctx
+      - type: bind
         source: ./config.yaml
         target: /app/config.yaml
         read_only: true
@@ -40,6 +43,7 @@ services:
     environment:
       TINYCTX_GATEWAY_HOST: "0.0.0.0"
       TINYCTX_WORKSPACE_PATH: /home/tinyctx
+      TINYCTX_CONFIG_DIR: /etc/tinyctx
       DISCORD_BOT_TOKEN:
       MATRIX_PASSWORD:
 

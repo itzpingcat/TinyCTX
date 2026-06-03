@@ -153,6 +153,7 @@ class CLIBridge:
         # Set by run_detached before run() is called.
         self._gateway_url: str = ""
         self._api_key: str     = ""
+        self._cli_username: str | None = None  # TinyCTX username for this session
 
     # --- HTTP helpers ---
 
@@ -372,6 +373,8 @@ class CLIBridge:
         import aiohttp
 
         payload: dict = {"node_id": self._cursor, "text": text, "permission_level": 100}
+        if self._cli_username:
+            payload["cli_username"] = self._cli_username
         if attachments:
             payload["attachments"] = attachments
 
@@ -669,16 +672,22 @@ async def run_detached(
     gateway_url: str,
     api_key: str,
     options: dict | None = None,
+    username: str | None = None,
 ) -> None:
     """
     Real entry point — called by commands/launch.py.
     Connects to the running daemon over HTTP and runs the interactive TUI.
+
+    username: TinyCTX username resolved and (optionally) elevated by launch.py.
+              Forwarded in every message body so the gateway can author messages
+              as that user rather than the generic api-client.
     """
     import aiohttp
 
     bridge = CLIBridge(None, options=options or {})
     bridge._gateway_url = gateway_url
     bridge._api_key     = api_key
+    bridge._cli_username = username  # forwarded in _send()
 
     # Resolve or create the cursor via /v1/lane/open.
     saved_cursor = _load_cli_cursor_path()

@@ -8,7 +8,11 @@ EXTENSION_META = {
         "Blacklist enforced on both before dispatch."
     ),
     "default_config": {
-        "timeout": 60,
+        # Timeout used when the agent does not pass an explicit timeout arg.
+        "default_timeout": 120,
+
+        # Hard ceiling — agent-supplied timeout values are capped to this.
+        "max_timeout": 1200,
 
         # Default points at the sandbox container defined in compose.yaml.
         # Override to null for bare-metal / Windows / dev (falls back to local).

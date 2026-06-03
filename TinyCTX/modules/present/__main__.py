@@ -1,9 +1,9 @@
 """
 modules/present/__main__.py — Always-on present() tool.
 
-Delivers workspace files directly to the user by firing an AgentOutboundFiles
-event through the router's dispatch path. The agent receives a plain success
-string as the tool result — no sentinel parsing, no structured return payload.
+Delivers workspace files directly to the user by appending an AgentOutboundFiles
+event to agent.outbound_events, which the agent loop yields immediately after
+the tool result — flowing through the normal reply_queue like any other event.
 """
 
 
@@ -36,17 +36,12 @@ def register_agent(agent) -> None:
                 return f"Error: {p} not found"
             validated.append(str(resolved))
 
-        event = AgentOutboundFiles(
+        agent.outbound_events.append(AgentOutboundFiles(
             paths=tuple(validated),
-            tail_node_id=agent.tail_node_id,
-            # lane_node_id=agent.lane_node_id,
-            trace_id="present",
+            tail_node_id=agent.context.tail_node_id if agent.context else "",
+            trace_id=agent.trace_id,
             reply_to_message_id="",
-        )
-        try:
-            await agent.gateway._dispatch_event(event)
-        except Exception as exc:
-            return f"Error: failed to dispatch files — {exc}"
+        ))
 
         names = ", ".join(Path(p).name for p in validated)
         return f"Successfully sent files: {names}"
