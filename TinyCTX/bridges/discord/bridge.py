@@ -74,6 +74,13 @@ DEFAULTS = {
     "typing_on_reply": True,
 }
 
+# Message types Discord fires for thread creation / system events — these are
+# not real user messages and must never be fed into the agent as context.
+_THREAD_SYSTEM_TYPES: frozenset[discord.MessageType] = frozenset({
+    discord.MessageType.thread_created,
+    discord.MessageType.thread_starter_message,
+})
+
 
 # ---------------------------------------------------------------------------
 # DiscordBridge
@@ -141,8 +148,12 @@ class DiscordBridge:
         async def on_message(message: discord.Message) -> None:
             await _bridge._on_message(message)
 
+        async def on_thread_create(thread: discord.Thread) -> None:
+            await _bridge._on_thread_create(thread)
+
         self._client.event(on_ready)
         self._client.event(on_message)
+        self._client.event(on_thread_create)
 
         # Stale-interaction error handler
         @self._tree.error
@@ -357,6 +368,72 @@ class DiscordBridge:
             )
         await _cmd_module.sync_app_commands(self)
 
+    async def _on_thread_create(self, thread: discord.Thread) -> None:
+        """
+        Fired by Discord the moment a thread is created.  We use this to pin
+        the thread's starting cursor to the exact node produced by the message
+        the thread was branched from, so the agent sees channel context up to
+        that point — no more, no less.
+
+        Resolution order:
+          1. thread.starter_message  — available when the thread was created
+             from a specific message and that message is still cached.
+          2. fetch the starter message via the API if not cached.
+          3. Fall back to the channel's current tail if the starter message
+             can't be resolved (e.g. forum-style threads with no parent msg).
+        """
+        thread_id  = str(thread.id)
+        cursor_key = f"thread:{thread_id}"
+
+        # Already initialised (shouldn't happen, but be safe).
+        if self._store.get(cursor_key):
+            return
+
+        channel_id = str(thread.parent_id) if thread.parent_id else ""
+
+        # Try to get the starter message id.
+        starter_msg_id: str | None = None
+
+        starter = getattr(thread, "starter_message", None)
+        if starter is not None:
+            starter_msg_id = str(starter.id)
+        elif thread.parent_id:
+            # starter_message is only populated when cached; try fetching it.
+            try:
+                parent = self._client.get_channel(thread.parent_id)
+                if parent is None:
+                    parent = await self._client.fetch_channel(thread.parent_id)
+                # The thread's id == the starter message's id for message threads.
+                fetched = await parent.fetch_message(thread.id)
+                starter_msg_id = str(fetched.id)
+            except Exception:
+                logger.debug(
+                    "Discord: could not fetch starter message for thread %s", thread_id
+                )
+
+        # Look up the node we recorded when that message was pushed.
+        fork_node: str | None = None
+        if starter_msg_id:
+            fork_node = self._store.get_msg_node(starter_msg_id)
+
+        # Fall back to the channel tail if we couldn't resolve the exact node.
+        if fork_node is None and channel_id:
+            fork_node = self._store.get(f"group:{channel_id}")
+
+        if fork_node is None:
+            fork_node = make_session_node(self._runtime.db, cursor_key)
+            logger.info(
+                "Discord: thread %s — no fork point found, fresh branch %s",
+                thread_id, fork_node,
+            )
+        else:
+            logger.info(
+                "Discord: thread %s forked from node %s (starter_msg=%s)",
+                thread_id, fork_node, starter_msg_id,
+            )
+
+        self._store.set(cursor_key, fork_node)
+
     async def _on_message(self, message: discord.Message) -> None:
         if message.author.bot and (
             self._client.user is None
@@ -366,6 +443,12 @@ class DiscordBridge:
 
         # ── Thread ───────────────────────────────────────────────────
         if isinstance(message.channel, discord.Thread):
+            # Discord fires on_message for thread-creation system events
+            # (thread_created, thread_starter_message) whose .content is the
+            # thread name — not a real user message.  Drop them here so the
+            # thread name never lands in the agent's context as a user turn.
+            if message.type in _THREAD_SYSTEM_TYPES:
+                return
             await self._handle_thread_message(message)
             return
 
@@ -533,6 +616,8 @@ class DiscordBridge:
                             dataclasses.replace(msg_, tail_node_id=node_id)
                         )
                         self._advance_cursor(ck, new_node_id)
+                        if msg_.message_id:
+                            self._store.set_msg_node(msg_.message_id, new_node_id)
 
             task = asyncio.create_task(_delayed())
             self._tasks.add(task)
@@ -547,6 +632,8 @@ class DiscordBridge:
                     dataclasses.replace(msg, tail_node_id=node_id)
                 )
                 self._advance_cursor(cursor_key, new_node_id)
+                if msg.message_id:
+                    self._store.set_msg_node(msg.message_id, new_node_id)
             return
 
         task = asyncio.create_task(
@@ -564,6 +651,11 @@ class DiscordBridge:
             self._client.user is None
             or message.author.id == self._client.user.id
         ):
+            return
+
+        # Secondary guard: drop any remaining system message types that
+        # might slip through (e.g. future Discord additions).
+        if message.type in _THREAD_SYSTEM_TYPES:
             return
 
         thread     = message.channel

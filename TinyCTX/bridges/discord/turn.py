@@ -61,6 +61,8 @@ async def handle_turn(
     Reads the live cursor tail under the lock, calls runtime.push(), then drains
     the reply_queue, emitting typing indicators and chunked text replies.
     Advances the cursor to the final assistant tail node when done.
+    After push, records message_id -> new_tail in the cursor store so that
+    threads created from this message can fork from the exact right node.
     """
     epoch_at_start = bridge._reset_epoch.get(cursor_key, 0)
     lock = bridge._lane_locks.setdefault(cursor_key, asyncio.Lock())
@@ -86,6 +88,10 @@ async def handle_turn(
             new_tail = await bridge._runtime.push(msg, reply_queue=reply_queue)
             bridge._advance_cursor(cursor_key, new_tail)
             bridge._node_to_cursor[new_tail] = cursor_key
+
+            # Record message_id -> node so on_thread_create can fork accurately.
+            if msg.message_id:
+                bridge._store.set_msg_node(msg.message_id, new_tail)
 
             if not msg.trigger:
                 return
