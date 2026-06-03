@@ -33,6 +33,19 @@ tool nodes) are accumulated in session state under the key
 ingest_pressure_ratio * config.context (floored by ingest_pressure_min_tokens),
 a "branch" queue message is dispatched so the librarian ingests only this
 branch's unvisited nodes, and the counter resets to zero.
+
+WAL checkpointing
+-----------------
+Ladybug's default CHECKPOINT_THRESHOLD is 16 MB. A small knowledge graph
+never reaches this, so without intervention the WAL grows indefinitely and
+the main .lbug files are only written at shutdown.
+
+Two mitigations:
+  1. graph.py lowers the threshold to 1 MB at schema-init time so automatic
+     checkpoints fire after modest write batches.
+  2. Every agent task created in _poll_cycle has a done-callback that calls
+     GraphDatabase.checkpoint(), flushing the WAL as soon as the write lock
+     is released and the task has committed its transaction.
 """
 from __future__ import annotations
 
@@ -161,6 +174,14 @@ class LibrarianRunner:
                 await asyncio.gather(*self._active_tasks, return_exceptions=True)
             logger.info("[memory/librarian] stopped")
 
+    def _checkpoint_callback(self, task: asyncio.Task) -> None:
+        """
+        Done-callback attached to every agent task.
+        Flushes the WAL to the main .lbug files once the task has committed
+        its writes and released the write lock.
+        """
+        self._graph_database.checkpoint()
+
     async def _poll_cycle(self) -> None:
         from TinyCTX.modules.memory.librarian_agents import (
             run_buffer_agent, run_targeted_agent, run_dedup_cycle,
@@ -191,6 +212,7 @@ class LibrarianRunner:
                             self._llm, prompt, self.agent_logger,
                         )
                     )
+                    t.add_done_callback(self._checkpoint_callback)
                     self._active_tasks.add(t)
                 elif prompt:
                     logger.warning("[memory/librarian] concurrency cap reached, dropping targeted msg")
@@ -213,6 +235,7 @@ class LibrarianRunner:
                                     self._llm, batch_text, agent_name, self.agent_logger,
                                 )
                             )
+                            t.add_done_callback(self._checkpoint_callback)
                             self._active_tasks.add(t)
                             logger.info(
                                 "[memory/librarian] pressure ingest: dispatched agent for %d node(s) on branch %s",
@@ -252,6 +275,7 @@ class LibrarianRunner:
                         self._llm, batch_text, agent_name, self.agent_logger,
                     )
                 )
+                t.add_done_callback(self._checkpoint_callback)
                 self._active_tasks.add(t)
                 logger.info("[memory/librarian] dispatched agent for %d node(s)", len(flagged_ids))
 
@@ -274,6 +298,7 @@ class LibrarianRunner:
                 )
             )
             t.add_done_callback(lambda _: self._state.__setitem__("dedup_running", False))
+            t.add_done_callback(self._checkpoint_callback)
             self._active_tasks.add(t)
 
 
