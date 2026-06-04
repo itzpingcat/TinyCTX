@@ -28,6 +28,12 @@ EXTENSION_META = {
         # Leave empty to disable semantic search (keyword only)
         "embedding_model": "",
 
+        # Separate embedding model for dedup/graph similarity.
+        # When set, graph_embedding is stored alongside the regular embedding.
+        # Dedup uses graph_embedding, falling back to embedding when absent.
+        # Leave empty to reuse embedding_model for dedup as well.
+        "graph_embedding_model": "",
+
         # Pinned entity injection priority in system prompt
         "pinned_priority": 5,
 

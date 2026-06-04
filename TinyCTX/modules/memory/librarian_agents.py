@@ -1,4 +1,4 @@
-﻿"""
+"""
 modules/memory/librarian_agents.py
 
 Pure agent logic for the knowledge librarian: buffer ingestion, targeted
@@ -221,10 +221,17 @@ async def run_dedup_cycle(
     embedder,
     agent_logger: logging.Logger,
 ) -> None:
+    """
+    embedder here is the graph embedder (may be the same object as the search
+    embedder when no separate graph_embedding_model is configured).
+    Refreshes graph_embedding / graph_embed_* columns.  Cosine similarity for
+    candidate selection uses graph_embedding, falling back to the regular
+    search embedding when graph_embedding is NULL on an entity.
+    """
     logger.info("[memory/librarian] dedup cycle starting")
     try:
         from TinyCTX.modules.memory.graph import (
-            embed_content_for, embed_hash, cosine_similarity,
+            graph_embed_content_for, embed_content_for, embed_hash, cosine_similarity,
         )
 
         threshold   = float(cfg.get("similarity_threshold", 0.85))
@@ -232,7 +239,7 @@ async def run_dedup_cycle(
 
         r = await conn.execute(
             "MATCH (e:Entity) RETURN e.uuid, e.name, e.description, e.entity_type, "
-            "e.embed_model, e.embed_hash, e.embedding"
+            "e.graph_embed_model, e.graph_embed_hash, e.graph_embedding, e.embedding"
         )
         col_names = r.get_column_names()
         entities  = []
@@ -247,47 +254,53 @@ async def run_dedup_cycle(
         distinct_cache = _load_distinct_cache(workspace_path)
         cache_dirty = False
 
-        embed_model_name = getattr(embedder, "model", "")
+        graph_embed_model_name = getattr(embedder, "model", "")
         stale = []
         for e in entities:
-            expected_hash = embed_hash(embed_content_for(e["e.name"], e["e.description"]))
+            expected_hash = embed_hash(
+                graph_embed_content_for(e["e.name"], e["e.entity_type"], e["e.description"])
+            )
             if (
-                not e["e.embedding"]
-                or e["e.embed_model"] != embed_model_name
-                or e["e.embed_hash"] != expected_hash
+                not e["e.graph_embedding"]
+                or e["e.graph_embed_model"] != graph_embed_model_name
+                or e["e.graph_embed_hash"] != expected_hash
             ):
                 stale.append(e)
 
         if stale:
-            logger.info("[memory/librarian] dedup: refreshing %d stale embedding(s)", len(stale))
+            logger.info("[memory/librarian] dedup: refreshing %d stale graph embedding(s)", len(stale))
             # Invalidate cache entries for any entity whose content has changed.
             for e in stale:
                 _invalidate_cache_for(distinct_cache, e["e.uuid"])
                 cache_dirty = True
 
-            texts   = [embed_content_for(e["e.name"], e["e.description"]) for e in stale]
+            texts   = [
+                graph_embed_content_for(e["e.name"], e["e.entity_type"], e["e.description"])
+                for e in stale
+            ]
             vectors = await embedder.embed(texts)
             async with write_lock:
                 for e, vec, txt in zip(stale, vectors, texts):
                     h   = embed_hash(txt)
                     uid = e["e.uuid"]
-                    await _aset(conn, uid, "embedding",    vec)
-                    await _aset(conn, uid, "embed_model",  embed_model_name)
-                    await _aset(conn, uid, "embed_content", txt)
-                    await _aset(conn, uid, "embed_hash",   h)
-                    e["e.embedding"]   = vec
-                    e["e.embed_model"] = embed_model_name
-                    e["e.embed_hash"]  = h
+                    await _aset(conn, uid, "graph_embedding",     vec)
+                    await _aset(conn, uid, "graph_embed_model",   graph_embed_model_name)
+                    await _aset(conn, uid, "graph_embed_content", txt)
+                    await _aset(conn, uid, "graph_embed_hash",    h)
+                    e["e.graph_embedding"]     = vec
+                    e["e.graph_embed_model"]   = graph_embed_model_name
+                    e["e.graph_embed_hash"]    = h
 
         pairs_seen: set[frozenset] = set()
         candidates: list[tuple[dict, dict, float]] = []
 
         for i, ea in enumerate(entities):
-            emb_a = ea.get("e.embedding") or []
+            # Prefer graph_embedding; fall back to regular search embedding.
+            emb_a = ea.get("e.graph_embedding") or ea.get("e.embedding") or []
             if not emb_a:
                 continue
             for eb in entities[i + 1:]:
-                emb_b = eb.get("e.embedding") or []
+                emb_b = eb.get("e.graph_embedding") or eb.get("e.embedding") or []
                 if not emb_b:
                     continue
                 pair_key = frozenset([ea["e.uuid"], eb["e.uuid"]])

@@ -79,19 +79,23 @@ _SCHEMA_DDL = [
     # Knowledge nodes
     """
     CREATE NODE TABLE IF NOT EXISTS Entity (
-        uuid         STRING,
-        name         STRING,
-        entity_type  STRING,
-        description  STRING,
-        pinned       BOOL,
-        priority     INT64,
-        mention_count INT64,
-        created_at   DOUBLE,
-        updated_at   DOUBLE,
-        embed_model  STRING,
-        embed_content STRING,
-        embed_hash   STRING,
-        embedding    DOUBLE[],
+        uuid                STRING,
+        name                STRING,
+        entity_type         STRING,
+        description         STRING,
+        pinned              BOOL,
+        priority            INT64,
+        mention_count       INT64,
+        created_at          DOUBLE,
+        updated_at          DOUBLE,
+        embed_model         STRING,
+        embed_content       STRING,
+        embed_hash          STRING,
+        embedding           DOUBLE[],
+        graph_embed_model   STRING,
+        graph_embed_content STRING,
+        graph_embed_hash    STRING,
+        graph_embedding     DOUBLE[],
         PRIMARY KEY (uuid)
     )
     """,
@@ -141,6 +145,49 @@ def init_schema(conn) -> None:
     logger.info("[memory/graph] schema initialised")
 
 
+
+def migrate_schema(conn) -> None:
+    """
+    Add graph_embedding columns to an existing Entity table that predates them.
+    Safe to call on every startup; skips columns that already exist.
+    """
+    already = False
+    try:
+        r = conn.execute(
+            "MATCH (m:GraphMeta {key: \'migration_graph_embedding_v1\'}) RETURN m.val LIMIT 1"
+        )
+        already = r.has_next()
+    except Exception:
+        pass
+
+    if already:
+        return
+
+    cols_to_add = [
+        ("graph_embed_model",   "STRING"),
+        ("graph_embed_content", "STRING"),
+        ("graph_embed_hash",    "STRING"),
+        ("graph_embedding",     "DOUBLE[]"),
+    ]
+    for col, dtype in cols_to_add:
+        try:
+            conn.execute(f"ALTER TABLE Entity ADD {col} {dtype}")
+            logger.info("[memory/graph] migration: added column %s %s", col, dtype)
+        except Exception as exc:
+            if "already exist" in str(exc).lower() or "duplicate" in str(exc).lower():
+                logger.debug("[memory/graph] migration: column %s already present", col)
+            else:
+                logger.warning("[memory/graph] migration: unexpected error adding %s: %s", col, exc)
+
+    try:
+        conn.execute(
+            "CREATE (m:GraphMeta {key: \'migration_graph_embedding_v1\', val: \'done\'})"
+        )
+    except Exception:
+        pass
+
+    logger.info("[memory/graph] migration: graph_embedding columns ready")
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -161,6 +208,15 @@ def embed_hash(content: str) -> str:
 def embed_content_for(name: str, description: str) -> str:
     """The string we embed — name + space + description."""
     return f"{name} {description}"
+
+
+def graph_embed_content_for(name: str, entity_type: str, description: str) -> str:
+    """
+    The string we embed for graph/dedup purposes.
+    Includes entity_type so the model can distinguish e.g. two entities named
+    'Alice' of different types.
+    """
+    return f"{entity_type}: {name} {description}"
 
 
 # ---------------------------------------------------------------------------
@@ -293,6 +349,7 @@ class GraphDatabase:
         conn = ladybug.Connection(self._db)
         try:
             init_schema(conn)
+            migrate_schema(conn)
         finally:
             conn.close()
 
@@ -626,6 +683,23 @@ class GraphDB:
             emb = row[1]
             if emb:
                 results.append((row[0], emb))
+        return results
+
+    def all_entities_with_graph_embeddings(self) -> list[tuple[str, list[float]]]:
+        """
+        Return [(uuid, embedding)] for dedup, preferring graph_embedding.
+        Falls back to the regular search embedding when graph_embedding is NULL.
+        """
+        r = self.safe_execute(
+            "MATCH (e:Entity) RETURN e.uuid, e.graph_embedding, e.embedding"
+        )
+        results = []
+        while r.has_next():
+            row = r.get_next()
+            uid, graph_emb, search_emb = row[0], row[1], row[2]
+            emb = graph_emb if graph_emb else search_emb
+            if emb:
+                results.append((uid, emb))
         return results
 
     def bump_mention_count(self, uids: list[str]) -> None:
