@@ -476,7 +476,6 @@ async def _dedup_batch(
         raise ValueError(
             f"Expected {len(pairs)} verdicts, got {len(verdicts_data)}"
         )
-        )
 
     results: list[tuple[frozenset, str, bool]] = []
     for item in verdicts_data:
