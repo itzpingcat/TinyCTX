@@ -1,4 +1,4 @@
-"""
+﻿"""
 modules/memory/librarian_agents.py
 
 Pure agent logic for the knowledge librarian: buffer ingestion, targeted
@@ -54,6 +54,25 @@ def _chunks(lst: list, n: int):
     """Yield successive n-sized chunks from lst."""
     for i in range(0, len(lst), n):
         yield lst[i : i + n]
+
+
+def _parse_dedup_response(raw: str) -> list[dict]:
+    """
+    Parse a dedup LLM response into a list of verdict dicts.
+    Accepts:
+      - a JSON array (canonical form)
+      - a bare JSON object (model forgot the outer array)
+    Strips markdown fences before parsing.
+    Raises json.JSONDecodeError on unparseable input.
+    """
+    raw = _re.sub(r"^```json?\s*", "", raw.strip())
+    raw = _re.sub(r"\s*```$", "", raw).strip()
+    parsed = json.loads(raw)
+    if isinstance(parsed, dict):
+        parsed = [parsed]
+    if not isinstance(parsed, list):
+        raise ValueError(f"Expected list or dict, got {type(parsed).__name__}")
+    return parsed
 
 
 # ---------------------------------------------------------------------------
@@ -324,7 +343,7 @@ async def run_dedup_cycle(
                         verdict = await _dedup_pair(
                             conn, write_lock, llm, ea, eb, agent_logger, cache_on_fail=False
                         )
-                        results.append((frozenset([ea["e.uuid"], eb["e.uuid"]]), verdict, True))
+                        results.append((frozenset([ea["e.uuid"], eb["e.uuid"]]), verdict, False))
 
                 for entry in results:
                     pair_key, verdict, cacheable = entry
@@ -332,8 +351,9 @@ async def run_dedup_cycle(
                         distinct_cache.add(pair_key)
                         cache_dirty = True
 
-        if cache_dirty:
-            _save_distinct_cache(distinct_cache)
+            if cache_dirty:
+                _save_distinct_cache(distinct_cache)
+                cache_dirty = False
 
         logger.info("[memory/librarian] dedup cycle complete")
     except Exception:
@@ -370,22 +390,24 @@ async def _dedup_pair(
     )
 
     response_text = ""
-    async for event in llm.stream([{"role": "user", "content": prompt}], tools=None):
+    async for event in llm.stream(
+        [{"role": "system", "content": _prompt("dedup_system.txt")},
+         {"role": "user",   "content": prompt}],
+        tools=None,
+    ):
         if isinstance(event, TextDelta):
             response_text += event.text
 
     if response_text:
         agent_logger.info("[dedup %s/%s] %s", ea["e.uuid"][:8], eb["e.uuid"][:8], response_text)
 
-    raw = _re.sub(r"^```json?\s*", "", response_text.strip())
-    raw = _re.sub(r"\s*```$", "", raw)
-
     try:
-        verdict_data = json.loads(raw)
-    except json.JSONDecodeError:
+        verdicts = _parse_dedup_response(response_text)
+        verdict_data = verdicts[0]
+    except (json.JSONDecodeError, ValueError, IndexError):
         logger.warning(
             "[memory/librarian] dedup: could not parse verdict for %s/%s: %s",
-            ea["e.uuid"][:8], eb["e.uuid"][:8], raw[:200],
+            ea["e.uuid"][:8], eb["e.uuid"][:8], response_text[:200],
         )
         return "distinct"
 
@@ -438,22 +460,22 @@ async def _dedup_batch(
     )
 
     response_text = ""
-    async for event in llm.stream([{"role": "user", "content": prompt}], tools=None):
+    async for event in llm.stream(
+        [{"role": "system", "content": _prompt("dedup_system.txt")},
+         {"role": "user",   "content": prompt}],
+        tools=None,
+    ):
         if isinstance(event, TextDelta):
             response_text += event.text
 
     if response_text:
         agent_logger.info("[dedup batch/%d] %s", len(pairs), response_text)
+    verdicts_data = _parse_dedup_response(response_text)  # raises on failure -> caller retries
 
-    raw = _re.sub(r"^```json?\s*", "", response_text.strip())
-    raw = _re.sub(r"\s*```$", "", raw)
-
-    verdicts_data = json.loads(raw)  # raises JSONDecodeError on failure → caller retries
-
-    if not isinstance(verdicts_data, list) or len(verdicts_data) != len(pairs):
+    if len(verdicts_data) != len(pairs):
         raise ValueError(
-            f"Expected {len(pairs)} verdicts, got "
-            f"{len(verdicts_data) if isinstance(verdicts_data, list) else type(verdicts_data).__name__}"
+            f"Expected {len(pairs)} verdicts, got {len(verdicts_data)}"
+        )
         )
 
     results: list[tuple[frozenset, str, bool]] = []
