@@ -17,7 +17,6 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 _PROMPTS_DIR = Path(__file__).parent / "prompts"
-_DEDUP_CACHE_PATH = Path(__file__).parent / "dedup_cache.json"
 
 
 def _prompt(filename: str) -> str:
@@ -28,17 +27,17 @@ def _prompt(filename: str) -> str:
 # Distinct-pair cache  (persists across cycles; keyed by frozenset of uuids)
 # ---------------------------------------------------------------------------
 
-def _load_distinct_cache() -> set[frozenset]:
+def _load_distinct_cache(workspace_path: Path) -> set[frozenset]:
     """Load the set of UUID pairs already confirmed as distinct."""
     try:
-        raw = json.loads(_DEDUP_CACHE_PATH.read_text(encoding="utf-8"))
+        raw = json.loads((workspace_path / "memory" / "dedup_cache.json").read_text(encoding="utf-8"))
         return {frozenset(pair) for pair in raw}
     except (FileNotFoundError, json.JSONDecodeError, TypeError):
         return set()
 
 
-def _save_distinct_cache(cache: set[frozenset]) -> None:
-    _DEDUP_CACHE_PATH.write_text(
+def _save_distinct_cache(workspace_path: Path, cache: set[frozenset]) -> None:
+    (workspace_path / "memory" / "dedup_cache.json").write_text(
         json.dumps([sorted(pair) for pair in cache], indent=2),
         encoding="utf-8",
     )
@@ -215,6 +214,7 @@ async def run_targeted_agent(
 
 async def run_dedup_cycle(
     cfg: dict,
+    workspace_path: Path,
     conn,
     write_lock: asyncio.Lock,
     llm,
@@ -244,7 +244,7 @@ async def run_dedup_cycle(
             return
 
         # Load the persisted distinct-pair cache.
-        distinct_cache = _load_distinct_cache()
+        distinct_cache = _load_distinct_cache(workspace_path)
         cache_dirty = False
 
         embed_model_name = getattr(embedder, "model", "")
@@ -301,7 +301,7 @@ async def run_dedup_cycle(
         if not candidates:
             logger.info("[memory/librarian] dedup: no candidate pairs above threshold %.2f", threshold)
             if cache_dirty:
-                _save_distinct_cache(distinct_cache)
+                _save_distinct_cache(workspace_path, distinct_cache)
             return
 
         logger.info("[memory/librarian] dedup: %d candidate pair(s) to evaluate", len(candidates))
@@ -352,7 +352,7 @@ async def run_dedup_cycle(
                         cache_dirty = True
 
             if cache_dirty:
-                _save_distinct_cache(distinct_cache)
+                _save_distinct_cache(workspace_path, distinct_cache)
                 cache_dirty = False
 
         logger.info("[memory/librarian] dedup cycle complete")

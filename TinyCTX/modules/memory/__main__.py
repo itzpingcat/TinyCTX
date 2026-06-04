@@ -1,9 +1,9 @@
-"""
+﻿"""
 modules/memory/__main__.py
 
 Registers the memory module.
 
-register_runtime(runtime) — called once at startup:
+register_runtime(runtime) â€” called once at startup:
   1. Resolves config, builds embedder, LLM, ConversationDB
   2. Creates GraphDatabase (owns the ladybug.Database lifetime)
   3. Builds LibrarianRunner (gets write conn from GraphDatabase) and starts
@@ -11,7 +11,7 @@ register_runtime(runtime) — called once at startup:
   4. Builds GraphDB (gets read conn from GraphDatabase) for agent tools
   5. Inits tools module globals
 
-register_agent(cycle) — called per AgentCycle after tool_handler is ready:
+register_agent(cycle) â€” called per AgentCycle after tool_handler is ready:
   1. Registers kg_* read tools + call_librarian on cycle.tool_handler
   2. Registers pinned entity PromptProvider on cycle.context
   3. Registers pressure-ingest post_turn_hook on cycle
@@ -23,7 +23,7 @@ the sole writer; GraphDB is the sync reader.
 Shutdown order (enforced by _shutdown()):
   1. Cancel the librarian background task (stop accepting new writes)
   2. Close the GraphDB read connection
-  3. GraphDatabase.close() — checkpoints then closes the DB
+  3. GraphDatabase.close() â€” checkpoints then closes the DB
 
 Pressure-based ingest
 ---------------------
@@ -74,7 +74,7 @@ _token_budget:   int = 4096
 
 
 # ---------------------------------------------------------------------------
-# LibrarianRunner — in-process background task
+# LibrarianRunner â€” in-process background task
 # ---------------------------------------------------------------------------
 
 class LibrarianRunner:
@@ -131,7 +131,7 @@ class LibrarianRunner:
         self._active_tasks: set[asyncio.Task] = set()
 
     # ------------------------------------------------------------------
-    # WAL rebuild — delegates to GraphDatabase, then refreshes write conn
+    # WAL rebuild â€” delegates to GraphDatabase, then refreshes write conn
     # ------------------------------------------------------------------
 
     def _rebuild_write_conn(self) -> None:
@@ -293,7 +293,7 @@ class LibrarianRunner:
             self._state["last_dedup_ts"] = now
             t = asyncio.create_task(
                 run_dedup_cycle(
-                    self._cfg, self._write_conn, self._write_lock,
+                    self._cfg, _workspace, self._write_conn, self._write_lock,
                     self._llm, self._embedder, self.agent_logger,
                 )
             )
@@ -303,7 +303,7 @@ class LibrarianRunner:
 
 
 # ---------------------------------------------------------------------------
-# call_librarian — defined at module level, reads globals set by register_runtime
+# call_librarian â€” defined at module level, reads globals set by register_runtime
 # ---------------------------------------------------------------------------
 
 async def call_librarian(prompt: str = "", file_path: str = "") -> str:
@@ -338,11 +338,11 @@ async def call_librarian(prompt: str = "", file_path: str = "") -> str:
         if prompt.strip():
             combined = f"{combined}\n\n{prompt.strip()}"
         _runner.queue.put_nowait({"type": "targeted", "prompt": combined})
-        return f"[librarian: file agent queued — '{p.name}']"
+        return f"[librarian: file agent queued â€” '{p.name}']"
     elif prompt.strip():
         assert _runner is not None
         _runner.queue.put_nowait({"type": "targeted", "prompt": prompt.strip()})
-        return f"[librarian: targeted agent queued — '{prompt[:60]}']"
+        return f"[librarian: targeted agent queued â€” '{prompt[:60]}']"
     else:
         assert _runner is not None
         _runner.queue.put_nowait({"type": "trigger"})
@@ -350,7 +350,7 @@ async def call_librarian(prompt: str = "", file_path: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
-# _count_entry_tokens — token count for a single HistoryEntry
+# _count_entry_tokens â€” token count for a single HistoryEntry
 # ---------------------------------------------------------------------------
 
 def _count_entry_tokens(entry) -> int:
@@ -373,7 +373,7 @@ def _count_entry_tokens(entry) -> int:
 
 
 # ---------------------------------------------------------------------------
-# register_runtime — one-time startup
+# register_runtime â€” one-time startup
 # ---------------------------------------------------------------------------
 
 def register_runtime(runtime) -> None:
@@ -410,7 +410,7 @@ def register_runtime(runtime) -> None:
     _pinned_prio  = int(cfg.get("pinned_priority", 5))
     _token_budget = int(cfg.get("memory_block_tokens", 4096))
 
-    # GraphDatabase — single owner of the ladybug.Database
+    # GraphDatabase â€” single owner of the ladybug.Database
     from TinyCTX.modules.memory.graph import GraphDatabase, GraphDB
     _graph_database = GraphDatabase(graph_path, max_concurrent=max_concurrent)
 
@@ -425,7 +425,7 @@ def register_runtime(runtime) -> None:
             logger.info("[memory] embedder: %s @ %s", emb_cfg.model, emb_cfg.base_url)
         except (KeyError, ValueError) as exc:
             logger.warning(
-                "[memory] embedding_model '%s' not usable (%s) — semantic search disabled",
+                "[memory] embedding_model '%s' not usable (%s) â€” semantic search disabled",
                 embedding_model, exc,
             )
 
@@ -452,10 +452,10 @@ def register_runtime(runtime) -> None:
     conv_db = ConversationDB(agent_db)
     atexit.register(conv_db.close)
 
-    # LibrarianRunner — gets write conn from GraphDatabase
+    # LibrarianRunner â€” gets write conn from GraphDatabase
     _runner = LibrarianRunner(cfg, _graph_database, log_path, conv_db, llm, embedder)
 
-    # GraphDB — gets read conn from GraphDatabase
+    # GraphDB â€” gets read conn from GraphDatabase
     _graph_db = GraphDB(_graph_database)
 
     # tools
@@ -463,7 +463,7 @@ def register_runtime(runtime) -> None:
     _tools = tools_mod
     _tools.init(_runner._write_conn, _runner._write_lock, _graph_db, embedder)
 
-    # Shutdown: stop writer → close read conn → checkpoint + close DB.
+    # Shutdown: stop writer â†’ close read conn â†’ checkpoint + close DB.
     # Registered on atexit and both termination signals so clean exits always
     # flush the WAL regardless of how the process is stopped.
     _shutdown_called = [False]
@@ -506,18 +506,18 @@ def register_runtime(runtime) -> None:
     )
 
     logger.info(
-        "[memory] ready — graph: %s | embedder: %s",
+        "[memory] ready â€” graph: %s | embedder: %s",
         graph_path, embedding_model or "none",
     )
 
 
 # ---------------------------------------------------------------------------
-# register_agent — per AgentCycle
+# register_agent â€” per AgentCycle
 # ---------------------------------------------------------------------------
 
 def register_agent(cycle) -> None:
     if _runner is None:
-        logger.error("[memory] register_agent called before register_runtime — skipping")
+        logger.error("[memory] register_agent called before register_runtime â€” skipping")
         return
 
     assert _tools is not None
@@ -606,21 +606,21 @@ def register_agent(cycle) -> None:
         pinned_uuids: set[str] = {_get(e, "uuid") for e in pinned}
 
         def _render_pinned(e: dict) -> str:
-            lines = [f"[{_get(e, 'entity_type')}] {_get(e, 'name')} — {_get(e, 'description')}"]
+            lines = [f"[{_get(e, 'entity_type')}] {_get(e, 'name')} â€” {_get(e, 'description')}"]
             for edge in e.get("edges_out", []):
                 w = edge.get("weight", 0.0)
-                desc = f" — {edge['description']}" if edge.get("description") else ""
+                desc = f" â€” {edge['description']}" if edge.get("description") else ""
                 lines.append(f"  ->[{edge['relation']}]-> {edge['target_name']} (w={w:.2f}){desc}")
             for edge in e.get("edges_in", []):
                 w = edge.get("weight", 0.0)
-                desc = f" — {edge['description']}" if edge.get("description") else ""
+                desc = f" â€” {edge['description']}" if edge.get("description") else ""
                 lines.append(f"  <-[{edge['relation']}]<- {edge['source_name']} (w={w:.2f}){desc}")
             return "\n".join(lines)
 
         def _render_neighbor(e: dict, score: float) -> str:
             return (
                 f"[{_get(e, 'entity_type')}] {_get(e, 'name')} "
-                f"(linked, w={score:.2f}) — {_get(e, 'description')}"
+                f"(linked, w={score:.2f}) â€” {_get(e, 'description')}"
             )
 
         def _tok(text: str) -> int:
