@@ -131,7 +131,7 @@ async def _aset(conn, uid: str, field: str, value):
     return await conn.execute(
         f"MATCH (e:Entity) WHERE e.uuid = $uid SET e.{field} = $v",
         parameters={"uid": uid, "v": value},
-    )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +266,23 @@ async def run_dedup_cycle(
                 if score >= threshold:
                     candidates.append((stale_e, eb, score))
 
+        # Name-based candidates: same name (case-insensitive), not already caught by embeddings
+        by_name: dict[str, list[dict]] = {}
+        for e in entities:
+            key = (e["e.name"] or "").strip().lower()
+            if key:
+                by_name.setdefault(key, []).append(e)
+        for group in by_name.values():
+            if len(group) < 2:
+                continue
+            for i in range(len(group)):
+                for j in range(i + 1, len(group)):
+                    ea, eb = group[i], group[j]
+                    pair_key = frozenset([ea["e.uuid"], eb["e.uuid"]])
+                    if pair_key not in pairs_seen:
+                        pairs_seen.add(pair_key)
+                        candidates.append((ea, eb, 1.0))
+
         if not candidates:
             logger.info("[memory/librarian] dedup: no candidate pairs above threshold %.2f", threshold)
             return
@@ -319,7 +336,7 @@ async def run_dedup_cycle(
 
         logger.info("[memory/librarian] dedup cycle complete")
     except Exception:
-        logger.exception("[memory/librarian] dedup cycle error")
+        logger.exception("[memory/librarian] dedup cycle error")
 
 
 # ---------------------------------------------------------------------------
@@ -509,5 +526,5 @@ async def _apply_verdict(
                 f"CREATE (a)-[:Relation {{relation: 'ALIASED_TO', weight: 1.0, "
                 f"description: 'alias', created_at: {now!r}, superseded_at: null}}]->(c)",
                 parameters={"alias": dup_uuid, "canon": canonical_uuid},
-            )
-
+            )
+
