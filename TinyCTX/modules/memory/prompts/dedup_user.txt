@@ -3,11 +3,13 @@
   name: {name_a}
   type: {type_a}
   description: {desc_a}
+  relationships: {edges_a}
 
 Node B:
   uuid: {uuid_b}
   name: {name_b}
   type: {type_b}
   description: {desc_b}
+  relationships: {edges_b}
 
 Respond with the single-pair JSON schema.

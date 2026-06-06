@@ -9,7 +9,9 @@ VERDICT VALUES
   "alias"      - same real thing under different names or contexts (e.g. username
                  vs full name); keep both nodes, add an ALIASED_TO edge
 
-When in doubt, prefer "distinct" — false merges are harder to undo.
+When in doubt, prefer "duplicate" or "alias" — stub nodes with generic descriptions
+are cheap to merge and expensive to leave as clutter. Only use "distinct" when
+there is a clear, concrete reason the two nodes cannot be the same thing.
 
 SCHEMA
 Always respond with a JSON array, one object per pair:

@@ -373,14 +373,14 @@ async def run_dedup_cycle(
         for chunk in _chunks(pending, dedup_batch):
             if dedup_batch == 1:
                 ea, eb, _ = chunk[0]
-                verdict = await _dedup_pair(conn, write_lock, llm, ea, eb, agent_logger)
+                verdict = await _dedup_pair(conn, write_lock, llm, ea, eb, agent_logger, edges_by_uuid=edges_by_uuid)
                 if verdict == "distinct":
                     _add_to_cache(workspace_path, ea["e.uuid"], eb["e.uuid"])
                     distinct_cache.add(frozenset([ea["e.uuid"], eb["e.uuid"]]))
             else:
                 pairs = [(ea, eb) for ea, eb, _ in chunk]
                 try:
-                    results = await _dedup_batch(conn, write_lock, llm, pairs, agent_logger)
+                    results = await _dedup_batch(conn, write_lock, llm, pairs, agent_logger, edges_by_uuid=edges_by_uuid)
                 except Exception:
                     logger.warning(
                         "[memory/librarian] dedup: batch of %d failed, retrying individually", len(pairs)
@@ -388,7 +388,8 @@ async def run_dedup_cycle(
                     results = []
                     for ea, eb in pairs:
                         verdict = await _dedup_pair(
-                            conn, write_lock, llm, ea, eb, agent_logger, cache_on_fail=False
+                            conn, write_lock, llm, ea, eb, agent_logger,
+                            edges_by_uuid=edges_by_uuid, cache_on_fail=False
                         )
                         results.append((frozenset([ea["e.uuid"], eb["e.uuid"]]), verdict, False))
 
@@ -415,15 +416,24 @@ async def _dedup_pair(
     ea: dict,
     eb: dict,
     agent_logger: logging.Logger,
+    edges_by_uuid: dict[str, list[dict]] | None = None,
     cache_on_fail: bool = True,
 ) -> str:
     from TinyCTX.ai import TextDelta
 
+    def _fmt_edges(uid: str) -> str:
+        edges = (edges_by_uuid or {}).get(uid, [])
+        if not edges:
+            return "(none)"
+        return ", ".join(f"-[{e['relation']}]-> {e['target_name']}" for e in edges)
+
     prompt = _prompt("dedup_user.txt").format(
         uuid_a=ea["e.uuid"], name_a=ea["e.name"],
         type_a=ea["e.entity_type"], desc_a=ea["e.description"],
+        edges_a=_fmt_edges(ea["e.uuid"]),
         uuid_b=eb["e.uuid"], name_b=eb["e.name"],
         type_b=eb["e.entity_type"], desc_b=eb["e.description"],
+        edges_b=_fmt_edges(eb["e.uuid"]),
     )
 
     response_text = ""
@@ -473,17 +483,26 @@ async def _dedup_batch(
     llm,
     pairs: list[tuple[dict, dict]],
     agent_logger: logging.Logger,
+    edges_by_uuid: dict[str, list[dict]] | None = None,
 ) -> list[tuple[frozenset, str, bool]]:
     from TinyCTX.ai import TextDelta
+
+    def _fmt_edges(uid: str) -> str:
+        edges = (edges_by_uuid or {}).get(uid, [])
+        if not edges:
+            return "(none)"
+        return ", ".join(f"-[{e['relation']}]-> {e['target_name']}" for e in edges)
 
     pair_lines = []
     for idx, (ea, eb) in enumerate(pairs):
         pair_lines.append(
             f"[{idx}]\n"
             f"  Node A: uuid={ea['e.uuid']}  name={ea['e.name']}  "
-            f"type={ea['e.entity_type']}  description={ea['e.description']}\n"
+            f"type={ea['e.entity_type']}  description={ea['e.description']}  "
+            f"relationships={_fmt_edges(ea['e.uuid'])}\n"
             f"  Node B: uuid={eb['e.uuid']}  name={eb['e.name']}  "
-            f"type={eb['e.entity_type']}  description={eb['e.description']}"
+            f"type={eb['e.entity_type']}  description={eb['e.description']}  "
+            f"relationships={_fmt_edges(eb['e.uuid'])}"
         )
 
     prompt = _prompt("dedup_batch_user.txt").format(
