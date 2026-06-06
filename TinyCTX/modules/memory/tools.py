@@ -1,4 +1,4 @@
-"""
+﻿"""
 modules/memory/tools.py
 
 Memory tool functions for the knowledge graph.
@@ -14,18 +14,30 @@ from TinyCTX.modules.memory.graph import new_uuid, now_ts, top_k_cosine
 
 logger = logging.getLogger(__name__)
 
-_conn:       Any = None
-_write_lock: Any = None
-_graph_db:   Any = None
-_embedder:   Any = None
+_conn:           Any = None
+_write_lock:     Any = None
+_graph_db:       Any = None
+_embedder:       Any = None
+_query_template: str = "{text}"
+_doc_template:   str = "{text}"
 
 
-def init(conn, write_lock: asyncio.Lock, graph_db, embedder):
-    global _conn, _write_lock, _graph_db, _embedder
-    _conn       = conn
-    _write_lock = write_lock
-    _graph_db   = graph_db
-    _embedder   = embedder
+def init(
+    conn,
+    write_lock: asyncio.Lock,
+    graph_db,
+    embedder,
+    *,
+    query_template: str = "{text}",
+    doc_template: str = "{text}",
+):
+    global _conn, _write_lock, _graph_db, _embedder, _query_template, _doc_template
+    _conn             = conn
+    _write_lock       = write_lock
+    _graph_db         = graph_db
+    _embedder         = embedder
+    _query_template   = query_template
+    _doc_template     = doc_template
 
 
 # ---------------------------------------------------------------------------
@@ -48,7 +60,8 @@ async def kg_add_entity(
     entity_type: str,
     description: str,
     priority: int = 40,
-    pinned: bool = False,
+    pinned: str = "",
+    pinned_target: str = "",
 ) -> str:
     """
     Add a new knowledge graph entity. Returns an error if an entity with the
@@ -60,7 +73,11 @@ async def kg_add_entity(
             Location, Organization, Project, Technology, Rule, Directive, Role.
         description: 1-3 sentence factual description.
         priority: 0-100 importance score (default 40).
-        pinned: If true, inject into every system prompt.
+        pinned: Pin scope — "global" (always inject into system prompt) or
+            "user" (inject only when pinned_target user is active). Leave empty
+            to not pin.
+        pinned_target: TinyCTX username of the user to target. Only used when
+            pinned="user".
     """
     now = now_ts()
     r = await _conn.execute(
@@ -69,18 +86,47 @@ async def kg_add_entity(
     )
     if r.has_next():
         uid = r.get_next()[0]
+        # Return the entity's current state so the agent can decide whether to
+        # call kg_update_entity without a redundant kg_get_entity round-trip.
+        existing = _graph_db.get_entity(uid)
+        if existing:
+            ex_desc   = existing.get("e.description", "")
+            ex_pri    = existing.get("e.priority", "?")
+            ex_pin    = existing.get("e.pinned_target")
+            pin_note  = f"  [pinned:{ex_pin}]" if ex_pin else ""
+            lines     = [
+                f"Error: {entity_type} '{name}' already exists (UUID: {uid}).{pin_note}",
+                f"  Description: {ex_desc}",
+                f"  Priority: {ex_pri}",
+            ]
+            for edge in existing.get("edges_out", []):
+                w    = edge.get("weight", "")
+                note = f" — {edge['description']}" if edge.get("description") else ""
+                lines.append(f"  ->[{edge['relation']}]-> {edge['target_name']} (UUID: {edge['target_uuid']}) (w={w}){note}")
+            for edge in existing.get("edges_in", []):
+                w    = edge.get("weight", "")
+                note = f" — {edge['description']}" if edge.get("description") else ""
+                lines.append(f"  <-[{edge['relation']}]<- {edge['source_name']} (UUID: {edge['source_uuid']}) (w={w}){note}")
+            lines.append("Use kg_update_entity to modify it.")
+            return "\n".join(lines)
         return (
             f"Error: {entity_type} '{name}' already exists (UUID: {uid}). "
             f"Use kg_update_entity to modify it."
         )
 
     uid = new_uuid()
+    # Resolve stored pinned_target value
+    stored_pin = None
+    if pinned == "global":
+        stored_pin = "global"
+    elif pinned == "user" and pinned_target.strip():
+        stored_pin = pinned_target.strip()
     async with _write_lock:
         await _conn.execute("CREATE (e:Entity {uuid: $uid})", parameters={"uid": uid})
         await _aset(uid, "name",          name)
         await _aset(uid, "entity_type",   entity_type)
         await _aset(uid, "description",   description)
-        await _aset(uid, "pinned",        pinned)
+        await _aset(uid, "pinned_target", stored_pin)
         await _aset(uid, "priority",      priority)
         await _aset(uid, "mention_count", 0)
         await _aset(uid, "created_at",    now)
@@ -88,7 +134,7 @@ async def kg_add_entity(
         await _aset(uid, "embed_model",   "")
         await _aset(uid, "embed_content", "")
         await _aset(uid, "embed_hash",    "")
-    pin_note = "  [pinned]" if pinned else ""
+    pin_note = f"  [pinned:{stored_pin}]" if stored_pin else ""
     return (
         f"Added {entity_type} '{name}' (UUID: {uid}){pin_note}\n"
         f"  Description: {description}\n"
@@ -100,7 +146,8 @@ async def kg_update_entity(
     uuid: str,
     description: str | None = None,
     priority: int | None = None,
-    pinned: bool | None = None,
+    pinned: str | None = None,
+    pinned_target: str = "",
 ) -> str:
     """
     Update fields on an existing entity. Only provided fields are changed.
@@ -109,7 +156,9 @@ async def kg_update_entity(
         uuid: The entity UUID.
         description: New description (optional).
         priority: New priority value (optional).
-        pinned: New pinned flag (optional).
+        pinned: Pin scope — "global", "user", or "" to clear pinning. Pass
+            None to leave pinning unchanged.
+        pinned_target: TinyCTX username to target. Only used when pinned="user".
     """
     if description is None and priority is None and pinned is None:
         return f"No fields to update — nothing changed for UUID {uuid}."
@@ -122,7 +171,7 @@ async def kg_update_entity(
     etype    = entity.get("e.entity_type", "Entity")
     old_desc = entity.get("e.description", "") or ""
     old_pri  = entity.get("e.priority")
-    old_pin  = entity.get("e.pinned")
+    old_pin  = entity.get("e.pinned_target")
 
     now = now_ts()
     async with _write_lock:
@@ -132,7 +181,13 @@ async def kg_update_entity(
         if priority is not None:
             await _aset(uuid, "priority", priority)
         if pinned is not None:
-            await _aset(uuid, "pinned", pinned)
+            if pinned == "global":
+                new_pin = "global"
+            elif pinned == "user" and pinned_target.strip():
+                new_pin = pinned_target.strip()
+            else:  # "" or anything else clears pinning
+                new_pin = None
+            await _aset(uuid, "pinned_target", new_pin)
         await _aset(uuid, "updated_at", now)
 
     lines = [f"Updated {etype} '{name}' (UUID: {uuid})"]
@@ -145,7 +200,9 @@ async def kg_update_entity(
     if priority is not None:
         lines.append(f"  Priority: {old_pri} → {priority}")
     if pinned is not None:
-        lines.append(f"  Pinned: {old_pin} → {pinned}")
+        new_pin_display = new_pin or "(not pinned)"
+        old_pin_display = old_pin or "(not pinned)"
+        lines.append(f"  Pinned: {old_pin_display} → {new_pin_display}")
     return "\n".join(lines)
 
 
@@ -158,6 +215,8 @@ async def kg_add_relationship(
 ) -> str:
     """
     Add a directed relationship between two entities.
+    No-op if an active edge with the same relation already exists between
+    these two entities — returns the existing edge instead.
 
     Args:
         source_uuid: UUID of the source entity.
@@ -171,8 +230,26 @@ async def kg_add_relationship(
     src_name   = src_entity["name"] if src_entity else source_uuid
     tgt_name   = tgt_entity["name"] if tgt_entity else target_uuid
 
+    rel = relation.upper().replace("'", "")
+
+    # Check for existing active edge with the same relation type.
+    existing = await _conn.execute(
+        f"MATCH (a:Entity)-[r:Relation]->(b:Entity) "
+        f"WHERE a.uuid = $src AND b.uuid = $tgt "
+        f"AND r.relation = '{rel}' AND r.superseded_at IS NULL "
+        f"RETURN r.weight, r.description LIMIT 1",
+        parameters={"src": source_uuid, "tgt": target_uuid},
+    )
+    if existing.has_next():
+        row = existing.get_next()
+        ex_w, ex_desc = row[0], row[1]
+        ex_note = f" — {ex_desc}" if ex_desc else ""
+        return (
+            f"Relationship already exists: '{src_name}' -[{rel}]-> '{tgt_name}' "
+            f"(w={ex_w}){ex_note}. Use kg_delete_relationship then kg_add_relationship to replace it."
+        )
+
     now  = now_ts()
-    rel  = relation.upper().replace("'", "")
     desc = description.replace("'", "''")
     async with _write_lock:
         await _conn.execute(
@@ -246,10 +323,15 @@ async def kg_search(query: str, top_k: int = 5, semantic: bool = True) -> str:
         semantic: If true (default), use vector similarity search.
             If false or no embedding model configured, uses keyword search.
     """
+    # Check for an exact name match — pin it to the top but continue searching.
+    exact_matches = _graph_db.find_entity(name=query)
+    exact = next((e for e in exact_matches if e["name"].lower() == query.lower()), None)
+    exact_uid = exact["uuid"] if exact else None
+
     query_vec = None
     if semantic and _embedder is not None:
         try:
-            query_vec = await _embedder.embed_one(query)
+            query_vec = await _embedder.embed_one(_query_template.format(text=query))
         except Exception as exc:
             logger.warning("[memory] kg_search embed failed: %s -- falling back to keyword", exc)
 
@@ -258,6 +340,10 @@ async def kg_search(query: str, top_k: int = 5, semantic: bool = True) -> str:
         uids     = [uid for uid, _ in top_k_cosine(query_vec, all_embs, top_k)]
     else:
         uids = [r["uuid"] for r in _graph_db.find_entity(name=query)[:top_k]]
+
+    # Prepend exact match (if any) and deduplicate, preserving order.
+    if exact_uid:
+        uids = [exact_uid] + [u for u in uids if u != exact_uid]
 
     if not uids:
         return "No matching entities found."
@@ -273,8 +359,10 @@ async def kg_search(query: str, top_k: int = 5, semantic: bool = True) -> str:
         etype = entity.get("e.entity_type", "?")
         desc  = entity.get("e.description", "")
         pri   = entity.get("e.priority", "?")
-        pin   = "  [pinned]" if entity.get("e.pinned") else ""
-        lines.append(f"[{etype}] {name} (UUID: {uid}){pin}  priority: {pri}")
+        pin   = entity.get("e.pinned_target")
+        pin_note = f"  [pinned:{pin}]" if pin else ""
+        exact_note = "  [exact match]" if uid == exact_uid else ""
+        lines.append(f"[{etype}] {name} (UUID: {uid}){pin_note}  priority: {pri}{exact_note}")
         if desc:
             lines.append(f"  {desc}")
         for edge in entity.get("edges_out", []):
@@ -318,29 +406,19 @@ async def kg_traverse(uuid: str, hops: int = 1, relation_filter: str = "") -> st
     return "\n".join(lines)
 
 
-async def kg_get_entity(uuid: str) -> str:
-    """
-    Retrieve full details of a knowledge graph entity including all
-    active incoming and outgoing relationships.
-
-    Args:
-        uuid: The entity UUID to retrieve.
-    """
-    entity = _graph_db.get_entity(uuid)
-    if not entity:
-        return f"Entity UUID {uuid} not found."
-
+def _format_entity(uuid: str, entity: dict) -> str:
+    """Shared formatter for kg_get_entity output."""
     name  = entity.get("e.name", "?")
     etype = entity.get("e.entity_type", "?")
     desc  = entity.get("e.description", "")
-    pin   = entity.get("e.pinned")
-    pri   = entity.get("e.priority")
-    mens  = entity.get("e.mention_count")
-
+    pin   = entity.get("e.pinned_target")
+    pri   = entity.get("e.priority", "?")
+    mens  = entity.get("e.mention_count", 0)
+    pin_note = f"[pinned:{pin}]" if pin else ""
     lines = [
         f"[{etype}] {name}",
         f"  UUID:        {uuid}",
-        f"  Pinned:      {pin}  |  Priority: {pri}  |  Mentions: {mens}",
+        f"  Pinned:      {pin_note or '(not pinned)'}  |  Priority: {pri}  |  Mentions: {mens}",
         f"  Description: {desc}",
     ]
     out_edges = entity.get("edges_out", [])
@@ -358,6 +436,39 @@ async def kg_get_entity(uuid: str) -> str:
     if not out_edges and not in_edges:
         lines.append("  No relationships.")
     return "\n".join(lines)
+
+
+async def kg_get_entity(uuid_or_name: str) -> str:
+    """
+    Retrieve full details of a knowledge graph entity including all
+    active incoming and outgoing relationships.
+
+    Args:
+        uuid_or_name: The entity UUID or exact entity name to retrieve.
+    """
+    # Try UUID lookup first.
+    entity = _graph_db.get_entity(uuid_or_name)
+    if entity:
+        return _format_entity(uuid_or_name, entity)
+
+    # Fall back to name lookup.
+    matches = _graph_db.find_entity(name=uuid_or_name)
+    exact   = next((e for e in matches if e["name"].lower() == uuid_or_name.lower()), None)
+    if exact:
+        entity = _graph_db.get_entity(exact["uuid"])
+        if entity:
+            return _format_entity(exact["uuid"], entity)
+
+    # Ambiguous partial matches — list them so the caller can retry with a UUID.
+    if matches:
+        lines = [f"No exact match for '{uuid_or_name}'. Did you mean:"]
+        for m in matches[:5]:
+            lines.append(f"  [{m['entity_type']}] {m['name']} (UUID: {m['uuid']})")
+        return "\n".join(lines)
+
+    return f"Entity '{uuid_or_name}' not found."
+
+
 
 
 async def kg_list(entity_type: str = "", pinned_only: bool = False) -> str:
@@ -381,7 +492,7 @@ async def kg_list(entity_type: str = "", pinned_only: bool = False) -> str:
 
     lines = []
     for e in entities:
-        pin = "  [pinned]" if e.get("pinned") else ""
+        pin = f"  [pinned:{e.get('pinned_target')}]" if e.get("pinned_target") else ""
         lines.append(
             f"[{e['entity_type']}] {e['name']} (UUID: {e['uuid']}){pin}  priority: {e['priority']}\n"
             f"  {e['description']}"

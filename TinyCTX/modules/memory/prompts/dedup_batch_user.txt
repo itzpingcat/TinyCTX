@@ -1,0 +1,5 @@
+﻿Compare the following {pair_count} node pairs. For each, decide if they are the same real-world entity.
+
+{pairs_block}
+
+Respond with the batch JSON schema — exactly {pair_count} objects, one per pair index.

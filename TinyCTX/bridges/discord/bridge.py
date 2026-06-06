@@ -4,7 +4,7 @@ bridges/discord/bridge.py — DiscordBridge: event routing, access control,
 
 This is the central class. Responsibilities kept here:
   - discord.py client setup and event registration
-  - Access-control checks (allowed_users_dm, allowed_servers, admin_users)
+  - Access-control checks (allowed_servers, permission levels via user registry)
   - on_message routing (DM / group channel / thread)
   - Attachment + forwarded-message extraction
   - Cursor read/create/advance wrappers
@@ -56,10 +56,10 @@ logger = logging.getLogger(__name__)
 
 DEFAULTS = {
     "token_env": "DISCORD_BOT_TOKEN",
-    "allowed_users_dm": [],
     "allowed_servers": {},
-    "admin_users": [],
     "dm_enabled": True,
+    "dm_requires_permission": 75,       # minimum user registry level to use the bot in DMs
+    "reset_requires_permission": 75,    # minimum user registry level to /reset in a server
     "prefix_required": True,
     "command_prefix": "!",
     "reset_command": "/reset",
@@ -73,6 +73,13 @@ DEFAULTS = {
     "typing_on_tools": True,
     "typing_on_reply": True,
 }
+
+# Message types Discord fires for thread creation / system events — these are
+# not real user messages and must never be fed into the agent as context.
+_THREAD_SYSTEM_TYPES: frozenset[discord.MessageType] = frozenset({
+    discord.MessageType.thread_created,
+    discord.MessageType.thread_starter_message,
+})
 
 
 # ---------------------------------------------------------------------------
@@ -103,9 +110,6 @@ class DiscordBridge:
         self._buffer_timeout_s:  float = float(self._opts["buffer_timeout_s"])
         self._buffer_head_lines: int   = int(self._opts["buffer_head_lines"])
         self._buffer_tail_lines: int   = int(self._opts["buffer_tail_lines"])
-
-        self._allowed_users_dm: set[int] = {int(u) for u in self._opts["allowed_users_dm"]}
-        self._admin_users:      set[int] = {int(u) for u in self._opts["admin_users"]}
 
         # In-flight state (not persisted)
         self._typing_active:    dict[str, asyncio.Event]          = {}
@@ -141,8 +145,12 @@ class DiscordBridge:
         async def on_message(message: discord.Message) -> None:
             await _bridge._on_message(message)
 
+        async def on_thread_create(thread: discord.Thread) -> None:
+            await _bridge._on_thread_create(thread)
+
         self._client.event(on_ready)
         self._client.event(on_message)
+        self._client.event(on_thread_create)
 
         # Stale-interaction error handler
         @self._tree.error
@@ -219,21 +227,19 @@ class DiscordBridge:
     # Permission helpers
     # ------------------------------------------------------------------
 
-    def _resolve_permission_level(self, member_roles: list | None) -> int:
-        role_map = self._opts.get("role_permissions", {})
-        default  = int(self._opts.get("default_permission", 25))
-        if not member_roles or not role_map:
-            return default
-        int_map = {int(k): int(v) for k, v in role_map.items()}
-        for role in sorted(member_roles, key=lambda r: r.position, reverse=True):
-            if role.id in int_map:
-                return int_map[role.id]
-        return default
+    def _user_permission_level(self, platform_user_id: int) -> int:
+        """Look up the TinyCTX user registry level for a Discord user id."""
+        user = self._runtime.users.resolve_user(
+            platform=Platform.DISCORD,
+            user_id=str(platform_user_id),
+            username="",
+            display_name="",
+        )
+        return user.permission_level
 
     def _is_allowed_dm(self, user_id: int) -> bool:
-        if not self._allowed_users_dm:
-            return True
-        return user_id in self._allowed_users_dm
+        required = int(self._opts["dm_requires_permission"])
+        return self._user_permission_level(user_id) >= required
 
     def _is_allowed_server(self, guild_id: int, channel_id: int) -> bool:
         if guild_id not in self._allowed_servers:
@@ -241,8 +247,9 @@ class DiscordBridge:
         allowed_channels = self._allowed_servers[guild_id]
         return not allowed_channels or channel_id in allowed_channels
 
-    def _is_admin(self, user_id: int) -> bool:
-        return user_id in self._admin_users
+    def _can_reset(self, user_id: int) -> bool:
+        required = int(self._opts["reset_requires_permission"])
+        return self._user_permission_level(user_id) >= required
 
     def _is_group_trigger(self, text: str) -> bool:
         if not self._prefix_required:
@@ -340,22 +347,78 @@ class DiscordBridge:
             self._client.user,
             self._client.user.id if self._client.user else "?",
         )
-        if not self._allowed_users_dm:
-            logger.warning(
-                "Discord bridge: allowed_users_dm is empty — the bot will respond "
-                "to DMs from anyone."
-            )
         if not self._allowed_servers:
             logger.warning(
                 "Discord bridge: allowed_servers is empty — the bot will not respond "
                 "in any server."
             )
-        if not self._admin_users:
-            logger.warning(
-                "Discord bridge: admin_users is empty — nobody can use /%s in group sessions.",
-                self._reset_command.lstrip("/"),
-            )
         await _cmd_module.sync_app_commands(self)
+
+    async def _on_thread_create(self, thread: discord.Thread) -> None:
+        """
+        Fired by Discord the moment a thread is created.  We use this to pin
+        the thread's starting cursor to the exact node produced by the message
+        the thread was branched from, so the agent sees channel context up to
+        that point — no more, no less.
+
+        Resolution order:
+          1. thread.starter_message  — available when the thread was created
+             from a specific message and that message is still cached.
+          2. fetch the starter message via the API if not cached.
+          3. Fall back to the channel's current tail if the starter message
+             can't be resolved (e.g. threads created without a starter message).
+        """
+        thread_id  = str(thread.id)
+        cursor_key = f"thread:{thread_id}"
+
+        # Already initialised (shouldn't happen, but be safe).
+        if self._store.get(cursor_key):
+            return
+
+        channel_id = str(thread.parent_id) if thread.parent_id else ""
+
+        # Try to get the starter message id.
+        starter_msg_id: str | None = None
+
+        starter = getattr(thread, "starter_message", None)
+        if starter is not None:
+            starter_msg_id = str(starter.id)
+        elif thread.parent_id:
+            # starter_message is only populated when cached; try fetching it.
+            try:
+                parent = self._client.get_channel(thread.parent_id)
+                if parent is None:
+                    parent = await self._client.fetch_channel(thread.parent_id)
+                # For message threads, thread.id == starter message.id
+                fetched = await parent.fetch_message(thread.id)
+                starter_msg_id = str(fetched.id)
+            except Exception:
+                logger.debug(
+                    "Discord: could not fetch starter message for thread %s", thread_id
+                )
+
+        # Look up the node we recorded when that message was pushed.
+        fork_node: str | None = None
+        if starter_msg_id:
+            fork_node = self._store.get_msg_node(starter_msg_id)
+
+        # Fall back to the channel tail if we couldn't resolve the exact node.
+        if fork_node is None and channel_id:
+            fork_node = self._store.get(f"group:{channel_id}")
+
+        if fork_node is None:
+            fork_node = make_session_node(self._runtime.db, cursor_key)
+            logger.info(
+                "Discord: thread %s — no fork point found, fresh branch %s",
+                thread_id, fork_node,
+            )
+        else:
+            logger.info(
+                "Discord: thread %s forked from node %s (starter_msg=%s)",
+                thread_id, fork_node, starter_msg_id,
+            )
+
+        self._store.set(cursor_key, fork_node)
 
     async def _on_message(self, message: discord.Message) -> None:
         if message.author.bot and (
@@ -366,6 +429,12 @@ class DiscordBridge:
 
         # ── Thread ───────────────────────────────────────────────────
         if isinstance(message.channel, discord.Thread):
+            # Discord fires on_message for thread-creation system events
+            # (thread_created, thread_starter_message) whose .content is the
+            # thread name — not a real user message.  Drop them here so the
+            # thread name never lands in the agent's context as a user turn.
+            if message.type in _THREAD_SYSTEM_TYPES:
+                return
             await self._handle_thread_message(message)
             return
 
@@ -533,6 +602,8 @@ class DiscordBridge:
                             dataclasses.replace(msg_, tail_node_id=node_id)
                         )
                         self._advance_cursor(ck, new_node_id)
+                        if msg_.message_id:
+                            self._store.set_msg_node(msg_.message_id, new_node_id)
 
             task = asyncio.create_task(_delayed())
             self._tasks.add(task)
@@ -547,6 +618,8 @@ class DiscordBridge:
                     dataclasses.replace(msg, tail_node_id=node_id)
                 )
                 self._advance_cursor(cursor_key, new_node_id)
+                if msg.message_id:
+                    self._store.set_msg_node(msg.message_id, new_node_id)
             return
 
         task = asyncio.create_task(
@@ -564,6 +637,11 @@ class DiscordBridge:
             self._client.user is None
             or message.author.id == self._client.user.id
         ):
+            return
+
+        # Secondary guard: drop any remaining system message types that
+        # might slip through (e.g. future Discord additions).
+        if message.type in _THREAD_SYSTEM_TYPES:
             return
 
         thread     = message.channel

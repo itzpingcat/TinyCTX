@@ -29,12 +29,15 @@ async callables:
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Awaitable
 
 logger = logging.getLogger(__name__)
 
 Handler = Callable[[list[str], dict], Awaitable[None]]
+
+# Param spec: (name, python_type, description)
+ParamSpec = list[tuple[str, type, str]]
 
 
 @dataclass
@@ -43,6 +46,7 @@ class _Entry:
     sub:       str        # "" for bare /namespace
     handler:   Handler
     help:      str = ""
+    params:    ParamSpec = field(default_factory=list)
 
 
 class CommandRegistry:
@@ -60,6 +64,7 @@ class CommandRegistry:
         handler: Handler,
         *,
         help: str = "",
+        params: ParamSpec | None = None,
     ) -> None:
         """
         Register a command handler.
@@ -69,13 +74,22 @@ class CommandRegistry:
                       Use "" to handle bare `/namespace` with no subcommand.
         handler     — async callable(args: list[str], context: dict) -> None
         help        — one-line description shown by /help
+        params      — optional list of (name, type, description) tuples.
+                      Bridges use this to build typed native commands (e.g.
+                      Discord slash command parameters). Types should be
+                      str or int. If omitted, the command takes no parameters
+                      on native bridges.
         """
         namespace = namespace.lower().strip()
         sub       = sub.lower().strip()
-        # Replace any existing entry with the same (namespace, sub) so that
-        # open_lane() calls after /reset don't accumulate duplicates.
         self._entries = [e for e in self._entries if not (e.namespace == namespace and e.sub == sub)]
-        self._entries.append(_Entry(namespace=namespace, sub=sub, handler=handler, help=help))
+        self._entries.append(_Entry(
+            namespace=namespace,
+            sub=sub,
+            handler=handler,
+            help=help,
+            params=params or [],
+        ))
         logger.debug(
             "[commands] registered /%s%s",
             namespace, f" {sub}" if sub else "",
@@ -142,3 +156,7 @@ class CommandRegistry:
             cmd = f"/{e.namespace}" + (f" {e.sub}" if e.sub else "")
             rows.append((cmd, e.help))
         return sorted(rows, key=lambda r: r[0])
+
+    def entries(self) -> list[_Entry]:
+        """Return all registered entries (for bridges that need full metadata)."""
+        return list(self._entries)

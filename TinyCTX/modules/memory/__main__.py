@@ -1,4 +1,4 @@
-"""
+﻿"""
 modules/memory/__main__.py
 
 Registers the memory module.
@@ -71,6 +71,33 @@ _graph_db:       object | None = None
 _tools:          "ModuleType | None" = None
 _pinned_prio:    int = 5
 _token_budget:   int = 4096
+_pinned_user_scan: int = 3
+_graph_embedder: object | None = None  # embedder for dedup; falls back to search embedder
+
+
+# ---------------------------------------------------------------------------
+# _YieldingLLM — pauses background LLM calls while user cycles are active
+# ---------------------------------------------------------------------------
+
+class _YieldingLLM:
+    """
+    Thin wrapper around LLM that waits for user cycles to finish before
+    each streaming request. Prevents background consolidation from
+    competing with real messages mid-generation.
+    """
+
+    def __init__(self, llm, is_busy_fn):
+        self._llm = llm
+        self._is_busy = is_busy_fn  # callable() -> bool
+
+    async def stream(self, messages, tools=None):
+        while self._is_busy():
+            await asyncio.sleep(1)
+        async for event in self._llm.stream(messages, tools):
+            yield event
+
+    def __getattr__(self, name):
+        return getattr(self._llm, name)
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +121,8 @@ class LibrarianRunner:
         conv_db,
         llm,
         embedder,
+        graph_embedder=None,
+        runtime=None,
     ) -> None:
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -103,9 +132,15 @@ class LibrarianRunner:
         self._write_conn = graph_database.new_async_write_conn()
         self._write_lock = asyncio.Lock()
 
-        self._conv_db  = conv_db
-        self._llm      = llm
-        self._embedder = embedder
+        self._conv_db       = conv_db
+        self._embedder      = embedder
+        self._runtime       = runtime  # used to yield to user-facing cycles
+        # graph_embedder is used exclusively for dedup similarity.
+        # Falls back to the regular search embedder when None.
+        self._graph_embedder = graph_embedder if graph_embedder is not None else embedder
+
+        # Wrap the LLM so background calls pause while user cycles are active.
+        self._llm = _YieldingLLM(llm, self._user_cycles_active)
 
         # Dedicated file logger for all librarian agent text output
         self.agent_logger = logging.getLogger("memory.librarian.agent")
@@ -182,11 +217,16 @@ class LibrarianRunner:
         """
         self._graph_database.checkpoint()
 
+    def _user_cycles_active(self) -> bool:
+        """True when at least one user-facing AgentCycle is running."""
+        return self._runtime is not None and self._runtime._active > 0
+
     async def _poll_cycle(self) -> None:
         from TinyCTX.modules.memory.librarian_agents import (
             run_buffer_agent, run_targeted_agent, run_dedup_cycle,
             nodes_to_text,
         )
+        from TinyCTX.modules.memory.dedup_agents import run_edge_dedup
 
         # Reap finished tasks
         done = {t for t in self._active_tasks if t.done()}
@@ -248,10 +288,13 @@ class LibrarianRunner:
                 elif tail_id:
                     logger.warning("[memory/librarian] concurrency cap reached, dropping branch msg for %s", tail_id[:8])
 
-        # Node walk on schedule
+        # Node walk on schedule — skip when user cycles are active
         now = time.time()
         interval_secs = float(self._cfg.get("trigger_interval_hours", 6)) * 3600
-        if (now - self._state["last_poll_ts"]) >= interval_secs:
+        if (
+            not self._user_cycles_active()
+            and (now - self._state["last_poll_ts"]) >= interval_secs
+        ):
             self._state["last_poll_ts"] = now
 
             async with self._write_lock:
@@ -279,27 +322,44 @@ class LibrarianRunner:
                 self._active_tasks.add(t)
                 logger.info("[memory/librarian] dispatched agent for %d node(s)", len(flagged_ids))
 
-        # Dedup on schedule
+        # Dedup on schedule — skip when user cycles are active
         dedup_enabled  = bool(self._cfg.get("dedup_enabled", True))
         dedup_interval = float(self._cfg.get("dedup_interval_hours", 24)) * 3600
         if (
             dedup_enabled
+            and not self._user_cycles_active()
             and not self._state["dedup_running"]
             and (now - self._state["last_dedup_ts"]) >= dedup_interval
-            and self._embedder is not None
             and len(self._active_tasks) < max_concurrent
         ):
             self._state["dedup_running"] = True
             self._state["last_dedup_ts"] = now
+
+            # Edge dedup runs unconditionally — no embedder required.
             t = asyncio.create_task(
-                run_dedup_cycle(
-                    self._cfg, self._write_conn, self._write_lock,
-                    self._llm, self._embedder, self.agent_logger,
+                run_edge_dedup(
+                    self._write_conn, self._write_lock, self.agent_logger,
                 )
             )
-            t.add_done_callback(lambda _: self._state.__setitem__("dedup_running", False))
             t.add_done_callback(self._checkpoint_callback)
             self._active_tasks.add(t)
+
+            # Entity dedup requires an embedder.
+            if (
+                self._embedder is not None
+                and len(self._active_tasks) < max_concurrent
+            ):
+                t = asyncio.create_task(
+                    run_dedup_cycle(
+                        self._cfg, _workspace, self._write_conn, self._write_lock,
+                        self._llm, self._graph_embedder, self.agent_logger,
+                    )
+                )
+                t.add_done_callback(lambda _: self._state.__setitem__("dedup_running", False))
+                t.add_done_callback(self._checkpoint_callback)
+                self._active_tasks.add(t)
+            else:
+                self._state["dedup_running"] = False
 
 
 # ---------------------------------------------------------------------------
@@ -377,7 +437,7 @@ def _count_entry_tokens(entry) -> int:
 # ---------------------------------------------------------------------------
 
 def register_runtime(runtime) -> None:
-    global _graph_database, _runner, _workspace, _graph_db, _tools, _pinned_prio, _token_budget
+    global _graph_database, _runner, _workspace, _graph_db, _tools, _pinned_prio, _token_budget, _pinned_user_scan, _graph_embedder
 
     _workspace = Path(runtime.config.workspace.path).expanduser().resolve()
     _workspace.mkdir(parents=True, exist_ok=True)
@@ -409,6 +469,7 @@ def register_runtime(runtime) -> None:
 
     _pinned_prio  = int(cfg.get("pinned_priority", 5))
     _token_budget = int(cfg.get("memory_block_tokens", 4096))
+    _pinned_user_scan = int(cfg.get("pinned_user_scan", 3))
 
     # GraphDatabase — single owner of the ladybug.Database
     from TinyCTX.modules.memory.graph import GraphDatabase, GraphDB
@@ -428,6 +489,23 @@ def register_runtime(runtime) -> None:
                 "[memory] embedding_model '%s' not usable (%s) — semantic search disabled",
                 embedding_model, exc,
             )
+
+    # Graph embedder (dedup) — falls back to search embedder when not configured
+    graph_embedder        = None
+    graph_embedding_model = cfg.get("graph_embedding_model", "").strip()
+    if graph_embedding_model and graph_embedding_model != embedding_model:
+        try:
+            from TinyCTX.ai import Embedder
+            gemb_cfg       = runtime.config.get_embedding_model(graph_embedding_model)
+            graph_embedder = Embedder.from_config(gemb_cfg)
+            logger.info("[memory] graph embedder: %s @ %s", gemb_cfg.model, gemb_cfg.base_url)
+        except (KeyError, ValueError) as exc:
+            logger.warning(
+                "[memory] graph_embedding_model '%s' not usable (%s)"
+                " â falling back to search embedder for dedup",
+                graph_embedding_model, exc,
+            )
+    # None here means LibrarianRunner falls back to the search embedder
 
     # LLM for librarian agents
     primary_name        = runtime.config.llm.primary
@@ -453,7 +531,7 @@ def register_runtime(runtime) -> None:
     atexit.register(conv_db.close)
 
     # LibrarianRunner — gets write conn from GraphDatabase
-    _runner = LibrarianRunner(cfg, _graph_database, log_path, conv_db, llm, embedder)
+    _runner = LibrarianRunner(cfg, _graph_database, log_path, conv_db, llm, embedder, graph_embedder, runtime=runtime)
 
     # GraphDB — gets read conn from GraphDatabase
     _graph_db = GraphDB(_graph_database)
@@ -461,7 +539,11 @@ def register_runtime(runtime) -> None:
     # tools
     import TinyCTX.modules.memory.tools as tools_mod
     _tools = tools_mod
-    _tools.init(_runner._write_conn, _runner._write_lock, _graph_db, embedder)
+    _tools.init(
+        _runner._write_conn, _runner._write_lock, _graph_db, embedder,
+        query_template=cfg.get("embed_query_template", "{text}"),
+        doc_template=cfg.get("embed_document_template", "{text}"),
+    )
 
     # Shutdown: stop writer → close read conn → checkpoint + close DB.
     # Registered on atexit and both termination signals so clean exits always
@@ -509,6 +591,28 @@ def register_runtime(runtime) -> None:
         "[memory] ready — graph: %s | embedder: %s",
         graph_path, embedding_model or "none",
     )
+
+
+# ---------------------------------------------------------------------------
+# _active_users_from_dialogue — collect recent participants
+# ---------------------------------------------------------------------------
+
+def _active_users_from_dialogue(dialogue: list, scan: int) -> set[str]:
+    """
+    Walk dialogue backwards, collecting author_id from user-role entries.
+    Stop after finding `scan` distinct user messages.
+    Returns a set of TinyCTX usernames seen in those recent turns.
+    """
+    from TinyCTX.context import ROLE_USER
+    active: set[str] = set()
+    count = 0
+    for entry in reversed(dialogue):
+        if entry.role == ROLE_USER and entry.author_id:
+            active.add(entry.author_id)
+            count += 1
+            if count >= scan:
+                break
+    return active
 
 
 # ---------------------------------------------------------------------------
@@ -595,13 +699,25 @@ def register_agent(cycle) -> None:
     # Pinned entity memory block
     # ------------------------------------------------------------------
 
-    def _build_memory_block(gdb, budget: int) -> str | None:
+    def _build_memory_block(gdb, budget: int, active_users: set[str]) -> str | None:
         pinned = gdb.get_pinned_entities_full()
         if not pinned:
             return None
 
         def _get(e: dict, field: str) -> str:
             return str(e.get(f"e.{field}", e.get(field, "")) or "")
+
+        # Filter by pinned_target: global always included, user-scoped only
+        # when that username appears in the recent active_users set.
+        def _is_visible(e: dict) -> bool:
+            target = _get(e, "pinned_target")
+            if target == "global":
+                return True
+            return target in active_users
+
+        pinned = [e for e in pinned if _is_visible(e)]
+        if not pinned:
+            return None
 
         pinned_uuids: set[str] = {_get(e, "uuid") for e in pinned}
 
@@ -662,7 +778,11 @@ def register_agent(cycle) -> None:
 
     cycle.context.register_prompt(
         "memory_pinned",
-        lambda _ctx: _build_memory_block(_graph_db, _token_budget),
+        lambda _ctx: _build_memory_block(
+            _graph_db,
+            _token_budget,
+            _active_users_from_dialogue(_ctx.dialogue, _pinned_user_scan),
+        ),
         role="system",
         priority=_pinned_prio,
     )

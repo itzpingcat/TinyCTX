@@ -33,13 +33,11 @@ Available template variables (both templates):
   config_path     — resolved absolute path to config.yaml (best-effort)
   source_root     — cwd at launch time (where TinyCTX's own code lives);
                     equals workspace_path when launched from the workspace
-  is_group_chat   — True when the current lane has a GroupPolicy attached
-                    (i.e. a multi-user group channel/room). False for DMs
-                    and synthetic turns. Read from ctx.state["group_policy"].
+  is_group_chat   — True when server_name is set in session state (i.e. a
+                    group channel or thread). False for DMs and synthetic turns.
   is_dm           — Opposite of is_group_chat. True for 1:1 DM lanes.
   platform        — Bridge platform string: "discord", "matrix", "cli",
                     "api", "cron", or "" for synthetic/unknown turns.
-                    Read from ctx.state["platform"].
   trusted         — True when the current user is in the trusted_users list
                     in equipment_manifest config (format: "platform:user_id").
                     Always False for group chats — trust is DM-only.
@@ -97,11 +95,10 @@ def _build_variables(agent, ctx=None, trusted_users: frozenset = frozenset()) ->
         except Exception:
             config_path = str(raw)
 
-    is_group_chat = bool(
-        ctx is not None and ctx.state.get("group_policy") is not None
-    )
-    platform = (ctx.state.get("platform") or "") if ctx is not None else ""
-    author_id = (ctx.state.get("author_id") or "") if ctx is not None else ""
+    session = ctx.state.get("session", {}) if ctx is not None else {}
+    is_group_chat = bool(session.get("server_name"))
+    platform = session.get("platform") or ""
+    author_id = session.get("author_id") or ""
     # Trust is only meaningful in DMs — never grant it in group chats.
     trusted = (
         not is_group_chat
@@ -121,8 +118,8 @@ def _build_variables(agent, ctx=None, trusted_users: frozenset = frozenset()) ->
         "is_dm":          not is_group_chat,
         "platform":       platform,
         "trusted":        trusted,
-        "server_name":    (ctx.state.get("server_name") or "") if ctx is not None else "",
-        "channel_name":   (ctx.state.get("channel_name") or "") if ctx is not None else "",
+        "server_name":    session.get("server_name") or "",
+        "channel_name":   session.get("channel_name") or "",
     }
 
 
@@ -140,11 +137,10 @@ def _build_static_variables(agent, ctx=None, trusted_users: frozenset = frozense
             config_path = str(raw)
 
     # is_group_chat is stable for the lifetime of a lane — safe in the cached block.
-    is_group_chat = bool(
-        ctx is not None and ctx.state.get("group_policy") is not None
-    )
-    platform = (ctx.state.get("platform") or "") if ctx is not None else ""
-    author_id = (ctx.state.get("author_id") or "") if ctx is not None else ""
+    session = ctx.state.get("session", {}) if ctx is not None else {}
+    is_group_chat = bool(session.get("server_name"))
+    platform = session.get("platform") or ""
+    author_id = session.get("author_id") or ""
     trusted = (
         not is_group_chat
         and bool(platform)
@@ -162,8 +158,8 @@ def _build_static_variables(agent, ctx=None, trusted_users: frozenset = frozense
         "is_dm":          not is_group_chat,
         "platform":       platform,
         "trusted":        trusted,
-        "server_name":    (ctx.state.get("server_name") or "") if ctx is not None else "",
-        "channel_name":   (ctx.state.get("channel_name") or "") if ctx is not None else "",
+        "server_name":    session.get("server_name") or "",
+        "channel_name":   session.get("channel_name") or "",
     }
 
 

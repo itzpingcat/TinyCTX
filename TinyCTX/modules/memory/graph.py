@@ -1,4 +1,4 @@
-"""
+﻿"""
 modules/memory/graph.py
 
 LadybugDB schema initialisation, database lifetime management, and low-level
@@ -79,19 +79,23 @@ _SCHEMA_DDL = [
     # Knowledge nodes
     """
     CREATE NODE TABLE IF NOT EXISTS Entity (
-        uuid         STRING,
-        name         STRING,
-        entity_type  STRING,
-        description  STRING,
-        pinned       BOOL,
-        priority     INT64,
-        mention_count INT64,
-        created_at   DOUBLE,
-        updated_at   DOUBLE,
-        embed_model  STRING,
-        embed_content STRING,
-        embed_hash   STRING,
-        embedding    DOUBLE[],
+        uuid                STRING,
+        name                STRING,
+        entity_type         STRING,
+        description         STRING,
+        pinned_target       STRING,
+        priority            INT64,
+        mention_count       INT64,
+        created_at          DOUBLE,
+        updated_at          DOUBLE,
+        embed_model         STRING,
+        embed_content       STRING,
+        embed_hash          STRING,
+        embedding           DOUBLE[],
+        graph_embed_model   STRING,
+        graph_embed_content STRING,
+        graph_embed_hash    STRING,
+        graph_embedding     DOUBLE[],
         PRIMARY KEY (uuid)
     )
     """,
@@ -141,6 +145,86 @@ def init_schema(conn) -> None:
     logger.info("[memory/graph] schema initialised")
 
 
+
+def migrate_schema(conn) -> None:
+    """
+    Add graph_embedding and pinned_target columns to an existing Entity table.
+    Safe to call on every startup; skips columns that already exist.
+    """
+    # --- migration: graph_embedding columns ---
+    already = False
+    try:
+        r = conn.execute(
+            "MATCH (m:GraphMeta {key: \'migration_graph_embedding_v1\'}) RETURN m.val LIMIT 1"
+        )
+        already = r.has_next()
+    except Exception:
+        pass
+
+    if not already:
+        cols_to_add = [
+            ("graph_embed_model",   "STRING"),
+            ("graph_embed_content", "STRING"),
+            ("graph_embed_hash",    "STRING"),
+            ("graph_embedding",     "DOUBLE[]"),
+        ]
+        for col, dtype in cols_to_add:
+            try:
+                conn.execute(f"ALTER TABLE Entity ADD {col} {dtype}")
+                logger.info("[memory/graph] migration: added column %s %s", col, dtype)
+            except Exception as exc:
+                if "already exist" in str(exc).lower() or "duplicate" in str(exc).lower():
+                    logger.debug("[memory/graph] migration: column %s already present", col)
+                else:
+                    logger.warning("[memory/graph] migration: unexpected error adding %s: %s", col, exc)
+
+        try:
+            conn.execute(
+                "CREATE (m:GraphMeta {key: \'migration_graph_embedding_v1\', val: \'done\'})"
+            )
+        except Exception:
+            pass
+
+        logger.info("[memory/graph] migration: graph_embedding columns ready")
+
+    # --- migration: pinned_target column ---
+    already_pt = False
+    try:
+        r = conn.execute(
+            "MATCH (m:GraphMeta {key: \'migration_pinned_target_v1\'}) RETURN m.val LIMIT 1"
+        )
+        already_pt = r.has_next()
+    except Exception:
+        pass
+
+    if not already_pt:
+        try:
+            conn.execute("ALTER TABLE Entity ADD pinned_target STRING")
+            logger.info("[memory/graph] migration: added column pinned_target STRING")
+        except Exception as exc:
+            if "already exist" in str(exc).lower() or "duplicate" in str(exc).lower():
+                logger.debug("[memory/graph] migration: column pinned_target already present")
+            else:
+                logger.warning("[memory/graph] migration: unexpected error adding pinned_target: %s", exc)
+
+        # Backfill: existing pinned=true entities become pinned_target='global'
+        try:
+            conn.execute(
+                "MATCH (e:Entity) WHERE e.pinned = true SET e.pinned_target = 'global'"
+            )
+            logger.info("[memory/graph] migration: backfilled pinned_target for existing pinned entities")
+        except Exception as exc:
+            logger.warning("[memory/graph] migration: backfill failed (old pinned col may not exist): %s", exc)
+
+        try:
+            conn.execute(
+                "CREATE (m:GraphMeta {key: \'migration_pinned_target_v1\', val: \'done\'})"
+            )
+        except Exception:
+            pass
+
+        logger.info("[memory/graph] migration: pinned_target ready")
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -158,9 +242,47 @@ def embed_hash(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
-def embed_content_for(name: str, description: str) -> str:
-    """The string we embed — name + space + description."""
-    return f"{name} {description}"
+def embed_content_for(
+    name: str,
+    description: str,
+    *,
+    doc_template: str = "{text}",
+) -> str:
+    """Format name+description via doc_template (use {text} as placeholder)."""
+    body = f"{name} {description}"
+    return doc_template.format(text=body)
+
+
+def embed_content_with_edges(
+    name: str,
+    description: str,
+    edges_out: list[dict],
+    *,
+    doc_template: str = "{text}",
+) -> str:
+    """
+    Build the embedding string for a graph node, including its 1-hop outgoing
+    neighbourhood so that structurally different nodes with similar text
+    descriptions are pushed apart in embedding space.
+
+    Each active outgoing edge contributes a short natural-language phrase:
+        RELATION_TYPE -> target_name
+    becomes
+        "relation type -> target name"
+
+    The resulting string is passed through doc_template before being sent to
+    the embedding model, exactly like the plain embed_content_for path.
+    """
+    body = f"{name} {description}"
+    if edges_out:
+        edge_phrases = [
+            f"{e['relation'].replace('_', ' ').lower()} -> {e['target_name']}"
+            for e in edges_out
+            if e.get("relation") and e.get("target_name")
+        ]
+        if edge_phrases:
+            body = body + "\nEdges: " + "; ".join(edge_phrases)
+    return doc_template.format(text=body)
 
 
 # ---------------------------------------------------------------------------
@@ -293,6 +415,7 @@ class GraphDatabase:
         conn = ladybug.Connection(self._db)
         try:
             init_schema(conn)
+            migrate_schema(conn)
         finally:
             conn.close()
 
@@ -490,19 +613,13 @@ class GraphDB:
             clauses.append("e.entity_type = $et")
             params["et"] = entity_type
         if pinned_only:
-            clauses.append("e.pinned = true")
+            clauses.append("e.pinned_target IS NOT NULL")
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         r = self.safe_execute(
-            f"MATCH (e:Entity) {where} RETURN e.uuid, e.name, e.entity_type, e.description, e.pinned, e.priority ORDER BY e.priority DESC",
+            f"MATCH (e:Entity) {where} RETURN e.uuid, e.name, e.entity_type, e.description, e.pinned_target, e.priority ORDER BY e.priority DESC",
             parameters=params if params else None,
         )
-        return self._rows_to_dicts(r, ["uuid", "name", "entity_type", "description", "pinned", "priority"])
-
-    def get_pinned_entities(self) -> list[dict]:
-        r = self.safe_execute(
-            "MATCH (e:Entity) WHERE e.pinned = true RETURN e.uuid, e.name, e.entity_type, e.description ORDER BY e.priority DESC"
-        )
-        return self._rows_to_dicts(r, ["uuid", "name", "entity_type", "description"])
+        return self._rows_to_dicts(r, ["uuid", "name", "entity_type", "description", "pinned_target", "priority"])
 
     def get_pinned_entities_full(self) -> list[dict]:
         """
@@ -510,7 +627,7 @@ class GraphDB:
         ordered by priority descending. Used by the memory block assembler.
         """
         r = self.safe_execute(
-            "MATCH (e:Entity) WHERE e.pinned = true RETURN e.uuid ORDER BY e.priority DESC"
+            "MATCH (e:Entity) WHERE e.pinned_target IS NOT NULL RETURN e.uuid ORDER BY e.priority DESC"
         )
         uuids = [row[0] for row in self._drain(r)]
         results = []
@@ -574,7 +691,7 @@ class GraphDB:
         ).get_next()[0]
 
         pinned_count = self.safe_execute(
-            "MATCH (e:Entity) WHERE e.pinned = true RETURN count(e)"
+            "MATCH (e:Entity) WHERE e.pinned_target IS NOT NULL RETURN count(e)"
         ).get_next()[0]
 
         avg_priority_row = self.safe_execute(
@@ -626,6 +743,23 @@ class GraphDB:
             emb = row[1]
             if emb:
                 results.append((row[0], emb))
+        return results
+
+    def all_entities_with_graph_embeddings(self) -> list[tuple[str, list[float]]]:
+        """
+        Return [(uuid, embedding)] for dedup, preferring graph_embedding.
+        Falls back to the regular search embedding when graph_embedding is NULL.
+        """
+        r = self.safe_execute(
+            "MATCH (e:Entity) RETURN e.uuid, e.graph_embedding, e.embedding"
+        )
+        results = []
+        while r.has_next():
+            row = r.get_next()
+            uid, graph_emb, search_emb = row[0], row[1], row[2]
+            emb = graph_emb if graph_emb else search_emb
+            if emb:
+                results.append((uid, emb))
         return results
 
     def bump_mention_count(self, uids: list[str]) -> None:

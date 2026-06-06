@@ -30,7 +30,6 @@ ConversationDB(path)          — open (or create) the database
 
 Phase 2 additions
 -----------------
-  author_name      TEXT — display name of the message sender (group chats)
   attachment_paths TEXT — JSON list of workspace-relative upload paths
   state_delta      TEXT — JSON object of changed session-state keys; may
                           include "_checkpoint": true for full snapshots
@@ -70,7 +69,6 @@ class Node:
     tool_calls:       str | None
     tool_call_id:     str | None
     author_id:        str | None
-    author_name:      str | None
     attachment_paths: str | None
     state_delta:      str | None
     flags:            str = "[]"     # JSON array of flag strings
@@ -90,7 +88,6 @@ CREATE TABLE IF NOT EXISTS nodes (
     tool_calls       TEXT,
     tool_call_id     TEXT,
     author_id        TEXT,
-    author_name      TEXT,
     attachment_paths TEXT,
     state_delta      TEXT,
     flags            TEXT NOT NULL DEFAULT '[]',
@@ -109,17 +106,16 @@ CREATE TABLE IF NOT EXISTS meta (
 # Note: ALTER TABLE in SQLite does not support NOT NULL without a default, and
 # older SQLite versions reject NOT NULL in ADD COLUMN entirely. Use plain DEFAULT.
 _MIGRATIONS = [
-    "ALTER TABLE nodes ADD COLUMN author_name      TEXT",
     "ALTER TABLE nodes ADD COLUMN attachment_paths TEXT",
     "ALTER TABLE nodes ADD COLUMN state_delta      TEXT",
     "ALTER TABLE nodes ADD COLUMN flags            TEXT DEFAULT '[]'",
 ]
 
-_COLS = "id, parent_id, role, content, created_at, tool_calls, tool_call_id, author_id, author_name, attachment_paths, state_delta, flags"
+_COLS = "id, parent_id, role, content, created_at, tool_calls, tool_call_id, author_id, attachment_paths, state_delta, flags"
 
 _INSERT_NODE = f"""
 INSERT INTO nodes ({_COLS})
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 _SELECT_NODE = f"SELECT {_COLS} FROM nodes WHERE id = ?"
@@ -158,10 +154,9 @@ def _row_to_node(row: tuple) -> Node:
         tool_calls=row[5],
         tool_call_id=row[6],
         author_id=row[7],
-        author_name=row[8],
-        attachment_paths=row[9],
-        state_delta=row[10],
-        flags=row[11] if row[11] is not None else "[]",
+        attachment_paths=row[8],
+        state_delta=row[9],
+        flags=row[10] if row[10] is not None else "[]",
     )
 
 
@@ -196,7 +191,7 @@ class ConversationDB:
             root_id = str(uuid.uuid4())
             self._conn.execute(
                 _INSERT_NODE,
-                (root_id, None, "system", "", time.time(), None, None, None, None, None, None, "[]"),
+                (root_id, None, "system", "", time.time(), None, None, None, None, None, "[]"),
             )
             self._conn.execute(
                 "INSERT INTO meta (key, value) VALUES ('root_id', ?)", (root_id,)
@@ -221,7 +216,6 @@ class ConversationDB:
         tool_calls: str | None = None,
         tool_call_id: str | None = None,
         author_id: str | None = None,
-        author_name: str | None = None,
         attachment_paths: str | None = None,
         state_delta: str | None = None,
     ) -> Node:
@@ -240,7 +234,7 @@ class ConversationDB:
         self._conn.execute(
             _INSERT_NODE,
             (node_id, parent_id, role, content, now, tool_calls, tool_call_id,
-             author_id, author_name, attachment_paths, state_delta, "[]"),
+             author_id, attachment_paths, state_delta, "[]"),
         )
         self._conn.commit()
         return Node(
@@ -252,7 +246,6 @@ class ConversationDB:
             tool_calls=tool_calls,
             tool_call_id=tool_call_id,
             author_id=author_id,
-            author_name=author_name,
             attachment_paths=attachment_paths,
             state_delta=state_delta,
             flags="[]",

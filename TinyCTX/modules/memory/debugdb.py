@@ -32,7 +32,7 @@ def dump(gdb) -> None:
 
     for e in all_entities:
         uid = e["uuid"]
-        pin = " [PINNED]" if e.get("pinned") else ""
+        pin = f" [pinned:{e.get('pinned_target')}]" if e.get("pinned_target") else ""
         print(f"[{e['entity_type']}] {e['name']}{pin}")
         print(f"  uuid:     {uid}")
         print(f"  priority: {e['priority']}")

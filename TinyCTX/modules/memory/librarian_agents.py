@@ -1,8 +1,8 @@
-"""
+﻿"""
 modules/memory/librarian_agents.py
 
-Pure agent logic for the knowledge librarian: buffer ingestion, targeted
-edits, and dedup. No process management, no IPC, no event loop ownership.
+Pure agent logic for the knowledge librarian: buffer ingestion and targeted
+edits. Deduplication logic lives in dedup_agents.py.
 
 Called by LibrarianRunner (_poll_cycle) in __main__.py.
 """
@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re as _re
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -21,6 +20,10 @@ _PROMPTS_DIR = Path(__file__).parent / "prompts"
 
 def _prompt(filename: str) -> str:
     return (_PROMPTS_DIR / filename).read_text(encoding="utf-8")
+
+
+# Re-export run_dedup_cycle so callers that import it from here still work.
+from TinyCTX.modules.memory.dedup_agents import run_dedup_cycle as run_dedup_cycle  # noqa: E402
 
 
 async def get_relation_types(conn) -> str:
@@ -50,14 +53,14 @@ async def _aset(conn, uid: str, field: str, value):
 
 
 # ---------------------------------------------------------------------------
-# Conversation node → text
+# Conversation node -> text
 # ---------------------------------------------------------------------------
 
 def nodes_to_text(conv_db, node_ids: list[str], batch_size: int) -> tuple[str, str]:
     """
     Render up to batch_size nodes as '[author]: content' lines.
     Returns (batch_text, agent_name) where agent_name is the last assistant
-    author_name seen in the batch, or 'assistant' if none found.
+    author_id seen in the batch, or 'assistant' if none found.
     """
     lines: list[str] = []
     agent_name = "assistant"
@@ -65,9 +68,9 @@ def nodes_to_text(conv_db, node_ids: list[str], batch_size: int) -> tuple[str, s
         node = conv_db.get_node(node_id)
         if node is None or node.role not in ("user", "assistant"):
             continue
-        author  = node.author_name or node.author_id or node.role
-        if node.role == "assistant" and node.author_name:
-            agent_name = node.author_name
+        author = node.author_id or node.role
+        if node.role == "assistant" and node.author_id:
+            agent_name = node.author_id
         content = node.content or ""
         if content.startswith("["):
             try:
@@ -155,196 +158,6 @@ async def run_targeted_agent(
 
 
 # ---------------------------------------------------------------------------
-# Dedup cycle
-# ---------------------------------------------------------------------------
-
-async def run_dedup_cycle(
-    cfg: dict,
-    conn,
-    write_lock: asyncio.Lock,
-    llm,
-    embedder,
-    agent_logger: logging.Logger,
-) -> None:
-    logger.info("[memory/librarian] dedup cycle starting")
-    try:
-        from TinyCTX.modules.memory.graph import (
-            embed_content_for, embed_hash, cosine_similarity,
-        )
-
-        threshold = float(cfg.get("similarity_threshold", 0.85))
-
-        r = await conn.execute(
-            "MATCH (e:Entity) RETURN e.uuid, e.name, e.description, e.entity_type, "
-            "e.embed_model, e.embed_hash, e.embedding"
-        )
-        col_names = r.get_column_names()
-        entities  = []
-        while r.has_next():
-            entities.append(dict(zip(col_names, r.get_next())))
-
-        if len(entities) < 2:
-            logger.info("[memory/librarian] dedup: fewer than 2 entities, skipping")
-            return
-
-        embed_model_name = getattr(embedder, "model", "")
-        stale = []
-        for e in entities:
-            expected_hash = embed_hash(embed_content_for(e["e.name"], e["e.description"]))
-            if (
-                not e["e.embedding"]
-                or e["e.embed_model"] != embed_model_name
-                or e["e.embed_hash"] != expected_hash
-            ):
-                stale.append(e)
-
-        if stale:
-            logger.info("[memory/librarian] dedup: refreshing %d stale embedding(s)", len(stale))
-            texts   = [embed_content_for(e["e.name"], e["e.description"]) for e in stale]
-            vectors = await embedder.embed(texts)
-            async with write_lock:
-                for e, vec, txt in zip(stale, vectors, texts):
-                    h   = embed_hash(txt)
-                    uid = e["e.uuid"]
-                    await _aset(conn, uid, "embedding",    vec)
-                    await _aset(conn, uid, "embed_model",  embed_model_name)
-                    await _aset(conn, uid, "embed_content", txt)
-                    await _aset(conn, uid, "embed_hash",   h)
-                    e["e.embedding"]   = vec
-                    e["e.embed_model"] = embed_model_name
-                    e["e.embed_hash"]  = h
-
-        pairs_seen: set[frozenset] = set()
-        candidates: list[tuple[dict, dict, float]] = []
-
-        for i, ea in enumerate(entities):
-            emb_a = ea.get("e.embedding") or []
-            if not emb_a:
-                continue
-            for eb in entities[i + 1:]:
-                emb_b = eb.get("e.embedding") or []
-                if not emb_b:
-                    continue
-                pair_key = frozenset([ea["e.uuid"], eb["e.uuid"]])
-                if pair_key in pairs_seen:
-                    continue
-                pairs_seen.add(pair_key)
-                score = cosine_similarity(emb_a, emb_b)
-                if score >= threshold:
-                    candidates.append((ea, eb, score))
-
-        if not candidates:
-            logger.info("[memory/librarian] dedup: no candidate pairs above threshold %.2f", threshold)
-            return
-
-        logger.info("[memory/librarian] dedup: %d candidate pair(s) to evaluate", len(candidates))
-
-        already_aliased: set[frozenset] = set()
-        r = await conn.execute(
-            "MATCH (a:Entity)-[r:Relation]->(b:Entity) "
-            "WHERE r.relation = 'ALIASED_TO' AND r.superseded_at IS NULL "
-            "RETURN a.uuid, b.uuid"
-        )
-        while r.has_next():
-            row = r.get_next()
-            already_aliased.add(frozenset([row[0], row[1]]))
-
-        for ea, eb, _score in candidates:
-            pair_key = frozenset([ea["e.uuid"], eb["e.uuid"]])
-            if pair_key in already_aliased:
-                continue
-            await _dedup_pair(conn, write_lock, llm, ea, eb, agent_logger)
-
-        logger.info("[memory/librarian] dedup cycle complete")
-    except Exception:
-        logger.exception("[memory/librarian] dedup cycle error")
-
-
-async def _dedup_pair(conn, write_lock: asyncio.Lock, llm, ea: dict, eb: dict, agent_logger: logging.Logger) -> None:
-    from TinyCTX.modules.memory.graph import now_ts
-    from TinyCTX.ai import TextDelta
-
-    prompt = _prompt("dedup_user.txt").format(
-        uuid_a=ea["e.uuid"], name_a=ea["e.name"],
-        type_a=ea["e.entity_type"], desc_a=ea["e.description"],
-        uuid_b=eb["e.uuid"], name_b=eb["e.name"],
-        type_b=eb["e.entity_type"], desc_b=eb["e.description"],
-    )
-
-    response_text = ""
-    async for event in llm.stream([{"role": "user", "content": prompt}], tools=None):
-        if isinstance(event, TextDelta):
-            response_text += event.text
-
-    if response_text:
-        agent_logger.info("[dedup %s/%s] %s", ea["e.uuid"][:8], eb["e.uuid"][:8], response_text)
-
-    raw = _re.sub(r"^```json?\s*", "", response_text.strip())
-    raw = _re.sub(r"\s*```$", "", raw)
-
-    try:
-        verdict_data = json.loads(raw)
-    except json.JSONDecodeError:
-        logger.warning(
-            "[memory/librarian] dedup: could not parse verdict for %s/%s: %s",
-            ea["e.uuid"][:8], eb["e.uuid"][:8], raw[:200],
-        )
-        return
-
-    verdict        = verdict_data.get("verdict", "distinct")
-    canonical_uuid = verdict_data.get("canonical_uuid")
-    merged_desc    = verdict_data.get("merged_description", "")
-
-    if verdict == "distinct":
-        return
-
-    if not canonical_uuid or canonical_uuid not in {ea["e.uuid"], eb["e.uuid"]}:
-        logger.warning("[memory/librarian] dedup: invalid canonical_uuid in verdict")
-        return
-
-    dup_uuid = eb["e.uuid"] if canonical_uuid == ea["e.uuid"] else ea["e.uuid"]
-    now      = now_ts()
-
-    async with write_lock:
-        if verdict == "duplicate":
-            logger.info("[memory/librarian] dedup: merging %s → %s", dup_uuid[:8], canonical_uuid[:8])
-            await _aset(conn, canonical_uuid, "description", merged_desc)
-            await _aset(conn, canonical_uuid, "updated_at",  now)
-            await _aset(conn, canonical_uuid, "embed_hash",  "")
-            await conn.execute(
-                "MATCH (dup:Entity)-[r:Relation]->(x:Entity), (c:Entity) "
-                "WHERE dup.uuid = $dup AND r.superseded_at IS NULL "
-                "AND x.uuid <> $canon AND c.uuid = $canon "
-                "CREATE (c)-[:Relation {relation: r.relation, weight: r.weight, "
-                "description: r.description, created_at: r.created_at, superseded_at: null}]->(x)",
-                parameters={"dup": dup_uuid, "canon": canonical_uuid},
-            )
-            await conn.execute(
-                "MATCH (x:Entity)-[r:Relation]->(dup:Entity), (c:Entity) "
-                "WHERE dup.uuid = $dup AND r.superseded_at IS NULL "
-                "AND x.uuid <> $canon AND c.uuid = $canon "
-                "CREATE (x)-[:Relation {relation: r.relation, weight: r.weight, "
-                "description: r.description, created_at: r.created_at, superseded_at: null}]->(c)",
-                parameters={"dup": dup_uuid, "canon": canonical_uuid},
-            )
-            await conn.execute(
-                "MATCH (e:Entity) WHERE e.uuid = $uid DETACH DELETE e",
-                parameters={"uid": dup_uuid},
-            )
-        elif verdict == "alias":
-            logger.info("[memory/librarian] dedup: aliasing %s → %s", dup_uuid[:8], canonical_uuid[:8])
-            await _aset(conn, dup_uuid, "description", merged_desc)
-            await _aset(conn, dup_uuid, "updated_at",  now)
-            await conn.execute(
-                f"MATCH (a:Entity), (c:Entity) "
-                f"WHERE a.uuid = $alias AND c.uuid = $canon "
-                f"CREATE (a)-[:Relation {{relation: 'ALIASED_TO', weight: 1.0, "
-                f"description: 'alias', created_at: {now!r}, superseded_at: null}}]->(c)",
-                parameters={"alias": dup_uuid, "canon": canonical_uuid},
-            )
-
-
-# ---------------------------------------------------------------------------
 # Agent loop
 # ---------------------------------------------------------------------------
 
@@ -404,7 +217,7 @@ async def _agent_loop(
                 caller_level=25,
             )
             result = outcome["result"] if outcome["success"] else outcome["error"]
-            agent_logger.debug("  tool %s → %s", tc["name"], result)
+            agent_logger.debug("  tool %s -> %s", tc["name"], result)
             messages.append({
                 "role":         "tool",
                 "tool_call_id": tc["id"],

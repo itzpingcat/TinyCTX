@@ -20,7 +20,7 @@ TinyCTX/
 ├── ai.py               LLM / Embedder async clients (OpenAI-compat SSE streaming)
 ├── context.py          Context — assembles message list for the LLM; hook pipeline; token budgeting
 ├── db.py               ConversationDB — SQLite-backed conversation tree
-├── module_registry.py  Loads modules from modules/ and wires them into each AgentCycle
+├── module_registry.py  Loads modules from modules/ and custom_modules/ and wires them into each AgentCycle
 │
 ├── config/             Config loading (YAML → dataclasses)
 ├── users/              UserStore + User/PlatformIdentity models (SQLite)
@@ -50,6 +50,8 @@ TinyCTX/
 │   ├── bridges_setup.py
 │   └── workspace_setup.py
 │
+├── custom_modules/     User-defined plugins, gitignored (same interface as modules/)
+│   └── anima/          generate_image_anima — always-on tool for Anima.json ComfyUI workflow
 └── modules/            Auto-discovered plugins (see Module System below)
     ├── cron/           Cron scheduler
     ├── ctx_tools/      Context manipulation tools (edit, delete turns)

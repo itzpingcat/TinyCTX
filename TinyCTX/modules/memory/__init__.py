@@ -1,4 +1,4 @@
-EXTENSION_META = {
+﻿EXTENSION_META = {
     "name":    "memory",
     "version": "0.2",
     "description": (
@@ -28,8 +28,24 @@ EXTENSION_META = {
         # Leave empty to disable semantic search (keyword only)
         "embedding_model": "",
 
+        # Templates applied to text before embedding. Use {text} as the placeholder.
+        # e.g. "Query: {text}" / "Document: {text}" for models like Jina.
+        "embed_query_template":    "{text}",
+        "embed_document_template": "{text}",
+
+        # Separate embedding model for dedup/graph similarity.
+        # When set, graph_embedding is stored alongside the regular embedding.
+        # Dedup uses graph_embedding, falling back to embedding when absent.
+        # Leave empty to reuse embedding_model for dedup as well.
+        "graph_embedding_model": "",
+
         # Pinned entity injection priority in system prompt
         "pinned_priority": 5,
+
+        # How many user messages to scan back to find active participants.
+        # A pinned_target=<username> entity is only injected when that user
+        # appears within this many recent user turns.
+        "pinned_user_scan": 3,
 
         # Token budget for the <memory> block injected into system prompt
         "memory_block_tokens": 4096,

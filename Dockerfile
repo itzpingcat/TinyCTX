@@ -27,7 +27,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install \
         PyYAML aiohttp pyfiglet rich questionary requests mcp numpy \
         tiktoken structlog tenacity ddgs pdfplumber ladybug\
-        python-docx sympy "antlr4-python3-runtime==4.13.2" jinja2 \
+        python-docx Pillow sympy "antlr4-python3-runtime==4.13.2" jinja2 \
         platformdirs croniter "discord.py" matrix-nio
 
 # --- playwright (cached separately so browser install layer is isolated) ---

@@ -43,16 +43,15 @@ class Runtime:
 
     def _register_user_commands(self) -> None:
         """
-        Register /user grant and /user info slash commands.
+        Register /user modify_permissions, /user info, and /user rename slash commands.
 
-        /user grant <username> <level>  — set a user's permission_level (requires caller level 100)
-        /user info <username>           — show a user's stored info
-        /user rename <username> <new>   — rename a TinyCTX username (requires caller level 100)
+        /user modify_permissions <username> <level>  — set a user's permission_level
+        /user info <username>                        — show a user's stored info
+        /user rename <username> <new>                — rename a TinyCTX username (requires caller level 100)
 
-        Admin check: the invoker's own User is resolved from the context's
-        platform identity (interaction.user on Discord) and must have
-        permission_level == 100.  If context carries no resolvable identity,
-        the command is denied.
+        Permission rules match the agent tool:
+          - caller can only promote to at most (their level - 1)
+          - caller can only modify users whose current level is at most (their level - 1)
         """
         users = self.users
 
@@ -71,10 +70,10 @@ class Runtime:
 
         from TinyCTX.users import UsernameConflictError
 
-        async def _cmd_grant(args: list[str], context: dict) -> None:
+        async def _cmd_modify_permissions(args: list[str], context: dict) -> None:
             send = context["send"]
             if len(args) < 2:
-                await send("Usage: /user grant <username> <level>")
+                await send("Usage: /user modify_permissions <username> <level>")
                 return
             caller = _caller_user(context)
             if caller is None:
@@ -89,18 +88,22 @@ class Runtime:
             if not (0 <= level <= 100):
                 await send("Level must be between 0 and 100.")
                 return
-            if level > caller.permission_level:
-                await send(f"⛔ Cannot grant level {level} — your level is {caller.permission_level}.")
+            max_grantable = caller.permission_level - 1
+            if level > max_grantable:
+                await send(f"⛔ Cannot set level {level} — you may only grant up to {max_grantable} (your level − 1).")
                 return
             user = users.get_user(target_username)
             if user is None:
                 await send(f"User {target_username!r} not found.")
                 return
+            if user.permission_level >= caller.permission_level:
+                await send(f"⛔ {target_username!r} is at level {user.permission_level} — not below your level ({caller.permission_level}).")
+                return
             old_level = user.permission_level
             user.permission_level = level
             users.update_user(user)
             logger.info(
-                "[user] %s granted level %d to %s (was %d)",
+                "[user] %s set level %d on %s (was %d)",
                 caller.username, level, target_username, old_level,
             )
             await send(f"✅ {target_username}: {old_level} → {level}")
@@ -141,9 +144,15 @@ class Runtime:
             except UsernameConflictError:
                 await send(f"Username {args[1]!r} is already taken.")
 
-        self.commands.register("user", "grant",  _cmd_grant,  help="Set a user's permission level (admin only)")
-        self.commands.register("user", "info",   _cmd_info,   help="Show a user's stored identity and level")
-        self.commands.register("user", "rename",  _cmd_rename, help="Rename a TinyCTX username (admin only)")
+        self.commands.register("user", "modify_permissions", _cmd_modify_permissions,
+            help="Set a user's permission level",
+            params=[("username", str, "TinyCTX username"), ("level", int, "Permission level (0-100)")])
+        self.commands.register("user", "info", _cmd_info,
+            help="Show a user's stored identity and level",
+            params=[("username", str, "TinyCTX username")])
+        self.commands.register("user", "rename", _cmd_rename,
+            help="Rename a TinyCTX username (admin only)",
+            params=[("username", str, "Current username"), ("new_username", str, "New username")])
 
     # ------------------------------------------------------------------
     # Entry Point: push()
@@ -179,7 +188,6 @@ class Runtime:
             role="user",
             content=content_str,
             author_id=msg.author.username,
-            author_name=None,
             state_delta=json.dumps(state_delta) if state_delta else None,
         )
         

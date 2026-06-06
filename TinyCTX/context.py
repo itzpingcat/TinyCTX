@@ -112,8 +112,7 @@ class HistoryEntry:
     index:        int            = 0     # position in dialogue; set by Context.add()
     tool_calls:   list[dict]     = field(default_factory=list)
     tool_call_id: str | None     = None
-    author_id:    str | None     = None  # stable per-platform sender id; None for DM/assistant/tool/system
-    author_name:  str | None     = None  # display name at send time; None for DM/assistant/tool/system
+    author_id:    str | None     = None  # TinyCTX username of sender; None for assistant/tool/system
     parent_id:    str | None     = None  # DB node_id of parent node
 
     @staticmethod
@@ -279,7 +278,6 @@ class Context:
             tool_calls=tool_calls_str,
             tool_call_id=entry.tool_call_id,
             author_id=entry.author_id,
-            author_name=entry.author_name,
         )
         entry.id        = node.id
         entry.parent_id = node.parent_id
@@ -434,7 +432,6 @@ class Context:
                 tool_calls=tool_calls,
                 tool_call_id=node.tool_call_id,
                 author_id=node.author_id,
-                author_name=node.author_name,
                 parent_id=node.parent_id,
             )
             entries.append(entry)
@@ -565,7 +562,7 @@ class Context:
                     entry = result
 
             if entry.role == ROLE_USER and entry.author_id is not None:
-                label = entry.author_name or entry.author_id
+                label = entry.author_id
                 raw = entry.content
                 if isinstance(raw, str):
                     labelled_content: str | list = f"[{label}]: {raw}"

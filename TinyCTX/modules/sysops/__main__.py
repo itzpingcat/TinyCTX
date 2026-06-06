@@ -6,13 +6,13 @@ Agent-callable tools for user and permission management.
 Tools registered (all always_on=False):
   user_list   — list all users                     min_permission=50
   user_info   — show one user's details            min_permission=50
-  user_grant  — set a user's permission_level      min_permission=50
+  user_modify_permissions — set a user's permission_level  min_permission=50
   user_rename — rename a TinyCTX username          min_permission=100
   user_merge  — merge two users into one           min_permission=100
 
 Permission rules enforced at call time (not just at registration):
-  - user_grant: caller cannot grant a level higher than their own.
-  - user_grant: caller cannot modify a user whose current level exceeds theirs.
+  - user_modify_permissions: caller can only promote to at most (their level - 1).
+  - user_modify_permissions: caller can only demote users whose current level is at most (their level - 1).
   - user_rename / user_merge: caller must be level 100.
 
 The runtime's UserStore is captured once in register_runtime and shared
@@ -118,46 +118,50 @@ def register_agent(agent) -> None:
         )
 
     # ------------------------------------------------------------------
-    # user_grant
+    # user_modify_permissions
     # ------------------------------------------------------------------
 
-    def user_grant(username: str, level: int) -> str:
+    def user_modify_permissions(username: str, level: int) -> str:
         """Set a user's permission_level.
 
         Permission rules:
-          - You cannot grant a level higher than your own.
-          - You cannot modify a user whose current level is higher than yours.
+          - You can only promote a user to at most (your level - 1).
+          - You can only demote users whose current level is at most (your level - 1).
           - Level must be between 0 and 100.
 
         Args:
             username: TinyCTX username to modify.
             level:    New permission level (0-100).
         """
+        try:
+            level = int(level)
+        except (ValueError, TypeError):
+            return f"Error: level must be an integer, got {level!r}."
         if not (0 <= level <= 100):
             return f"Error: level must be 0-100, got {level}."
-
-        if level > caller_level:
+        max_grantable = caller_level - 1
+        if level > max_grantable:
             return (
-                f"Error: cannot grant level {level} — "
-                f"your own level is {caller_level}."
+                f"Error: cannot set level {level} — "
+                f"you may only grant up to level {max_grantable} (your level - 1)."
             )
 
         user = users.get_user(username)
         if user is None:
             return f"User '{username}' not found."
 
-        if user.permission_level > caller_level:
+        if user.permission_level >= caller_level:
             return (
                 f"Error: '{username}' has level {user.permission_level}, "
-                f"which is higher than your level ({caller_level}). "
-                "You cannot modify users with higher permissions than your own."
+                f"which is not below your level ({caller_level}). "
+                "You can only modify users at least 1 level below you."
             )
 
         old = user.permission_level
         user.permission_level = level
         users.update_user(user)
         logger.info(
-            "[sysops] user_grant: '%s' level %d → %d (caller_level=%d)",
+            "[sysops] user_modify_permissions: '%s' level %d → %d (caller_level=%d)",
             username, old, level, caller_level,
         )
         return f"'{username}': permission_level {old} → {level}."
@@ -231,10 +235,11 @@ def register_agent(agent) -> None:
 
     agent.tool_handler.register_tool(user_list,   always_on=False, min_permission=50)
     agent.tool_handler.register_tool(user_info,   always_on=False, min_permission=50)
-    agent.tool_handler.register_tool(user_grant,  always_on=False, min_permission=50)
+    agent.tool_handler.register_tool(user_modify_permissions, always_on=False, min_permission=50)
     agent.tool_handler.register_tool(user_rename, always_on=False, min_permission=100)
     agent.tool_handler.register_tool(user_merge,  always_on=False, min_permission=100)
 
     logger.debug(
         "[sysops] registered 5 tools for caller_level=%d", caller_level
     )
+

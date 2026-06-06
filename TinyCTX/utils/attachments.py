@@ -1,34 +1,34 @@
 """
-utils/attachments.py — Attachment classification, saving, and LLM content-block assembly.
+utils/attachments.py â€” Attachment classification, saving, and LLM content-block assembly.
 
 This is a pure utility module (not an agent module).  It has no tools, hooks, or
 prompts.  Bridges and the gateway call it directly.
 
 Pipeline
 --------
-1. classify(attachment) → sets Attachment.kind based on mime_type / filename extension
-2. save_upload(attachment, uploads_dir) → writes bytes to disk, returns Path
+1. classify(attachment) â†’ sets Attachment.kind based on mime_type / filename extension
+2. save_upload(attachment, uploads_dir) â†’ writes bytes to disk, returns Path
 3. build_content_blocks(text, attachments, model_cfg, att_cfg, workspace)
-     → list[dict]  (OpenAI-compat content block list for a user message)
+     â†’ list[dict]  (OpenAI-compat content block list for a user message)
 
 Content block strategies
 ------------------------
-image/*      + vision model  → {"type": "image_url", "image_url": {"url": "data:<mime>;base64,..."}}
-image/*      + no vision     → reference note in text, saved to uploads/
-text/* + md/py/json/etc.     → {"type": "text", "text": "<fenced code block>"}
-application/pdf              → {"type": "text", "text": "<extracted or stub>"}  (pdfplumber if available)
-.docx                        → {"type": "text", "text": "<extracted>"}  (python-docx if available)
-binary / unknown             → reference note in text, saved to uploads/
+image/*      + vision model  â†’ {"type": "image_url", "image_url": {"url": "data:<mime>;base64,..."}}
+image/*      + no vision     â†’ reference note in text, saved to uploads/
+text/* + md/py/json/etc.     â†’ {"type": "text", "text": "<fenced code block>"}
+application/pdf              â†’ {"type": "text", "text": "<extracted or stub>"}  (pdfplumber if available)
+.docx                        â†’ {"type": "text", "text": "<extracted>"}  (python-docx if available)
+binary / unknown             â†’ reference note in text, saved to uploads/
 
 The inline-vs-reference decision respects AttachmentConfig thresholds:
-  inline_max_files — max number of files to inline per message (default 3)
-  inline_max_bytes — max total raw bytes to inline (default ~200 KB)
+  inline_max_files â€” max number of files to inline per message (default 3)
+  inline_max_bytes â€” max total raw bytes to inline (default ~200 KB)
 Once either threshold is hit, remaining files are reference-only regardless of kind.
 
 Soft dependencies
 -----------------
-pdfplumber  — PDF text extraction.  If absent, PDFs get a stub reference note.
-python-docx — DOCX text extraction. If absent, DOCX files get a stub reference note.
+pdfplumber  â€” PDF text extraction.  If absent, PDFs get a stub reference note.
+python-docx â€” DOCX text extraction. If absent, DOCX files get a stub reference note.
 Neither is required; attachments.py degrades gracefully.
 """
 
@@ -46,7 +46,7 @@ from TinyCTX.config import ModelConfig, AttachmentConfig
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Extension → MIME overrides for types mimetypes may not know
+# Extension â†’ MIME overrides for types mimetypes may not know
 # ---------------------------------------------------------------------------
 _EXT_MIME: dict[str, str] = {
     ".md":   "text/markdown",
@@ -91,7 +91,7 @@ _IMAGE_MIMES: frozenset[str] = frozenset({
 def classify(attachment: Attachment) -> AttachmentKind:
     """
     Derive the AttachmentKind for an Attachment from its mime_type and filename.
-    The returned kind is not stored back onto the (frozen) dataclass — callers
+    The returned kind is not stored back onto the (frozen) dataclass â€” callers
     use the return value directly.
     """
     mime  = (attachment.mime_type or "").lower().split(";")[0].strip()
@@ -129,7 +129,7 @@ def classify(attachment: Attachment) -> AttachmentKind:
 # ---------------------------------------------------------------------------
 
 def _load_cache(uploads_dir: Path) -> dict[str, str]:
-    """Load uploads/cache.json → {sha256hex: filename}.  Returns {} on any error."""
+    """Load uploads/cache.json â†’ {sha256hex: filename}.  Returns {} on any error."""
     cache_path = uploads_dir / "cache.json"
     try:
         return json.loads(cache_path.read_text(encoding="utf-8"))
@@ -155,7 +155,7 @@ def save_upload(attachment: Attachment, uploads_dir: Path) -> Path:
     """
     Write attachment bytes to uploads_dir/<filename>, deduplicating by content.
 
-    A sidecar uploads/cache.json maps sha256 → stored filename so that
+    A sidecar uploads/cache.json maps sha256 â†’ stored filename so that
     re-uploading the same file returns the existing path without a write.
     Original filenames are preserved; a counter suffix is only added when
     two genuinely different files share the same name.
@@ -181,13 +181,13 @@ def save_upload(attachment: Attachment, uploads_dir: Path) -> Path:
     content_hash = hashlib.sha256(attachment.data).hexdigest()
     cache = _load_cache(uploads_dir)
 
-    # Cache hit — same bytes already stored.
+    # Cache hit â€” same bytes already stored.
     if content_hash in cache:
         existing = uploads_dir / cache[content_hash]
         if existing.exists():
             logger.debug("Dedup: reusing existing upload %s", existing.name)
             return existing
-        # Stale entry (file was deleted) — fall through and re-save.
+        # Stale entry (file was deleted) â€” fall through and re-save.
         logger.debug("Upload cache stale for %s, re-saving", safe_name)
 
     # Determine destination, avoiding name collisions with different-content files.
@@ -210,6 +210,26 @@ def save_upload(attachment: Attachment, uploads_dir: Path) -> Path:
     cache[content_hash] = dest.name
     _save_cache(uploads_dir, cache)
     return dest
+
+
+# ---------------------------------------------------------------------------
+# Image conversion helpers
+# ---------------------------------------------------------------------------
+
+def _convert_to_jpeg(data: bytes) -> bytes | None:
+    """Convert image bytes to JPEG using Pillow.  Returns None if unavailable."""
+    try:
+        import io
+        from PIL import Image
+        img = Image.open(io.BytesIO(data))
+        buf = io.BytesIO()
+        img.convert("RGB").save(buf, format="JPEG")
+        return buf.getvalue()
+    except ImportError:
+        return None
+    except Exception as exc:
+        logger.warning("Image conversion to JPEG failed: %s", exc)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -308,12 +328,24 @@ def build_content_blocks(
             if not model_cfg.supports_vision:
                 ref_notes.append(
                     f"[Image uploaded to {saved_path}: {att.filename}"
-                    " — model does not support vision, use filesystem tools to inspect]"
+                    " â€” model does not support vision, use filesystem tools to inspect]"
                 )
                 continue
             # Inline as image_url block
-            b64 = base64.b64encode(att.data).decode()
+            img_data = att.data
             mime = att.mime_type.split(";")[0].strip()
+            if mime == "image/webp":
+                converted = _convert_to_jpeg(img_data)
+                if converted is not None:
+                    img_data = converted
+                    mime = "image/jpeg"
+                else:
+                    ref_notes.append(
+                        f"[Image uploaded to {saved_path}: {att.filename}"
+                        " — webp not supported by model and Pillow unavailable for conversion]"
+                    )
+                    continue
+            b64 = base64.b64encode(img_data).decode()
             blocks.append({
                 "type": "image_url",
                 "image_url": {"url": f"data:{mime};base64,{b64}"},
@@ -344,7 +376,7 @@ def build_content_blocks(
                 if extracted is None:
                     ref_notes.append(
                         f"[PDF uploaded to {saved_path}: {att.filename}"
-                        " — install pdfplumber to extract text, or use filesystem tools]"
+                        " â€” install pdfplumber to extract text, or use filesystem tools]"
                     )
                     continue
             elif ext == ".docx":
@@ -352,7 +384,7 @@ def build_content_blocks(
                 if extracted is None:
                     ref_notes.append(
                         f"[DOCX uploaded to {saved_path}: {att.filename}"
-                        " — install python-docx to extract text, or use filesystem tools]"
+                        " â€” install python-docx to extract text, or use filesystem tools]"
                     )
                     continue
 
@@ -375,7 +407,7 @@ def build_content_blocks(
         full_text = (text + "\n\n" + "\n".join(ref_notes)).strip()
 
     if not blocks:
-        # All reference — return plain string, no content block list needed
+        # All reference â€” return plain string, no content block list needed
         return full_text
 
     # Mix: text block first, then attachment blocks
