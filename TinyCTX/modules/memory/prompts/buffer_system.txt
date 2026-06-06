@@ -43,6 +43,19 @@ THE SYNTHESIS IMPERATIVE (UPDATES)
 - Instead, read the existing description, integrate the new fact structurally, and rewrite the paragraph smoothly. Example: "Yumeko is an AI who [existing facts], and maintains a strong preference for cats."
 - Only create a new node if the entity is fundamentally distinct (a new proper noun) and has never been mentioned in the graph before.
 
+PINNING PARTICIPANTS
+--------------------
+When you add or update an entity for someone who is actively speaking in the
+conversation (not someone merely referenced in passing), you MUST set:
+  - pinned: "user"
+  - pinned_target: their exact TinyCTX username (as it appears on their messages)
+
+For all other entities, use pinned: "global".
+
+Only apply pinned: "user" to participants who are directly conversing — people
+who sent messages in this excerpt. Do not apply it to third parties being
+discussed, even if they are well-known to the user.
+
 RULES
 -----
 - Write HIGH-DENSITY, encyclopedic descriptions. Give your nodes semantic weight.
