@@ -87,6 +87,18 @@ class ToolCallHandler:
         import typing
         import types
 
+        # `from __future__ import annotations` makes all annotations lazy strings.
+        # Resolve them back to actual types before anything else.
+        if isinstance(annotation, str):
+            resolved = {
+                'int': int, 'float': float, 'bool': bool,
+                'str': str, 'dict': dict, 'list': list,
+            }.get(annotation)
+            if resolved is not None:
+                annotation = resolved
+            else:
+                return {"type": "string"}
+
         origin = getattr(annotation, '__origin__', None)
         args   = getattr(annotation, '__args__', None)
 
@@ -130,6 +142,41 @@ class ToolCallHandler:
             list:  {"type": "array"},
         }
         return mapping.get(annotation, {"type": "string"})
+
+    def _coerce_args(self, function_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Coerce argument values to their declared Python types.
+
+        JSON deserialization loses type information (e.g. the LLM may emit
+        ``{"level": "5"}`` even though the schema says integer). We walk the
+        registered signature and attempt a safe cast for mismatched primitives.
+        Non-primitive or already-correct values are left untouched.
+        """
+        sig = self.tools[function_name]['signature']
+        coerced = {}
+        for key, value in args.items():
+            param = sig.parameters.get(key)
+            if param is None or param.annotation is inspect.Parameter.empty:
+                coerced[key] = value
+                continue
+            ann = param.annotation
+            # Unwrap Optional[X] / X | None
+            import types as _types, typing as _typing
+            # Resolve stringified annotations from `from __future__ import annotations`
+            if isinstance(ann, str):
+                ann = {'int': int, 'float': float, 'bool': bool, 'str': str}.get(ann, ann)
+            origin = getattr(ann, '__origin__', None)
+            type_args = getattr(ann, '__args__', None)
+            if isinstance(ann, _types.UnionType) or origin is _typing.Union:
+                non_none = [a for a in (ann.__args__ if hasattr(ann, '__args__') else type_args) if a is not type(None)]
+                ann = non_none[0] if len(non_none) == 1 else ann
+            if ann in (int, float, bool, str) and not isinstance(value, ann):
+                try:
+                    coerced[key] = ann(value)
+                except (ValueError, TypeError):
+                    coerced[key] = value  # leave it; let the function raise
+            else:
+                coerced[key] = value
+        return coerced
 
     def enable(self, name: str) -> bool:
         """Enable a registered tool by name. Returns True if found, False if unknown."""
@@ -247,6 +294,10 @@ class ToolCallHandler:
             else:
                 args = arguments
                         
+            # Coerce args to their annotated types where possible.
+            # This handles LLMs serializing integers as strings, etc.
+            args = self._coerce_args(function_name, args)
+
             # Call the function.
             # Async functions are awaited directly.
             # Sync functions are dispatched to a thread-pool executor so they
