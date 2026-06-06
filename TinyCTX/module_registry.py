@@ -17,6 +17,7 @@ A module with only register_runtime does no per-cycle wiring.
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
@@ -27,6 +28,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 MODULES_DIR = Path(__file__).parent / "modules"
+CUSTOM_MODULES_DIR = Path(__file__).parent / "custom_modules"
 
 
 class ModuleRegistry:
@@ -43,15 +45,25 @@ class ModuleRegistry:
         self._agent_registrations: list[Callable] = []
 
     def load_modules(self, runtime) -> None:
-        """Scan modules/ and call register_runtime on each."""
-        if not MODULES_DIR.exists():
-            print(f"[module_registry] WARNING: modules dir not found: {MODULES_DIR}")
-            logger.warning("[module_registry] modules dir not found: %s", MODULES_DIR)
+        """Scan modules/ and custom_modules/ and call register_runtime on each."""
+        self._load_from_dir(MODULES_DIR, runtime, import_prefix="TinyCTX.modules")
+        self._load_from_dir(CUSTOM_MODULES_DIR, runtime, import_prefix=None)
+
+        print(f"[module_registry] done — {len(self._agent_registrations)} register_agent hook(s) queued")
+        logger.info(
+            "[module_registry] done — %d register_agent hook(s) queued",
+            len(self._agent_registrations),
+        )
+
+    def _load_from_dir(self, modules_dir: Path, runtime, import_prefix: str | None) -> None:
+        """Scan one modules directory and register all valid modules found."""
+        if not modules_dir.exists():
+            logger.debug("[module_registry] skipping missing dir: %s", modules_dir)
             return
 
-        entries = sorted(e for e in MODULES_DIR.iterdir() if e.is_dir())
-        print(f"[module_registry] scanning {len(entries)} candidate module(s)")
-        logger.info("[module_registry] scanning %d candidate module(s)", len(entries))
+        entries = sorted(e for e in modules_dir.iterdir() if e.is_dir())
+        print(f"[module_registry] scanning {modules_dir.name}/ — {len(entries)} candidate(s)")
+        logger.info("[module_registry] scanning %s — %d candidate(s)", modules_dir, len(entries))
 
         for entry in entries:
             has_main = (entry / "__main__.py").exists()
@@ -60,11 +72,13 @@ class ModuleRegistry:
                 logger.debug("[module_registry] skipping '%s' (no __main__.py or __init__.py)", entry.name)
                 continue
 
-            module_name = f"TinyCTX.modules.{entry.name}"
-            print(f"[module_registry] loading '{entry.name}'")
-            logger.info("[module_registry] loading '%s'", entry.name)
+            print(f"[module_registry] loading '{entry.name}' from {modules_dir.name}/")
+            logger.info("[module_registry] loading '%s' from %s", entry.name, modules_dir.name)
             try:
-                mod = self._find_module(module_name, entry.name)
+                if import_prefix is not None:
+                    mod = self._find_module(f"{import_prefix}.{entry.name}", entry.name)
+                else:
+                    mod = self._find_module_from_path(entry)
                 if mod is None:
                     continue
                 self._register_one(mod, runtime, entry.name)
@@ -72,11 +86,30 @@ class ModuleRegistry:
                 print(f"[module_registry] ERROR: failed to load module '{entry.name}'")
                 logger.exception("[module_registry] failed to load module '%s'", entry.name)
 
-        print(f"[module_registry] done — {len(self._agent_registrations)} register_agent hook(s) queued")
-        logger.info(
-            "[module_registry] done — %d register_agent hook(s) queued",
-            len(self._agent_registrations),
-        )
+    def _find_module_from_path(self, entry: Path):
+        """Load a module from a filesystem path without requiring it to be a package."""
+        for filename in ("__main__.py", "__init__.py"):
+            fpath = entry / filename
+            if not fpath.exists():
+                continue
+            fqn = f"custom_modules.{entry.name}.{filename[:-3]}"
+            try:
+                spec = importlib.util.spec_from_file_location(fqn, fpath)
+                candidate = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(candidate)
+                has_rt = hasattr(candidate, "register_runtime")
+                has_ra = hasattr(candidate, "register_agent")
+                if has_rt or has_ra:
+                    logger.debug(
+                        "[module_registry] '%s' loaded from path (register_runtime=%s, register_agent=%s)",
+                        entry.name, has_rt, has_ra,
+                    )
+                    return candidate
+            except Exception:
+                logger.exception("[module_registry] error loading '%s' from path", entry.name)
+                return None
+        logger.warning("[module_registry] '%s' has no register_runtime/register_agent — skipping", entry.name)
+        return None
 
     def _find_module(self, module_name: str, entry_name: str):
         """Import __main__ then package; return first with register_runtime or register_agent."""

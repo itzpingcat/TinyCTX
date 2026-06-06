@@ -12,6 +12,9 @@ __pycache__/
 tinyctx.egg-info/
 .docker-cache
 
+# user custom modules
+TinyCTX/custom_modules/
+
 # sessions / workspace data
 sessions/
 workspace/
