@@ -115,7 +115,7 @@ _COLS = "id, parent_id, role, content, created_at, tool_calls, tool_call_id, aut
 
 _INSERT_NODE = f"""
 INSERT INTO nodes ({_COLS})
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 _SELECT_NODE = f"SELECT {_COLS} FROM nodes WHERE id = ?"
