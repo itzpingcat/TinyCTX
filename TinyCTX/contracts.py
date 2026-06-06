@@ -100,6 +100,19 @@ class Attachment:
 
 
 # ---------------------------------------------------------------------------
+# Session environment — describes the environment a message arrived in.
+# Carried by InboundMessage; snapshotted into state_delta by runtime.
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class SessionEnvironment:
+    platform:     Platform
+    agent_name:   str | None = None
+    server_name:  str | None = None
+    channel_name: str | None = None
+
+
+# ---------------------------------------------------------------------------
 # Inbound message envelope
 # ---------------------------------------------------------------------------
 
@@ -111,25 +124,21 @@ class InboundMessage:
     tail_node_id  — the cursor node_id for this conversation branch.
                     The router opens or reuses the Lane keyed by this id.
     author        — who sent the message (platform + user_id + display name)
+    env           — session environment (platform, agent name, server, channel)
     group_policy  — present for group/channel messages; None for DMs
-    server_name   — human-readable server/guild name (e.g. Discord guild name); None for DMs
-    channel_name  — human-readable channel or thread name; None for DMs
     """
     tail_node_id: str
     author:       Any             # TinyCTX.users.User; typed as Any to avoid circular import
+    env:          SessionEnvironment
     content_type: ContentType
     text:         str
     message_id:   str
     timestamp:    float
-    trigger:      bool          = True          # bridge sets False for non-triggering group messages
+    trigger:      bool          = True
     reply_to_id:  str | None    = None
-    reply_to_author: str | None = None          # display name of replied-to message author; None if replying to the assistant
+    reply_to_author: str | None = None
     attachments:  tuple["Attachment", ...] = field(default_factory=tuple)
     trace_id:     str           = field(default_factory=lambda: str(uuid.uuid4()))
-    server_name:  str | None    = None          # guild/server name (bridges populate when known)
-    channel_name: str | None    = None          # channel/thread name (bridges populate when known)
-    agent_name:   str | None    = None          # display name of the agent in this context (bridge-set)
-    # permission_level removed — permissions live on User only (phase 2 enforcement)
 
 
 # ---------------------------------------------------------------------------

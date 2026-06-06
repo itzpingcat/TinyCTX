@@ -38,7 +38,7 @@ from datetime import datetime, time as dtime
 from pathlib import Path
 
 from TinyCTX.contracts import (
-    InboundMessage, ContentType, Platform,
+    InboundMessage, SessionEnvironment, ContentType, Platform,
     AgentTextChunk, AgentTextFinal, AgentError
 )
 
@@ -97,6 +97,7 @@ class _HeartbeatRunner:
             msg = InboundMessage(
                 tail_node_id=self.cursor_node_id or "",
                 author=self._get_author(),
+                env=SessionEnvironment(platform=Platform.CRON),
                 content_type=ContentType.TEXT,
                 text=current_prompt,
                 message_id=f"heartbeat-{time.time()}",

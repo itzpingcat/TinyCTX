@@ -8,7 +8,7 @@ import weakref
 from dataclasses import dataclass, field
 from typing import Any
 
-from TinyCTX.contracts import AgentError, AgentTextChunk, AgentTextFinal, InboundMessage, ContentType, Platform
+from TinyCTX.contracts import AgentError, AgentTextChunk, AgentTextFinal, InboundMessage, SessionEnvironment, ContentType, Platform
 
 logger = logging.getLogger(__name__)
 
@@ -184,6 +184,7 @@ async def _run_subagent(handle: SubagentTask, runtime) -> None:
     msg = InboundMessage(
         tail_node_id=handle.branch_tail_node_id,
         author=author,
+        env=SessionEnvironment(platform=Platform.CRON),
         content_type=ContentType.TEXT,
         text=handle.prompt,
         message_id=f"subagent-{handle.task_id}",

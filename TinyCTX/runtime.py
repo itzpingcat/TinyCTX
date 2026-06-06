@@ -6,7 +6,7 @@ import logging
 from pathlib import Path
 
 from TinyCTX.config import Config
-from TinyCTX.contracts import InboundMessage
+from TinyCTX.contracts import InboundMessage, SessionEnvironment
 from TinyCTX.users import UserStore
 from TinyCTX.utils.attachments import build_content_blocks as _build_content_blocks
 from TinyCTX.db import ConversationDB
@@ -249,11 +249,11 @@ class Runtime:
         prior_state, _ = self.db.load_session_state(msg.tail_node_id)
         delta = {}
         mapping = {
-            "platform": msg.author.identities[0].platform.value if msg.author.identities else None,
-            "author_id": msg.author.username,
-            "server_name": msg.server_name,
-            "channel_name": msg.channel_name,
-            "agent_name": msg.agent_name,
+            "platform":     msg.env.platform.value,
+            "agent_name":   msg.env.agent_name,
+            "server_name":  msg.env.server_name,
+            "channel_name": msg.env.channel_name,
+            "author_id":    msg.author.username,
         }
         for k, v in mapping.items():
             if v is not None and prior_state.get(k) != v:

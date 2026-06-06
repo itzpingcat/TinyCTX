@@ -105,7 +105,8 @@ All cross-layer communication uses these frozen dataclasses/enums. No business l
 | Type | Purpose |
 |------|---------|
 | `Platform` | Enum: CLI, DISCORD, MATRIX, CRON, API, SYSTEM |
-| `InboundMessage` | Canonical message envelope from bridges. Carries `tail_node_id`, `author` (User), `text`, `attachments`, `trigger`. |
+| `SessionEnvironment` | Environment context carried by every `InboundMessage`: `platform`, `agent_name`, `server_name`, `channel_name`. Constructed by bridges per message; snapshotted into `state_delta` by `Runtime`. Adding new session metadata goes here, not on `InboundMessage`. |
+| `InboundMessage` | Canonical message envelope from bridges. Carries `tail_node_id`, `author` (User), `env` (SessionEnvironment), `text`, `attachments`, `trigger`. |
 | `AgentTextChunk` | One streaming token |
 | `AgentTextFinal` | End of turn (or non-streaming full text) |
 | `AgentToolCall` | Tool invocation emitted during the tool loop |
@@ -123,9 +124,9 @@ All cross-layer communication uses these frozen dataclasses/enums. No business l
 
 SQLite WAL-mode database at `workspace/agent.db`. All conversation state is a **tree of nodes** — every message is a node with a `parent_id`, forming branches.
 
-**Key columns:** `id, parent_id, role, content, created_at, tool_calls, tool_call_id, author_id, author_name, attachment_paths, state_delta, flags`
+**Key columns:** `id, parent_id, role, content, created_at, tool_calls, tool_call_id, author_id, attachment_paths, state_delta, flags`
 
-**Session state** is reconstructed by walking the ancestor chain, merging `state_delta` JSON objects (most-recent wins). Checkpoint nodes with `"_checkpoint": true` stop the walk early.
+**Session state** is reconstructed by walking the ancestor chain, merging `state_delta` JSON objects (most-recent wins). Checkpoint nodes with `"_checkpoint": true` stop the walk early. Keys written by `Runtime._compute_state_delta()`: `platform`, `author_id`, `agent_name`, `server_name`, `channel_name` — sourced from `msg.env` and `msg.author`.
 
 **Flags** are a JSON array column (`flags TEXT`) on each node, used by modules to mark nodes without a dedicated column (e.g. `"librarian_visited"`).
 
@@ -219,7 +220,7 @@ Slash commands registered by `Runtime`:
 
 `push(InboundMessage, reply_queue)`:
 1. Build content blocks from attachments
-2. Write user node to DB with `state_delta`
+2. Compute `state_delta` from `msg.env` (platform, agent_name, server_name, channel_name) and `msg.author`; write user node to DB
 3. If `msg.trigger`, spawn `_process()` as an asyncio task
 
 `_process()` constructs an `AgentCycle`, runs it, and puts each event into `reply_queue`
@@ -236,6 +237,7 @@ Slash commands registered by `Runtime`:
 - Rich TUI with persistent session restore (reads cursor from `workspace/cursors/`)
 - Supports paste refs, slash commands, copy helpers
 - Provider presets for OpenAI, OpenRouter, Ollama, LM Studio, llama.cpp, custom
+- `agent_name` option: set `agent_name: "Aria"` under `bridges.cli.options` to stamp assistant nodes with a custom name (forwarded in every message payload to the gateway)
 
 ### Discord (`bridges/discord/`)
 
@@ -272,6 +274,8 @@ Key config options (under `bridges.discord.options`):
 - `max_reply_length` — Discord message chunk size cap (default: 1900)
 - `typing_indicator` / `typing_on_thinking` / `typing_on_tools` / `typing_on_reply`
 
+`agent_name` is populated automatically per message via `_bot_display_name(guild)`, which uses the bot's server nickname when set (so the bot can have different names in different guilds) and falls back to its global display name. It flows into session state via `SessionEnvironment` so the memory librarian sees the correct name on assistant nodes.
+
 Thread branching: when a thread is created inside a tracked channel, the bot forks a
 new DB branch from the channel turn that spawned it. Both evolve independently.
 Cursors (`dm:<uid>`, `group:<cid>`, `thread:<tid>`) are persisted in
@@ -290,7 +294,7 @@ Cursors (`dm:<uid>`, `group:<cid>`, `thread:<tid>`) are persisted in
 
 ### `rag` — indexes `workspace/memory/*.md` files; auto-injects relevant chunks each turn (BM25 or embedding cosine similarity); provides `memory_search` tool; triggers background memory consolidation when context budget is near.
 
-### `memory` — LadybugDB property-graph knowledge store. A background "librarian" walks unvisited conversation nodes (tracked with DB flags), extracts entities/relationships via sub-agents, and writes to the graph. Main agent uses `kg_search` / `kg_traverse` / `call_librarian` tools. Pinned entities are injected into the system prompt.
+### `memory` — LadybugDB property-graph knowledge store. A background "librarian" walks unvisited conversation nodes (tracked with DB flags), extracts entities/relationships via sub-agents, and writes to the graph. Main agent uses `kg_search` / `kg_traverse` / `call_librarian` tools. Pinned entities are injected into the system prompt. The librarian identifies the agent by reading `author_id` on assistant nodes (set from session state `agent_name`); this is how it knows which speaker is the agent vs the user in the conversation transcript.
 
 ### `heartbeat` — fires periodic agent turns on a background DB branch at a configured interval. Suppresses `HEARTBEAT_OK` replies. Slash command: `/heartbeat run`.
 

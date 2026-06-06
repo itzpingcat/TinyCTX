@@ -59,7 +59,7 @@ from aiohttp import web
 
 from TinyCTX.config import GatewayConfig
 from TinyCTX.contracts import (
-    Platform, content_type_for,
+    Platform, SessionEnvironment, content_type_for,
     InboundMessage, Attachment,
     AgentThinkingChunk, AgentTextChunk, AgentTextFinal,
     AgentToolCall, AgentToolResult, AgentError, AgentOutboundFiles,
@@ -229,11 +229,15 @@ async def handle_lane_message(request: web.Request) -> web.StreamResponse:
         )
 
     reply_to_author = (body.get("reply_to_author") or "").strip() or None
-    agent_name = (body.get("agent_name") or "").strip() or None
+    agent_name      = (body.get("agent_name") or "").strip() or None
 
     msg = InboundMessage(
         tail_node_id=node_id,
         author=author,
+        env=SessionEnvironment(
+            platform=Platform.API,
+            agent_name=agent_name,
+        ),
         content_type=content_type_for(text, bool(attachments)),
         text=text,
         message_id=str(time.time_ns()),
@@ -241,7 +245,6 @@ async def handle_lane_message(request: web.Request) -> web.StreamResponse:
         attachments=attachments,
         trigger=True,
         reply_to_author=reply_to_author,
-        agent_name=agent_name,
     )
 
     # Register SSE queue with Runtime before pushing so no events are missed.

@@ -56,7 +56,7 @@ from typing import Any
 
 from TinyCTX.contracts import (
     AgentError, AgentTextFinal,
-    InboundMessage, ContentType,
+    InboundMessage, SessionEnvironment, ContentType,
     Platform,
 )
 
@@ -446,6 +446,7 @@ class _CronRunner:
         msg = InboundMessage(
             tail_node_id=parent_id,
             author=self._cron_author,
+            env=SessionEnvironment(platform=Platform.CRON),
             content_type=ContentType.TEXT,
             text=job.message,
             message_id=str(start_ms),
