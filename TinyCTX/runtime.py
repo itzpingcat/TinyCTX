@@ -144,9 +144,15 @@ class Runtime:
             except UsernameConflictError:
                 await send(f"Username {args[1]!r} is already taken.")
 
-        self.commands.register("user", "modify_permissions", _cmd_modify_permissions, help="Set a user's permission level")
-        self.commands.register("user", "info",   _cmd_info,   help="Show a user's stored identity and level")
-        self.commands.register("user", "rename",  _cmd_rename, help="Rename a TinyCTX username (admin only)")
+        self.commands.register("user", "modify_permissions", _cmd_modify_permissions,
+            help="Set a user's permission level",
+            params=[("username", str, "TinyCTX username"), ("level", int, "Permission level (0-100)")])
+        self.commands.register("user", "info", _cmd_info,
+            help="Show a user's stored identity and level",
+            params=[("username", str, "TinyCTX username")])
+        self.commands.register("user", "rename", _cmd_rename,
+            help="Rename a TinyCTX username (admin only)",
+            params=[("username", str, "Current username"), ("new_username", str, "New username")])
 
     # ------------------------------------------------------------------
     # Entry Point: push()
