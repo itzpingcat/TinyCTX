@@ -323,6 +323,11 @@ async def kg_search(query: str, top_k: int = 5, semantic: bool = True) -> str:
         semantic: If true (default), use vector similarity search.
             If false or no embedding model configured, uses keyword search.
     """
+    # Check for an exact name match — pin it to the top but continue searching.
+    exact_matches = _graph_db.find_entity(name=query)
+    exact = next((e for e in exact_matches if e["name"].lower() == query.lower()), None)
+    exact_uid = exact["uuid"] if exact else None
+
     query_vec = None
     if semantic and _embedder is not None:
         try:
@@ -335,6 +340,10 @@ async def kg_search(query: str, top_k: int = 5, semantic: bool = True) -> str:
         uids     = [uid for uid, _ in top_k_cosine(query_vec, all_embs, top_k)]
     else:
         uids = [r["uuid"] for r in _graph_db.find_entity(name=query)[:top_k]]
+
+    # Prepend exact match (if any) and deduplicate, preserving order.
+    if exact_uid:
+        uids = [exact_uid] + [u for u in uids if u != exact_uid]
 
     if not uids:
         return "No matching entities found."
@@ -352,7 +361,8 @@ async def kg_search(query: str, top_k: int = 5, semantic: bool = True) -> str:
         pri   = entity.get("e.priority", "?")
         pin   = entity.get("e.pinned_target")
         pin_note = f"  [pinned:{pin}]" if pin else ""
-        lines.append(f"[{etype}] {name} (UUID: {uid}){pin_note}  priority: {pri}")
+        exact_note = "  [exact match]" if uid == exact_uid else ""
+        lines.append(f"[{etype}] {name} (UUID: {uid}){pin_note}  priority: {pri}{exact_note}")
         if desc:
             lines.append(f"  {desc}")
         for edge in entity.get("edges_out", []):
@@ -396,26 +406,15 @@ async def kg_traverse(uuid: str, hops: int = 1, relation_filter: str = "") -> st
     return "\n".join(lines)
 
 
-async def kg_get_entity(uuid: str) -> str:
-    """
-    Retrieve full details of a knowledge graph entity including all
-    active incoming and outgoing relationships.
-
-    Args:
-        uuid: The entity UUID to retrieve.
-    """
-    entity = _graph_db.get_entity(uuid)
-    if not entity:
-        return f"Entity UUID {uuid} not found."
-
+def _format_entity(uuid: str, entity: dict) -> str:
+    """Shared formatter for kg_get_entity output."""
     name  = entity.get("e.name", "?")
     etype = entity.get("e.entity_type", "?")
     desc  = entity.get("e.description", "")
     pin   = entity.get("e.pinned_target")
-    pri  = entity.get("e.priority", "?")
-    mens = entity.get("e.mention_count", 0)
+    pri   = entity.get("e.priority", "?")
+    mens  = entity.get("e.mention_count", 0)
     pin_note = f"[pinned:{pin}]" if pin else ""
-
     lines = [
         f"[{etype}] {name}",
         f"  UUID:        {uuid}",
@@ -437,6 +436,39 @@ async def kg_get_entity(uuid: str) -> str:
     if not out_edges and not in_edges:
         lines.append("  No relationships.")
     return "\n".join(lines)
+
+
+async def kg_get_entity(uuid_or_name: str) -> str:
+    """
+    Retrieve full details of a knowledge graph entity including all
+    active incoming and outgoing relationships.
+
+    Args:
+        uuid_or_name: The entity UUID or exact entity name to retrieve.
+    """
+    # Try UUID lookup first.
+    entity = _graph_db.get_entity(uuid_or_name)
+    if entity:
+        return _format_entity(uuid_or_name, entity)
+
+    # Fall back to name lookup.
+    matches = _graph_db.find_entity(name=uuid_or_name)
+    exact   = next((e for e in matches if e["name"].lower() == uuid_or_name.lower()), None)
+    if exact:
+        entity = _graph_db.get_entity(exact["uuid"])
+        if entity:
+            return _format_entity(exact["uuid"], entity)
+
+    # Ambiguous partial matches — list them so the caller can retry with a UUID.
+    if matches:
+        lines = [f"No exact match for '{uuid_or_name}'. Did you mean:"]
+        for m in matches[:5]:
+            lines.append(f"  [{m['entity_type']}] {m['name']} (UUID: {m['uuid']})")
+        return "\n".join(lines)
+
+    return f"Entity '{uuid_or_name}' not found."
+
+
 
 
 async def kg_list(entity_type: str = "", pinned_only: bool = False) -> str:
