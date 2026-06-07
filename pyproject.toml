@@ -23,6 +23,7 @@ dependencies = [
     "pdfplumber",
     "python-docx",
     "Pillow",
+    "onnxruntime",
     "sympy",
     "antlr4-python3-runtime",
     "jinja2",
