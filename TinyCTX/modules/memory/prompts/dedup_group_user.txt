@@ -1,0 +1,5 @@
+The following {node_count} entity nodes are candidates for deduplication.
+Decide which (if any) refer to the same real-world thing and return merge operations.
+Return [] if all nodes are distinct.
+
+{nodes_block}

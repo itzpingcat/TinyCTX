@@ -1,4 +1,4 @@
-﻿"""
+"""
 modules/memory/dedup_agents.py
 
 Deduplication logic for the knowledge librarian.
@@ -15,6 +15,7 @@ import json
 import logging
 import re as _re
 import sqlite3
+from collections import defaultdict
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -61,21 +62,6 @@ def _load_distinct_cache(workspace_path: Path) -> set[frozenset]:
         return set()
 
 
-def _save_distinct_cache(workspace_path: Path, cache: set[frozenset]) -> None:
-    """Full replace -- used only as a fallback; prefer _add_to_cache for incremental writes."""
-    try:
-        con = _open_db(workspace_path)
-        con.execute("DELETE FROM distinct_pairs")
-        con.executemany(
-            "INSERT OR IGNORE INTO distinct_pairs (uuid_a, uuid_b) VALUES (?, ?)",
-            [_canonical_pair(*pair) for pair in cache],
-        )
-        con.commit()
-        con.close()
-    except Exception:
-        logger.exception("[dedup_cache] failed to save cache")
-
-
 def _add_to_cache(workspace_path: Path, uid_a: str, uid_b: str) -> None:
     """Incrementally insert a single pair."""
     try:
@@ -111,11 +97,6 @@ def _invalidate_db_for(workspace_path: Path, uid: str) -> None:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _chunks(lst: list, n: int):
-    for i in range(0, len(lst), n):
-        yield lst[i : i + n]
-
-
 def _parse_dedup_response(raw: str) -> list[dict]:
     raw = _re.sub(r"^```json?\s*", "", raw.strip())
     raw = _re.sub(r"\s*```$", "", raw).strip()
@@ -132,6 +113,82 @@ async def _aset(conn, uid: str, field: str, value):
         f"MATCH (e:Entity) WHERE e.uuid = $uid SET e.{field} = $v",
         parameters={"uid": uid, "v": value},
     )
+
+
+# ---------------------------------------------------------------------------
+# Connected-component grouping + batch-size-aware partitioning
+# ---------------------------------------------------------------------------
+
+def _build_and_partition(
+    candidates: list[tuple[dict, dict, float]],
+    batch_size: int,
+) -> list[list[dict]]:
+    """
+    Build connected components from candidate pairs, then partition any component
+    larger than batch_size into groups using greedy degree-aware packing.
+
+    Every candidate edge's two endpoints are guaranteed to land in the same group,
+    unless the component is so dense that splitting is unavoidable — in that case
+    high-degree nodes (hubs) are packed together first to preserve the most edges.
+    """
+    by_uuid: dict[str, dict] = {}
+    adjacency: dict[str, set[str]] = defaultdict(set)
+
+    for ea, eb, _ in candidates:
+        uid_a, uid_b = ea["e.uuid"], eb["e.uuid"]
+        by_uuid[uid_a] = ea
+        by_uuid[uid_b] = eb
+        adjacency[uid_a].add(uid_b)
+        adjacency[uid_b].add(uid_a)
+
+    # BFS to find connected components
+    visited: set[str] = set()
+    raw_components: list[list[str]] = []
+
+    for start_uid in by_uuid:
+        if start_uid in visited:
+            continue
+        component_uids: list[str] = []
+        queue = [start_uid]
+        while queue:
+            uid = queue.pop()
+            if uid in visited:
+                continue
+            visited.add(uid)
+            component_uids.append(uid)
+            queue.extend(adjacency[uid] - visited)
+        raw_components.append(component_uids)
+
+    # Partition each component if it exceeds batch_size
+    result: list[list[dict]] = []
+    for component_uids in raw_components:
+        if len(component_uids) <= batch_size:
+            result.append([by_uuid[u] for u in component_uids])
+            continue
+
+        # Greedy degree-descending packing: high-degree nodes anchor groups,
+        # each new node joins the first group it shares an edge with that still
+        # has room, otherwise starts a new group.
+        sorted_uids = sorted(
+            component_uids,
+            key=lambda u: len(adjacency.get(u, set())),
+            reverse=True,
+        )
+        groups: list[list[str]] = []
+        for uid in sorted_uids:
+            placed = False
+            neighbors = adjacency.get(uid, set())
+            for group in groups:
+                if len(group) < batch_size and neighbors & set(group):
+                    group.append(uid)
+                    placed = True
+                    break
+            if not placed:
+                groups.append([uid])
+
+        result.extend([by_uuid[u] for u in g] for g in groups)
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -152,25 +209,22 @@ async def run_edge_dedup(
     """
     logger.info("[memory/librarian] edge dedup starting")
     try:
-        # Fetch all active edges grouped by (src_uuid, tgt_uuid, relation).
         r = await conn.execute(
             "MATCH (a:Entity)-[r:Relation]->(b:Entity) "
             "WHERE r.superseded_at IS NULL "
             "RETURN a.uuid, b.uuid, r.relation, r.created_at"
         )
 
-        from collections import defaultdict
-        groups: dict[tuple, list[tuple]] = defaultdict(list)  # key -> [(created_at,)]
+        groups: dict[tuple, list[tuple]] = defaultdict(list)
         while r.has_next():
             row = r.get_next()
             src, tgt, rel, created_at = row
             groups[(src, tgt, rel)].append((created_at or 0.0,))
 
-        to_delete: list = []  # list of (src, tgt, rel, created_at)
+        to_delete: list = []
         for (src, tgt, rel), edges in groups.items():
             if len(edges) <= 1:
                 continue
-            # Sort by created_at descending — keep the newest, delete the rest.
             edges.sort(key=lambda x: x[0], reverse=True)
             to_delete.extend((src, tgt, rel, ca) for (ca,) in edges[1:])
 
@@ -192,7 +246,10 @@ async def run_edge_dedup(
                         parameters={"src": src, "tgt": tgt, "rel": rel, "ca": created_at},
                     )
                 except Exception as exc:
-                    logger.warning("[memory/librarian] edge dedup: failed to delete edge %s->%s [%s] @ %s: %s", src, tgt, rel, created_at, exc)
+                    logger.warning(
+                        "[memory/librarian] edge dedup: failed to delete edge %s->%s [%s] @ %s: %s",
+                        src, tgt, rel, created_at, exc,
+                    )
 
         logger.info("[memory/librarian] edge dedup complete")
     except Exception:
@@ -213,8 +270,9 @@ async def run_dedup_cycle(
     agent_logger: logging.Logger,
 ) -> None:
     """
-    Refresh graph embeddings for stale entities, then evaluate near-duplicate
-    candidate pairs with an LLM and apply merge / alias verdicts.
+    Refresh graph embeddings for stale entities, then cluster near-duplicate
+    candidates into connected components and evaluate each component with a
+    single LLM call.
 
     Thrash mitigations
     ------------------
@@ -228,8 +286,8 @@ async def run_dedup_cycle(
             embed_content_with_edges, embed_hash, cosine_similarity,
         )
 
-        threshold    = float(cfg.get("similarity_threshold", 0.85))
-        dedup_batch  = int(cfg.get("dedup_batch_count", 1))
+        threshold   = float(cfg.get("similarity_threshold", 0.85))
+        batch_size  = int(cfg.get("dedup_batch_count", 6))
         doc_template = cfg.get("embed_document_template", "{text}")
 
         r = await conn.execute(
@@ -308,6 +366,7 @@ async def run_dedup_cycle(
             logger.info("[memory/librarian] dedup: all embeddings current, no pairs to re-evaluate")
             return
 
+        # Build candidate pairs (stale × all, deduplicated)
         pairs_seen: set[frozenset] = set()
         candidates: list[tuple[dict, dict, float]] = []
 
@@ -331,7 +390,7 @@ async def run_dedup_cycle(
                 if score >= threshold:
                     candidates.append((stale_e, eb, score))
 
-        # Name-based candidates: same name (case-insensitive), not already caught by embeddings
+        # Name-based candidates: same name (case-insensitive)
         by_name: dict[str, list[dict]] = {}
         for e in entities:
             key = (e["e.name"] or "").strip().lower()
@@ -352,8 +411,7 @@ async def run_dedup_cycle(
             logger.info("[memory/librarian] dedup: no candidate pairs above threshold %.2f", threshold)
             return
 
-        logger.info("[memory/librarian] dedup: %d candidate pair(s) to evaluate", len(candidates))
-
+        # Filter already-aliased and cached-distinct pairs
         already_aliased: set[frozenset] = set()
         r = await conn.execute(
             "MATCH (a:Entity)-[r:Relation]->(b:Entity) "
@@ -364,41 +422,30 @@ async def run_dedup_cycle(
             row = r.get_next()
             already_aliased.add(frozenset([row[0], row[1]]))
 
-        pending = [
+        filtered = [
             (ea, eb, score) for ea, eb, score in candidates
             if frozenset([ea["e.uuid"], eb["e.uuid"]]) not in already_aliased
             and frozenset([ea["e.uuid"], eb["e.uuid"]]) not in distinct_cache
         ]
 
-        for chunk in _chunks(pending, dedup_batch):
-            if dedup_batch == 1:
-                ea, eb, _ = chunk[0]
-                verdict = await _dedup_pair(conn, write_lock, llm, ea, eb, agent_logger, edges_by_uuid=edges_by_uuid)
-                if verdict == "distinct":
-                    _add_to_cache(workspace_path, ea["e.uuid"], eb["e.uuid"])
-                    distinct_cache.add(frozenset([ea["e.uuid"], eb["e.uuid"]]))
-            else:
-                pairs = [(ea, eb) for ea, eb, _ in chunk]
-                try:
-                    results = await _dedup_batch(conn, write_lock, llm, pairs, agent_logger, edges_by_uuid=edges_by_uuid)
-                except Exception:
-                    logger.warning(
-                        "[memory/librarian] dedup: batch of %d failed, retrying individually", len(pairs)
-                    )
-                    results = []
-                    for ea, eb in pairs:
-                        verdict = await _dedup_pair(
-                            conn, write_lock, llm, ea, eb, agent_logger,
-                            edges_by_uuid=edges_by_uuid, cache_on_fail=False
-                        )
-                        results.append((frozenset([ea["e.uuid"], eb["e.uuid"]]), verdict, False))
+        if not filtered:
+            logger.info("[memory/librarian] dedup: all candidates already resolved")
+            return
 
-                for entry in results:
-                    pair_key, verdict, cacheable = entry
-                    if verdict == "distinct" and cacheable:
-                        distinct_cache.add(pair_key)
-                        uids = list(pair_key)
-                        _add_to_cache(workspace_path, uids[0], uids[1])
+        # Cluster into connected components, partition to batch_size, evaluate each group
+        components = _build_and_partition(filtered, batch_size)
+        logger.info(
+            "[memory/librarian] dedup: %d candidate(s) → %d group(s) (batch_size=%d)",
+            len(filtered), len(components), batch_size,
+        )
+
+        for component in components:
+            new_distinct_pairs = await _dedup_group(
+                conn, write_lock, llm, component, agent_logger, edges_by_uuid=edges_by_uuid,
+            )
+            for uid_a, uid_b in new_distinct_pairs:
+                _add_to_cache(workspace_path, uid_a, uid_b)
+                distinct_cache.add(frozenset([uid_a, uid_b]))
 
         logger.info("[memory/librarian] dedup cycle complete")
     except Exception:
@@ -406,20 +453,29 @@ async def run_dedup_cycle(
 
 
 # ---------------------------------------------------------------------------
-# Dedup: single pair
+# Dedup: group of N nodes (unified, replaces _dedup_pair + _dedup_batch)
 # ---------------------------------------------------------------------------
 
-async def _dedup_pair(
+async def _dedup_group(
     conn,
     write_lock: asyncio.Lock,
     llm,
-    ea: dict,
-    eb: dict,
+    entities: list[dict],
     agent_logger: logging.Logger,
     edges_by_uuid: dict[str, list[dict]] | None = None,
-    cache_on_fail: bool = True,
-) -> str:
+) -> list[tuple[str, str]]:
+    """
+    Ask the LLM to evaluate a group of N entity nodes for deduplication.
+    Returns a list of (uid_a, uid_b) pairs that were confirmed distinct,
+    so the caller can cache them.
+
+    The LLM returns a list of merge operations (possibly empty). Each operation
+    specifies a canonical uuid and one or more duplicate uuids to absorb.
+    Silence (empty list) means all nodes in the group are distinct.
+    """
     from TinyCTX.ai import TextDelta
+
+    all_uuids = {e["e.uuid"] for e in entities}
 
     def _fmt_edges(uid: str) -> str:
         edges = (edges_by_uuid or {}).get(uid, [])
@@ -427,13 +483,20 @@ async def _dedup_pair(
             return "(none)"
         return ", ".join(f"-[{e['relation']}]-> {e['target_name']}" for e in edges)
 
-    prompt = _prompt("dedup_user.txt").format(
-        uuid_a=ea["e.uuid"], name_a=ea["e.name"],
-        type_a=ea["e.entity_type"], desc_a=ea["e.description"],
-        edges_a=_fmt_edges(ea["e.uuid"]),
-        uuid_b=eb["e.uuid"], name_b=eb["e.name"],
-        type_b=eb["e.entity_type"], desc_b=eb["e.description"],
-        edges_b=_fmt_edges(eb["e.uuid"]),
+    node_lines = []
+    for e in entities:
+        node_lines.append(
+            f"  uuid: {e['e.uuid']}\n"
+            f"  name: {e['e.name']}\n"
+            f"  type: {e['e.entity_type']}\n"
+            f"  description: {e['e.description']}\n"
+            f"  relationships: {_fmt_edges(e['e.uuid'])}"
+        )
+
+    nodes_block = "\n\n".join(f"[{i}]\n{block}" for i, block in enumerate(node_lines))
+    prompt = _prompt("dedup_group_user.txt").format(
+        node_count=len(entities),
+        nodes_block=nodes_block,
     )
 
     response_text = ""
@@ -445,115 +508,61 @@ async def _dedup_pair(
         if isinstance(event, TextDelta):
             response_text += event.text
 
+    short_ids = "/".join(e["e.uuid"][:8] for e in entities)
     if response_text:
-        agent_logger.info("[dedup %s/%s] %s", ea["e.uuid"][:8], eb["e.uuid"][:8], response_text)
+        agent_logger.info("[dedup group/%s] %s", short_ids, response_text)
 
     try:
-        verdicts = _parse_dedup_response(response_text)
-        verdict_data = verdicts[0]
-    except (json.JSONDecodeError, ValueError, IndexError):
+        merge_ops = _parse_dedup_response(response_text)
+    except (json.JSONDecodeError, ValueError):
         logger.warning(
-            "[memory/librarian] dedup: could not parse verdict for %s/%s: %s",
-            ea["e.uuid"][:8], eb["e.uuid"][:8], response_text[:200],
+            "[memory/librarian] dedup: could not parse group response (%s): %s",
+            short_ids, response_text[:200],
         )
-        return "distinct"
+        return []
 
-    verdict        = verdict_data.get("verdict", "distinct")
-    canonical_uuid = verdict_data.get("canonical_uuid")
-    merged_desc    = verdict_data.get("merged_description", "")
+    # Validate and apply each merge op
+    merged_uuids: set[str] = set()
+    for op in merge_ops:
+        verdict        = op.get("verdict")
+        canonical_uuid = op.get("canonical_uuid")
+        duplicate_uuids = op.get("duplicate_uuids") or []
+        merged_desc    = op.get("merged_description", "")
 
-    if verdict == "distinct":
-        return "distinct"
-
-    if not canonical_uuid or canonical_uuid not in {ea["e.uuid"], eb["e.uuid"]}:
-        logger.warning("[memory/librarian] dedup: invalid canonical_uuid in verdict")
-        return "distinct"
-
-    await _apply_verdict(ea, eb, verdict, canonical_uuid, merged_desc)
-    return verdict
-
-
-# ---------------------------------------------------------------------------
-# Dedup: batch of pairs
-# ---------------------------------------------------------------------------
-
-async def _dedup_batch(
-    conn,
-    write_lock: asyncio.Lock,
-    llm,
-    pairs: list[tuple[dict, dict]],
-    agent_logger: logging.Logger,
-    edges_by_uuid: dict[str, list[dict]] | None = None,
-) -> list[tuple[frozenset, str, bool]]:
-    from TinyCTX.ai import TextDelta
-
-    def _fmt_edges(uid: str) -> str:
-        edges = (edges_by_uuid or {}).get(uid, [])
-        if not edges:
-            return "(none)"
-        return ", ".join(f"-[{e['relation']}]-> {e['target_name']}" for e in edges)
-
-    pair_lines = []
-    for idx, (ea, eb) in enumerate(pairs):
-        pair_lines.append(
-            f"[{idx}]\n"
-            f"  Node A: uuid={ea['e.uuid']}  name={ea['e.name']}  "
-            f"type={ea['e.entity_type']}  description={ea['e.description']}  "
-            f"relationships={_fmt_edges(ea['e.uuid'])}\n"
-            f"  Node B: uuid={eb['e.uuid']}  name={eb['e.name']}  "
-            f"type={eb['e.entity_type']}  description={eb['e.description']}  "
-            f"relationships={_fmt_edges(eb['e.uuid'])}"
-        )
-
-    prompt = _prompt("dedup_batch_user.txt").format(
-        pairs_block="\n\n".join(pair_lines),
-        pair_count=len(pairs),
-    )
-
-    response_text = ""
-    async for event in llm.stream(
-        [{"role": "system", "content": _prompt("dedup_system.txt")},
-         {"role": "user",   "content": prompt}],
-        tools=None,
-    ):
-        if isinstance(event, TextDelta):
-            response_text += event.text
-
-    if response_text:
-        agent_logger.info("[dedup batch/%d] %s", len(pairs), response_text)
-    verdicts_data = _parse_dedup_response(response_text)
-
-    if len(verdicts_data) != len(pairs):
-        raise ValueError(f"Expected {len(pairs)} verdicts, got {len(verdicts_data)}")
-
-    results: list[tuple[frozenset, str, bool]] = []
-    for item in verdicts_data:
-        idx            = item.get("pair_index")
-        verdict        = item.get("verdict", "distinct")
-        canonical_uuid = item.get("canonical_uuid")
-        merged_desc    = item.get("merged_description", "")
-
-        if not isinstance(idx, int) or idx < 0 or idx >= len(pairs):
-            raise ValueError(f"Invalid pair_index {idx!r} in batch verdict")
-
-        ea, eb = pairs[idx]
-        pair_key = frozenset([ea["e.uuid"], eb["e.uuid"]])
-
-        if verdict == "distinct":
-            results.append((pair_key, "distinct", True))
+        if verdict not in ("duplicate", "alias"):
+            logger.warning("[memory/librarian] dedup: unknown verdict %r, skipping op", verdict)
             continue
 
-        if not canonical_uuid or canonical_uuid not in {ea["e.uuid"], eb["e.uuid"]}:
-            logger.warning(
-                "[memory/librarian] dedup batch: invalid canonical_uuid for pair %d, skipping", idx
-            )
-            results.append((pair_key, "distinct", False))
+        if not canonical_uuid or canonical_uuid not in all_uuids:
+            logger.warning("[memory/librarian] dedup: invalid canonical_uuid %r, skipping op", canonical_uuid)
             continue
 
-        await _apply_verdict(ea, eb, verdict, canonical_uuid, merged_desc)
-        results.append((pair_key, verdict, True))
+        invalid_dups = [u for u in duplicate_uuids if u not in all_uuids or u == canonical_uuid]
+        if invalid_dups:
+            logger.warning("[memory/librarian] dedup: invalid duplicate_uuids %r, skipping op", invalid_dups)
+            continue
 
-    return results
+        overlap = merged_uuids & (set(duplicate_uuids) | {canonical_uuid})
+        if overlap:
+            logger.warning("[memory/librarian] dedup: uuids %r appear in multiple ops, skipping op", overlap)
+            continue
+
+        merged_uuids.add(canonical_uuid)
+        merged_uuids.update(duplicate_uuids)
+
+        for dup_uuid in duplicate_uuids:
+            ea = next(e for e in entities if e["e.uuid"] == canonical_uuid)
+            eb = next(e for e in entities if e["e.uuid"] == dup_uuid)
+            await _apply_verdict(ea, eb, verdict, canonical_uuid, merged_desc)
+
+    # All pairs NOT involved in a merge op are implicitly distinct
+    unmerged = [e["e.uuid"] for e in entities if e["e.uuid"] not in merged_uuids]
+    distinct_pairs: list[tuple[str, str]] = []
+    for i in range(len(unmerged)):
+        for j in range(i + 1, len(unmerged)):
+            distinct_pairs.append((unmerged[i], unmerged[j]))
+
+    return distinct_pairs
 
 
 # ---------------------------------------------------------------------------
@@ -574,4 +583,3 @@ async def _apply_verdict(
         merged_description=merged_desc,
         verdict=verdict,
     )
-
