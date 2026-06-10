@@ -338,5 +338,5 @@ def register_agent(agent) -> None:
         """
         return _dispatch(command, local=True, call_timeout=timeout)
 
-    agent.tool_handler.register_tool(shell,      always_on=True, min_permission=25)
+    agent.tool_handler.register_tool(shell,      always_on=True, min_permission=45)
     agent.tool_handler.register_tool(core_shell, always_on=True, min_permission=80)
