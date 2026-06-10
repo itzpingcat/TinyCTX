@@ -40,14 +40,30 @@ import ipaddress
 import socket
 
 _PRIVATE_NETWORKS = [
-    ipaddress.ip_network("127.0.0.0/8"),
+    # IPv4
+    ipaddress.ip_network("0.0.0.0/8"),         # "this" network
     ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("100.64.0.0/10"),     # carrier-grade NAT (CGNAT)
+    ipaddress.ip_network("127.0.0.0/8"),       # loopback
+    ipaddress.ip_network("169.254.0.0/16"),    # link-local / cloud metadata (AWS IMDSv1 etc.)
     ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.0.0.0/24"),      # IETF protocol assignments
+    ipaddress.ip_network("192.0.2.0/24"),      # TEST-NET-1 (documentation)
     ipaddress.ip_network("192.168.0.0/16"),
-    ipaddress.ip_network("169.254.0.0/16"),   # link-local / cloud metadata
-    ipaddress.ip_network("100.64.0.0/10"),    # carrier-grade NAT
-    ipaddress.ip_network("::1/128"),
-    ipaddress.ip_network("fc00::/7"),          # ULA
+    ipaddress.ip_network("198.18.0.0/15"),     # benchmarking
+    ipaddress.ip_network("198.51.100.0/24"),   # TEST-NET-2 (documentation)
+    ipaddress.ip_network("203.0.113.0/24"),    # TEST-NET-3 (documentation)
+    ipaddress.ip_network("240.0.0.0/4"),       # reserved
+    ipaddress.ip_network("255.255.255.255/32"),# broadcast
+    # IPv6
+    ipaddress.ip_network("::1/128"),           # loopback
+    ipaddress.ip_network("::ffff:0:0/96"),     # IPv4-mapped (::ffff:192.168.x.x etc.)
+    ipaddress.ip_network("64:ff9b::/96"),      # NAT64 well-known prefix
+    ipaddress.ip_network("100::/64"),          # discard-only
+    ipaddress.ip_network("2002::/16"),         # 6to4 (embeds IPv4)
+    ipaddress.ip_network("fc00::/7"),          # ULA (fc00:: and fd00::)
+    ipaddress.ip_network("fe80::/10"),         # link-local
+    ipaddress.ip_network("ff00::/8"),          # multicast
 ]
 
 
@@ -451,6 +467,17 @@ async def _ensure_page(agent):
     pw = await async_playwright().start()
     browser = await pw.chromium.launch(headless=st["settings"]["headless"])
     page = await browser.new_page()
+
+    # Block requests (including redirects) to private/internal addresses.
+    async def _ssrf_route_handler(route, request):
+        err = _check_ssrf(request.url)
+        if err:
+            await route.abort("blockedbyclient")
+        else:
+            await route.continue_()
+
+    await page.route("**/*", _ssrf_route_handler)
+
     st["playwright"] = pw
     st["browser"]    = browser
     st["page"]       = page
@@ -643,49 +670,7 @@ def register_agent(agent) -> None:
         except Exception as e:
             return f"[error: {e}]"
 
-    async def http_request(
-        method: str,
-        url: str,
-        params: dict | None = None,
-        data: dict | None = None,
-        json_data: dict | None = None,
-        headers: dict | None = None,
-    ) -> str:
-        """
-        Perform a generic HTTP request (GET, POST, PUT, DELETE, PATCH, HEAD).
-
-        Args:
-            method: HTTP method (GET, POST, PUT, DELETE, PATCH, HEAD).
-            url: The target URL.
-            params: Query string parameters.
-            data: Form data payload.
-            json_data: JSON payload.
-            headers: Extra request headers.
-        """
-        ssrf_err = _check_ssrf(url)
-        if ssrf_err:
-            return ssrf_err
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.request(
-                    method.upper(), url,
-                    params=params,
-                    data=data,
-                    json=json_data,
-                    headers=headers or {},
-                ) as resp:
-                    body_text = await resp.text()
-                    try:
-                        body = json.loads(body_text)
-                    except Exception:
-                        body = body_text
-                    return json.dumps({
-                        "status_code": resp.status,
-                        "headers":     dict(resp.headers),
-                        "body":        body,
-                    }, indent=2)
-        except Exception as e:
-            return f"[error: {e}]"
+    # http_request removed — deprecated.
 
     async def open_url(
         url: str,
@@ -997,7 +982,7 @@ def register_agent(agent) -> None:
     _WEB_DEFAULTS: dict[str, bool] = {
         "web_search":     True,
         "open_url":       True,
-        "http_request":   False,
+        # http_request removed — deprecated.
         "click":          False,
         "type_text":      False,
         "extract_text":   False,
@@ -1010,7 +995,7 @@ def register_agent(agent) -> None:
     _WEB_PERMISSIONS: dict[str, int] = {
         "web_search":        25,
         "open_url":          25,
-        "http_request":      75,
+        # http_request removed — deprecated.
         "click":             50,
         "type_text":         50,
         "extract_text":      25,
@@ -1023,7 +1008,6 @@ def register_agent(agent) -> None:
     for fn in (
         web_search,
         open_url,
-        http_request,
         click,
         type_text,
         extract_text,
