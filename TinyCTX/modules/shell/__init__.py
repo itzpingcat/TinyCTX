@@ -1,11 +1,12 @@
 EXTENSION_META = {
     "name":    "shell",
-    "version": "1.1",
+    "version": "1.2",
     "description": (
-        "Shell execution tools. "
-        "shell: always-on, runs in the sandbox container (no LAN/Tailscale). "
-        "core_shell: deferred, runs directly on the host — permission 100 only. "
-        "Blacklist enforced on both before dispatch."
+        "Shell execution tool. "
+        "shell: always-on, runs in the sandbox container by default (no LAN/Tailscale). "
+        "Pass internal_network=True to run in the main TinyCTX container with full network access "
+        "(permission level 80 required). "
+        "Blacklist enforced before dispatch in both modes."
     ),
     "default_config": {
         # Timeout used when the agent does not pass an explicit timeout arg.

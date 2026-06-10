@@ -229,9 +229,16 @@ def register_agent(agent) -> None:
                 return "[error: view_range must be [start, end] or 'start,end' integers]"
 
         try:
-            text = p.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            return "[error: binary file, cannot read as text]"
+            fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                text = os.fdopen(fd, "r", encoding="utf-8").read()
+            except UnicodeDecodeError:
+                os.close(fd)
+                return "[error: binary file, cannot read as text]"
+        except OSError as exc:
+            if exc.errno == 40:  # ELOOP — final component is a symlink
+                return f"[error: {p.name} is a symlink — not followed]"
+            return f"[error: could not open {p}: {exc}]"
 
         lines = text.splitlines()
         total = len(lines)
@@ -271,14 +278,21 @@ def register_agent(agent) -> None:
                 return err
 
         if mode == "overwrite" or not existed:
-            p.write_text(content, encoding="utf-8")
+            fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o666)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(content)
             action = "truncated" if existed and content == "" else ("overwrote" if existed else "created")
         elif mode == "prepend":
-            existing = p.read_text(encoding="utf-8")
-            p.write_text(content + existing, encoding="utf-8")
+            fd = os.open(p, os.O_RDWR | os.O_NOFOLLOW)
+            with os.fdopen(fd, "r+", encoding="utf-8") as f:
+                existing = f.read()
+                f.seek(0)
+                f.write(content + existing)
+                f.truncate()
             action = "prepended"
-        else:  # append (default)
-            with p.open("a", encoding="utf-8") as f:
+        else:  # append
+            fd = os.open(p, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW)
+            with os.fdopen(fd, "a", encoding="utf-8") as f:
                 f.write(content)
             action = "appended"
 
@@ -304,7 +318,14 @@ def register_agent(agent) -> None:
         if err:
             return err
 
-        original = p.read_text(encoding="utf-8")
+        fd = os.open(p, os.O_RDWR | os.O_NOFOLLOW)
+        try:
+            with os.fdopen(fd, "r+", encoding="utf-8") as f:
+                original = f.read()
+        except OSError as exc:
+            if exc.errno == 40:
+                return f"[error: {p.name} is a symlink — not followed]"
+            return f"[error: could not open {p}: {exc}]"
 
         # Quote normalization — match even if file uses curly quotes and
         # the LLM sent straight quotes (or vice versa).
@@ -319,10 +340,14 @@ def register_agent(agent) -> None:
         if count > 1 and not replace_all:
             return f"[error: old_str appears {count} times — add more context to make it unique, or set replace_all=true]"
         if replace_all:
-            p.write_text(original.replace(actual_old, clean_new), encoding="utf-8")
+            fd = os.open(p, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(original.replace(actual_old, clean_new))
             _update_after_write(p)
             return f"[replaced {count} occurrences in {p}]"
-        p.write_text(original.replace(actual_old, clean_new, 1), encoding="utf-8")
+        fd = os.open(p, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(original.replace(actual_old, clean_new, 1))
         _update_after_write(p)
         return f"[replaced 1 occurrence in {p}]"
 

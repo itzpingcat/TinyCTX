@@ -298,45 +298,36 @@ def register_agent(agent) -> None:
             output = _run_sandbox(command, sandbox_url, effective_timeout)
         return prefix + output
 
-    def shell(command: str, timeout: int | None = None) -> str:
-        """Run a shell command in the isolated sandbox container.
+    def shell(command: str, timeout: int | None = None, internal_network: bool = False) -> str:
+        """Run a shell command.
 
-        The sandbox has outbound internet access (HTTP/S, git, pip, npm, etc.)
-        but is NETWORK-ISOLATED: it cannot reach the local LAN, Tailscale
-        peers, internal services, or the host. Use this for the vast majority
-        of shell work: building, running scripts, calling public APIs, git, etc.
-        Blocked commands return an error string without executing.
+        By default runs in the isolated sandbox container, which has outbound
+        internet access (HTTP/S, git, pip, npm, etc.) but is NETWORK-ISOLATED:
+        it cannot reach the local LAN, Tailscale peers, or internal services.
+        Use this for the vast majority of shell work.
 
-        For anything that needs to reach a private/local address (e.g.
-        Tailscale IPs, LAN services, ComfyUI, internal APIs) use core_shell.
-
-        Args:
-            command: The shell command to run.
-            timeout: Optional per-call timeout in seconds. Capped at the
-                     configured maximum (default 1200s). Use for long-running
-                     tasks like image generation that may exceed the default.
-        """
-        return _dispatch(command, call_timeout=timeout)
-
-    def core_shell(command: str, timeout: int | None = None) -> str:
-        """Run a shell command in the main TinyCTX container (NOT the sandbox).
-
-        Has full network access: LAN, Tailscale peers, internal services, and
-        the host. Use this whenever the command needs to reach a private or
-        local address — for example:
+        Set internal_network=True to run in the main TinyCTX container instead,
+        which has full network access — use when the command needs to reach a
+        private or local address, e.g.:
           - Tailscale IPs (100.x.x.x)
           - LAN services (192.168.x.x, 10.x.x.x)
           - Internal APIs (ComfyUI, local databases, self-hosted services)
           - Docker host or sibling containers by hostname
-
-        Requires permission level 100. Blacklist still applies.
+        Requires permission level 80. Blacklist still applies in both modes.
 
         Args:
             command: The shell command to run.
             timeout: Optional per-call timeout in seconds. Capped at the
                      configured maximum (default 1200s).
+            internal_network: If True, run in the main container with full
+                              network access (requires permission level 80).
         """
-        return _dispatch(command, local=True, call_timeout=timeout)
+        if internal_network:
+            # Checked inside tool_handler via min_permission, but we guard
+            # explicitly here too so the error message is clear.
+            if agent.config.permissions.level < 80:
+                return "[blocked: internal_network=True requires permission level 80]"
+            return _dispatch(command, local=True, call_timeout=timeout)
+        return _dispatch(command, call_timeout=timeout)
 
-    agent.tool_handler.register_tool(shell,      always_on=True, min_permission=45)
-    agent.tool_handler.register_tool(core_shell, always_on=True, min_permission=80)
+    agent.tool_handler.register_tool(shell, always_on=True, min_permission=45)
