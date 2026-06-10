@@ -1,4 +1,4 @@
-"""
+﻿"""
 utils/attachments.py  --" Attachment classification, saving, and LLM content-block assembly.
 
 This is a pure utility module (not an agent module).  It has no tools, hooks, or
@@ -327,8 +327,7 @@ def build_content_blocks(
         if kind == AttachmentKind.IMAGE:
             if not model_cfg.supports_vision:
                 ref_notes.append(
-                    f"[Image uploaded to {saved_path}: {att.filename}"
-                    "  --" model does not support vision, use filesystem tools to inspect]"
+                    f"[Image uploaded to {saved_path}: {att.filename} -- model does not support vision, use filesystem tools to inspect]"
                 )
                 continue
             # Inline as image_url block -- always convert to PNG for broad API compatibility
