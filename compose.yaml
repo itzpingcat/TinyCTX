@@ -65,6 +65,8 @@ services:
           memory: 4G
         reservations:
           memory: 512M
+    storage_opt:
+      inodes: "100000"
 
     networks:
       tinyctx_net: {}     # internet + Tailscale
@@ -131,6 +133,8 @@ services:
           memory: 4G
         reservations:
           memory: 256M
+    storage_opt:
+      inodes: "100000"
 
     networks:
       agent_sandbox: {}   # IPC from agent
