@@ -38,7 +38,7 @@ class AgentCycle:
         self.context = None
         self.models: dict[str, LLM] = {}
         self.tool_handler = None
-        self.permission_level = 0
+        self.caller = None        # User; set in run()
 
         # Extra events enqueued by tools (e.g. present()) to be yielded
         # immediately after the AgentToolResult for that tool call.
@@ -47,13 +47,13 @@ class AgentCycle:
     async def run(
         self,
         node_id: str,
-        permission_level: int,
+        caller,
         abort_event: asyncio.Event | None = None,
     ) -> AsyncIterator[AgentEvent]:
         if abort_event is None:
             abort_event = asyncio.Event()
 
-        self.permission_level = permission_level
+        self.caller = caller
 
         # --- 1. Resource Setup (Lazy Loading) ---
         if not self.db:
@@ -118,7 +118,7 @@ class AgentCycle:
             logger.debug("[agent] running async hooks")
             await self.context.run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC)
             tools = self.tool_handler.get_tool_definitions(
-                caller_level=self.permission_level,
+                caller_level=self.caller.permission_level,
                 minimal_tokens=self.config.permissions.minimal_tokens,
             ) or None
             messages, _ = self.context.assemble(tools=tools)
@@ -264,7 +264,7 @@ class AgentCycle:
         }
         
         assert self.tool_handler is not None
-        result = await self.tool_handler.execute_tool_call(proxy, caller_level=self.permission_level)
+        result = await self.tool_handler.execute_tool_call(proxy, caller=self.caller)
         raw_output = str(result.get("result", result.get("error", "[no output]")))
         
         # Determine if the tool failed based on the result flag or content analysis

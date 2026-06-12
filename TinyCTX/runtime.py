@@ -207,7 +207,7 @@ class Runtime:
         # Spawn Task
         abort_ev = self._get_abort_event(new_tail_id)
         task = asyncio.create_task(
-            self._process(new_tail_id, msg.author.permission_level, abort_ev, reply_queue),
+            self._process(new_tail_id, msg.author, abort_ev, reply_queue),
             name=f"cycle:{new_tail_id}"
         )
         self._tasks.add(task)
@@ -219,7 +219,7 @@ class Runtime:
     # Processing Logic
     # ------------------------------------------------------------------
 
-    async def _process(self, node_id: str, permission_level: int, abort_event: asyncio.Event, reply_queue: asyncio.Queue | None = None) -> None:
+    async def _process(self, node_id: str, caller, abort_event: asyncio.Event, reply_queue: asyncio.Queue | None = None) -> None:
         from TinyCTX.agent import AgentCycle
         
         async with self._semaphore:
@@ -228,7 +228,7 @@ class Runtime:
                 agent = AgentCycle(self.config, self.module_registry)
                 logger.debug("[runtime] cycle starting for node %s", node_id)
                 
-                async for event in agent.run(node_id, permission_level, abort_event):
+                async for event in agent.run(node_id, caller, abort_event):
                     if reply_queue is not None:
                         await reply_queue.put(event)
                 

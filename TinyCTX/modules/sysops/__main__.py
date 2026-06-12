@@ -47,7 +47,7 @@ def register_agent(agent) -> None:
     # Snapshot caller level once per cycle. The closure captures the *variable*
     # not the value, but agent.permission_level is set before register_agent is
     # called and never changes within a cycle, so this is safe.
-    caller_level = agent.permission_level
+    caller_level = agent.caller.permission_level
 
     # ------------------------------------------------------------------
     # user_list
@@ -240,6 +240,7 @@ def register_agent(agent) -> None:
     agent.tool_handler.register_tool(user_merge,  always_on=False, min_permission=100)
 
     logger.debug(
-        "[sysops] registered 5 tools for caller_level=%d", caller_level
+        "[sysops] registered 5 tools for caller=%s level=%d",
+        agent.caller.username, caller_level,
     )
 
