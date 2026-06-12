@@ -193,35 +193,43 @@ class ToolCallHandler:
         return True
 
     def tools_search(self, query: str) -> str:
-        """Search for available tools by keyword and enable them for use.
+        """Search for available tools by keyword and enable them for use. If the query exactly matches a tool name, that tool is enabled immediately.
+        Otherwise, returns a list of candidates — call tools_search again with the
+        exact tool name you want to enable.
 
         Args:
-            query: Keyword or description of the capability you're looking for.
+            query: Exact tool name to enable, or a keyword/description to search for.
         """
         from TinyCTX.utils.bm25 import BM25
 
+        # --- Exact match: enable immediately ---
+        if query in self.tools:
+            if query in self.enabled:
+                return f"'{query}' is already enabled."
+            self.enabled.add(query)
+            return f"Enabled: {query}"
+
+        # --- Fuzzy search: suggest candidates, do NOT enable anything ---
         corpus = {
             name: f"{name.replace('_', ' ')} {tool['description']}"
             for name, tool in self.tools.items()
         }
         if not corpus:
-            return "No tools found matching that query."
+            return "No tools available."
 
         bm25   = BM25(corpus)
         scored = bm25.search(query, top_k=len(corpus))
-        # Only surface results with a positive BM25 score
         hits   = [name for name, score in scored if score > 0.0]
 
-        new     = [n for n in hits if n not in self.enabled]
-        already = [n for n in hits if n in self.enabled]
-
-        self.enabled.update(new)
-
-        if not new:
-            if already:
-                return f"No new tools found. Already enabled: {', '.join(already)}"
+        if not hits:
             return "No tools found matching that query."
-        return f"Enabled: {', '.join(new)}"
+
+        lines = [f"No exact match for '{query}'. Call tools_search again with the exact name you want to enable. Candidates:"]
+        for name in hits:
+            desc = self.tools[name]['description']
+            already = " (already enabled)" if name in self.enabled else ""
+            lines.append(f"  - {name}{already}: {desc}")
+        return "\n".join(lines)
 
     def get_tool_definitions(self, caller_level: int = 100, minimal_tokens: bool = False) -> List[Dict[str, Any]]:
         definitions = []
