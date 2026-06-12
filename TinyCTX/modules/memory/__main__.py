@@ -640,7 +640,7 @@ def register_agent(cycle) -> None:
         always = (fn.__name__ == "kg_search")
         cycle.tool_handler.register_tool(fn, always_on=always, min_permission=25)
 
-    cycle.tool_handler.register_tool(call_librarian, always_on=True, min_permission=25)
+    cycle.tool_handler.register_tool(call_librarian, always_on=True, min_permission=35)
 
     # ------------------------------------------------------------------
     # Pressure-based ingest hook
