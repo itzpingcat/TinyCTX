@@ -105,7 +105,14 @@ def _build_variables(agent, ctx=None, trusted_threshold: int = 90, last_message_
     session = ctx.state.get("session", {}) if ctx is not None else {}
     is_group_chat = bool(session.get("server_name"))
     platform = session.get("platform") or ""
-    author_id = session.get("author_id") or ""
+    # author_id lives on HistoryEntry nodes, not in session state.
+    # Find it from the most recent user turn in dialogue.
+    author_id = ""
+    if ctx is not None:
+        for entry in reversed(ctx.dialogue):
+            if entry.role == "user" and entry.author_id:
+                author_id = entry.author_id
+                break
     # Trust check — applies in both DMs and group chats.
     trusted = False
     if _users is not None and platform and author_id:
@@ -161,7 +168,12 @@ def _build_static_variables(agent, ctx=None, trusted_threshold: int = 90) -> dic
     session = ctx.state.get("session", {}) if ctx is not None else {}
     is_group_chat = bool(session.get("server_name"))
     platform = session.get("platform") or ""
-    author_id = session.get("author_id") or ""
+    author_id = ""
+    if ctx is not None:
+        for entry in reversed(ctx.dialogue):
+            if entry.role == "user" and entry.author_id:
+                author_id = entry.author_id
+                break
     trusted = False
     if _users is not None and platform and author_id:
         try:

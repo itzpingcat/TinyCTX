@@ -584,9 +584,23 @@ class Context:
             messages.append(self._render(entry))
 
         # 4. post_assemble
-        # Append deferred non-system prompts (e.g. footer) after all history.
-        for slot, content in sorted(deferred_prompts, key=lambda x: x[0].priority):
-            messages.append({"role": slot.role, "content": content})
+        # Insert deferred non-system prompts (e.g. footer) BEFORE the last
+        # user message so the merge produces: <footer>\n\n[user message].
+        # Priority is respected within the deferred set.
+        if deferred_prompts:
+            sorted_deferred = sorted(deferred_prompts, key=lambda x: x[0].priority)
+            # Find the last user message index in messages
+            last_user_idx = next(
+                (i for i in range(len(messages) - 1, -1, -1)
+                 if messages[i]["role"] == ROLE_USER),
+                None,
+            )
+            if last_user_idx is not None:
+                for slot, content in reversed(sorted_deferred):
+                    messages.insert(last_user_idx, {"role": slot.role, "content": content})
+            else:
+                for slot, content in sorted_deferred:
+                    messages.append({"role": slot.role, "content": content})
 
         for _, _, fn in self._hooks[HOOK_POST_ASSEMBLE]:
             result = fn(messages, self)
