@@ -71,6 +71,8 @@ from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader, TemplateNotFound, TemplateSyntaxError
 
+from TinyCTX.context import HOOK_PRE_ASSEMBLE_ASYNC
+
 logger = logging.getLogger(__name__)
 
 # Module-level reference set by register_runtime.
