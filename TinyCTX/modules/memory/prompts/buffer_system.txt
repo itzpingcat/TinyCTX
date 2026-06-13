@@ -45,16 +45,29 @@ THE SYNTHESIS IMPERATIVE (UPDATES)
 
 PINNING PARTICIPANTS
 --------------------
-When you add or update an entity for someone who is actively speaking in the
-conversation (not someone merely referenced in passing), you MUST set:
-  - pinned: "user"
-  - pinned_target: their exact TinyCTX username (as it appears on their messages)
+Pinning controls what appears in {agent_name}'s persistent memory block. Use it
+sparingly — only for things that genuinely need to be recalled across ALL future
+conversations.
 
-For all other entities, use pinned: "global".
+Rules:
+- pinned: "user", pinned_target: <username>
+    Use for a direct conversation participant (someone actively sending messages
+    in this excerpt) when you add or update their personal entity node.
+    Do NOT apply to third parties being discussed, even if well-known.
 
-Only apply pinned: "user" to participants who are directly conversing — people
-who sent messages in this excerpt. Do not apply it to third parties being
-discussed, even if they are well-known to the user.
+- pinned: "global"
+    Use ONLY for durable, cross-cutting facts that {agent_name} must remember
+    regardless of who is talking: core system facts, {agent_name}'s own identity
+    or configuration, persistent rules or directives, and major long-term
+    projects central to {agent_name}'s operation.
+    Do NOT use this as a default. One-off preferences, transient requests,
+    third-party people, external tools mentioned in passing, and per-user
+    trivia must NOT be pinned global.
+
+- No pinning (omit pinned / pinned_target entirely)
+    The default for almost everything. Most extracted facts — referenced people,
+    organisations, technologies, one-off preferences, events — should not be
+    pinned at all. They remain in the graph and are retrievable via search.
 
 RULES
 -----
