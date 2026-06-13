@@ -254,7 +254,9 @@ class ToolCallHandler:
         return definitions
     
     async def execute_tool_call(self, tool_call, caller) -> Dict[str, Any]:
-        """Execute a tool call from the LLM"""
+        """Execute a tool call from the LLM."""
+        caller_level    = caller.permission_level
+        caller_username = caller.username
         try:
             if hasattr(tool_call, 'function'):
                 function_name = tool_call.function.name
@@ -288,12 +290,12 @@ class ToolCallHandler:
 
             # Permission guard — enforce even if LLM hallucinated a filtered tool.
             min_perm = self.tools[function_name].get('min_permission', 25)
-            if caller.permission_level < min_perm:
+            if caller_level < min_perm:
                 return {
                     'tool_call_id': tool_call_id,
                     'error': (
-                        f"[PERMISSION DENIED] User '{caller.username}' has permission level "
-                        f"{caller.permission_level} but '{function_name}' requires {min_perm}."
+                        f"[PERMISSION DENIED] '{caller_username}' has permission level "
+                        f"{caller_level} but '{function_name}' requires {min_perm}."
                     ),
                     'success': False,
                 }

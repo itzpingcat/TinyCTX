@@ -173,6 +173,10 @@ async def _agent_loop(
 ) -> None:
     from TinyCTX.ai import TextDelta, ToolCallAssembled, LLMError
 
+    class _InternalCaller:
+        permission_level = 25
+        username = "librarian"
+
     tool_defs = handler.get_tool_definitions(caller_level=25)
     messages: list[dict] = [
         {"role": "system", "content": system_prompt},
@@ -216,7 +220,7 @@ async def _agent_loop(
         for tc in tool_calls:
             outcome = await handler.execute_tool_call(
                 {"id": tc["id"], "function": {"name": tc["name"], "arguments": tc["args"]}},
-                caller_level=25,
+                _InternalCaller(),
             )
             result = outcome["result"] if outcome["success"] else outcome["error"]
             agent_logger.debug("  tool %s -> %s", tc["name"], result)

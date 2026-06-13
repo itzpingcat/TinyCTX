@@ -193,6 +193,19 @@ class UserStore:
             return self._cache_by_username[username]
         return self._load_user(username)
 
+    def get_by_platform(self, platform: Platform, user_id: str) -> User | None:
+        """Read-only lookup by platform identity. Returns None if not found."""
+        cache_key = (platform.value, user_id)
+        if cache_key in self._cache_by_platform:
+            return self._cache_by_platform[cache_key]
+        row = self._conn.execute(
+            "SELECT username FROM user_platform_index WHERE platform = ? AND user_id = ?",
+            (platform.value, user_id),
+        ).fetchone()
+        if not row:
+            return None
+        return self._load_user(row["username"])
+
     def update_user(self, user: User) -> None:
         self._conn.execute(
             "UPDATE users SET permission_level = ?, identities = ?, meta = ? WHERE username = ?",

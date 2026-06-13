@@ -111,7 +111,7 @@ def _build_variables(agent, ctx=None, trusted_threshold: int = 90, last_message_
     if _users is not None and platform and author_id:
         try:
             from TinyCTX.contracts import Platform
-            user = _users.get_by_platform_id(Platform(platform), author_id)
+            user = _users.get_by_platform(Platform(platform), author_id)
             trusted = user is not None and user.permission_level >= trusted_threshold
         except Exception as exc:
             logger.debug("[equipment_manifest] trusted lookup failed: %s", exc)
@@ -166,7 +166,7 @@ def _build_static_variables(agent, ctx=None, trusted_threshold: int = 90) -> dic
     if _users is not None and platform and author_id:
         try:
             from TinyCTX.contracts import Platform
-            user = _users.get_by_platform_id(Platform(platform), author_id)
+            user = _users.get_by_platform(Platform(platform), author_id)
             trusted = user is not None and user.permission_level >= trusted_threshold
         except Exception as exc:
             logger.debug("[equipment_manifest] trusted lookup failed: %s", exc)
