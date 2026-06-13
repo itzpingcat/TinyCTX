@@ -540,9 +540,10 @@ class Context:
         system_lines = [c for s, c in resolved if s.role == ROLE_SYSTEM]
         if system_lines:
             messages.append({"role": ROLE_SYSTEM, "content": "\n\n".join(system_lines)})
-        for slot, content in resolved:
-            if slot.role != ROLE_SYSTEM:
-                messages.append({"role": slot.role, "content": content})
+
+        # Non-system prompts (e.g. role=user footer) are deferred until after
+        # dialogue history so they land on the latest user message, not the first.
+        deferred_prompts = [(s, c) for s, c in resolved if s.role != ROLE_SYSTEM]
 
         # 2 & 3. filter + transform per dialogue entry
         for entry in source:
@@ -583,6 +584,10 @@ class Context:
             messages.append(self._render(entry))
 
         # 4. post_assemble
+        # Append deferred non-system prompts (e.g. footer) after all history.
+        for slot, content in sorted(deferred_prompts, key=lambda x: x[0].priority):
+            messages.append({"role": slot.role, "content": content})
+
         for _, _, fn in self._hooks[HOOK_POST_ASSEMBLE]:
             result = fn(messages, self)
             if result is not None:
