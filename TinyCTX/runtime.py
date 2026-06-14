@@ -178,8 +178,12 @@ class Runtime:
             workspace=workspace,
         ) if msg.attachments else effective_text
 
-        # Serialise list content to JSON string for DB storage.
-        content_str = json.dumps(content, ensure_ascii=False) if isinstance(content, list) else content
+        # build_content_blocks returns list[dict] when attachments are inlined
+        # (e.g. small images within the inline_max_bytes threshold), or a plain
+        # str when every attachment exceeded the threshold and was written as a
+        # reference note instead (the agent reads those files via filesystem tools).
+        # Normalise to str for DB storage in both cases.
+        content_str = json.dumps(content, ensure_ascii=False) if isinstance(content, list) else str(content)
 
         # 2. Write User Node to DB
         state_delta = self._compute_state_delta(msg)

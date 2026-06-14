@@ -282,6 +282,18 @@ class AgentCycle:
                 mime = payload[:sep]
                 b64data = payload[sep + 1:]
 
+                # Convert to PNG if needed — local backends (llama.cpp / llama-swap)
+                # often reject non-PNG image_url blocks with HTTP 500.
+                # _convert_to_png also strips ICC profiles that some backends choke on.
+                if mime != "image/png":
+                    from TinyCTX.utils.attachments import _convert_to_png
+                    import base64 as _base64
+                    raw_bytes = _base64.b64decode(b64data)
+                    converted = _convert_to_png(raw_bytes)
+                    if converted is not None:
+                        mime = "image/png"
+                        b64data = _base64.b64encode(converted).decode()
+
                 primary_cfg = self.config.get_model_config(self.config.llm.primary)
                 
                 if primary_cfg.supports_vision:
