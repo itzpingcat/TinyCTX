@@ -58,10 +58,15 @@ async def _aset(conn, uid: str, field: str, value):
 
 def nodes_to_text(conv_db, node_ids: list[str], batch_size: int) -> tuple[str, str]:
     """
-    Render up to batch_size nodes as '[author]: content' lines.
+    Render up to batch_size nodes as '【author】: content' lines (fullwidth
+    brackets, U+3010/U+3011 — matching the speaker-label convention used in
+    context.py). Content is passed through _sanitize_brackets() first so it
+    cannot forge this delimiter.
     Returns (batch_text, agent_name) where agent_name is the last assistant
     author_id seen in the batch, or 'assistant' if none found.
     """
+    from TinyCTX.utils.sanitize import sanitize_brackets
+
     lines: list[str] = []
     agent_name = "assistant"
     for node_id in node_ids[:batch_size]:
@@ -80,9 +85,9 @@ def nodes_to_text(conv_db, node_ids: list[str], batch_size: int) -> tuple[str, s
                 content = " ".join(texts)
             except Exception:
                 pass
-        content = content.strip()
+        content = sanitize_brackets(content.strip())
         if content:
-            lines.append(f"[{author}]: {content}")
+            lines.append(f"\u3010{author}\u3011: {content}")
     return "\n".join(lines), agent_name
 
 
