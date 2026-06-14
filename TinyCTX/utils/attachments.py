@@ -217,13 +217,18 @@ def save_upload(attachment: Attachment, uploads_dir: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 def _convert_to_png(data: bytes) -> bytes | None:
-    """Convert image bytes to PNG using Pillow.  Returns None if unavailable."""
+    """Convert image bytes to PNG using Pillow.  Returns None if unavailable.
+
+    ICC profiles are explicitly stripped (icc_profile=None) because some model
+    backends (llama.cpp / llama-swap) reject PNG input that contains an iCCP
+    chunk, returning HTTP 400 "Failed to load image".
+    """
     try:
         import io
         from PIL import Image
         img = Image.open(io.BytesIO(data))
         buf = io.BytesIO()
-        img.save(buf, format="PNG")
+        img.save(buf, format="PNG", icc_profile=None)
         return buf.getvalue()
     except ImportError:
         return None
