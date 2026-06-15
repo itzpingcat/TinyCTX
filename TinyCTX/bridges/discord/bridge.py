@@ -24,6 +24,7 @@ import asyncio
 import dataclasses
 import logging
 import os
+import random
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -61,10 +62,11 @@ DEFAULTS = {
     "dm_enabled": True,
     "dm_requires_permission": 75,       # minimum user registry level to use the bot in DMs
     "reset_requires_permission": 75,    # minimum user registry level to /reset in a server
-    "prefix_required": True,
-    "command_prefix": "!",
     "reset_command": "/reset",
     "shutdown_command": "/shutdown",
+    "keyword_listen_keywords": [],
+    "keyword_listen_timeout_s": 600,
+    "keyword_chance_keywords": {},     # {"word": 0.25} — always-on probabilistic trigger
     "buffer_timeout_s": 0,
     "buffer_head_lines": 2,
     "buffer_tail_lines": 10,
@@ -97,8 +99,6 @@ class DiscordBridge:
         self._typing_on_thinking: bool  = bool(self._opts["typing_on_thinking"])
         self._typing_on_tools:    bool  = bool(self._opts["typing_on_tools"])
         self._typing_on_reply:    bool  = bool(self._opts["typing_on_reply"])
-        self._prefix:             str   = str(self._opts["command_prefix"])
-        self._prefix_required:    bool  = bool(self._opts["prefix_required"])
         self._reset_command:      str   = str(self._opts["reset_command"])
         self._shutdown_command:   str   = str(self._opts["shutdown_command"])
         self._dm_enabled:         bool  = bool(self._opts["dm_enabled"])
@@ -111,6 +111,21 @@ class DiscordBridge:
         self._buffer_timeout_s:  float = float(self._opts["buffer_timeout_s"])
         self._buffer_head_lines: int   = int(self._opts["buffer_head_lines"])
         self._buffer_tail_lines: int   = int(self._opts["buffer_tail_lines"])
+
+        # Keyword listen window: maps cursor_key -> expiry timestamp
+        self._keyword_listen_keywords: list[str] = [
+            kw.lower() for kw in self._opts["keyword_listen_keywords"]
+        ]
+        self._keyword_listen_timeout_s: float = float(
+            self._opts["keyword_listen_timeout_s"]
+        )
+        self._keyword_listen_expiry: dict[str, float] = {}
+
+        # Probabilistic keywords: {keyword_lower: probability}
+        self._keyword_chance: dict[str, float] = {
+            k.lower(): float(v)
+            for k, v in self._opts["keyword_chance_keywords"].items()
+        }
 
         # In-flight state (not persisted)
         self._typing_active:    dict[str, asyncio.Event]          = {}
@@ -300,15 +315,39 @@ class DiscordBridge:
         required = int(self._opts["reset_requires_permission"])
         return self._user_permission_level(user_id) >= required
 
-    def _is_group_trigger(self, text: str) -> bool:
-        if not self._prefix_required:
-            return True
-        if text.startswith(self._prefix):
-            return True
+    def _is_group_trigger(self, text: str, cursor_key: str = "") -> bool:
         bot_name = self._client.user.name if self._client.user else ""
         if bot_name and f"@{bot_name}" in text:
             return True
+        # Keyword listen window: active after a direct trigger for up to timeout_s.
+        if cursor_key and self._keyword_listen_keywords:
+            expiry = self._keyword_listen_expiry.get(cursor_key, 0.0)
+            if time.time() < expiry:
+                text_lower = text.lower()
+                if any(kw in text_lower for kw in self._keyword_listen_keywords):
+                    return True
+        # Probabilistic keywords: always-on, each keyword has its own trigger chance.
+        if self._keyword_chance:
+            text_lower = text.lower()
+            for kw, chance in self._keyword_chance.items():
+                if kw in text_lower and random.random() < chance:
+                    logger.debug(
+                        "Discord: probabilistic keyword %r fired (%.0f%%) for %s",
+                        kw, chance * 100, cursor_key,
+                    )
+                    return True
         return False
+
+    def _refresh_keyword_listen(self, cursor_key: str) -> None:
+        """Reset the keyword-listen window for cursor_key to now + timeout."""
+        if self._keyword_listen_keywords and self._keyword_listen_timeout_s > 0:
+            self._keyword_listen_expiry[cursor_key] = (
+                time.time() + self._keyword_listen_timeout_s
+            )
+            logger.debug(
+                "Discord: keyword-listen window refreshed for %s (%.0fs)",
+                cursor_key, self._keyword_listen_timeout_s,
+            )
 
     def _dehumanize_mentions(self, text: str) -> str:
         return dehumanize_mentions(text, self._runtime)
@@ -598,7 +637,7 @@ class DiscordBridge:
             username=message.author.name,
             display_name=message.author.display_name,
         )
-        is_trigger = self._is_group_trigger(text)
+        is_trigger = self._is_group_trigger(text, cursor_key)
         ref_group  = message.reference
         resolved_group = ref_group.resolved if ref_group else None
         reply_to_author_group: str | None = None
@@ -663,6 +702,7 @@ class DiscordBridge:
             await self._push_passive(msg, cursor_key)
             return
 
+        self._refresh_keyword_listen(cursor_key)
         self._dispatch_turn(msg, message.channel, cursor_key)
 
     # ------------------------------------------------------------------
