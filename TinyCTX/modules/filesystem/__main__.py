@@ -94,6 +94,16 @@ def _image_mime(path: Path) -> str | None:
     return None
 
 
+# Extensions whose raw bytes need text extraction before they can be viewed
+# as text. Maps extension -> attachments.py function name (looked up via
+# getattr so pdfplumber/python-docx/rapidocr stay fully optional -- view()
+# only imports TinyCTX.utils.attachments lazily, inside the branch that needs it).
+_DOC_EXTRACTORS: dict[str, str] = {
+    ".pdf":  "extract_pdf_text",
+    ".docx": "extract_docx_text",
+}
+
+
 def register_agent(agent) -> None:
     workspace = Path(agent.config.workspace.path).expanduser().resolve()
     source_root = Path.cwd().resolve()
@@ -183,7 +193,8 @@ def register_agent(agent) -> None:
 
         For image files (jpg, png, gif, webp) the raw image bytes are returned
         as a vision content block so the model can see the image directly.
-        For all other binary files an error is returned.
+        For PDF/DOCX files, extracted text is returned (paginated like any
+        other text file). For all other binary files an error is returned.
 
         Args:
             path: File or directory path.
@@ -209,8 +220,7 @@ def register_agent(agent) -> None:
             # Return a sentinel that agent._execute_tool knows how to unwrap.
             return f"{IMAGE_BLOCK_PREFIX}{mime};{b64}"
 
-        # --- text handling ---
-        # Normalize view_range early so we can use it for unchanged detection.
+        # Normalize view_range early so both the document and text paths can use it.
         parsed_range: tuple | None = None
         if view_range:
             try:
@@ -228,6 +238,31 @@ def register_agent(agent) -> None:
             except (ValueError, IndexError):
                 return "[error: view_range must be [start, end] or 'start,end' integers]"
 
+        # --- document handling (PDF / DOCX text extraction) ---
+        ext = p.suffix.lower()
+        if ext in _DOC_EXTRACTORS:
+            try:
+                raw_doc = p.read_bytes()
+            except OSError as exc:
+                return f"[error: could not read {p}: {exc}]"
+            from TinyCTX.utils import attachments
+            extracted = getattr(attachments, _DOC_EXTRACTORS[ext])(raw_doc)
+            if extracted is None:
+                return (
+                    f"[error: could not extract text from {p.name} -- "
+                    "pdfplumber/python-docx not installed, or extraction failed]"
+                )
+            lines = extracted.splitlines()
+            total = len(lines)
+            if parsed_range:
+                start = parsed_range[0] - 1
+                end = parsed_range[1] if parsed_range[1] != -1 else total
+                lines = lines[start:end]
+            return f"[{p} | {total} lines, extracted text]\n" + "\n".join(
+                f"{i:>6}\t{l}" for i, l in enumerate(lines, 1)
+            )
+
+        # --- text handling ---
         try:
             fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW)
             try:

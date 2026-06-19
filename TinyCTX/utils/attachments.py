@@ -219,7 +219,7 @@ def save_upload(attachment: Attachment, uploads_dir: Path) -> Path:
 # Image conversion helpers
 # ---------------------------------------------------------------------------
 
-def _convert_to_png(data: bytes) -> bytes | None:
+def convert_to_png(data: bytes) -> bytes | None:
     """Convert image bytes to PNG using Pillow.  Returns None if unavailable.
 
     ICC profiles are explicitly stripped (icc_profile=None) because some model
@@ -271,7 +271,7 @@ def _ocr_image(img) -> str | None:
         return None
 
 
-def _extract_pdf_text(data: bytes) -> str | None:
+def extract_pdf_text(data: bytes) -> str | None:
     """
     Extract text from a PDF using pdfplumber's text layer.  Pages with little or
     no extractable text (scanned/image pages) are rasterized and run through
@@ -299,7 +299,7 @@ def _extract_pdf_text(data: bytes) -> str | None:
     return "\n\n".join(p for p in pages if p.strip()) or None
 
 
-def _extract_docx_text(data: bytes) -> str | None:
+def extract_docx_text(data: bytes) -> str | None:
     """
     Extract text from a DOCX using python-docx: paragraphs, table cells, and
     OCR of embedded images (covers pasted screenshots / scanned pages).
@@ -408,7 +408,7 @@ def build_content_blocks(
             img_data = att.data
             mime = att.mime_type.split(";")[0].strip()
             if mime != "image/png":
-                converted = _convert_to_png(img_data)
+                converted = convert_to_png(img_data)
                 if converted is not None:
                     img_data = converted
                     mime = "image/png"
@@ -445,7 +445,7 @@ def build_content_blocks(
             extracted: str | None = None
 
             if ext == ".pdf" or att.mime_type == "application/pdf":
-                extracted = _extract_pdf_text(att.data)
+                extracted = extract_pdf_text(att.data)
                 if extracted is None:
                     ref_notes.append(
                         f"[PDF uploaded to {saved_path}: {att.filename}"
@@ -453,7 +453,7 @@ def build_content_blocks(
                     )
                     continue
             elif ext == ".docx":
-                extracted = _extract_docx_text(att.data)
+                extracted = extract_docx_text(att.data)
                 if extracted is None:
                     ref_notes.append(
                         f"[DOCX uploaded to {saved_path}: {att.filename}"
