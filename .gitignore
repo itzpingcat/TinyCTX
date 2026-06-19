@@ -18,3 +18,5 @@ TinyCTX/custom_modules/
 # sessions / workspace data
 sessions/
 workspace/
+
+mcp.json

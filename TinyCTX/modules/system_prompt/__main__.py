@@ -1,7 +1,7 @@
 """
 modules/system_prompt/__main__.py
 
-Static system-prompt injection: SOUL.md, AGENTS.md, MEMORY.md, TOOLS.md.
+Static system-prompt injection: SOUL.md, AGENTS.md, TOOLS.md.
 
 This module's only job is to register the four file-backed prompt providers
 onto the agent cycle's context.  The RAG pipeline (indexing, hybrid search,

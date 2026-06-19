@@ -66,7 +66,7 @@ TinyCTX/
     ├── skills/         use_skill tool (loads SKILL.md files)
     ├── subagents/      spawn_agent / wait_agent tools
     ├── sysops/         System operation tools (model switching, abort, etc.)
-    ├── system_prompt/  Injects SOUL.md, AGENTS.md, MEMORY.md into system prompt
+    ├── system_prompt/  Injects SOUL.md, AGENTS.md into system prompt
     ├── todo/           todo_read / todo_write tools (per-session task list)
     └── web/            web_search / open_url tools (DuckDuckGo + Playwright)
 ```
@@ -292,7 +292,7 @@ Cursors (`dm:<uid>`, `group:<cid>`, `thread:<tid>`) are persisted in
 
 ## Notable Modules
 
-### `system_prompt` — injects SOUL.md, AGENTS.md, MEMORY.md, TOOLS.md into every system prompt via `register_prompt` providers.
+### `system_prompt` — injects SOUL.md, AGENTS.md,, TOOLS.md into every system prompt via `register_prompt` providers.
 
 ### `rag` — indexes `workspace/memory/*.md` files; auto-injects relevant chunks each turn (BM25 or embedding cosine similarity); provides `memory_search` tool; triggers background memory consolidation when context budget is near.
 
@@ -343,7 +343,6 @@ agent.db          Conversation tree (SQLite)
 cursors/          Per-bridge session cursors (CLI resume)
 SOUL.md           Agent personality (loaded every turn)
 AGENTS.md         Sub-agent/persona definitions
-MEMORY.md         Long-term facts always in context
 memory/           Semantic search corpus (*.md files, subdirs OK)
 downloads/        Files/images sent by users via bridges
 CRON.json         Scheduled jobs

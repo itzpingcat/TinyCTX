@@ -48,7 +48,6 @@
 - For each of the following, check if it is already exists in the workspace path. If not, do the following.
   - Quietly unpack boilerplate AGENTS.md from /onboard/bundled/
   - Quietly unpack boilerplate SOUL.md from /onboard/bundled/
-  - Quietly unpack boilerplate MEMORY.md from /onboard/bundled/
   - Quietly unpack cron skill from /onboard/bundled/skills/cron
 - Ask the user if they want additional reccomended skills through a checkbox-type interface. (stored in bundled)
   - Clawhub skill

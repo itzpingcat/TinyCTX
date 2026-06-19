@@ -3,7 +3,7 @@ onboard/workspace_setup.py — Step 3: Workspace path selection and bootstrappin
 
 - Prompts the user for the workspace directory (default ~/.tinyctx/).
 - Unpacks BOOTSTRAP.md if the workspace is empty or brand-new.
-- Quietly copies boilerplate files (AGENTS.md, SOUL.md, MEMORY.md) if missing.
+- Quietly copies boilerplate files (AGENTS.md, SOUL.md) if missing.
 - Quietly installs the bundled cron skill if missing.
 - Offers optional recommended skills via a checkbox.
 """
@@ -29,7 +29,7 @@ from .helpers import (
 )
 
 # Boilerplate .md files that live in onboard/bundled/
-BOILERPLATE_MD = ["AGENTS.md", "SOUL.md", "MEMORY.md", "TOOLS.md", "USER.md"]
+BOILERPLATE_MD = ["AGENTS.md", "SOUL.md", "TOOLS.md", "USER.md"]
 
 # Optional recommended skills (must be zip files in onboard/bundled/)
 RECOMMENDED_SKILLS = ["clawhub", "weather", "skill-creator"]
