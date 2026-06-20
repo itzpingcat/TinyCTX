@@ -52,6 +52,7 @@ async def main() -> None:
     await gw.start()
 
     tasks: list[asyncio.Task] = []
+    bridge_modules: dict[asyncio.Task, object] = {}
 
     # ------------------------------------------------------------------ gateway
     if cfg.gateway.enabled:
@@ -99,7 +100,9 @@ async def main() -> None:
                 if not hasattr(mod, "run"):
                     logger.warning("Bridge '%s' has no run() — skipping", name)
                     continue
-                tasks.append(asyncio.create_task(mod.run(gw), name=f"bridge:{name}"))
+                bridge_task = asyncio.create_task(mod.run(gw), name=f"bridge:{name}")
+                tasks.append(bridge_task)
+                bridge_modules[bridge_task] = mod
                 logger.info("Started bridge '%s'", name)
             except Exception:
                 logger.exception("Failed to load bridge '%s'", name)
@@ -119,11 +122,25 @@ async def main() -> None:
             logger.info("Task '%s' exited cleanly.", t.get_name())
 
     for t in pending:
+        mod = bridge_modules.get(t)
+        close_fn = getattr(mod, "close", None) if mod else None
+        if close_fn is not None:
+            try:
+                logger.info("Closing task '%s' via module close() hook", t.get_name())
+                await asyncio.wait_for(close_fn(gw), timeout=5)
+            except Exception:
+                logger.exception("Task '%s' close() hook failed", t.get_name())
+
         t.cancel()
         try:
-            await t
+            await asyncio.wait_for(t, timeout=5)
         except asyncio.CancelledError:
             pass
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Task '%s' did not finish within 5s of cancellation — abandoning it.",
+                t.get_name(),
+            )
 
     await gw.shutdown()
     logger.info("Shutdown complete.")

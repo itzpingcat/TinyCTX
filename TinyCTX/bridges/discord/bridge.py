@@ -794,3 +794,14 @@ class DiscordBridge:
             )
         logger.info("Discord bridge: starting (token_env=%s)", token_env)
         await self._client.start(token)
+
+    async def close(self) -> None:
+        """
+        Stop the Discord client cleanly. discord.py's reconnect/heartbeat
+        loops do not reliably unwind from a bare task cancellation — they
+        expect close() to be called, which sets their internal closed-flag
+        and lets start() return on its own. Call this before cancelling the
+        bridge task on shutdown.
+        """
+        logger.info("Discord bridge: closing client")
+        await self._client.close()

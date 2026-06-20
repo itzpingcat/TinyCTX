@@ -28,10 +28,22 @@ from .bridge import DiscordBridge
 if TYPE_CHECKING:
     from TinyCTX.runtime import Runtime
 
+# Set by run() once the bridge is constructed, so close() can reach the
+# live discord.py client. discord.py's task does not unwind reliably from
+# a bare task.cancel() — it needs close() called on it explicitly.
+_bridge: DiscordBridge | None = None
+
 
 async def run(runtime: "Runtime") -> None:
     """Entry point called by main.py bridge loader."""
+    global _bridge
     bridge_cfg = runtime.config.bridges.get("discord")
     options: dict = bridge_cfg.options if bridge_cfg else {}
-    bridge = DiscordBridge(runtime, options)
-    await bridge.run()
+    _bridge = DiscordBridge(runtime, options)
+    await _bridge.run()
+
+
+async def close(runtime: "Runtime") -> None:
+    """Optional shutdown hook called by main.py before cancelling the bridge task."""
+    if _bridge is not None:
+        await _bridge.close()

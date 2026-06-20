@@ -19,7 +19,7 @@ services:
     depends_on:
       shell_sandbox:
         condition: service_healthy
-    restart: unless-stopped
+    restart: on-failure
 
     ports:
       - "127.0.0.1:8085:8085"

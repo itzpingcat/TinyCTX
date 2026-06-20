@@ -163,13 +163,23 @@ After hook processing, adjacent same-role messages are merged. Then token budget
 
 `LLM` — async OpenAI-compatible streaming client. Works with Anthropic (compat endpoint), OpenAI, OpenRouter, Ollama, LM Studio, llama.cpp.
 
-- `LLM.stream(messages, tools)` yields: `TextDelta | ThinkingDelta | ToolCallAssembled | LLMError`
+- `LLM.stream(messages, tools, priority=10)` yields: `TextDelta | ThinkingDelta | ToolCallAssembled | LLMError`
 - Tool call argument fragments are assembled before yielding — callers always receive complete args dicts.
 - Retries on `ClientConnectionError` (3 attempts, exponential backoff via tenacity).
 - `budget_tokens` enables Anthropic extended thinking (forces `temperature=1`).
 - `cache_prompts` injects `cache_control: ephemeral` on the last system message.
 
-`Embedder` — async OpenAI-compatible embedding client. `embed(texts)` batches automatically.
+`Embedder` — async OpenAI-compatible embedding client. `embed(texts, priority=10)` batches automatically; `embed_one(text, priority=10)` is the single-string convenience wrapper.
+
+### Priority queue
+
+Every `LLM.stream()` / `Embedder.embed()` / `embed_one()` call is admission-controlled by a single module-level priority queue living inside `ai.py` itself — not a separate object, not passed around through `runtime.py`/`agent.py`/modules. Lower `priority` runs first; ties are FIFO (via a monotonic sequence counter, since `heapq` isn't stable on priority alone).
+
+- `configure_parallel(n)` sets the max number of concurrent in-flight requests (from `config.parallel`, default 3). Called once at startup in `main.py` right after `config.load()`. Worker tasks spin up lazily on first use — no explicit start call needed anywhere else.
+- Streaming stays live, not buffered: a queued request's generator hasn't started yet, so it emits nothing while waiting. The moment a worker admits it, the real `_stream_with_retry()` generator runs and each event is forwarded to the caller as it's produced — identical token-by-token behavior to a non-queued call, just gated on when it's allowed to start.
+- A worker holds its slot for a stream's entire duration (submit → last chunk), not just the initial POST.
+- Convention used by current call sites (not enforced, just a lower-is-more-urgent int): `0` for the user-facing main cycle (`agent.py`), `5` for query-time embeddings that block a tool call (`kg_search`, `rag_search`), `15` for librarian/dedup background agent loops, `20` for RAG indexer batch embedding (nobody waiting on it).
+- This is also why `modules/memory/__main__.py` no longer has a `_YieldingLLM` wrapper — background librarian calls just pass `priority=15` and queue behind user turns naturally, instead of busy-polling `_user_cycles_active()` in a `stream()` wrapper. `_user_cycles_active()` itself still exists and is still used by `LibrarianRunner._poll_cycle()` to decide whether to *schedule* new background tasks at all (a separate concern from LLM-call ordering).
 
 ---
 
@@ -329,6 +339,7 @@ YAML-based. Loaded from `config.yaml` (or path specified via `--config`). Key to
 - `llm.primary` / `llm.fallback` — model name(s); AgentCycle tries primary then fallbacks
 - `context` — token budget for context assembly
 - `max_tool_cycles` — max tool-call iterations per turn
+- `parallel` — max concurrent in-flight LLM/embedding requests across the whole process (default 3); see Priority queue under `ai.py` above
 - `bridges.<name>.enabled` / `bridges.<name>.options` — per-bridge config
 - `gateway.enabled` / `gateway.host` / `gateway.port` / `gateway.api_key`
 - `logging.level`
