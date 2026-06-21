@@ -21,7 +21,7 @@
 
         # Dedup cycle
         "dedup_enabled":          True,
-        "dedup_interval_hours":   24,
+        "dedup_interval_hours":   6,
         "similarity_threshold":   0.90,
 
         # Decay sweep — hard-deletes non-pinned entities scoring below
@@ -30,7 +30,7 @@
         # count, and read/update recency (half-life in days). Pinned entities
         # are never scored or touched. Weights need not sum to 1.
         "decay_enabled":            True,
-        "decay_interval_hours":     24,
+        "decay_interval_hours":     6,
         "decay_threshold":          0.25,
         "decay_max_hops":           4,
         "decay_half_life_days":     30,
