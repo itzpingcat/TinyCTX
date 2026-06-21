@@ -178,6 +178,95 @@ def _pivot_partition(
 
 
 # ---------------------------------------------------------------------------
+# Clique-based edge cover
+# ---------------------------------------------------------------------------
+
+def _clique_edge_cover(
+    candidates: list[tuple[dict, dict, float]],
+    batch_size: int,
+) -> list[list[dict]]:
+    """
+    Cover every candidate edge with at least one clique-batch, sized up to
+    batch_size, for a single LLM call each.
+
+    This is a minimum clique edge cover problem (NP-hard in general; greedy
+    here). The requirement is edge coverage, not a disjoint node partition:
+    every candidate pair must be co-present in at least one batch so the LLM
+    actually gets asked to compare it. A disjoint partition (e.g. randomised
+    pivot clustering) does not guarantee this — a node can lose all its
+    candidate edges to earlier-claimed pivots and end up alone, silently
+    dropping every pair it was part of.
+
+    Batches must stay true cliques in the candidate graph: _dedup_group
+    treats every pair inside a returned batch as having been implicitly
+    compared by the LLM (any pair not in a merge op is assumed distinct), so
+    a batch can only contain nodes that are mutual candidate-neighbours of
+    every other node already in it.
+
+    Algorithm:
+      1. Track uncovered edges in a set.
+      2. While uncovered edges remain: pick any uncovered edge (u, v), seed
+         a batch with {u, v}.
+      3. Greedily extend the batch with nodes that are candidate-neighbours
+         of every node currently in the batch, up to batch_size.
+      4. Mark every edge fully contained in the finished batch as covered.
+      5. Repeat until no uncovered edges remain.
+
+    Nodes with no candidate edges never appear here (candidates is a list of
+    pairs), so every emitted batch has at least 2 members.
+    """
+    by_uuid: dict[str, dict] = {}
+    adjacency: dict[str, set[str]] = defaultdict(set)
+
+    for ea, eb, _ in candidates:
+        uid_a, uid_b = ea["e.uuid"], eb["e.uuid"]
+        by_uuid[uid_a] = ea
+        by_uuid[uid_b] = eb
+        adjacency[uid_a].add(uid_b)
+        adjacency[uid_b].add(uid_a)
+
+    uncovered: set[frozenset] = {
+        frozenset([ea["e.uuid"], eb["e.uuid"]]) for ea, eb, _ in candidates
+    }
+
+    result: list[list[dict]] = []
+
+    while uncovered:
+        # Any remaining uncovered edge seeds the next batch.
+        seed_edge = next(iter(uncovered))
+        u, v = tuple(seed_edge)
+        batch: list[str] = [u, v]
+        batch_set: set[str] = {u, v}
+
+        # Greedily extend with nodes adjacent to every current batch member,
+        # preferring candidates that cover the most still-uncovered edges.
+        if len(batch) < batch_size:
+            common = adjacency[u] & adjacency[v]
+            common -= batch_set
+            while common and len(batch) < batch_size:
+                def _uncovered_gain(node: str) -> int:
+                    return sum(
+                        1 for member in batch
+                        if frozenset([node, member]) in uncovered
+                    )
+                next_node = max(common, key=_uncovered_gain)
+                batch.append(next_node)
+                batch_set.add(next_node)
+                common &= adjacency[next_node]
+                common -= batch_set
+
+        # Mark every edge fully contained in this batch as covered.
+        for i in range(len(batch)):
+            for j in range(i + 1, len(batch)):
+                pair = frozenset([batch[i], batch[j]])
+                uncovered.discard(pair)
+
+        result.append([by_uuid[u] for u in batch])
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Edge dedup — delete duplicate active edges
 # ---------------------------------------------------------------------------
 
@@ -421,11 +510,9 @@ async def run_dedup_cycle(
             logger.debug("[memory/librarian] dedup: all candidates already resolved")
             return
 
-        # Partition into pivot-anchored groups, evaluate each with one LLM call.
-        # Singleton groups (a node whose only candidate edge was already
-        # claimed by an earlier pivot) have nothing to compare against, so
-        # skip them rather than spending an LLM call on a guaranteed no-op.
-        components = [c for c in _pivot_partition(filtered, batch_size) if len(c) >= 2]
+        # Cover every candidate edge with at least one clique-batch so no pair
+        # is silently dropped (unlike the disjoint pivot partition).
+        components = _clique_edge_cover(filtered, batch_size)
         agent_logger.info(
             "[dedup] %d candidate(s) → %d group(s) (batch_size=%d)",
             len(filtered), len(components), batch_size,
