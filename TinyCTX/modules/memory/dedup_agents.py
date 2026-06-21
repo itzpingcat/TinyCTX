@@ -421,8 +421,11 @@ async def run_dedup_cycle(
             logger.debug("[memory/librarian] dedup: all candidates already resolved")
             return
 
-        # Partition into pivot-anchored groups, evaluate each with one LLM call
-        components = _pivot_partition(filtered, batch_size)
+        # Partition into pivot-anchored groups, evaluate each with one LLM call.
+        # Singleton groups (a node whose only candidate edge was already
+        # claimed by an earlier pivot) have nothing to compare against, so
+        # skip them rather than spending an LLM call on a guaranteed no-op.
+        components = [c for c in _pivot_partition(filtered, batch_size) if len(c) >= 2]
         agent_logger.info(
             "[dedup] %d candidate(s) → %d group(s) (batch_size=%d)",
             len(filtered), len(components), batch_size,
@@ -503,9 +506,8 @@ async def _dedup_group(
         if isinstance(event, TextDelta):
             response_text += event.text
 
-    short_ids = "/".join(e["e.uuid"][:8] for e in entities)
-    if response_text:
-        agent_logger.info("[dedup group/%s] %s", short_ids, response_text)
+    names_label = "/".join(e["e.name"] for e in entities)
+    short_ids   = "/".join(e["e.uuid"][:8] for e in entities)
 
     try:
         merge_ops = _parse_dedup_response(response_text)
@@ -514,7 +516,11 @@ async def _dedup_group(
             "[memory/librarian] dedup: could not parse group response (%s): %s",
             short_ids, response_text[:200],
         )
+        agent_logger.warning("[dedup group/%s] unparseable response: %s", names_label, response_text[:200])
         return []
+
+    if not merge_ops:
+        agent_logger.info("[dedup group/%s] no duplicates — all %d distinct", names_label, len(entities))
 
     # Validate and apply each merge op
     merged_uuids: set[str] = set()
@@ -548,6 +554,10 @@ async def _dedup_group(
         for dup_uuid in duplicate_uuids:
             ea = next(e for e in entities if e["e.uuid"] == canonical_uuid)
             eb = next(e for e in entities if e["e.uuid"] == dup_uuid)
+            agent_logger.info(
+                "[dedup group/%s] %s: '%s' absorbs '%s'",
+                names_label, verdict, ea["e.name"], eb["e.name"],
+            )
             await _apply_verdict(ea, eb, verdict, canonical_uuid, merged_desc)
 
     # All pairs NOT involved in a merge op are implicitly distinct
