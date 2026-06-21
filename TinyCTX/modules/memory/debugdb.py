@@ -7,6 +7,7 @@ Subcommands:
   pinned  — show only pinned entities, grouped by pinned_target
   entity  — inspect a single entity by UUID or name fragment
   stats   — graph statistics summary
+  decay   — dry-run decay scoring, shows what the next sweep would delete
 
 Usage:
     python debugdb.py [subcommand] [--config path] [--db path] [options]
@@ -53,6 +54,12 @@ def _print_entity_full(e: dict) -> None:
     print(f"  created:  {_ts(_get(e, 'created_at'))}")
     print(f"  updated:  {_ts(_get(e, 'updated_at'))}")
     print(f"  mentions: {_get(e, 'mention_count')}")
+    last_read = _get(e, 'last_read_at')
+    if last_read:
+        print(f"  last read: {_ts(last_read)}")
+    decay = _get(e, 'decay_score')
+    if decay:
+        print(f"  decay score: {float(decay):.3f}")
     desc = _get(e, 'description')
     if desc:
         print(f"  desc:     {desc}")
@@ -174,6 +181,55 @@ def cmd_stats(gdb, args) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Subcommand: decay
+# ---------------------------------------------------------------------------
+
+def cmd_decay(gdb, args, graph_database=None, memory_cfg=None) -> None:
+    """
+    Dry-run the decay scoring pass and print every non-pinned entity sorted
+    by score ascending (most decay-prone first). Does not write decay_score
+    or delete anything — read-only inspection of what the next scheduled
+    sweep would do.
+
+    memory_cfg should be the fully resolved memory config (defaults merged
+    with config.yaml overrides) so the printed threshold matches what the
+    real scheduled sweep would actually use, not just the hardcoded defaults.
+    """
+    import asyncio
+    from TinyCTX.modules.memory.decay import compute_decay_scores
+
+    cfg = memory_cfg if memory_cfg is not None else {}
+    threshold = float(cfg.get("decay_threshold", 0.2))
+
+    assert graph_database is not None
+    conn = graph_database.new_async_write_conn()
+    try:
+        scores = asyncio.run(compute_decay_scores(conn, cfg))
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    if not scores:
+        print("(no non-pinned entities to score)")
+        return
+
+    ranked = sorted(scores.items(), key=lambda kv: kv[1]["score"])
+    below = sum(1 for _, r in ranked if r["score"] < threshold)
+
+    print(f"{len(ranked)} non-pinned entities scored — threshold {threshold:.2f} ({below} below)\n")
+    for uid, r in ranked:
+        flag = "  [WOULD DELETE]" if r["score"] < threshold else ""
+        f = r["factors"]
+        print(f"{r['score']:.3f}  [{r['entity_type']}] {r['name']} ({uid[:8]}){flag}")
+        print(
+            f"        priority={f['priority']:.2f} distance={f['distance']:.2f} "
+            f"edges={f['edges']:.2f} mentions={f['mentions']:.2f} recency={f['recency']:.2f}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # DB open helper
 # ---------------------------------------------------------------------------
 
@@ -189,6 +245,34 @@ def _find_config(given: str) -> Path:
         if candidate.exists():
             return candidate
     return p  # fall through to original error
+
+
+def _resolve_memory_cfg(args) -> dict:
+    """
+    Resolve the memory config the same way register_runtime does: defaults
+    from EXTENSION_META merged with config.yaml's extra.memory overrides.
+    Falls back to defaults only when --db was given directly (no config.yaml
+    to read) or when config loading fails.
+    """
+    from TinyCTX.modules.memory import EXTENSION_META
+    defaults = EXTENSION_META.get("default_config", {})
+
+    if args.db:
+        # Direct DB path, no config.yaml in play — defaults only.
+        return dict(defaults)
+
+    config_path = _find_config(args.config)
+    if not config_path.exists():
+        return dict(defaults)
+
+    try:
+        from TinyCTX.config import load as load_config
+        cfg = load_config(str(config_path))
+        overrides = cfg.extra.get("memory", {}) if hasattr(cfg, "extra") and isinstance(cfg.extra, dict) else {}
+    except Exception:
+        return dict(defaults)
+
+    return {**defaults, **overrides}
 
 
 def _open_db(args):
@@ -242,6 +326,7 @@ SUBCOMMANDS = {
     "pinned": cmd_pinned,
     "entity": cmd_entity,
     "stats":  cmd_stats,
+    "decay":  cmd_decay,
 }
 
 
@@ -258,6 +343,7 @@ def main() -> None:
     subparsers.add_parser("dump",   help="List all entities with edges (default)")
     subparsers.add_parser("pinned", help="Show pinned entities grouped by pinned_target")
     subparsers.add_parser("stats",  help="Graph statistics summary")
+    subparsers.add_parser("decay",  help="Dry-run decay scoring — shows what the next sweep would delete")
 
     ep = subparsers.add_parser("entity", help="Inspect a single entity by name or UUID")
     ep.add_argument("name", nargs="*", help="Name fragment to search for")
@@ -270,7 +356,11 @@ def main() -> None:
     kg_path, graph_database, gdb = _open_db(args)
     print(f"db: {kg_path}\n")
     try:
-        cmd_fn(gdb, args)
+        if cmd_fn is cmd_decay:
+            memory_cfg = _resolve_memory_cfg(args)
+            cmd_fn(gdb, args, graph_database=graph_database, memory_cfg=memory_cfg)
+        else:
+            cmd_fn(gdb, args)
     finally:
         gdb.close()
         graph_database.close()

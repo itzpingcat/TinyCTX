@@ -382,6 +382,7 @@ async def kg_search(query: str, top_k: int = 3, semantic: bool = True) -> str:
         return "No matching entities found."
 
     _graph_db.bump_mention_count(uids)
+    _graph_db.bump_last_read(uids, now_ts())
 
     lines = []
     for uid in uids:

@@ -144,6 +144,7 @@ class LibrarianRunner:
             "last_poll_ts":  0.0,
             "last_dedup_ts": 0.0,
             "dedup_running": False,
+            "last_decay_ts": 0.0,
         }
         self._active_tasks: set[asyncio.Task] = set()
 
@@ -209,6 +210,7 @@ class LibrarianRunner:
             nodes_to_text,
         )
         from TinyCTX.modules.memory.dedup_agents import run_edge_dedup
+        from TinyCTX.modules.memory.decay import run_decay_sweep
 
         # Reap finished tasks
         done = {t for t in self._active_tasks if t.done()}
@@ -342,6 +344,28 @@ class LibrarianRunner:
                 self._active_tasks.add(t)
             else:
                 self._state["dedup_running"] = False
+
+        # Decay sweep on schedule — skip when user cycles are active.
+        # Hard-deletes non-pinned entities scoring below decay_threshold based
+        # on priority, distance to nearest pinned entity, edge count, mention
+        # count, and read/update recency. Runs fully automatically.
+        decay_enabled  = bool(self._cfg.get("decay_enabled", True))
+        decay_interval = float(self._cfg.get("decay_interval_hours", 24)) * 3600
+        if (
+            decay_enabled
+            and not self._user_cycles_active()
+            and (now - self._state["last_decay_ts"]) >= decay_interval
+            and len(self._active_tasks) < max_concurrent
+        ):
+            self._state["last_decay_ts"] = now
+
+            t = asyncio.create_task(
+                run_decay_sweep(
+                    self._cfg, self._write_conn, self._write_lock, self.agent_logger,
+                )
+            )
+            t.add_done_callback(self._checkpoint_callback)
+            self._active_tasks.add(t)
 
 
 # ---------------------------------------------------------------------------

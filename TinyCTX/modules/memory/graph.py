@@ -225,6 +225,49 @@ def migrate_schema(conn) -> None:
 
         logger.info("[memory/graph] migration: pinned_target ready")
 
+    # --- migration: decay columns (last_read_at, decay_score) ---
+    already_decay = False
+    try:
+        r = conn.execute(
+            "MATCH (m:GraphMeta {key: \'migration_decay_v1\'}) RETURN m.val LIMIT 1"
+        )
+        already_decay = r.has_next()
+    except Exception:
+        pass
+
+    if not already_decay:
+        cols_to_add = [
+            ("last_read_at", "DOUBLE"),
+            ("decay_score",  "DOUBLE"),
+        ]
+        for col, dtype in cols_to_add:
+            try:
+                conn.execute(f"ALTER TABLE Entity ADD {col} {dtype}")
+                logger.info("[memory/graph] migration: added column %s %s", col, dtype)
+            except Exception as exc:
+                if "already exist" in str(exc).lower() or "duplicate" in str(exc).lower():
+                    logger.debug("[memory/graph] migration: column %s already present", col)
+                else:
+                    logger.warning("[memory/graph] migration: unexpected error adding %s: %s", col, exc)
+
+        # Backfill: last_read_at defaults to updated_at (best available guess).
+        try:
+            conn.execute(
+                "MATCH (e:Entity) WHERE e.last_read_at IS NULL SET e.last_read_at = e.updated_at"
+            )
+            logger.info("[memory/graph] migration: backfilled last_read_at from updated_at")
+        except Exception as exc:
+            logger.warning("[memory/graph] migration: last_read_at backfill failed: %s", exc)
+
+        try:
+            conn.execute(
+                "CREATE (m:GraphMeta {key: \'migration_decay_v1\', val: \'done\'})"
+            )
+        except Exception:
+            pass
+
+        logger.info("[memory/graph] migration: decay columns ready")
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -779,6 +822,16 @@ class GraphDB:
             self.safe_execute(
                 "MATCH (e:Entity {uuid: $uid}) SET e.mention_count = e.mention_count + 1",
                 parameters={"uid": uid},
+            )
+
+    def bump_last_read(self, uids: list[str], ts: float) -> None:
+        """Stamp last_read_at on the given entities. Used by kg_search to mark
+        entities as actively recalled (distinct from updated_at, which tracks
+        content edits) so the decay sweep can weigh read-recency."""
+        for uid in uids:
+            self.safe_execute(
+                "MATCH (e:Entity {uuid: $uid}) SET e.last_read_at = $ts",
+                parameters={"uid": uid, "ts": ts},
             )
 
     # ------------------------------------------------------------------

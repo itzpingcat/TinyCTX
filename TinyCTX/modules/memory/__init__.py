@@ -24,6 +24,22 @@
         "dedup_interval_hours":   24,
         "similarity_threshold":   0.90,
 
+        # Decay sweep — hard-deletes non-pinned entities scoring below
+        # decay_threshold. Score blends priority, distance to nearest pinned
+        # entity (BFS capped at decay_max_hops), active edge count, mention
+        # count, and read/update recency (half-life in days). Pinned entities
+        # are never scored or touched. Weights need not sum to 1.
+        "decay_enabled":            True,
+        "decay_interval_hours":     24,
+        "decay_threshold":          0.25,
+        "decay_max_hops":           4,
+        "decay_half_life_days":     30,
+        "decay_weight_priority":    0.30,
+        "decay_weight_distance":    0.20,
+        "decay_weight_edges":       0.15,
+        "decay_weight_mentions":    0.15,
+        "decay_weight_recency":     0.20,
+
         # Embedding model key from config.yaml models: (must be kind: embedding)
         # Leave empty to disable semantic search (keyword only)
         "embedding_model": "",
