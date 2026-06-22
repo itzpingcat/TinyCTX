@@ -153,6 +153,8 @@ Key methods:
 
 User turns with `author_id` set are prefixed with `【author_id】: ` (fullwidth brackets, U+3010/U+3011) after the hook pipeline runs. Before prefixing, `_sanitize_brackets()` normalizes Unicode bracket look-alikes in the message content to ASCII, so this exact delimiter cannot be forged by user-supplied text.
 
+**Diagnostic logging:** `assemble()` logs `logger.error` when a user entry with a non-None `parent_id` has `author_id=None` — this distinguishes real user nodes (which should always have an `author_id`) from synthetic image-relay turns (which are created by `add_tool_result` with no `parent_id` and no `author_id`, and are expected to have no prefix). Complementary logging in `runtime.push()` fires at node-write time if `msg.author.username` is empty.
+
 After hook processing, adjacent same-role messages are merged. Then token budget enforcement trims oldest non-system turns until the count fits.
 
 `assemble()` returns `(messages, AssembleMeta)` where `AssembleMeta` has `tokens_pre_trim`, `tokens_used`, `was_trimmed`.

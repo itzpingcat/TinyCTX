@@ -562,6 +562,18 @@ class Context:
                 if result is not None:
                     entry = result
 
+            if entry.role == ROLE_USER and entry.author_id is None:
+                # Synthetic image-relay turns (from add_tool_result) have no author_id
+                # and no parent_id — that's expected. Any other user turn missing
+                # author_id means the prefix will be silently dropped.
+                if entry.parent_id is not None:
+                    logger.error(
+                        "[assemble] user entry id=%s (age=%d) has no author_id — "
+                        "【prefix】 will be missing in LLM context. "
+                        "Check that runtime.push() wrote author_id correctly for node %s.",
+                        entry.id, age, entry.id,
+                    )
+
             if entry.role == ROLE_USER and entry.author_id is not None:
                 label = entry.author_id
                 raw = entry.content
