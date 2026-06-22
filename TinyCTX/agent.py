@@ -282,6 +282,8 @@ class AgentCycle:
                 mime = payload[:sep]
                 b64data = payload[sep + 1:]
 
+                _conversion_failed = False
+
                 # Convert to PNG if needed — local backends (llama.cpp / llama-swap)
                 # often reject non-PNG image_url blocks with HTTP 500.
                 # convert_to_png also strips ICC profiles that some backends choke on.
@@ -293,25 +295,41 @@ class AgentCycle:
                     if converted is not None:
                         mime = "image/png"
                         b64data = _base64.b64encode(converted).decode()
+                    else:
+                        # Pillow unavailable or conversion failed — cannot safely send
+                        # this format to the backend. Falling through with a non-PNG
+                        # mime would cause the backend to reject the image_url block
+                        # with a misleading "mmproj is missing" error.
+                        logger.warning(
+                            "[agent] image conversion to PNG failed for mime=%s "
+                            "(Pillow unavailable?); falling back to text description.",
+                            mime,
+                        )
+                        raw_output = (
+                            f"[Image file detected ({mime}) but could not be converted "
+                            "to PNG (Pillow unavailable). Install Pillow or use a PNG/JPEG image.]"
+                        )
+                        _conversion_failed = True
 
-                primary_cfg = self.config.get_model_config(self.config.llm.primary)
-                
-                if primary_cfg.supports_vision:
-                    return ToolResult(
-                        call_id=call.call_id,
-                        tool_name=call.tool_name,
-                        output=f"[{mime} — see attached image below]",
-                        is_error=False,
-                        is_image=True,
-                        image_mime=mime,
-                        image_b64=b64data,
-                    )
-                else:
-                    # Fallback for non-vision models
-                    raw_output = (
-                        f"[Image file detected ({mime}) but the current model does not "
-                        "support vision. Use a vision-capable model to inspect this file.]"
-                    )
+                if not _conversion_failed:
+                    primary_cfg = self.config.get_model_config(self.config.llm.primary)
+
+                    if primary_cfg.supports_vision:
+                        return ToolResult(
+                            call_id=call.call_id,
+                            tool_name=call.tool_name,
+                            output=f"[{mime} — see attached image below]",
+                            is_error=False,
+                            is_image=True,
+                            image_mime=mime,
+                            image_b64=b64data,
+                        )
+                    else:
+                        # Fallback for non-vision models
+                        raw_output = (
+                            f"[Image file detected ({mime}) but the current model does not "
+                            "support vision. Use a vision-capable model to inspect this file.]"
+                        )
             except (ValueError, IndexError) as e:
                 logger.error(f"[agent] Failed to parse image payload: {e}")
                 is_error = True

@@ -316,7 +316,7 @@ Cursors (`dm:<uid>`, `group:<cid>`, `thread:<tid>`) are persisted in
 
 ### `cron` — CRON.json-backed job scheduler; creates agent turns at specified times.
 
-### `filesystem` — `view`, `write_file`, `edit_file`, `grep`, `glob_search` tools. Write tools require prior `view()` to prevent blind overwrites. Operations sandboxed to workspace directory.
+### `filesystem` — `view`, `write_file`, `edit_file`, `grep`, `glob_search` tools. Write tools require prior `view()` to prevent blind overwrites. Operations sandboxed to workspace directory. `view()` detects image files by extension (`.jpg/.jpeg/.png/.gif/.webp`) and returns them as `IMAGE_BLOCK_PREFIX` sentinels; `agent._execute_tool` unwraps these, converts to PNG via Pillow, and injects a follow-up user turn with an `image_url` block. If PNG conversion fails (Pillow unavailable), the image path falls back to a plain text description rather than sending an unconverted format to the backend (which would cause a misleading "mmproj is missing" backend error).
 
 ### `shell` — `shell` tool. Runs in workspace directory. Maintains a blacklist of dangerous commands.
 
