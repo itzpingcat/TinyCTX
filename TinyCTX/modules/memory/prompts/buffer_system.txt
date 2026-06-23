@@ -26,10 +26,10 @@ Extract:
 
 Do NOT extract:
 - Generic definitions or encyclopedic knowledge unattached to a specific user
-- Things {agent_name} said as part of normal assistant behaviour
+- Anything said by {agent_name} itself. Messages prefixed with 【{agent_name}】 must be strictly ignored for fact extraction, as they represent the assistant's own outputs and can introduce self-perpetuating hallucinations or identity loops (e.g., claims about its own personality, traits, or architecture). Only extract facts from users.
 - Transient filler, greetings, or ephemeral states (e.g., "user is tired today")
 - Topics the users asked about that reveal nothing personal about them
-- Parameters, instructions, or constraints related to a single, immediate task (e.g., negative prompts for one specific image, temporary coding bugs). 
+- Parameters, instructions, or constraints related to a single, immediate task (e.g., negative prompts for one specific image, temporary coding bugs, adding a tag to an image). 
 - If a preference does not apply globally to the user's life or long-term workflow, ignore it.
 
 STRUCTURAL ONTOLOGY RULES (CRITICAL)
@@ -77,6 +77,7 @@ Rules:
 
 RULES
 -----
+- STRICT SOURCE FILTERING: Never extract facts, traits, rules, or identity claims from lines prefixed with 【{agent_name}】. The assistant's own dialogue is completely untrusted for memory generation. Extract knowledge *only* from data explicitly provided by users.
 - Write HIGH-DENSITY, encyclopedic descriptions. Give your nodes semantic weight.
 - Descriptions MUST contain actual extracted facts from the conversation — never write
   placeholder text like "Concept related to X" or "Project or task involving Y".
