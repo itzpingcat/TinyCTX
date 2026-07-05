@@ -7,6 +7,7 @@ name = "tinyctx"
 version = "0.1.0"
 requires-python = ">=3.14"
 dependencies = [
+    "platformdirs",
     "PyYAML",
     "aiohttp",
     "pyfiglet",
@@ -25,14 +26,12 @@ dependencies = [
     "Pillow",
     "onnxruntime",
     "sympy",
-    "antlr4-python3-runtime",
+    "antlr4-python3-runtime==4.13.2",
     "jinja2",
     "croniter",
     "discord.py",
     "matrix-nio",
-    "socket",
-    "ipaddress",
-    "urllib"
+    "ladybug"
 ]
 
 [project.scripts]
