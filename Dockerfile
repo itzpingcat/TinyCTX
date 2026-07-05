@@ -23,7 +23,6 @@ WORKDIR /app
 
 # --- playwright (pinned first so it never re-runs when other deps change) --
 RUN --mount=type=cache,target=/root/.cache/pip \
-    --mount=type=cache,target=/ms-playwright \
     pip install playwright && playwright install chromium
 
 # --- python deps -----------------------------------------------------------
