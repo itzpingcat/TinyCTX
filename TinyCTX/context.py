@@ -289,22 +289,26 @@ class Context:
 
     def add_tool_result(self, result: ToolResult) -> None:
         """
-        Write a tool result into the context.  If the result carries image
-        data (is_image=True), a synthetic user turn containing an image_url
-        content block is appended immediately after the tool node so the
-        model sees the image on the next inference pass.
+        Write a tool result into the context. If the result carries image
+        data, the image is stored as a content block list on the tool entry
+        itself. ai.py detects this before sending and injects a synthetic
+        user turn with the image_url block into the outgoing payload only.
 
-        This is necessary because OpenAI-compat APIs do not support image
-        content in tool-role messages.
+        This keeps the image paired with its tool result for trimming: if
+        the tool result is trimmed out, the image goes with it.
         """
-        self.add(HistoryEntry.tool_result(result))
-
         if result.is_image and result.image_mime and result.image_b64:
-            image_block: list[dict] = [{
-                "type": "image_url",
-                "image_url": {"url": f"data:{result.image_mime};base64,{result.image_b64}"},
-            }]
-            self.add(HistoryEntry(role=ROLE_USER, content=image_block))
+            entry = HistoryEntry(
+                role=ROLE_TOOL,
+                content=[
+                    {"type": "text", "text": result.output},
+                    {"type": "image_url", "image_url": {"url": f"data:{result.image_mime};base64,{result.image_b64}"}},
+                ],
+                tool_call_id=result.call_id,
+            )
+            self.add(entry)
+        else:
+            self.add(HistoryEntry.tool_result(result))
 
     def clear(self) -> None:
         self.dialogue.clear()
@@ -400,7 +404,7 @@ class Context:
         for i, node in enumerate(nodes):
             _VALID_BLOCK_TYPES = {"text", "image_url", "image", "document"}
             content: str | list = node.content
-            if node.role == ROLE_USER and isinstance(content, str) and content.startswith("["):
+            if node.role in (ROLE_USER, ROLE_TOOL) and isinstance(content, str) and content.startswith("["):
                 try:
                     parsed = json.loads(content)
                     if isinstance(parsed, list) and all(
@@ -562,6 +566,15 @@ class Context:
                 if result is not None:
                     entry = result
 
+            if entry.role == ROLE_USER and entry.author_id is None:
+                if entry.parent_id is not None:
+                    logger.error(
+                        "[assemble] user entry id=%s (age=%d) has no author_id — "
+                        "【prefix】 will be missing in LLM context. "
+                        "Check that runtime.push() wrote author_id correctly for node %s.",
+                        entry.id, age, entry.id,
+                    )
+
             if entry.role == ROLE_USER and entry.author_id is not None:
                 label = entry.author_id
                 raw = entry.content
@@ -678,12 +691,9 @@ class Context:
 
     def _render(self, entry: HistoryEntry) -> dict:
         if entry.role == ROLE_TOOL:
-            content = entry.content
-            if isinstance(content, list):
-                content = json.dumps(content, ensure_ascii=False)
             return {
                 "role":         ROLE_TOOL,
-                "content":      content,
+                "content":      entry.content,
                 "tool_call_id": entry.tool_call_id,
             }
         if entry.role == ROLE_ASSISTANT:

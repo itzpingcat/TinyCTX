@@ -153,6 +153,8 @@ Key methods:
 
 User turns with `author_id` set are prefixed with `【author_id】: ` (fullwidth brackets, U+3010/U+3011) after the hook pipeline runs. Before prefixing, `_sanitize_brackets()` normalizes Unicode bracket look-alikes in the message content to ASCII, so this exact delimiter cannot be forged by user-supplied text.
 
+**Diagnostic logging:** `assemble()` logs `logger.error` when a user entry with a non-None `parent_id` has `author_id=None` — this distinguishes real user nodes (which should always have an `author_id`) from synthetic image-relay turns (which are created by `add_tool_result` with no `parent_id` and no `author_id`, and are expected to have no prefix). Complementary logging in `runtime.push()` fires at node-write time if `msg.author.username` is empty.
+
 After hook processing, adjacent same-role messages are merged. Then token budget enforcement trims oldest non-system turns until the count fits.
 
 `assemble()` returns `(messages, AssembleMeta)` where `AssembleMeta` has `tokens_pre_trim`, `tokens_used`, `was_trimmed`.
@@ -191,6 +193,8 @@ Every `LLM.stream()` / `Embedder.embed()` / `embed_one()` call is admission-cont
 - `tools_search(query)` — BM25 search over tool names+descriptions; enables matching tools; always-on tool exposed to the LLM
 - `get_tool_definitions(caller_level, minimal_tokens)` — returns OpenAI-format tool definitions for enabled tools the caller has permission to use
 - `execute_tool_call(tool_call, caller_level)` — dispatches sync or async functions; sync functions run in a thread-pool executor
+
+**Known schema generation caveat:** `_python_type_to_json_schema` handles `from __future__ import annotations` by resolving bare stringified type names (`'list'`, `'bool'`, etc.) back to their builtins. Complex generic strings like `'list[str]'` are not parseable this way and fall back to `{"type": "string"}` — a wrong but non-crashing result. Bare `list` (resolved to the `list` builtin) is handled by the `origin is list or annotation is list` branch and always emits `{"type": "array", "items": {"type": "string"}}` to avoid producing a schema without `items`, which crashes llama.cpp/llama-swap's Jinja2 tool template.
 
 Permission levels: 0–100. Each tool has a `min_permission`. `minimal_tokens=True` hides tools the caller can't use.
 
@@ -312,7 +316,7 @@ Cursors (`dm:<uid>`, `group:<cid>`, `thread:<tid>`) are persisted in
 
 ### `cron` — CRON.json-backed job scheduler; creates agent turns at specified times.
 
-### `filesystem` — `view`, `write_file`, `edit_file`, `grep`, `glob_search` tools. Write tools require prior `view()` to prevent blind overwrites. Operations sandboxed to workspace directory.
+### `filesystem` — `view`, `write_file`, `edit_file`, `grep`, `glob_search` tools. Write tools require prior `view()` to prevent blind overwrites. Operations sandboxed to workspace directory. `view()` detects image files by extension (`.jpg/.jpeg/.png/.gif/.webp`) and returns them as `IMAGE_BLOCK_PREFIX` sentinels; `agent._execute_tool` unwraps these, converts to PNG via Pillow, and injects a follow-up user turn with an `image_url` block. If PNG conversion fails (Pillow unavailable), the image path falls back to a plain text description rather than sending an unconverted format to the backend (which would cause a misleading "mmproj is missing" backend error).
 
 ### `shell` — `shell` tool. Runs in workspace directory. Maintains a blacklist of dangerous commands.
 

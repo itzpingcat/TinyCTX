@@ -109,8 +109,13 @@ class ToolCallHandler:
                 return self._python_type_to_json_schema(non_none[0])
             return {"type": "string"}
 
-        # list[X]
-        if origin is list:
+        # list[X] — also catches bare `list` resolved from a stringified annotation
+        # (from __future__ import annotations turns `list[str]` into the string
+        # 'list[str]', which the string-resolution block above can't parse, but
+        # bare `list` resolves to the list builtin which has no __origin__.
+        # Both cases must produce {"type": "array", "items": ...} — never a bare
+        # {"type": "array"} without items, which causes backend Jinja2 to crash.)
+        if origin is list or annotation is list:
             item_schema = self._python_type_to_json_schema(args[0]) if args else {"type": "string"}
             return {"type": "array", "items": item_schema}
 
@@ -139,7 +144,6 @@ class ToolCallHandler:
             float: {"type": "number"},
             bool:  {"type": "boolean"},
             dict:  {"type": "object"},
-            list:  {"type": "array"},
         }
         return mapping.get(annotation, {"type": "string"})
 

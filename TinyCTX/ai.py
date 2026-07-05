@@ -279,6 +279,26 @@ class LLM:
         messages: list[dict],
         tools:    list[dict] | None = None,
     ) -> AsyncIterator[LLMEvent]:
+        # Expand image tool results: a tool turn whose content is a list
+        # containing an image_url block is not valid as-is (OpenAI-compat APIs
+        # don't support image content in tool messages). Split it into a plain
+        # text tool result + a synthetic user turn with the image_url block.
+        expanded: list[dict] = []
+        for msg in messages:
+            if (
+                msg.get("role") == "tool"
+                and isinstance(msg.get("content"), list)
+                and any(b.get("type") == "image_url" for b in msg["content"])
+            ):
+                image_blocks = [b for b in msg["content"] if b.get("type") == "image_url"]
+                text_blocks  = [b for b in msg["content"] if b.get("type") != "image_url"]
+                text_content = text_blocks[0]["text"] if text_blocks else ""
+                expanded.append({**msg, "content": text_content})
+                expanded.append({"role": "user", "content": image_blocks})
+            else:
+                expanded.append(msg)
+        messages = expanded
+
         # --- cache_prompts: inject ephemeral cache_control on last system message ---
         if self.cache_prompts:
             messages = _inject_cache_control(messages)
@@ -320,10 +340,33 @@ class LLM:
         tool_buf: dict[int, dict] = {}
 
         # Compact message summary — one line per message, no content dumps
+        def _image_fmt(block: dict) -> str:
+            """Extract image format from an image_url block for logging."""
+            url = ""
+            img = block.get("image_url", {})
+            if isinstance(img, dict):
+                url = img.get("url", "")
+            elif isinstance(img, str):
+                url = img
+            if url.startswith("data:"):
+                # data:image/png;base64,... → png
+                try:
+                    mime = url[5:url.index(";")]
+                    return f"image_url({mime})"
+                except ValueError:
+                    return "image_url(data:?)"
+            # plain URL — grab extension
+            ext = url.rsplit(".", 1)[-1].split("?")[0][:8] if "." in url else "?"
+            return f"image_url({ext})"
+
         def _msg_summary(m):
             c = m.get("content", "")
             if isinstance(c, list):
-                parts = "/".join(b.get("type", "?") if isinstance(b, dict) else "?" for b in c)
+                parts = "/".join(
+                    (_image_fmt(b) if isinstance(b, dict) and b.get("type") == "image_url" else b.get("type", "?"))
+                    if isinstance(b, dict) else "?"
+                    for b in c
+                )
                 detail = f"[{parts}]"
             else:
                 detail = f"{len(str(c))}ch"
