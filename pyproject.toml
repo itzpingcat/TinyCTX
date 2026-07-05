@@ -30,10 +30,7 @@ dependencies = [
     "croniter",
     "discord.py",
     "matrix-nio",
-    "sockets",
-    "ladybug",
-    "ipaddress",
-    "urllib"
+    "ladybug"
 ]
 
 [project.scripts]
