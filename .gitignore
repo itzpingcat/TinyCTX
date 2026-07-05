@@ -19,4 +19,13 @@ TinyCTX/custom_modules/
 sessions/
 workspace/
 
+# tinyctx persistent data (bind-mounted into the containers)
+# Keep the folder structure, ignore the databases/attachments themselves.
+/data/**
+!/data/
+!/data/workspace/
+!/data/config/
+!/data/workspace/.gitkeep
+!/data/config/.gitkeep
+
 mcp.json

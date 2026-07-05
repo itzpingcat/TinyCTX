@@ -26,10 +26,10 @@ services:
 
     volumes:
       - type: bind
-        source: ${TINYCTX_WORKSPACE:-~/.tinyctx}
+        source: ${TINYCTX_WORKSPACE:-./data/workspace}
         target: /home/tinyctx
       - type: bind
-        source: ${TINYCTX_CONFIG:-~/.config/tinyctx}
+        source: ${TINYCTX_CONFIG:-./data/config}
         target: /etc/tinyctx
       - type: bind
         source: ./config.yaml
@@ -44,6 +44,7 @@ services:
       TINYCTX_GATEWAY_HOST: "0.0.0.0"
       TINYCTX_WORKSPACE_PATH: /home/tinyctx
       TINYCTX_CONFIG_DIR: /etc/tinyctx
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       DISCORD_BOT_TOKEN:
       MATRIX_PASSWORD:
 
@@ -107,7 +108,7 @@ services:
 
     volumes:
       - type: bind
-        source: ${TINYCTX_WORKSPACE:-~/.tinyctx}
+        source: ${TINYCTX_WORKSPACE:-./data/workspace}
         target: /home/tinyctx
 
     environment:

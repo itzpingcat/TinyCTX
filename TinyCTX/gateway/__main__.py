@@ -252,11 +252,11 @@ async def handle_lane_message(request: web.Request) -> web.StreamResponse:
     # immediately move the registration to the new tail returned by push().
     # push() returns the new tail node_id (the user node it writes); all
     # cycle events are dispatched to that id, not the original tail.
+    # push() runs the agent cycle and streams its events into this queue,
+    # terminated by a None sentinel. Register the queue by passing it in.
     q: asyncio.Queue = asyncio.Queue()
-    # Tentatively register so we can unregister cleanly on 429.
-    # The real registration happens after push() returns the new tail.
 
-    new_tail = await runtime.push(msg)
+    new_tail = await runtime.push(msg, reply_queue=q)
     if not new_tail:
         raise web.HTTPTooManyRequests(content_type="application/json",
                                       body=json.dumps({"error": "runtime at capacity"}))
@@ -271,12 +271,13 @@ async def handle_lane_message(request: web.Request) -> web.StreamResponse:
 
     try:
         while True:
-            kind, event_or_payload = await q.get()
+            event = await q.get()
 
-            if kind != "event":
-                continue
+            # None sentinel → turn complete.
+            if event is None:
+                break
 
-            payload = _event_to_dict(event_or_payload)
+            payload = _event_to_dict(event)
             if not payload:
                 continue
 
@@ -284,16 +285,8 @@ async def handle_lane_message(request: web.Request) -> web.StreamResponse:
                 await response.write(
                     f"data: {json.dumps(payload)}\n\n".encode()
                 )
-
-                # Terminal event → emit final done frame
                 if payload["type"] in ("text_final", "error"):
-                    new_tail = event_or_payload.tail_node_id
-
-                    await response.write(
-                        f'data: {json.dumps({"type": "done", "node_id": new_tail})}\n\n'.encode()
-                    )
-                    break
-
+                    new_tail = event.tail_node_id
             except (ConnectionResetError, Exception) as exc:
                 logger.debug(
                     "gateway: client disconnected mid-stream for node_id=%s (%s)",
@@ -303,6 +296,14 @@ async def handle_lane_message(request: web.Request) -> web.StreamResponse:
                 break
 
     except asyncio.CancelledError:
+        pass
+
+    # Final done frame carries the new tail node id so the client can resume.
+    try:
+        await response.write(
+            f'data: {json.dumps({"type": "done", "node_id": new_tail})}\n\n'.encode()
+        )
+    except Exception:
         pass
 
     await response.write_eof()

@@ -143,7 +143,11 @@ def _pick_provider(
             if not is_valid_url(base_url):
                 warn("Invalid URL."); continue
         else:
-            provider_name, base_url = choice, providers[choice]
+            provider_name = choice
+            entry = providers[choice]
+            # Pro providers map name -> url string; beginner providers map
+            # name -> {base_url, key_url, ...}. Normalise to the url string.
+            base_url = entry["base_url"] if isinstance(entry, dict) else entry
 
         # ── Autodetect Auth Requirement ──────────────────────────────────────
         c.print(f"  Probing {provider_name}...", end=" ")
