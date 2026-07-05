@@ -44,6 +44,9 @@ services:
       TINYCTX_GATEWAY_HOST: "0.0.0.0"
       TINYCTX_WORKSPACE_PATH: /home/tinyctx
       TINYCTX_CONFIG_DIR: /etc/tinyctx
+      OPENROUTER_API_KEY:
+      ANTHROPIC_API_KEY:
+      OPENAI_API_KEY:
       DISCORD_BOT_TOKEN:
       MATRIX_PASSWORD:
 
