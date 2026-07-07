@@ -62,6 +62,22 @@ For multi-step tasks, state a brief plan:
 
 Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
 
+## 5. Conventions
+
+- Flat structure (≤2 directory levels).
+- Functions over classes unless persistent shared state required.
+- Direct library usage; avoid abstraction layers (no LangChain, no Celery).
+- Simple data types over complex structures.
+- Configuration via config.yaml.
+- NO MAGIC VALUES that aren't configurable.
+- Ensure logging to catch errors.
+- One module = one job = one sentence description.
+- Files under 600 lines
+- Ensure to run linters post changes
+- Tests to be stored in /tests
+- Scripts to be stored in /scripts
+- Docs to be stored in /docs
+
 ---
 
 **These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
