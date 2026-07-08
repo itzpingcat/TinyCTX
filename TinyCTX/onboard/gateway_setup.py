@@ -74,7 +74,7 @@ def run(mode: Mode) -> dict[str, Any]:
 
         port = _pick_port(host)
 
-        api_key = secrets.token_hex(16)
+        api_key = "sk-" + secrets.token_hex(32)
 
         success(f"Gateway: http://{host}:{port}  key=[bold]{api_key}[/]")
 
