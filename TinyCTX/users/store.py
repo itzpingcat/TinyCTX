@@ -125,12 +125,27 @@ CREATE TABLE IF NOT EXISTS user_platform_index (
 # ---------------------------------------------------------------------------
 
 class UserStore:
-    def __init__(self) -> None:
-        config_dir_env = os.environ.get("TINYCTX_CONFIG_DIR", "")
-        if config_dir_env:
-            config_dir = Path(config_dir_env)
+    def __init__(self, data_dir: Path | None = None) -> None:
+        """
+        data_dir: directory to store users.db in. Should be the instance's
+        internal data dir (Config.data.path), NOT the workspace — keeps
+        per-instance user data isolated so multiple TinyCTX instances don't
+        share one users.db.
+
+        Falls back to TINYCTX_DATA_PATH env var, then platformdirs, only
+        when data_dir is not supplied (back-compat for callers that haven't
+        been updated yet). TINYCTX_DATA_PATH and the old TINYCTX_CONFIG_DIR
+        point at the same directory now that config-dir and data-dir are the
+        same concept — there is no separate config dir anymore.
+        """
+        if data_dir is not None:
+            config_dir = Path(data_dir)
         else:
-            config_dir = Path(platformdirs.user_config_dir("tinyctx"))
+            config_dir_env = os.environ.get("TINYCTX_DATA_PATH", "") or os.environ.get("TINYCTX_CONFIG_DIR", "")
+            if config_dir_env:
+                config_dir = Path(config_dir_env)
+            else:
+                config_dir = Path(platformdirs.user_config_dir("tinyctx"))
         config_dir.mkdir(parents=True, exist_ok=True)
         db_path = config_dir / "users.db"
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)

@@ -166,6 +166,12 @@ class GatewayConfig:
         override = os.environ.get("TINYCTX_GATEWAY_HOST", "").strip()
         if override:
             self.host = override
+        # TINYCTX_PORT lets `tinyctx start` assign a per-instance port (set
+        # by onboard/start to avoid collisions between multiple instances)
+        # without editing config.yaml.
+        port_override = os.environ.get("TINYCTX_PORT", "").strip()
+        if port_override:
+            self.port = int(port_override)
 
 
 @dataclass
@@ -177,7 +183,12 @@ class WorkspaceConfig:
     Configured via the top-level 'workspace:' key in config.yaml:
 
         workspace:
-          path: ~/.tinyctx
+          path: ~/.tinyctx/workspace
+
+    Optional — load() defaults this to <instance>/workspace, where
+    <instance> is config.yaml's own directory, so it rarely needs stating
+    explicitly. The bare dataclass default below (~/.tinyctx) only applies
+    when Config is constructed directly, bypassing load() (e.g. tests).
 
     In Docker the tinyctx user's home is /home/tinyctx, so ~ resolves
     naturally to the bind-mounted workspace. No env var override needed.
@@ -190,6 +201,32 @@ class WorkspaceConfig:
             self.path = Path(override).resolve()
         else:
             self.path = Path(self.path).expanduser().resolve()  # ~ → /home/tinyctx in container, %USERPROFILE% on Windows
+
+
+@dataclass
+class DataConfig:
+    """
+    Internal data directory — agent.db, users.db, and the memory graph live
+    here. Separate from workspace/ so the agent's own filesystem tools
+    (view/write_file/grep) never see or touch its internals.
+
+    Configured via the top-level 'data:' key in config.yaml:
+
+        data:
+          path: ~/.tinyctx/data
+
+    Optional — load() defaults this to <instance>/data, where <instance>
+    is config.yaml's own directory. The bare dataclass default below only
+    applies when Config is constructed directly, bypassing load().
+    """
+    path: Path = field(default_factory=lambda: Path("~/.tinyctx/data").expanduser())
+
+    def __post_init__(self):
+        override = os.environ.get("TINYCTX_DATA_PATH", "").strip()
+        if override:
+            self.path = Path(override).resolve()
+        else:
+            self.path = Path(self.path).expanduser().resolve()
 
 
 @dataclass
@@ -211,6 +248,7 @@ class Config:
     bridges:         dict[str, BridgeConfig] = field(default_factory=dict)
     gateway:         GatewayConfig           = field(default_factory=GatewayConfig)
     workspace:       WorkspaceConfig         = field(default_factory=WorkspaceConfig)
+    data:            DataConfig              = field(default_factory=DataConfig)
     logging:         LoggingConfig           = field(default_factory=LoggingConfig)
     max_tool_cycles: int                     = 20
     parallel:        int                     = 3     # max concurrent LLM/embedding requests in flight
@@ -317,7 +355,7 @@ def _parse_model(raw: dict) -> ModelConfig:
 
 # Known top-level keys — everything else goes into Config.extra
 _KNOWN_KEYS = {
-    "models", "llm", "router", "bridges", "gateway", "workspace",
+    "models", "llm", "router", "bridges", "gateway", "workspace", "data",
     "logging", "max_tool_cycles", "parallel", "context", "attachments", "permissions",
 }
 
@@ -365,13 +403,24 @@ def load(path="config.yaml") -> Config:
     llm = LLMRoutingConfig(primary=primary, fallback=fallback, fallback_on=fallback_on)
 
     # ------------------------------------------------------------------ workspace
+    # Defaults to <instance>/workspace, where <instance> is config.yaml's own
+    # directory — config.yaml, workspace/, and data/ are colocated under one
+    # instance dir, so there's nothing to state explicitly in most configs.
     ws_raw = raw.get("workspace", {})
-    ws_path_raw = ws_raw.get("path") or "~"
+    ws_path_raw = ws_raw.get("path") or (p.resolve().parent / "workspace")
     try:
         ws_path = Path(ws_path_raw).expanduser()
     except RuntimeError:
         ws_path = Path("/data")
     workspace = WorkspaceConfig(path=ws_path)
+
+    # ------------------------------------------------------------------ data
+    # Internal data dir (agent.db, users.db, memory graph). Defaults to
+    # <instance>/data (config.yaml's own directory), same reasoning as
+    # workspace above.
+    data_raw = raw.get("data", {})
+    data_path_raw = data_raw.get("path") or (p.resolve().parent / "data")
+    data = DataConfig(path=Path(data_path_raw))
 
     # ------------------------------------------------------------------ rest
     router_raw = raw.get("router", {})
@@ -431,6 +480,7 @@ def load(path="config.yaml") -> Config:
         bridges=bridges,
         gateway=gateway,
         workspace=workspace,
+        data=data,
         logging=LoggingConfig(level=log_raw.get("level", "INFO")),
         max_tool_cycles=int(raw.get("max_tool_cycles", 20)),
         parallel=parallel,

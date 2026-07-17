@@ -1,7 +1,7 @@
 """
-onboard/workspace_setup.py — Step 3: Workspace path selection and bootstrapping.
+onboard/workspace_setup.py — Step 3: Workspace bootstrapping.
 
-- Prompts the user for the workspace directory (default ~/.tinyctx/).
+- Workspace path is fixed at <instance>/workspace (see helpers.INSTANCE_DIR).
 - Unpacks BOOTSTRAP.md if the workspace is empty or brand-new.
 - Quietly copies boilerplate files (AGENTS.md, SOUL.md) if missing.
 - Quietly installs the bundled cron skill if missing.
@@ -19,7 +19,6 @@ import questionary
 from .helpers import (
     BUNDLED_DIR,
     DEFAULT_WORKSPACE,
-    GoBack,
     Mode,
     QSTYLE,
     c,
@@ -39,23 +38,23 @@ def run(mode: Mode) -> str:
     """
     Run the workspace setup step.
 
-    Returns the chosen workspace path string (unexpanded).
-    Raises GoBack if the user wants to return.
+    Workspace path is fixed at <instance>/workspace (no longer prompted for) —
+    workspace, data, and config.yaml all live under one instance directory
+    now, so relocating the workspace independently no longer makes sense.
+    To use a different instance entirely, run `tinyctx onboard --dir PATH`.
+
+    Returns the workspace path string.
     """
     if mode == "quickstart":
         section("Step 2 — Where to Save Your Data")
         c.print(f"TinyCTX will store your sessions and memory here.\n")
-        c.print(f"  Default: [bold]{DEFAULT_WORKSPACE}[/]  (recommended)\n")
-        raw = input("  Workspace path (Enter for default, 'back' to go back): ").strip()
+        c.print(f"  Workspace: [bold]{DEFAULT_WORKSPACE}[/]\n")
     else:
         section("Step 3 — Workspace")
         c.print("Stores sessions, memory index, SOUL.md, AGENTS.md, skills, etc.\n")
-        raw = input(f"  Workspace path (default: {DEFAULT_WORKSPACE}, 'back' to go back): ").strip()
+        c.print(f"  Workspace: [bold]{DEFAULT_WORKSPACE}[/]\n")
 
-    if raw.lower() in ("back", "b"):
-        raise GoBack
-
-    workspace = raw if raw else DEFAULT_WORKSPACE
+    workspace = DEFAULT_WORKSPACE
     ws_path = Path(workspace).expanduser()
     ws_path.mkdir(parents=True, exist_ok=True)
 

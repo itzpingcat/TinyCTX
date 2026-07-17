@@ -15,24 +15,24 @@ services:
       context: .
       dockerfile: Dockerfile
     image: tinyctx:latest
-    container_name: tinyctx
+    container_name: ${TINYCTX_INSTANCE:-tinyctx}
     depends_on:
       shell_sandbox:
         condition: service_healthy
     restart: on-failure
 
     ports:
-      - "127.0.0.1:8085:8085"
+      - "127.0.0.1:${TINYCTX_PORT:-8085}:8085"
 
     volumes:
       - type: bind
-        source: ${TINYCTX_WORKSPACE:-~/.tinyctx}
+        source: ${TINYCTX_WORKSPACE:-~/.tinyctx/workspace}
         target: /home/tinyctx
       - type: bind
-        source: ${TINYCTX_CONFIG:-~/.config/tinyctx}
+        source: ${TINYCTX_DATA:-~/.tinyctx/data}
         target: /etc/tinyctx
       - type: bind
-        source: ./config.yaml
+        source: ${TINYCTX_CONFIG_FILE:-~/.tinyctx/config.yaml}
         target: /app/config.yaml
         read_only: true
       - type: bind
@@ -43,7 +43,7 @@ services:
     environment:
       TINYCTX_GATEWAY_HOST: "0.0.0.0"
       TINYCTX_WORKSPACE_PATH: /home/tinyctx
-      TINYCTX_CONFIG_DIR: /etc/tinyctx
+      TINYCTX_DATA_PATH: /etc/tinyctx
       OPENROUTER_API_KEY:
       ANTHROPIC_API_KEY:
       OPENAI_API_KEY:
@@ -103,7 +103,7 @@ services:
       context: .
       dockerfile: sandbox/Dockerfile
     image: tinyctx-sandbox:latest
-    container_name: tinyctx_sandbox
+    container_name: ${TINYCTX_INSTANCE:-tinyctx}_sandbox
     restart: unless-stopped
 
     expose:
@@ -111,7 +111,7 @@ services:
 
     volumes:
       - type: bind
-        source: ${TINYCTX_WORKSPACE:-~/.tinyctx}
+        source: ${TINYCTX_WORKSPACE:-~/.tinyctx/workspace}
         target: /home/tinyctx
 
     environment:
@@ -159,7 +159,7 @@ networks:
   tinyctx_net:
     driver: bridge
     driver_opts:
-      com.docker.network.bridge.name: br_tinyctx
+      com.docker.network.bridge.name: br_${TINYCTX_TAG:-tinyctx}
 
   # IPC-only channel between agent and sandbox.
   # internal: true = Docker adds no gateway = zero internet egress on this net.
@@ -168,10 +168,10 @@ networks:
     driver: bridge
     internal: true
     driver_opts:
-      com.docker.network.bridge.name: br_agentsbox
+      com.docker.network.bridge.name: br_${TINYCTX_TAG:-tinyctx}_ab
 
   # Sandbox internet egress. Has a gateway; LAN/TS ranges blocked by firewall-init.
   sandbox_egress:
     driver: bridge
     driver_opts:
-      com.docker.network.bridge.name: br_sandboxout
+      com.docker.network.bridge.name: br_${TINYCTX_TAG:-tinyctx}_sb

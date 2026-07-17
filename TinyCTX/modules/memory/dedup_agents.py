@@ -275,7 +275,7 @@ async def run_edge_dedup(
 
 async def run_dedup_cycle(
     cfg: dict,
-    workspace_path: Path,
+    data_path: Path,
     conn,
     write_lock: asyncio.Lock,
     llm,
@@ -286,6 +286,10 @@ async def run_dedup_cycle(
     Refresh graph embeddings for stale entities, then cluster near-duplicate
     candidates into connected components and evaluate each component with a
     single LLM call.
+
+    data_path: internal data directory (agent.db / graph.lbug live here),
+    NOT the workspace — dedup_cache.db is TinyCTX-internal state, not
+    something the agent's filesystem tools should be able to see.
 
     Thrash mitigations
     ------------------
@@ -316,7 +320,7 @@ async def run_dedup_cycle(
             logger.debug("[memory/librarian] dedup: fewer than 2 entities, skipping")
             return
 
-        distinct_cache = _load_distinct_cache(workspace_path)
+        distinct_cache = _load_distinct_cache(data_path)
 
         edges_by_uuid: dict[str, list[dict]] = {e["e.uuid"]: [] for e in entities}
         er = await conn.execute(
@@ -376,7 +380,7 @@ async def run_dedup_cycle(
             logger.debug("[memory/librarian] dedup: refreshing %d stale graph embedding(s)", len(stale))
             for e in stale:
                 _invalidate_cache_for(distinct_cache, e["e.uuid"])
-                _invalidate_db_for(workspace_path, e["e.uuid"])
+                _invalidate_db_for(data_path, e["e.uuid"])
 
             texts: list[str] = [
                 embed_content_with_edges(
@@ -465,7 +469,7 @@ async def run_dedup_cycle(
                 conn, write_lock, llm, component, agent_logger, edges_by_uuid=edges_by_uuid,
             )
             for uid_a, uid_b in new_distinct_pairs:
-                _add_to_cache(workspace_path, uid_a, uid_b)
+                _add_to_cache(data_path, uid_a, uid_b)
                 distinct_cache.add(frozenset([uid_a, uid_b]))
 
         logger.debug("[memory/librarian] dedup cycle complete")

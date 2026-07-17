@@ -6,11 +6,13 @@ Currently supported targets: cli
 Reads gateway host/port/api_key directly from config.yaml and calls
 the bridge's run_detached() entry point.
 
-Default config path: <repo_root>/config.yaml. Override with --config.
+Default config path: resolved instance directory's config.yaml
+(see commands/_instance.py). Override with --dir or --config.
 
 Flags
 -----
-  --config PATH    Path to config.yaml.
+  --dir PATH       Path to a .tinyctx instance directory.
+  --config PATH    Path to config.yaml directly (overrides --dir/autodetect).
   --user USERNAME  TinyCTX username to log in as. If the user's
                    permission_level is below 100, you will be prompted
                    to elevate it (CLI is a trusted admin console — no
@@ -40,8 +42,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-_REPO_ROOT      = Path(__file__).resolve().parent.parent.parent
-_DEFAULT_CONFIG = _REPO_ROOT / "config.yaml"
+from TinyCTX.commands._instance import resolve_instance_dir, config_path_for
 
 
 def _prompt_elevate(username: str, current_level: int) -> bool:
@@ -70,9 +71,9 @@ def run(args: argparse.Namespace) -> None:
         print(f"error: unknown launch target '{target}'", file=sys.stderr)
         sys.exit(1)
 
-    config_path = Path(getattr(args, "config", None) or _DEFAULT_CONFIG).resolve()
+    config_path = Path(getattr(args, "config", None) or config_path_for(resolve_instance_dir(getattr(args, "dir", None)))).resolve()
     if not config_path.exists():
-        print("error: no config.yaml found.", file=sys.stderr)
+        print(f"error: no config.yaml found at {config_path}.", file=sys.stderr)
         print("  Run 'TinyCTX onboard' to set up TinyCTX, or manually create a config.yaml.", file=sys.stderr)
         sys.exit(1)
 

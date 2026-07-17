@@ -30,7 +30,16 @@ REPO_ROOT               = Path(__file__).resolve().parent.parent.parent
 BUNDLED_DIR             = Path(__file__).parent / "bundled"
 PROVIDERS_FILE          = Path(__file__).parent / "providers.json"
 BEGINNER_PROVIDERS_FILE = Path(__file__).parent / "beginner-providers.json"
-CONFIG_PATH             = REPO_ROOT / "config.yaml"
+
+# Instance directory this onboarding run targets. Set by commands/onboard.py
+# via TINYCTX_INSTANCE_DIR before this module is imported (mirrors every
+# other CLI command's --dir / CWD-.tinyctx / ~/.tinyctx resolution — see
+# commands/_instance.py). Falls back to ~/.tinyctx directly here only for
+# the case onboard's __main__ is invoked standalone (bypassing commands/onboard.py).
+_instance_dir_env = os.environ.get("TINYCTX_INSTANCE_DIR", "").strip()
+INSTANCE_DIR = Path(_instance_dir_env).expanduser().resolve() if _instance_dir_env else (Path.home() / ".tinyctx")
+
+CONFIG_PATH = INSTANCE_DIR / "config.yaml"
 
 BANNER = r"""
  _______ _             _____ _______ _  __
@@ -43,7 +52,8 @@ BANNER = r"""
                  |___/    Onboarding Wizard
 """
 
-DEFAULT_WORKSPACE    = "~/.tinyctx"
+DEFAULT_WORKSPACE    = str(INSTANCE_DIR / "workspace")
+DEFAULT_DATA         = str(INSTANCE_DIR / "data")
 DEFAULT_GATEWAY_HOST = "127.0.0.1"
 DEFAULT_GATEWAY_PORT = 8085
 
@@ -116,6 +126,7 @@ def load_existing_config() -> dict | None:
 
 
 def write_config(data: dict) -> None:
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(CONFIG_PATH, "w") as f:
         yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
 
@@ -145,6 +156,11 @@ def assemble_config(
 
     base["context"] = model_cfg.get("context", 16384)
     base["workspace"] = {"path": workspace}
+    # data.path is always instance-relative (<instance>/data) — not
+    # user-configurable via the wizard, since it's TinyCTX-internal state
+    # (agent.db, users.db, the memory graph), not something to relocate
+    # independently of the instance directory.
+    base["data"] = {"path": DEFAULT_DATA}
     base["gateway"]   = gateway
 
     existing_bridges = base.get("bridges", {})

@@ -10,6 +10,7 @@ onboard/gateway_setup.py — Step 4: Gateway port, API key, launch, and health c
 from __future__ import annotations
 
 import asyncio
+import os
 import secrets
 import socket
 import subprocess
@@ -20,6 +21,7 @@ from pathlib import Path
 import questionary
 
 from .helpers import (
+    CONFIG_PATH,
     DEFAULT_GATEWAY_HOST,
     DEFAULT_GATEWAY_PORT,
     REPO_ROOT,
@@ -114,14 +116,17 @@ def _launch_and_healthcheck(host: str, port: int) -> bool:
     section("Launching Gateway")
     c.print(f"  Starting gateway on http://{host}:{port} …\n")
 
-    log_file = Path.home() / ".tinyctx" / "daemon.log"
+    log_file = CONFIG_PATH.parent / "daemon.log"
     log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    env = {**os.environ, "TINYCTX_CONFIG_FILE": str(CONFIG_PATH)}
 
     with open(log_file, "a") as lf:
         if sys.platform == "win32":
             subprocess.Popen(
                 [sys.executable, str(_MAIN_PY)],
                 cwd=str(REPO_ROOT),
+                env=env,
                 stdout=lf,
                 stderr=lf,
                 creationflags=subprocess.DETACHED_PROCESS
@@ -131,6 +136,7 @@ def _launch_and_healthcheck(host: str, port: int) -> bool:
             subprocess.Popen(
                 [sys.executable, str(_MAIN_PY)],
                 cwd=str(REPO_ROOT),
+                env=env,
                 stdout=lf,
                 stderr=lf,
                 start_new_session=True,

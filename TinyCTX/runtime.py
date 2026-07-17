@@ -23,11 +23,17 @@ class Runtime:
         # AgentCycle will open its own connection for reading/inference.
         workspace = Path(config.workspace.path).expanduser().resolve()
         workspace.mkdir(parents=True, exist_ok=True)
-        self.db = ConversationDB(workspace / "agent.db")
+
+        # Internal data dir — agent.db, users.db, memory graph. Kept separate
+        # from workspace so the agent's own filesystem tools never see it.
+        data_path = Path(config.data.path).expanduser().resolve()
+        data_path.mkdir(parents=True, exist_ok=True)
+        self.data_path = data_path
+        self.db = ConversationDB(data_path / "agent.db")
 
         self.commands = CommandRegistry()
         self.module_registry = ModuleRegistry()
-        self.users = UserStore()
+        self.users = UserStore(data_path)
 
         # Concurrency Management
         max_workers = getattr(config, "max_workers", 8)

@@ -67,6 +67,7 @@ logger = logging.getLogger(__name__)
 _graph_database: "GraphDatabase | None" = None   # owns the ladybug.Database
 _runner:         "LibrarianRunner | None" = None
 _workspace:      Path | None = None
+_data_path:      Path | None = None   # internal data dir (agent.db, graph, dedup cache)
 _graph_db:       object | None = None
 _tools:          "ModuleType | None" = None
 _pinned_prio:    int = 5
@@ -102,11 +103,13 @@ class LibrarianRunner:
         embedder,
         graph_embedder=None,
         runtime=None,
+        data_path: Path | None = None,
     ) -> None:
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
         self._cfg            = cfg
         self._graph_database = graph_database
+        self._data_path       = data_path
 
         self._write_conn = graph_database.new_async_write_conn()
         self._write_lock = asyncio.Lock()
@@ -335,7 +338,7 @@ class LibrarianRunner:
             ):
                 t = asyncio.create_task(
                     run_dedup_cycle(
-                        self._cfg, _workspace, self._write_conn, self._write_lock,
+                        self._cfg, self._data_path, self._write_conn, self._write_lock,
                         self._llm, self._graph_embedder, self.agent_logger,
                     )
                 )
@@ -443,10 +446,18 @@ def _count_entry_tokens(entry) -> int:
 # ---------------------------------------------------------------------------
 
 def register_runtime(runtime) -> None:
-    global _graph_database, _runner, _workspace, _graph_db, _tools, _pinned_prio, _token_budget, _pinned_user_scan, _graph_embedder
+    global _graph_database, _runner, _workspace, _data_path, _graph_db, _tools, _pinned_prio, _token_budget, _pinned_user_scan, _graph_embedder
 
     _workspace = Path(runtime.config.workspace.path).expanduser().resolve()
     _workspace.mkdir(parents=True, exist_ok=True)
+
+    # Internal data dir — agent.db, graph, librarian log all live here now,
+    # not in workspace, so the agent's own filesystem tools never see them.
+    data_path = getattr(runtime, "data_path", None)
+    if data_path is None:
+        data_path = Path(runtime.config.data.path).expanduser().resolve()
+    data_path.mkdir(parents=True, exist_ok=True)
+    _data_path = data_path
 
     # Config
     try:
@@ -466,11 +477,11 @@ def register_runtime(runtime) -> None:
 
     def _resolve(rel: str) -> Path:
         p = Path(rel)
-        return p if p.is_absolute() else ws / p
+        return p if p.is_absolute() else data_path / p
 
     graph_path     = _resolve(cfg["graph_path"])
     log_path       = _resolve(cfg.get("librarian_log", "memory/librarian.log"))
-    agent_db       = ws / "agent.db"
+    agent_db       = data_path / "agent.db"
     max_concurrent = int(cfg.get("max_concurrent", 4))
 
     _pinned_prio  = int(cfg.get("pinned_priority", 5))
@@ -537,7 +548,10 @@ def register_runtime(runtime) -> None:
     atexit.register(conv_db.close)
 
     # LibrarianRunner — gets write conn from GraphDatabase
-    _runner = LibrarianRunner(cfg, _graph_database, log_path, conv_db, llm, embedder, graph_embedder, runtime=runtime)
+    _runner = LibrarianRunner(
+        cfg, _graph_database, log_path, conv_db, llm, embedder, graph_embedder,
+        runtime=runtime, data_path=data_path,
+    )
 
     # GraphDB — gets read conn from GraphDatabase
     _graph_db = GraphDB(_graph_database)
