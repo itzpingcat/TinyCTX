@@ -21,6 +21,8 @@ import math
 import time
 from collections import deque
 
+from TinyCTX.modules.memory.graph import execute_with_retry
+
 logger = logging.getLogger(__name__)
 
 
@@ -70,10 +72,11 @@ async def _compute_distance_to_pinned(
     if not pinned_uuids:
         return dist
 
-    r = await conn.execute(
+    r = await execute_with_retry(
+        conn,
         "MATCH (a:Entity)-[r:Relation]->(b:Entity) "
         "WHERE r.superseded_at IS NULL "
-        "RETURN a.uuid, b.uuid"
+        "RETURN a.uuid, b.uuid",
     )
     adjacency: dict[str, set[str]] = {}
     while r.has_next():
@@ -125,9 +128,10 @@ async def compute_decay_scores(
     }
 
     # Pull all entities with the raw fields needed for scoring.
-    r = await conn.execute(
+    r = await execute_with_retry(
+        conn,
         "MATCH (e:Entity) RETURN e.uuid, e.name, e.entity_type, e.pinned_target, "
-        "e.priority, e.mention_count, e.updated_at, e.last_read_at"
+        "e.priority, e.mention_count, e.updated_at, e.last_read_at",
     )
     rows = []
     while r.has_next():
@@ -153,10 +157,11 @@ async def compute_decay_scores(
     candidate_uuids = set(candidates.keys())
 
     # Active edge counts (in + out) for candidates only.
-    r = await conn.execute(
+    r = await execute_with_retry(
+        conn,
         "MATCH (a:Entity)-[r:Relation]->(b:Entity) "
         "WHERE r.superseded_at IS NULL "
-        "RETURN a.uuid, b.uuid"
+        "RETURN a.uuid, b.uuid",
     )
     edge_count: dict[str, int] = {uid: 0 for uid in candidate_uuids}
     while r.has_next():

@@ -18,6 +18,8 @@ import sqlite3
 from collections import defaultdict
 from pathlib import Path
 
+from TinyCTX.modules.memory.graph import execute_with_retry
+
 logger = logging.getLogger(__name__)
 
 _PROMPTS_DIR = Path(__file__).parent / "prompts"
@@ -222,10 +224,11 @@ async def run_edge_dedup(
     """
     logger.debug("[memory/librarian] edge dedup starting")
     try:
-        r = await conn.execute(
+        r = await execute_with_retry(
+            conn,
             "MATCH (a:Entity)-[r:Relation]->(b:Entity) "
             "WHERE r.superseded_at IS NULL "
-            "RETURN a.uuid, b.uuid, r.relation, r.created_at"
+            "RETURN a.uuid, b.uuid, r.relation, r.created_at",
         )
 
         groups: dict[tuple, list[tuple]] = defaultdict(list)
@@ -307,9 +310,10 @@ async def run_dedup_cycle(
         batch_size  = int(cfg.get("dedup_batch_count", 6))
         doc_template = cfg.get("embed_document_template", "{text}")
 
-        r = await conn.execute(
+        r = await execute_with_retry(
+            conn,
             "MATCH (e:Entity) RETURN e.uuid, e.name, e.description, e.entity_type, "
-            "e.graph_embed_model, e.graph_embed_hash, e.graph_embedding, e.embedding"
+            "e.graph_embed_model, e.graph_embed_hash, e.graph_embedding, e.embedding",
         )
         col_names = r.get_column_names()
         entities  = []
@@ -323,10 +327,11 @@ async def run_dedup_cycle(
         distinct_cache = _load_distinct_cache(data_path)
 
         edges_by_uuid: dict[str, list[dict]] = {e["e.uuid"]: [] for e in entities}
-        er = await conn.execute(
+        er = await execute_with_retry(
+            conn,
             "MATCH (a:Entity)-[r:Relation]->(b:Entity) "
             "WHERE r.superseded_at IS NULL "
-            "RETURN a.uuid, r.relation, b.name"
+            "RETURN a.uuid, r.relation, b.name",
         )
         while er.has_next():
             row = er.get_next()
@@ -433,10 +438,11 @@ async def run_dedup_cycle(
 
         # Filter already-aliased and cached-distinct pairs
         already_aliased: set[frozenset] = set()
-        r = await conn.execute(
+        r = await execute_with_retry(
+            conn,
             "MATCH (a:Entity)-[r:Relation]->(b:Entity) "
             "WHERE r.relation = 'ALIASED_TO' AND r.superseded_at IS NULL "
-            "RETURN a.uuid, b.uuid"
+            "RETURN a.uuid, b.uuid",
         )
         while r.has_next():
             row = r.get_next()

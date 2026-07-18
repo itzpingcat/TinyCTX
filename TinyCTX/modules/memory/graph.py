@@ -280,6 +280,42 @@ def now_ts() -> float:
     return time.time()
 
 
+class _EmptyResult:
+    """Stand-in for a QueryResult with zero rows — see execute_with_retry."""
+
+    def has_next(self) -> bool:
+        return False
+
+    def get_next(self):
+        raise StopIteration
+
+    def get_column_names(self) -> list:
+        return []
+
+
+async def execute_with_retry(conn, query: str, parameters: dict | None = None):
+    """
+    Await conn.execute(), tolerating a None return.
+
+    ladybug.AsyncConnection.execute() is documented to always return a
+    QueryResult, but on a still-empty/freshly-initialised on-disk database it
+    has been observed to return None instead of a QueryResult with zero rows
+    for MATCH queries that touch no data. That's a deterministic "no rows"
+    case (an empty graph stays empty on retry), not a transient failure, so
+    treat None the same as a QueryResult with has_next() == False rather than
+    retrying or raising.
+    """
+    result = await conn.execute(query, parameters=parameters) if parameters is not None \
+        else await conn.execute(query)
+    if result is None:
+        logger.debug(
+            "[memory/graph] conn.execute() returned None (treating as empty result): %s",
+            query.strip().splitlines()[0][:80],
+        )
+        return _EmptyResult()
+    return result
+
+
 def embed_hash(content: str) -> str:
     """SHA-256 of the content string used to detect embedding staleness."""
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
