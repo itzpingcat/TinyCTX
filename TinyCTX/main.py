@@ -24,6 +24,7 @@ import os
 from pathlib import Path
 
 from TinyCTX.config import load as load_config, apply_logging, resolve_log_level
+from TinyCTX.commands._instance import load_instance_env
 from TinyCTX.contracts import MANUAL_LAUNCH_ATTR
 from TinyCTX.runtime import Runtime
 from TinyCTX.ai import configure_parallel
@@ -39,8 +40,11 @@ def _startup_log_level(cfg) -> int:
 
 
 async def main() -> None:
+    config_path = Path(os.environ.get("TINYCTX_CONFIG_FILE") or "config.yaml").resolve()
+    load_instance_env(config_path.parent)
+
     logger.debug("loading config")
-    cfg = load_config(os.environ.get("TINYCTX_CONFIG_FILE") or "config.yaml")
+    cfg = load_config(str(config_path))
     apply_logging(cfg.logging, level_override=_startup_log_level(cfg))
     logger.debug("gateway.enabled=%s bridges=%s", cfg.gateway.enabled, list(cfg.bridges))
 

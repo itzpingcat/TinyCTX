@@ -366,6 +366,12 @@ An *instance* is a self-contained directory holding one agent's config, workspac
 ```
 <instance>/                 e.g. ~/.tinyctx, or anywhere via --dir
 ├── config.yaml             Loaded by default from here (workspace.path / data.path default relative to this file)
+├── .env                     Optional. KEY=VALUE per line (e.g. DISCORD_BOT_TOKEN=...). Loaded via
+│                            `commands/_instance.py`'s `load_instance_env()` — with override=True, so
+│                            values here win over anything already exported in the shell/global env.
+│                            Loaded by `main.py` (direct/non-Docker launch) and `commands/start.py`
+│                            (Docker launch — populates the host process env before `docker compose up`,
+│                            which compose.yaml's bare `environment:` entries then pass into the container).
 ├── workspace/               Agent-authored content — visible to the agent's own filesystem tools
 │   ├── SOUL.md              Agent personality (loaded every turn)
 │   ├── AGENTS.md            Sub-agent/persona definitions
@@ -390,7 +396,7 @@ Non-Docker launches (`onboard`'s direct `python main.py` spawn) instead set `TIN
 
 ## Dependency Notes
 
-Key packages: `aiohttp`, `rich`, `questionary`, `mcp`, `tiktoken`, `structlog`, `tenacity`, `ddgs`, `playwright`, `pdfplumber`, `python-docx`, `croniter`, `discord.py`, `jinja2`, `numpy`.
+Key packages: `aiohttp`, `rich`, `questionary`, `mcp`, `tiktoken`, `structlog`, `tenacity`, `ddgs`, `playwright`, `pdfplumber`, `python-docx`, `croniter`, `python-dotenv`, `discord.py`, `jinja2`, `numpy`.
 
 Python ≥ 3.11 required.
 

@@ -35,6 +35,7 @@ from TinyCTX.commands._instance import (
     config_path_for,
     project_name_for,
     compose_env,
+    load_instance_env,
 )
 
 # Repo root = TinyCTX/commands/ -> TinyCTX/ -> repo root.
@@ -104,6 +105,8 @@ def run(args: argparse.Namespace) -> None:
         return
 
     _require_docker()
+
+    load_instance_env(instance_dir)
 
     project_name = project_name_for(instance_dir)
     env = {**os.environ, **compose_env(instance_dir, port=cfg.gateway.port)}

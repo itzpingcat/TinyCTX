@@ -26,6 +26,22 @@ import hashlib
 from pathlib import Path
 
 
+def load_instance_env(instance_dir: Path) -> None:
+    """
+    Load `<instance_dir>/.env` into the process environment, if present.
+
+    Values in the file override anything already set in the environment
+    (e.g. a stale global DISCORD_BOT_TOKEN exported in the shell profile) —
+    this instance's .env is meant to be the source of truth for its secrets.
+    No-op if the file doesn't exist.
+    """
+    env_path = instance_dir / ".env"
+    if not env_path.is_file():
+        return
+    from dotenv import load_dotenv
+    load_dotenv(env_path, override=True)
+
+
 def resolve_instance_dir(explicit: str | None = None) -> Path:
     """Resolve the instance directory per the order documented above."""
     if explicit:
