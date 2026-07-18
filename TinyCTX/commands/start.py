@@ -4,13 +4,20 @@ commands/start.py — `tinyctx start`
 Starts the TinyCTX stack using Docker Compose and waits until the
 gateway responds to /v1/health.
 
-Docker Compose is expected to be run from the project root.
-
-Default config path: <repo_root>/config.yaml
+The instance directory (config.yaml, workspace/, data/) is resolved via
+commands/_instance.py: --dir, else .tinyctx/ in the current directory,
+else ~/.tinyctx. The Docker Compose file itself always lives at the repo
+root (shared across all instances) and is invoked with -f/-p plus env
+vars pointing at this instance's directories, so multiple instances can
+run concurrently without editing compose.yaml.
 
 Flags
 -----
-  --config PATH  Path to config.yaml.
+  --dir PATH     Path to a .tinyctx instance directory. Overrides
+                 autodetection (CWD/.tinyctx, then ~/.tinyctx).
+  --config PATH  Path to config.yaml directly. Overrides --dir/autodetect
+                 for config loading only (compose still uses --dir/autodetect
+                 for workspace/data paths unless --dir is also given).
 """
 
 from __future__ import annotations
@@ -20,11 +27,20 @@ import shutil
 import subprocess
 import sys
 import time
+import os
 from pathlib import Path
 
-# Repo root = TinyCTX/commands/ -> TinyCTX/ -> repo root
+from TinyCTX.commands._instance import (
+    resolve_instance_dir,
+    config_path_for,
+    project_name_for,
+    compose_env,
+)
+
+# Repo root = TinyCTX/commands/ -> TinyCTX/ -> repo root.
+# compose.yaml lives here, shared across all instances.
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-_DEFAULT_CONFIG = _REPO_ROOT / "config.yaml"
+_COMPOSE_FILE = _REPO_ROOT / "compose.yaml"
 
 _POLL_TIMEOUT = 15.0
 _POLL_INTERVAL = 0.25
@@ -66,10 +82,11 @@ def _require_docker() -> None:
 
 
 def run(args: argparse.Namespace) -> None:
-    config_path = Path(getattr(args, "config", None) or _DEFAULT_CONFIG).resolve()
+    instance_dir = resolve_instance_dir(getattr(args, "dir", None))
+    config_path = Path(getattr(args, "config", None) or config_path_for(instance_dir)).resolve()
 
     if not config_path.exists():
-        print("error: no config.yaml found.", file=sys.stderr)
+        print(f"error: no config.yaml found at {config_path}.", file=sys.stderr)
         print(
             "  Run 'tinyctx onboard' to set up TinyCTX first.",
             file=sys.stderr,
@@ -88,10 +105,14 @@ def run(args: argparse.Namespace) -> None:
 
     _require_docker()
 
+    project_name = project_name_for(instance_dir)
+    env = {**os.environ, **compose_env(instance_dir, port=cfg.gateway.port)}
+
     try:
         subprocess.run(
-            ["docker", "compose", "up", "-d"],
+            ["docker", "compose", "-f", str(_COMPOSE_FILE), "-p", project_name, "up", "-d"],
             cwd=_REPO_ROOT,
+            env=env,
             check=True,
         )
     except subprocess.CalledProcessError:
@@ -106,6 +127,7 @@ def run(args: argparse.Namespace) -> None:
     while time.monotonic() < deadline:
         if _health_check(gateway_url):
             print(f"✓ TinyCTX running — {gateway_url}")
+            print(f"  Instance: {instance_dir}")
             if api_key:
                 print(f"  API key: {api_key}")
             return

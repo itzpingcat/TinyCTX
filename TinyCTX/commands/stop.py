@@ -1,20 +1,27 @@
 """
 commands/stop.py — `tinyctx stop`
 
-Stops the TinyCTX Docker Compose stack.
+Stops the TinyCTX Docker Compose stack for the resolved instance.
 
-Docker Compose is expected to be run from the project root.
+Flags
+-----
+  --dir PATH  Path to a .tinyctx instance directory. Overrides
+              autodetection (CWD/.tinyctx, then ~/.tinyctx).
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
+from TinyCTX.commands._instance import resolve_instance_dir, project_name_for, compose_env
+
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+_COMPOSE_FILE = _REPO_ROOT / "compose.yaml"
 
 
 def _require_docker() -> None:
@@ -45,10 +52,15 @@ def _require_docker() -> None:
 def run(args: argparse.Namespace) -> None:
     _require_docker()
 
+    instance_dir = resolve_instance_dir(getattr(args, "dir", None))
+    project_name = project_name_for(instance_dir)
+    env = {**os.environ, **compose_env(instance_dir)}
+
     try:
         subprocess.run(
-            ["docker", "compose", "down"],
+            ["docker", "compose", "-f", str(_COMPOSE_FILE), "-p", project_name, "down"],
             cwd=_REPO_ROOT,
+            env=env,
             check=True,
         )
     except subprocess.CalledProcessError:
@@ -58,4 +70,4 @@ def run(args: argparse.Namespace) -> None:
         )
         sys.exit(1)
 
-    print("✓ TinyCTX stopped.")
+    print(f"✓ TinyCTX stopped. ({instance_dir})")

@@ -179,8 +179,11 @@ class AgentTextFinal(_AgentEventBase):
     """
     Final (non-streaming) text, or the closing sentinel after a stream.
     text may be empty when it closes a streamed sequence.
+    suppressed is True when the agent replied with the NO_REPLY sentinel —
+    bridges should discard any buffered/streamed text and send nothing.
     """
     text: str
+    suppressed: bool = False
 
 
 @dataclass(frozen=True)

@@ -100,6 +100,7 @@ async def handle_turn(
                 float(bridge._opts.get("turn_timeout_s", 0)) or None
             )
             buf: list[str] = []
+            suppressed = False
 
             while True:
                 try:
@@ -122,7 +123,10 @@ async def handle_turn(
                     if bridge._typing_on_thinking:
                         typing_ev.set()
                 elif isinstance(event, AgentTextFinal):
-                    if event.text:
+                    if event.suppressed:
+                        suppressed = True
+                        buf.clear()
+                    elif event.text:
                         buf.append(event.text)
                     current_epoch = bridge._reset_epoch.get(cursor_key, 0)
                     if current_epoch == epoch_at_start and event.tail_node_id:
@@ -152,8 +156,8 @@ async def handle_turn(
                     await channel.send(f"⚠️ {event.message}")
                     break
 
-            # Send accumulated text.
-            text = bridge._dehumanize_mentions("".join(buf).strip())
+            # Send accumulated text (unless the agent replied NO_REPLY).
+            text = "" if suppressed else bridge._dehumanize_mentions("".join(buf).strip())
             if text:
                 for i in range(0, len(text), bridge._max_len):
                     await channel.send(text[i : i + bridge._max_len])

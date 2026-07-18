@@ -141,9 +141,11 @@ class DiscordBridge:
         self._generating:       dict[str, bool]                   = {}
         self._pending:          dict[str, list[InboundMessage]]   = {}
 
-        # Persisted cursor store
-        workspace   = Path(runtime.config.workspace.path).expanduser().resolve()
-        cursors_dir = workspace / "cursors"
+        # Persisted cursor store — internal bridge bookkeeping (cursor_key ->
+        # node_id, message_id -> node_id), not agent-authored content, so it
+        # lives in data/ alongside agent.db rather than in workspace/.
+        data_path   = Path(getattr(runtime, "data_path", None) or runtime.config.data.path).expanduser().resolve()
+        cursors_dir = data_path / "cursors"
         cursors_dir.mkdir(parents=True, exist_ok=True)
         self._store = CursorStore(cursors_dir)
 

@@ -7,7 +7,7 @@ EXTENSION_META = {
         "DB branch — never polluting the user's conversation thread. "
         "Branch strategy is configurable: 'root' (fully isolated) or 'session' "
         "(branches off the user's session tail at startup). "
-        "Replies of HEARTBEAT_OK are silently dropped."
+        "Replies of NO_REPLY are silently dropped."
     ),
     "default_config": {
         # Interval in minutes. 0 = disabled.
@@ -22,16 +22,16 @@ EXTENSION_META = {
             "<heartbeat_sentinel>"
             "Read HEARTBEAT.md if it exists (workspace context). "
             "Follow it strictly. Do not infer or repeat old tasks from prior chats. "
-            "If nothing needs attention, reply HEARTBEAT_OK."
+            "If nothing needs attention, reply NO_REPLY."
             "</heartbeat_sentinel>"
         ),
-        # After stripping HEARTBEAT_OK, how many chars are still allowed before
+        # After stripping NO_REPLY, how many chars are still allowed before
         # we treat the reply as an alert worth surfacing.
         "ack_max_chars":   300,
-        # Prompt sent when the agent hasn't returned HEARTBEAT_OK yet.
+        # Prompt sent when the agent hasn't returned NO_REPLY yet.
         "continuation_prompt": (
             "<heartbeat_sentinel>"
-            "Continue the task, or reply HEARTBEAT_OK when you are done."
+            "Continue the task, or reply NO_REPLY when you are done."
             "</heartbeat_sentinel>"
         ),
         # Max number of continuation turns before giving up and moving on.

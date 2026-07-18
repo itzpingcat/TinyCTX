@@ -26,19 +26,29 @@ def main() -> None:
     p_onboard = sub.add_parser("onboard", help="Run the setup wizard")
     p_onboard.add_argument("--reset", action="store_true",
                            help="Re-run onboarding from scratch")
+    p_onboard.add_argument("--dir", metavar="PATH",
+                           help="Path to a .tinyctx instance directory to set up (default: ~/.tinyctx)")
 
     # start
     p_start = sub.add_parser("start", help="Start the gateway daemon")
     p_start.add_argument("--foreground", action="store_true",
                          help="Run in the foreground (don't detach)")
+    p_start.add_argument("--dir", metavar="PATH",
+                         help="Path to a .tinyctx instance directory")
     p_start.add_argument("--config", metavar="PATH",
                          help="Path to config.yaml")
 
     # stop
-    sub.add_parser("stop", help="Stop the gateway daemon")
+    p_stop = sub.add_parser("stop", help="Stop the gateway daemon")
+    p_stop.add_argument("--dir", metavar="PATH",
+                        help="Path to a .tinyctx instance directory")
 
     # status
-    sub.add_parser("status", help="Show daemon health")
+    p_status = sub.add_parser("status", help="Show daemon health")
+    p_status.add_argument("--dir", metavar="PATH",
+                          help="Path to a .tinyctx instance directory")
+    p_status.add_argument("--config", metavar="PATH",
+                          help="Path to config.yaml")
 
     # launch
     p_launch = sub.add_parser("launch", help="Launch a bridge client")
@@ -46,6 +56,8 @@ def main() -> None:
                           help="Bridge to launch (default: cli)")
     p_launch.add_argument("--user", metavar="USERNAME",
                           help="TinyCTX username to log in as")
+    p_launch.add_argument("--dir", metavar="PATH",
+                          help="Path to a .tinyctx instance directory")
     p_launch.add_argument("--config", metavar="PATH",
                           help="Path to config.yaml")
 

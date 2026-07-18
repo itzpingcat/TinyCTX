@@ -17,6 +17,12 @@ from TinyCTX.utils.tool_handler import ToolCallHandler
 
 logger = logging.getLogger(__name__)
 
+# Sentinel the agent can reply with (as its entire final response) to signal
+# that no message should be sent to the user. Checked as an exact match on
+# the stripped final response text.
+NO_REPLY_TOKEN = "NO_REPLY"
+
+
 class AgentCycle:
     """
     A single execution turn. 
@@ -58,9 +64,13 @@ class AgentCycle:
         # --- 1. Resource Setup (Lazy Loading) ---
         if not self.db:
             from TinyCTX.db import ConversationDB
-            workspace = Path(self.config.workspace.path).expanduser().resolve()
-            workspace.mkdir(parents=True, exist_ok=True)
-            self.db = ConversationDB(workspace / "agent.db")
+            # Must match Runtime's DB location (data/agent.db, not workspace/) —
+            # runtime.push() writes inbound nodes there, so this cycle needs to
+            # see the same file or every add_node() here fails FOREIGN KEY
+            # (parent_id pointing at a node that only exists in the other file).
+            data_path = Path(self.config.data.path).expanduser().resolve()
+            data_path.mkdir(parents=True, exist_ok=True)
+            self.db = ConversationDB(data_path / "agent.db")
 
         # Load session state (model choice, enabled tools, etc.)
         state, _ = self.db.load_session_state(node_id)
@@ -95,6 +105,11 @@ class AgentCycle:
         # Wire modules into this cycle turn
         self.module_registry.register_agent(self)
 
+        # Config-driven per-tool overrides (always_on / min_permission) — applied
+        # last so they win over whatever each module's register_tool() call set.
+        if self.config.tool_overrides:
+            self.tool_handler.apply_overrides(self.config.tool_overrides)
+
         # --- 2. Generation Loop ---
         # Tracker for metadata yielded in events
         meta = {
@@ -106,6 +121,7 @@ class AgentCycle:
         max_cycles = self.config.max_tool_cycles
         final_text = ""
         streaming_active = False
+        no_reply = False
         agent_name: str | None = state.get("agent_name")
 
         for cycle_num in range(max_cycles):
@@ -154,7 +170,11 @@ class AgentCycle:
             logger.debug("[agent] assistant node written, tail=%s", self.context.tail_node_id)
 
             if not tool_calls_list:
-                final_text = response_text
+                if response_text.strip() == NO_REPLY_TOKEN:
+                    no_reply = True
+                    final_text = ""
+                else:
+                    final_text = response_text
                 logger.debug("[agent] no tool calls, breaking loop")
                 break
 
@@ -192,7 +212,11 @@ class AgentCycle:
         # meta["tail_node_id"] is the real assistant tail — yield it as-is so
         # bridges can advance their cursor to the correct node.
         final_tail = meta["tail_node_id"]
-        yield AgentTextFinal(text=final_text if not streaming_active else "", **meta)
+        yield AgentTextFinal(
+            text=final_text if not streaming_active else "",
+            suppressed=no_reply,
+            **meta,
+        )
 
         # Fire post-turn hooks registered by modules via register_agent.
         for hook in self.post_turn_hooks:

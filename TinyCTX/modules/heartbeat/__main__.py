@@ -10,10 +10,10 @@ Branch strategy (configured via "branch_from"):
               heartbeat starts (inherits history up to that point, then diverges)
 
 Reply handling:
-  - "HEARTBEAT_OK" at start or end → silently dropped
+  - "NO_REPLY" at start or end → silently dropped
     (if remaining content is ≤ ack_max_chars).
   - Any other reply → printed as a heartbeat alert, then the agent is
-    re-prompted: "Continue the task, or reply HEARTBEAT_OK when done."
+    re-prompted: "Continue the task, or reply NO_REPLY when done."
   - This continuation loop runs up to max_continuations times before giving up.
   - Errors are logged; the background task continues normally.
 
@@ -45,7 +45,7 @@ from TinyCTX.contracts import (
 logger = logging.getLogger(__name__)
 
 _HEARTBEAT_USER_ID = "heartbeat-system"
-_TOKEN = "HEARTBEAT_OK"
+_TOKEN = "NO_REPLY"  # shared sentinel with agent.py's NO_REPLY_TOKEN
 
 
 class _HeartbeatRunner:
@@ -91,7 +91,7 @@ class _HeartbeatRunner:
             self.cursor_node_id = self.runtime.db.get_root().id
 
         # 2. Continuation loop
-        current_prompt = self.cfg.get("prompt", "Read HEARTBEAT.md if it exists. If nothing needs attention, reply HEARTBEAT_OK.")
+        current_prompt = self.cfg.get("prompt", "Read HEARTBEAT.md if it exists. If nothing needs attention, reply NO_REPLY.")
 
         for _turn in range(int(self.cfg.get("max_continuations", 5))):
             msg = InboundMessage(
@@ -155,7 +155,7 @@ class _HeartbeatRunner:
                 break
 
             logger.warning("[HEARTBEAT ALERT]\n%s", alert)
-            current_prompt = self.cfg.get("continuation_prompt", "Continue the task, or reply HEARTBEAT_OK when done.")
+            current_prompt = self.cfg.get("continuation_prompt", "Continue the task, or reply NO_REPLY when done.")
 
     def _in_active_window(self) -> bool:
         hours = self.cfg.get("active_hours")

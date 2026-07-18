@@ -341,17 +341,22 @@ class CLIBridge:
                 end="")
             self._console.print(preview, markup=False, style="bright_black")
         elif isinstance(event, (AgentTextFinal, _FakeTextFinal)):
-            # 1. Capture the text
-            final_text = (event.text or self._current_content).strip()
-            
-            # 2. Shut down the live display immediately 
+            # 1. Capture the text (NO_REPLY suppresses any streamed content)
+            suppressed = getattr(event, "suppressed", False)
+            final_text = "" if suppressed else (event.text or self._current_content).strip()
+
+            # 2. Shut down the live display immediately
             # (This flushes the current state to the console once)
-            self._stop_live() 
-            
+            if suppressed:
+                self._current_content = ""
+            self._stop_live()
+
             # 3. Clean up for next message
             if final_text:
                 self._last_reply = final_text
-                
+            elif suppressed:
+                self._console.print(f"  [{c('tool_ok')}]·  (no reply)[/{c('tool_ok')}]")
+
             self._current_content = ""
             self._thinking_content = ""
             self._label_printed = False
@@ -636,25 +641,32 @@ class CLIBridge:
 
 
 # ---------------------------------------------------------------------------
-# Cursor file helpers (client-side, ~/.tinyctx/cursors/cli)
+# Cursor file helpers (client-side) — <instance>/data/cursors/cli
+#
+# Lives in data/, not workspace/, for the same reason as the Discord
+# bridge's CursorStore: this is bridge bookkeeping (which conversation node
+# the CLI resumes from), not agent-authored content.
 # ---------------------------------------------------------------------------
 
-_CURSOR_FILE = Path.home() / ".tinyctx" / "cursors" / "cli"
+def _cursor_file_path(instance_dir: Path) -> Path:
+    return instance_dir / "data" / "cursors" / "cli"
 
 
-def _load_cli_cursor_path() -> str | None:
+def _load_cli_cursor_path(instance_dir: Path) -> str | None:
     try:
-        if _CURSOR_FILE.exists():
-            return _CURSOR_FILE.read_text(encoding="utf-8").strip() or None
+        cursor_file = _cursor_file_path(instance_dir)
+        if cursor_file.exists():
+            return cursor_file.read_text(encoding="utf-8").strip() or None
     except Exception:
         pass
     return None
 
 
-def _save_cli_cursor_path(node_id: str) -> None:
+def _save_cli_cursor_path(instance_dir: Path, node_id: str) -> None:
     try:
-        _CURSOR_FILE.parent.mkdir(parents=True, exist_ok=True)
-        _CURSOR_FILE.write_text(node_id, encoding="utf-8")
+        cursor_file = _cursor_file_path(instance_dir)
+        cursor_file.parent.mkdir(parents=True, exist_ok=True)
+        cursor_file.write_text(node_id, encoding="utf-8")
     except Exception:
         pass
 
@@ -676,6 +688,7 @@ async def run_detached(
     api_key: str,
     options: dict | None = None,
     username: str | None = None,
+    instance_dir: Path | None = None,
 ) -> None:
     """
     Real entry point — called by commands/launch.py.
@@ -684,8 +697,14 @@ async def run_detached(
     username: TinyCTX username resolved and (optionally) elevated by launch.py.
               Forwarded in every message body so the gateway can author messages
               as that user rather than the generic api-client.
+    instance_dir: resolved .tinyctx instance directory (see commands/_instance.py),
+                  used only to locate this instance's cursor file under data/cursors/.
+                  Falls back to ~/.tinyctx if not supplied (back-compat).
     """
     import aiohttp
+
+    if instance_dir is None:
+        instance_dir = Path.home() / ".tinyctx"
 
     bridge = CLIBridge(None, options=options or {})
     bridge._gateway_url = gateway_url
@@ -694,7 +713,7 @@ async def run_detached(
     bridge._cli_agent_name = (options or {}).get("agent_name") or None  # forwarded in _send()
 
     # Resolve or create the cursor via /v1/lane/open.
-    saved_cursor = _load_cli_cursor_path()
+    saved_cursor = _load_cli_cursor_path(instance_dir)
     async with aiohttp.ClientSession() as session:
         resp = await session.post(
             f"{gateway_url}/v1/lane/open",
@@ -705,6 +724,6 @@ async def run_detached(
         data = await resp.json()
 
     bridge._cursor = data["node_id"]
-    _save_cli_cursor_path(bridge._cursor)
+    _save_cli_cursor_path(instance_dir, bridge._cursor)
 
     await bridge.run()

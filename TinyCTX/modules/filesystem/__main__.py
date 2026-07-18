@@ -106,8 +106,28 @@ _DOC_EXTRACTORS: dict[str, str] = {
 
 def register_agent(agent) -> None:
     workspace = Path(agent.config.workspace.path).expanduser().resolve()
-    source_root = Path.cwd().resolve()
     workspace.mkdir(parents=True, exist_ok=True)
+
+    # Read-only whitelist: additional directories the agent's filesystem tools
+    # may VIEW (view/grep/glob_search) but never write to (write_file/edit_file).
+    # Nothing outside workspace/ is readable or writable unless listed here.
+    #
+    # Configured via:
+    #   filesystem:
+    #     read_only_paths:
+    #       - /app          # e.g. the agent's own source code in the container
+    #
+    # Empty by default — previously the source root (wherever the process was
+    # launched from, e.g. Path.cwd()) was always implicitly readable AND
+    # writable with no way to turn it off; that implicit grant is removed.
+    # Add /app (or the equivalent host path) here explicitly to restore
+    # read-only self-inspection of the agent's own code.
+    fs_cfg: dict = {}
+    if hasattr(agent.config, "extra") and isinstance(agent.config.extra, dict):
+        fs_cfg = agent.config.extra.get("filesystem", {}) or {}
+    read_only_paths: list[Path] = [
+        Path(p).expanduser().resolve() for p in fs_cfg.get("read_only_paths", [])
+    ]
 
     # ------------------------------------------------------------------
     # File-state tracking (read-before-write + staleness + unchanged detection)
@@ -171,21 +191,36 @@ def register_agent(agent) -> None:
         except OSError:
             pass
 
-    def resolve(raw: str) -> Path:
+    def _read_only_root_for(candidate: Path) -> Path | None:
+        """Return the read_only_paths entry containing candidate, or None."""
+        for ro in read_only_paths:
+            try:
+                candidate.relative_to(ro)
+                return ro
+            except ValueError:
+                continue
+        return None
+
+    def resolve(raw: str, *, for_write: bool = False) -> Path:
         p = Path(raw)
         # Resolve to an absolute path, then enforce containment.
-        # Allow access to the workspace and the TinyCTX source root, nothing else.
+        # workspace is always read+write. read_only_paths entries are
+        # readable (view/grep/glob) but never writable (write_file/edit_file).
+        # Nothing else is reachable.
         candidate = (workspace / p).resolve() if not p.is_absolute() else p.resolve()
         try:
-            candidate.relative_to(workspace.resolve())
+            candidate.relative_to(workspace)
             return candidate
         except ValueError:
             pass
-        try:
-            candidate.relative_to(source_root)
+        ro_root = _read_only_root_for(candidate)
+        if ro_root is not None:
+            if for_write:
+                raise ValueError(
+                    f"Path is read-only: {raw} (under {ro_root} — listed in "
+                    "filesystem.read_only_paths, which grants view access only)"
+                )
             return candidate
-        except ValueError:
-            pass
         raise ValueError(f"Path escapes allowed directories: {raw}")
 
     def view(path: str, view_range: list | None = None) -> str:
@@ -302,7 +337,7 @@ def register_agent(agent) -> None:
                   'prepend'   — insert content before existing content.
                   'overwrite' — replace the entire file with content (default).
         """
-        p = resolve(path)
+        p = resolve(path, for_write=True)
         p.parent.mkdir(parents=True, exist_ok=True)
         existed = p.exists()
 
@@ -344,7 +379,7 @@ def register_agent(agent) -> None:
             new_str: Replacement string. Leave empty to delete old_str.
             replace_all: If true, replace every occurrence instead of requiring uniqueness.
         """
-        p = resolve(path)
+        p = resolve(path, for_write=True)
         if not p.exists():
             return f"[error: file not found: {p}]"
 

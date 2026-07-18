@@ -4,11 +4,13 @@ commands/status.py — `tinyctx status`
 Reads gateway host/port/api_key directly from config.yaml and hits
 /v1/health to report daemon health.
 
-Default config path: <repo_root>/config.yaml. Override with --config.
+Instance directory resolved via commands/_instance.py: --dir, else
+.tinyctx/ in the current directory, else ~/.tinyctx.
 
 Flags
 -----
-  --config PATH  Path to config.yaml.
+  --dir PATH     Path to a .tinyctx instance directory.
+  --config PATH  Path to config.yaml directly (overrides --dir/autodetect).
 """
 from __future__ import annotations
 
@@ -18,14 +20,14 @@ import sys
 import urllib.request
 from pathlib import Path
 
-_REPO_ROOT      = Path(__file__).resolve().parent.parent.parent
-_DEFAULT_CONFIG = _REPO_ROOT / "config.yaml"
+from TinyCTX.commands._instance import resolve_instance_dir, config_path_for
 
 
 def _gateway_url_and_key(args: argparse.Namespace) -> tuple[str, str]:
-    config_path = Path(getattr(args, "config", None) or _DEFAULT_CONFIG).resolve()
+    instance_dir = resolve_instance_dir(getattr(args, "dir", None))
+    config_path = Path(getattr(args, "config", None) or config_path_for(instance_dir)).resolve()
     if not config_path.exists():
-        print("error: no config.yaml found.", file=sys.stderr)
+        print(f"error: no config.yaml found at {config_path}.", file=sys.stderr)
         print("  Run 'TinyCTX onboard' to set up TinyCTX, or manually create a config.yaml.", file=sys.stderr)
         sys.exit(1)
     from TinyCTX.config import load as load_config

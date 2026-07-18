@@ -90,6 +90,30 @@ class PermissionsConfig:
 
 
 @dataclass
+class ToolOverrideConfig:
+    """
+    Per-tool override of registration-time defaults (always_on / min_permission).
+
+    Configured via the top-level 'tool_overrides:' key in config.yaml:
+
+        tool_overrides:
+          shell:
+            min_permission: 80
+          present:
+            always_on: true
+          memory_search:
+            always_on: false
+            min_permission: 10
+
+    Fields left unset (null/omitted) leave that aspect of the tool untouched —
+    only the fields you specify are overridden. Unknown tool names are ignored
+    (logged at debug level) since not every module is loaded in every config.
+    """
+    always_on:      bool | None = None
+    min_permission: int | None  = None
+
+
+@dataclass
 class AttachmentConfig:
     """
     Thresholds that control whether attachments are inlined into the
@@ -166,6 +190,12 @@ class GatewayConfig:
         override = os.environ.get("TINYCTX_GATEWAY_HOST", "").strip()
         if override:
             self.host = override
+        # TINYCTX_PORT lets `tinyctx start` assign a per-instance port (set
+        # by onboard/start to avoid collisions between multiple instances)
+        # without editing config.yaml.
+        port_override = os.environ.get("TINYCTX_PORT", "").strip()
+        if port_override:
+            self.port = int(port_override)
 
 
 @dataclass
@@ -177,7 +207,12 @@ class WorkspaceConfig:
     Configured via the top-level 'workspace:' key in config.yaml:
 
         workspace:
-          path: ~/.tinyctx
+          path: ~/.tinyctx/workspace
+
+    Optional — load() defaults this to <instance>/workspace, where
+    <instance> is config.yaml's own directory, so it rarely needs stating
+    explicitly. The bare dataclass default below (~/.tinyctx) only applies
+    when Config is constructed directly, bypassing load() (e.g. tests).
 
     In Docker the tinyctx user's home is /home/tinyctx, so ~ resolves
     naturally to the bind-mounted workspace. No env var override needed.
@@ -190,6 +225,32 @@ class WorkspaceConfig:
             self.path = Path(override).resolve()
         else:
             self.path = Path(self.path).expanduser().resolve()  # ~ → /home/tinyctx in container, %USERPROFILE% on Windows
+
+
+@dataclass
+class DataConfig:
+    """
+    Internal data directory — agent.db, users.db, and the memory graph live
+    here. Separate from workspace/ so the agent's own filesystem tools
+    (view/write_file/grep) never see or touch its internals.
+
+    Configured via the top-level 'data:' key in config.yaml:
+
+        data:
+          path: ~/.tinyctx/data
+
+    Optional — load() defaults this to <instance>/data, where <instance>
+    is config.yaml's own directory. The bare dataclass default below only
+    applies when Config is constructed directly, bypassing load().
+    """
+    path: Path = field(default_factory=lambda: Path("~/.tinyctx/data").expanduser())
+
+    def __post_init__(self):
+        override = os.environ.get("TINYCTX_DATA_PATH", "").strip()
+        if override:
+            self.path = Path(override).resolve()
+        else:
+            self.path = Path(self.path).expanduser().resolve()
 
 
 @dataclass
@@ -211,12 +272,14 @@ class Config:
     bridges:         dict[str, BridgeConfig] = field(default_factory=dict)
     gateway:         GatewayConfig           = field(default_factory=GatewayConfig)
     workspace:       WorkspaceConfig         = field(default_factory=WorkspaceConfig)
+    data:            DataConfig              = field(default_factory=DataConfig)
     logging:         LoggingConfig           = field(default_factory=LoggingConfig)
     max_tool_cycles: int                     = 20
     parallel:        int                     = 3     # max concurrent LLM/embedding requests in flight
     context:         int                     = 16384
     attachments:     AttachmentConfig        = field(default_factory=AttachmentConfig)
     permissions:     PermissionsConfig       = field(default_factory=PermissionsConfig)
+    tool_overrides:  dict[str, ToolOverrideConfig] = field(default_factory=dict)
     # Catch-all for unknown top-level keys (e.g. mcp:, custom module config, etc.)
     # Modules access this via agent.config.extra.get("mcp", {})
     extra:           dict                    = field(default_factory=dict)
@@ -271,6 +334,24 @@ def _parse_fallback_on(raw: dict) -> FallbackOnConfig:
     )
 
 
+def _parse_tool_overrides(raw: dict) -> dict[str, ToolOverrideConfig]:
+    overrides: dict[str, ToolOverrideConfig] = {}
+    for tool_name, o in (raw or {}).items():
+        if not isinstance(o, dict):
+            raise ValueError(f"tool_overrides.{tool_name} must be a mapping")
+        always_on = o.get("always_on")
+        min_permission = o.get("min_permission")
+        if always_on is not None:
+            always_on = bool(always_on)
+        if min_permission is not None:
+            min_permission = int(min_permission)
+        overrides[tool_name] = ToolOverrideConfig(
+            always_on=always_on,
+            min_permission=min_permission,
+        )
+    return overrides
+
+
 def _parse_model(raw: dict) -> ModelConfig:
     if not raw.get("base_url"):
         raise ValueError("Model config missing required field: base_url")
@@ -317,8 +398,9 @@ def _parse_model(raw: dict) -> ModelConfig:
 
 # Known top-level keys — everything else goes into Config.extra
 _KNOWN_KEYS = {
-    "models", "llm", "router", "bridges", "gateway", "workspace",
+    "models", "llm", "router", "bridges", "gateway", "workspace", "data",
     "logging", "max_tool_cycles", "parallel", "context", "attachments", "permissions",
+    "tool_overrides",
 }
 
 
@@ -365,13 +447,24 @@ def load(path="config.yaml") -> Config:
     llm = LLMRoutingConfig(primary=primary, fallback=fallback, fallback_on=fallback_on)
 
     # ------------------------------------------------------------------ workspace
+    # Defaults to <instance>/workspace, where <instance> is config.yaml's own
+    # directory — config.yaml, workspace/, and data/ are colocated under one
+    # instance dir, so there's nothing to state explicitly in most configs.
     ws_raw = raw.get("workspace", {})
-    ws_path_raw = ws_raw.get("path") or "~"
+    ws_path_raw = ws_raw.get("path") or (p.resolve().parent / "workspace")
     try:
         ws_path = Path(ws_path_raw).expanduser()
     except RuntimeError:
         ws_path = Path("/data")
     workspace = WorkspaceConfig(path=ws_path)
+
+    # ------------------------------------------------------------------ data
+    # Internal data dir (agent.db, users.db, memory graph). Defaults to
+    # <instance>/data (config.yaml's own directory), same reasoning as
+    # workspace above.
+    data_raw = raw.get("data", {})
+    data_path_raw = data_raw.get("path") or (p.resolve().parent / "data")
+    data = DataConfig(path=Path(data_path_raw))
 
     # ------------------------------------------------------------------ rest
     router_raw = raw.get("router", {})
@@ -418,6 +511,9 @@ def load(path="config.yaml") -> Config:
     if parallel < 1:
         raise ValueError(f"parallel must be >= 1, got {parallel}")
 
+    # ------------------------------------------------------------------ tool_overrides
+    tool_overrides = _parse_tool_overrides(raw.get("tool_overrides", {}))
+
     # ------------------------------------------------------------------ extra
     extra = {k: v for k, v in raw.items() if k not in _KNOWN_KEYS}
 
@@ -431,12 +527,14 @@ def load(path="config.yaml") -> Config:
         bridges=bridges,
         gateway=gateway,
         workspace=workspace,
+        data=data,
         logging=LoggingConfig(level=log_raw.get("level", "INFO")),
         max_tool_cycles=int(raw.get("max_tool_cycles", 20)),
         parallel=parallel,
         context=int(raw.get("context", 16384)),
         attachments=attachments,
         permissions=permissions,
+        tool_overrides=tool_overrides,
         extra=extra,
     )
     setattr(cfg, "_source_path", p.resolve())

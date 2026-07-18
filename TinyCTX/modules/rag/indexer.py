@@ -125,10 +125,45 @@ class DataBankIndexer:
             "[rag/indexer] [%s] indexing %d dirty file(s)",
             self._databank.name, len(dirty),
         )
+        embedder_down = False
+        indexed = 0
         for path_str, content, content_hash in dirty:
-            await self._index_file(path_str, content, content_hash)
+            if embedder_down:
+                # Already know the embedder is unreachable this sync pass —
+                # don't hammer it once per remaining file, and don't mark
+                # them indexed (they must stay dirty so a later sync with a
+                # healthy embedder actually retries them).
+                continue
+            try:
+                ok = await self._index_file(path_str, content, content_hash)
+            except Exception:
+                # Any embedder call failing here means it's almost certainly
+                # unreachable for the rest of this batch too — stop trying
+                # instead of repeating the same failure per file.
+                embedder_down = True
+                logger.warning(
+                    "[rag/indexer] [%s] embedder unreachable — skipping remaining "
+                    "dirty file(s) this sync, will retry next sync",
+                    self._databank.name,
+                )
+                continue
+            if ok:
+                indexed += 1
+        if embedder_down and indexed == 0:
+            logger.warning(
+                "[rag/indexer] [%s] no files indexed — embedder unreachable",
+                self._databank.name,
+            )
 
-    async def _index_file(self, path_str: str, content: str, content_hash: str) -> None:
+    async def _index_file(self, path_str: str, content: str, content_hash: str) -> bool:
+        """
+        Index one file. Returns True if it was actually indexed (with or
+        without vectors from an absent embedder), False if nothing was
+        written. Raises if the embedder call fails so the caller can stop
+        retrying the rest of the batch — callers must NOT catch this and
+        still call upsert_file, or a failed embed gets silently recorded as
+        done and the file is never retried.
+        """
         path   = Path(path_str)
         mtime  = path.stat().st_mtime if path.exists() else 0.0
         chunks = self._strategy.chunk(content)
@@ -138,28 +173,26 @@ class DataBankIndexer:
                 "[rag/indexer] [%s] no chunks from %s — skipping",
                 self._databank.name, path_str,
             )
-            return
+            return False
 
         embeddings: list[list[float]] | None = None
         if self._embedder is not None:
-            try:
-                embeddings = await self._embedder.embed(chunks, priority=20)
-            except Exception as exc:
-                logger.warning(
-                    "[rag/indexer] [%s] embedding failed for %s: %s — BM25 only",
-                    self._databank.name, path_str, exc,
-                )
+            # Let embed() failures propagate — caller decides whether to
+            # keep going. We must not upsert_file() with a "success" hash
+            # when the embedding never happened.
+            embeddings = await self._embedder.embed(chunks, priority=20)
 
         self._store.delete_file(path_str)
         self._store.upsert_file(path_str, content_hash, self._embedding_model, mtime)
         self._store.insert_chunks(path_str, chunks, embeddings)
         self._store.commit()
 
-        vec_status = f"{len(embeddings)} vectors" if embeddings is not None else "no vectors (BM25 only)"
+        vec_status = f"{len(embeddings)} vectors" if embeddings is not None else "no vectors (no embedder configured)"
         logger.info(
             "[rag/indexer] [%s] indexed %s — %d chunk(s), %s",
             self._databank.name, Path(path_str).name, len(chunks), vec_status,
         )
+        return True
 
 
 # ---------------------------------------------------------------------------

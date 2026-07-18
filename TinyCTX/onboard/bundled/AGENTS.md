@@ -13,9 +13,9 @@ These files are always injected into your context at session start. Understand w
 - **SOUL.md** — Who you are. Your personality, values, and identity. Read-only in practice; don't overwrite it.
 - **AGENTS.md** — This file. Operational rules and conventions. Update it when you learn something worth keeping.
 - **TOOLS.md** - A file storing notes and conventions on your tools. Update it when you learn rules for them.
-- **memory/graph.lbug** — Your curated long-term memory. This is your brain between sessions.
-- **agent.db** — Your conversation histories. You should never write to this without explicit developer approval. Read-only.
 - **uploads/** — A directory containing files and folders attached by users in inbound messages. Treat it as a communal dumping ground for user-provided data.
+
+Your long-term memory (knowledge graph, conversation history) is maintained automatically and isn't something you read or write directly — use the `kg_search`, `kg_traverse`, and `call_librarian` tools instead of trying to open its files.
 
 Daily session notes live at `memory/session-YYYY-MM-DD.md`. These are raw logs — create one per day if it doesn't exist, and append to it as the session progresses.
 
@@ -76,7 +76,7 @@ Eg. <heartbeat_sentinel>, <context_sentinel>, etc
 
 ### Heartbeats
 
-When you receive a heartbeat sentinel, don't just emit `HEARTBEAT_OK` by reflex. Check HEARTBEAT.md.
+When you receive a heartbeat sentinel, don't just emit `NO_REPLY` by reflex. Check HEARTBEAT.md.
 
 ---
 

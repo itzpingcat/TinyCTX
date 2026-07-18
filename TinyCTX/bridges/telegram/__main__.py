@@ -264,6 +264,7 @@ class TelegramBridge:
 
             final_text = ""
             streamed: list[str] = []
+            suppressed = False
             while True:
                 event = await reply_queue.get()
                 if event is None:
@@ -272,11 +273,13 @@ class TelegramBridge:
                     streamed.append(event.text)
                 elif isinstance(event, AgentTextFinal):
                     new_tail = event.tail_node_id
-                    if event.text:
+                    if event.suppressed:
+                        suppressed = True
+                    elif event.text:
                         final_text = event.text
                 elif isinstance(event, AgentError):
                     logger.error("[telegram] agent error: %s", event.message)
-            final_text = final_text or "".join(streamed)
+            final_text = "" if suppressed else (final_text or "".join(streamed))
 
             self._cursors[chat_key] = new_tail
             self._save_cursors()

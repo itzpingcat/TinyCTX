@@ -1,7 +1,8 @@
 """
 bridges/discord/cursors.py — Session cursor persistence for the Discord bridge.
 
-Persists two JSON files under workspace/cursors/:
+Persists two JSON files under data/cursors/ (not workspace/ — this is
+bridge-internal bookkeeping, not agent-authored content):
 
   discord.json              cursor_key -> node_id
                             Keys: "dm:<uid>", "group:<cid>", "thread:<tid>"
@@ -27,7 +28,7 @@ logger = logging.getLogger(__name__)
 class CursorStore:
     """
     Persists Discord bridge session cursors and message→node mappings across
-    bot restarts. Backed by two JSON files in workspace/cursors/.
+    bot restarts. Backed by two JSON files in data/cursors/.
     """
 
     MAX_MSG_NODES = 2000

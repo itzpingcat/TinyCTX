@@ -12,9 +12,11 @@ from TinyCTX.config.__main__ import (
     BridgeConfig,
     GatewayConfig,
     WorkspaceConfig,
+    DataConfig,
     LoggingConfig,
     AttachmentConfig,
     PermissionsConfig,
+    ToolOverrideConfig,
 )
 
 __all__ = [
@@ -29,7 +31,9 @@ __all__ = [
     "BridgeConfig",
     "GatewayConfig",
     "WorkspaceConfig",
+    "DataConfig",
     "LoggingConfig",
     "AttachmentConfig",
     "PermissionsConfig",
+    "ToolOverrideConfig",
 ]

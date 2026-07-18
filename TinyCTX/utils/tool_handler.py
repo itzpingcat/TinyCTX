@@ -2,7 +2,10 @@ import asyncio
 import functools
 import inspect
 import json
+import logging
 from typing import Dict, Any, Callable, List, Optional
+
+logger = logging.getLogger(__name__)
 
 class ToolCallHandler:
     def __init__(self):
@@ -188,6 +191,31 @@ class ToolCallHandler:
             else:
                 coerced[key] = value
         return coerced
+
+    def apply_overrides(self, overrides: Dict[str, Any]) -> None:
+        """Apply config-driven per-tool overrides of always_on / min_permission.
+
+        Call after all modules have registered their tools (register_tool
+        calls set the baseline; this runs last and wins). Unset fields on an
+        override (None) leave that aspect of the tool untouched. Tool names
+        not currently registered are skipped with a debug log — not every
+        module is loaded in every config, so this isn't an error.
+        """
+        for name, override in (overrides or {}).items():
+            tool = self.tools.get(name)
+            if tool is None:
+                logger.debug("[tool_handler] override for unknown tool '%s' skipped", name)
+                continue
+
+            min_permission = getattr(override, "min_permission", None)
+            if min_permission is not None:
+                tool["min_permission"] = min_permission
+
+            always_on = getattr(override, "always_on", None)
+            if always_on is True:
+                self.enabled.add(name)
+            elif always_on is False:
+                self.enabled.discard(name)
 
     def enable(self, name: str) -> bool:
         """Enable a registered tool by name. Returns True if found, False if unknown."""

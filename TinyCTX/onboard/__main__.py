@@ -170,7 +170,8 @@ def step_bootstrap_admin() -> None:
 
     try:
         from TinyCTX.users import UserStore
-        store = UserStore()
+        from .helpers import INSTANCE_DIR
+        store = UserStore(INSTANCE_DIR / "data")
         users = list_users(store)
     except Exception as exc:
         warn(f"Could not open users.db: {exc}")

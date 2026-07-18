@@ -108,7 +108,12 @@ def _event_to_dict(event) -> dict:
     if isinstance(event, AgentTextChunk):
         return {"type": "text_chunk", "text": event.text}
     if isinstance(event, AgentTextFinal):
-        return {"type": "text_final", "text": event.text, "node_id": event.tail_node_id}
+        return {
+            "type": "text_final",
+            "text": "" if event.suppressed else event.text,
+            "node_id": event.tail_node_id,
+            "suppressed": event.suppressed,
+        }
     if isinstance(event, AgentToolCall):
         return {"type": "tool_call", "tool_name": event.tool_name,
                 "call_id": event.call_id, "args": event.args}
@@ -323,8 +328,6 @@ async def handle_lane_branch(request: web.Request) -> web.Response:
 
     parent_node_id: node to branch from. If null/absent, branches off DB root.
     """
-    workspace = request.app["workspace"]
-
     body = {}
     try:
         body = await request.json()
@@ -333,8 +336,10 @@ async def handle_lane_branch(request: web.Request) -> web.Response:
 
     parent_node_id = (body.get("parent_node_id") or "").strip() or None
 
-    from TinyCTX.db import ConversationDB
-    db   = ConversationDB(workspace / "agent.db")
+    # Reuse Runtime's own DB connection rather than opening a second one —
+    # it's already pointed at data/agent.db (the actual conversation DB;
+    # workspace/ is a different directory reserved for agent-authored files).
+    db   = request.app["runtime"].db
     root = db.get_root()
 
     if parent_node_id and db.get_node(parent_node_id) is not None:
