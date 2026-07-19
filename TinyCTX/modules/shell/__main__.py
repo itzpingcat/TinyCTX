@@ -274,7 +274,11 @@ def register_agent(agent) -> None:
     default_timeout = int(_extra.get("default_timeout", 120))
     max_timeout     = int(_extra.get("max_timeout", 1200))
     # Default to sandbox. Operators set null explicitly for bare-metal / dev.
-    sandbox_url = _extra.get("sandbox_url", "http://tinyctx_sandbox:8700") or None
+    # The sandbox container name is TINYCTX_INSTANCE (hashed per-instance, see
+    # commands/_instance.py::project_name_for) + "_sandbox" — falls back to
+    # "tinyctx" to match compose.yaml's own default when unset.
+    _default_sandbox_url = f"http://{os.environ.get('TINYCTX_INSTANCE', 'tinyctx')}_sandbox:8700"
+    sandbox_url = _extra.get("sandbox_url", _default_sandbox_url) or None
 
     if sandbox_url:
         logger.info("shell: dispatching via sandbox at %s", sandbox_url)
@@ -298,7 +302,7 @@ def register_agent(agent) -> None:
             output = _run_sandbox(command, sandbox_url, effective_timeout)
         return prefix + output
 
-    def shell(command: str, timeout: int | None = None, internal_network: bool = False) -> str:
+    def shell(command: str, timeout: int | None = None, backend_access: bool = False) -> str:
         """Run a shell command.
 
         By default runs in the isolated sandbox container, which has outbound
@@ -306,9 +310,9 @@ def register_agent(agent) -> None:
         it cannot reach the local LAN, Tailscale peers, or internal services.
         Use this for the vast majority of shell work.
 
-        Set internal_network=True to run in the main TinyCTX container instead,
-        which has full network access — use when the command needs to reach a
-        private or local address, e.g.:
+        Set backend_access=True to run in the main TinyCTX container instead,
+        which has full network access and its own backend files — use when
+        the command needs to reach a private or local address, e.g.:
           - Tailscale IPs (100.x.x.x)
           - LAN services (192.168.x.x, 10.x.x.x)
           - Internal APIs (ComfyUI, local databases, self-hosted services)
@@ -319,14 +323,15 @@ def register_agent(agent) -> None:
             command: The shell command to run.
             timeout: Optional per-call timeout in seconds. Capped at the
                      configured maximum (default 1200s).
-            internal_network: If True, run in the main container with full
-                              network access (requires permission level 80).
+            backend_access: If True, run in the main container with full
+                            network access and access to its own backend
+                            files (requires permission level 80).
         """
-        if internal_network:
+        if backend_access:
             # Checked inside tool_handler via min_permission, but we guard
             # explicitly here too so the error message is clear.
             if agent.config.permissions.level < 80:
-                return "[blocked: internal_network=True requires permission level 80]"
+                return "[blocked: backend_access=True requires permission level 80]"
             return _dispatch(command, local=True, call_timeout=timeout)
         return _dispatch(command, call_timeout=timeout)
 

@@ -4,8 +4,8 @@ EXTENSION_META = {
     "description": (
         "Shell execution tool. "
         "shell: always-on, runs in the sandbox container by default (no LAN/Tailscale). "
-        "Pass internal_network=True to run in the main TinyCTX container with full network access "
-        "(permission level 80 required). "
+        "Pass backend_access=True to run in the main TinyCTX container with full network access "
+        "and its own backend files (permission level 80 required). "
         "Blacklist enforced before dispatch in both modes."
     ),
     "default_config": {
@@ -16,7 +16,10 @@ EXTENSION_META = {
         "max_timeout": 1200,
 
         # Default points at the sandbox container defined in compose.yaml.
-        # Override to null for bare-metal / Windows / dev (falls back to local).
-        "sandbox_url": "http://tinyctx_sandbox:8700",
+        # Actual host is computed at runtime from TINYCTX_INSTANCE (the
+        # per-instance hashed container name) + "_sandbox" — see
+        # modules/shell/__main__.py::register_agent. Override to null for
+        # bare-metal / Windows / dev (falls back to local).
+        "sandbox_url": None,
     },
 }

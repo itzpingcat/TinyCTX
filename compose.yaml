@@ -44,6 +44,7 @@ services:
       TINYCTX_GATEWAY_HOST: "0.0.0.0"
       TINYCTX_WORKSPACE_PATH: /home/tinyctx
       TINYCTX_DATA_PATH: /etc/tinyctx
+      TINYCTX_INSTANCE: ${TINYCTX_INSTANCE:-tinyctx}
       OPENROUTER_API_KEY:
       ANTHROPIC_API_KEY:
       OPENAI_API_KEY:
