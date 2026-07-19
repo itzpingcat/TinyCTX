@@ -65,7 +65,7 @@ TinyCTX/
     ├── shell/          shell tool
     ├── skills/         use_skill tool (loads SKILL.md files)
     ├── subagents/      spawn_agent / wait_agent tools
-    ├── sysops/         System operation tools (model switching, abort, etc.)
+    ├── sysops/         User/permission management + /model command + set_active_model tool (per-branch LLM override, see below)
     ├── system_prompt/  Injects SOUL.md, AGENTS.md into system prompt
     ├── todo/           todo_read / todo_write tools (per-session task list)
     └── web/            web_search / open_url tools (DuckDuckGo + Playwright)
@@ -139,6 +139,8 @@ Key methods:
 - `load_session_state(node_id)` → `(dict, depth)` — reconstructs session state
 - `get_state(node_id, key, default=None)` — single-key read via `load_session_state`
 - `set_state(node_id, key, value)` — merge-write a single key onto `node_id`'s own `state_delta` (read-modify-write; safe alongside other modules writing other keys to the same node). Modules should use `get_state`/`set_state`, not `load_session_state`/`update_node_state_delta` directly — the latter is a blind full-column replace and two writers on the same node will clobber each other (fixed in `rag`, `skills`, `memory` modules, which previously did this).
+
+**The `"model"` session-state key** is read by `AgentCycle.run()` itself (`agent.py`): `primary_name = state.get("model") or self.config.llm.primary`. Any branch-scoped override of the LLM used for a cycle goes through this one key. `modules/sysops/` is the only writer today — both `/model <name>` (slash command) and the agent-callable `set_active_model` tool set it via `db.set_state`; `/model clear` / `set_active_model("")` reset it to `""` so the `or` falls through to the config default. A module adding its own model-switching UI should write the same key rather than inventing a new one. Both live under `modules/sysops/`, gated at `permission_level >= model_min_permission` (default 75, `extra.sysops.model_min_permission` in config.yaml).
 - `flag_branch(node_id, flag)` — walk ancestors, adding flag until one already has it
 - `get_nodes_without_flag(flag)` — used by librarian to find unvisited nodes
 
