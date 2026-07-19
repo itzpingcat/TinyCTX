@@ -2,7 +2,23 @@
 config.yaml
 config.yaml.bak
 .env
-*temp*
+# Matches "temp" as a whole word/segment only (temp/, temp.txt, foo_temp,
+# temp_foo, foo-temp.log, etc.) — NOT as a substring of a longer word like
+# "template" or "contemporary". Gitignore globs don't support real word
+# boundaries, so this is done by requiring temp to be bounded by a path
+# separator, underscore, hyphen, dot, or the start/end of the name.
+temp
+temp/
+temp.*
+temp_*
+temp-*
+*.temp
+*_temp
+*_temp.*
+*_temp/
+*-temp
+*-temp.*
+*-temp/
 
 # python
 __pycache__/
