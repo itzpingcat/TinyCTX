@@ -11,7 +11,8 @@ created once on the first register_agent call and shared across all cycles.
 
 Auto-rag state is stored in session state under the key "rag_auto_targets"
 (a list of databank name strings). set_auto_rag_databanks writes this key
-via db.update_node_state_delta; the pre-assemble hook reads it each turn.
+via db.set_state (merge-write — safe alongside other modules' state on the
+same node); the pre-assemble hook reads it each turn via db.get_state.
 
 Databank layout (workspace/rag/):
     lore/            <- FilesDataBank "lore"
@@ -31,7 +32,6 @@ register_runtime is not used by this module (no commands or runtime hooks needed
 from __future__ import annotations
 
 import atexit
-import json
 import logging
 from pathlib import Path
 
@@ -271,8 +271,7 @@ def register_agent(cycle) -> None:
             return
 
         # Read auto-rag targets from session state
-        state, _ = cycle.db.load_session_state(ctx.tail_node_id)
-        targets: list[str] = state.get("rag_auto_targets") or []
+        targets: list[str] = cycle.db.get_state(ctx.tail_node_id, "rag_auto_targets") or []
         if not targets:
             return
 
@@ -415,10 +414,7 @@ def register_agent(cycle) -> None:
             )
 
         tail = cycle.context.tail_node_id
-        cycle.db.update_node_state_delta(
-            tail,
-            json.dumps({"rag_auto_targets": targets}),
-        )
+        cycle.db.set_state(tail, "rag_auto_targets", targets)
 
         if not targets:
             return "[auto-rag cleared — no databanks will be injected automatically]"

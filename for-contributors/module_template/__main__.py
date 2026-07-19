@@ -34,7 +34,6 @@ merge works.
 """
 from __future__ import annotations
 
-import json
 import logging
 
 logger = logging.getLogger(__name__)
@@ -248,14 +247,26 @@ def register_agent(cycle) -> None:
     #     this way. Both write it from a tool call and read it back in a
     #     prompt provider or hook on the next turn.
     #
+    #     Use db.get_state / db.set_state — NOT the raw
+    #     load_session_state / update_node_state_delta primitives — for
+    #     anything module-level. Here's why: update_node_state_delta()
+    #     blindly REPLACES a node's entire state_delta column. If your tool
+    #     call does
+    #         db.update_node_state_delta(node_id, json.dumps({STATE_KEY: value}))
+    #     and some other module (or another tool call earlier in the same
+    #     turn) already wrote a different key onto that exact node_id, your
+    #     write silently erases it. set_state() avoids this by reading the
+    #     node's existing delta first and merging your key in before
+    #     writing it back — safe no matter who else touches that node.
+    #     get_state() is the matching single-key read (a thin wrapper over
+    #     load_session_state() that walks the whole ancestor chain, same as
+    #     before — only the WRITE side needed fixing).
+    #
     #     Read it (node_id is usually cycle.context.tail_node_id):
-    #         state, depth = cycle.db.load_session_state(node_id)
-    #         value = state.get(STATE_KEY)
+    #         value = cycle.db.get_state(node_id, STATE_KEY, default=None)
     #
     #     Write it (call from inside a tool, where you have a node_id):
-    #         cycle.db.update_node_state_delta(
-    #             node_id, json.dumps({STATE_KEY: value})
-    #         )
+    #         cycle.db.set_state(node_id, STATE_KEY, value)
     #
     # (b) ctx.state — a plain dict attribute on the live Context object,
     #     scoped to a single assemble() call (cleared every time it runs).
@@ -275,10 +286,9 @@ def register_agent(cycle) -> None:
         Args:
             value: The value to remember.
         """
-        cycle.db.update_node_state_delta(
-            cycle.context.tail_node_id,
-            json.dumps({STATE_KEY: value}),
-        )
+        # set_state merge-writes just STATE_KEY onto this node — it will
+        # not disturb any other key another module already wrote here.
+        cycle.db.set_state(cycle.context.tail_node_id, STATE_KEY, value)
         return f"remembered: {value}"
 
     cycle.tool_handler.register_tool(set_example_state, always_on=False, min_permission=25)
@@ -302,9 +312,11 @@ def register_agent(cycle) -> None:
 #    the agent needs standing context injected every turn.
 # 6. Register context hooks via cycle.context.register_hook(...) only if
 #    you need to filter/transform/reshape history or prompt assembly.
-# 7. For cross-turn memory, use db.load_session_state /
-#    db.update_node_state_delta with your own unique STATE_KEY — never
-#    write to the built-in keys (platform, author_id, agent_name,
-#    server_name, channel_name).
+# 7. For cross-turn memory, use db.get_state / db.set_state with your own
+#    unique STATE_KEY — never write to the built-in keys (platform,
+#    author_id, agent_name, server_name, channel_name). Don't use
+#    db.update_node_state_delta / db.load_session_state directly from
+#    module code — set_state/get_state wrap them safely (see the SESSION
+#    STATE section above for why the raw write primitive is a footgun).
 # 8. Run linters, and if this is a new top-level module, add it to the
 #    project layout list in TinyCTX/CODEBASE.md.

@@ -346,8 +346,7 @@ _STATE_KEY = "skills_expanded_categories"
 
 def _load_expanded(agent) -> set[str]:
     try:
-        state, _ = agent.db.load_session_state(agent.context.tail_node_id)
-        raw = state.get(_STATE_KEY, "[]")
+        raw = agent.db.get_state(agent.context.tail_node_id, _STATE_KEY, "[]")
         return set(json.loads(raw))
     except Exception:
         return set()
@@ -355,9 +354,12 @@ def _load_expanded(agent) -> set[str]:
 
 def _save_expanded(agent, expanded: set[str]) -> None:
     try:
-        agent.db.update_node_state_delta(
+        # set_state merge-writes just this key onto the tail node, so it
+        # can't clobber another module's key already written on this node.
+        agent.db.set_state(
             agent.context.tail_node_id,
-            json.dumps({_STATE_KEY: json.dumps(sorted(expanded))}),
+            _STATE_KEY,
+            json.dumps(sorted(expanded)),
         )
     except Exception as exc:
         logger.warning("[skills] failed to persist expanded categories: %s", exc)

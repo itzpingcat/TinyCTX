@@ -19,6 +19,11 @@ ConversationDB(path)          — open (or create) the database
   .get_root()                 — the single global root node
   .get_tail_nodes()           — all nodes with no children
   .load_session_state(node_id, threshold) — walk delta chain, return (state, depth)
+  .get_state(node_id, key, default=None) — single-key read via load_session_state
+  .set_state(node_id, key, value)     — merge-write a single key onto node_id's
+                                         own state_delta (read-modify-write —
+                                         does NOT clobber other keys already set
+                                         on that node by another caller)
   .write_checkpoint_if_needed(node_id, state, depth, threshold) — write checkpoint
   .add_flag(node_id, flag)    — add a flag string to a node's flags list
   .remove_flag(node_id, flag) — remove a flag string from a node's flags list
@@ -292,12 +297,69 @@ class ConversationDB:
         return cur.rowcount > 0
 
     def update_node_state_delta(self, node_id: str, state_delta: str) -> bool:
-        """Update a node's state_delta in-place. Returns True if found."""
+        """
+        Overwrite a node's entire state_delta column with the given JSON
+        string. This REPLACES the column — it does not merge with whatever
+        keys were already stored on that node.
+
+        This is a low-level primitive, used internally by
+        write_checkpoint_if_needed() (which computes the full merged state
+        first, so a full replace is correct there) and by callers that
+        already hold the complete delta they want on this node.
+
+        Module code that wants to persist ONE key without disturbing keys
+        another module (or an earlier call in the same turn) already wrote
+        on this same node should use set_state() instead — calling this
+        directly with a single-key dict is a common bug: two writers on the
+        same node_id will silently stomp each other's keys.
+        """
         cur = self._conn.execute(
             "UPDATE nodes SET state_delta = ? WHERE id = ?", (state_delta, node_id)
         )
         self._conn.commit()
         return cur.rowcount > 0
+
+    def get_state(self, node_id: str, key: str, default=None):
+        """
+        Convenience wrapper around load_session_state() for reading a single
+        key from the merged (ancestor-walked) session state.
+
+        Equivalent to: load_session_state(node_id)[0].get(key, default)
+        """
+        state, _ = self.load_session_state(node_id)
+        return state.get(key, default)
+
+    def set_state(self, node_id: str, key: str, value) -> bool:
+        """
+        Persist a single session-state key on node_id WITHOUT disturbing any
+        other keys already stored in that node's own state_delta column.
+
+        This is the safe way for a module to write session state. Unlike
+        update_node_state_delta() (a blind replace), this reads the node's
+        existing delta first, merges in `key: value`, and writes the merged
+        dict back — so it's safe even if another module (or another tool
+        call earlier in the same turn) already wrote a different key onto
+        this exact node.
+
+        Note this only merges with what's already ON this node — it does
+        NOT walk ancestors. That's intentional: a node's state_delta is
+        meant to hold this node's own contribution to the chain: reads walk
+        the whole chain (load_session_state / get_state), writes only ever
+        touch the single node they're attached to.
+
+        Returns True if node_id was found, False otherwise.
+        """
+        node = self.get_node(node_id)
+        if node is None:
+            return False
+        try:
+            delta = json.loads(node.state_delta) if node.state_delta else {}
+            if not isinstance(delta, dict):
+                delta = {}
+        except (json.JSONDecodeError, ValueError):
+            delta = {}
+        delta[key] = value
+        return self.update_node_state_delta(node_id, json.dumps(delta, ensure_ascii=False))
 
     def delete_node(self, node_id: str) -> bool:
         """Delete a single node row. Does NOT cascade — callers handle dependents."""

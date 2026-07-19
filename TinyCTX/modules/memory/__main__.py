@@ -709,10 +709,9 @@ def register_agent(cycle) -> None:
             )
 
         # Persist updated counter as a state_delta on the final tail node.
-        cycle.db.update_node_state_delta(
-            final_tail,
-            json.dumps({"memory_tokens_since_ingest": tokens_since}),
-        )
+        # set_state merge-writes just this key so it can't clobber another
+        # module's key already written on final_tail this turn.
+        cycle.db.set_state(final_tail, "memory_tokens_since_ingest", tokens_since)
 
     cycle.post_turn_hooks.append(_pressure_hook)
 

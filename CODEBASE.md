@@ -137,6 +137,8 @@ Key methods:
 - `add_node(parent_id, role, content, ...)` → `Node`
 - `get_ancestors(node_id)` → `[Node]` root→tip order (excludes structural root)
 - `load_session_state(node_id)` → `(dict, depth)` — reconstructs session state
+- `get_state(node_id, key, default=None)` — single-key read via `load_session_state`
+- `set_state(node_id, key, value)` — merge-write a single key onto `node_id`'s own `state_delta` (read-modify-write; safe alongside other modules writing other keys to the same node). Modules should use `get_state`/`set_state`, not `load_session_state`/`update_node_state_delta` directly — the latter is a blind full-column replace and two writers on the same node will clobber each other (fixed in `rag`, `skills`, `memory` modules, which previously did this).
 - `flag_branch(node_id, flag)` — walk ancestors, adding flag until one already has it
 - `get_nodes_without_flag(flag)` — used by librarian to find unvisited nodes
 

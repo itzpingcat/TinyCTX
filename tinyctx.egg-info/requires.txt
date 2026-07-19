@@ -1,3 +1,4 @@
+platformdirs
 PyYAML
 aiohttp
 pyfiglet
@@ -13,8 +14,13 @@ ddgs
 playwright
 pdfplumber
 python-docx
+Pillow
+onnxruntime
 sympy
-antlr4-python3-runtime
+antlr4-python3-runtime==4.13.2
+jinja2
 croniter
+python-dotenv
 discord.py
 matrix-nio
+ladybug
