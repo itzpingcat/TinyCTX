@@ -6,6 +6,7 @@ Usage
   tinyctx onboard          Setup wizard
   tinyctx start            Start the gateway daemon
   tinyctx stop             Stop the daemon
+  tinyctx restart          Restart the daemon
   tinyctx status           Show daemon health
   tinyctx launch cli       Attach interactive CLI to running daemon
 """
@@ -43,6 +44,13 @@ def main() -> None:
     p_stop.add_argument("--dir", metavar="PATH",
                         help="Path to a .tinyctx instance directory")
 
+    # restart
+    p_restart = sub.add_parser("restart", help="Restart the gateway daemon")
+    p_restart.add_argument("--dir", metavar="PATH",
+                           help="Path to a .tinyctx instance directory")
+    p_restart.add_argument("--config", metavar="PATH",
+                           help="Path to config.yaml")
+
     # status
     p_status = sub.add_parser("status", help="Show daemon health")
     p_status.add_argument("--dir", metavar="PATH",
@@ -77,6 +85,10 @@ def main() -> None:
 
     elif args.command == "stop":
         from TinyCTX.commands.stop import run
+        run(args)
+
+    elif args.command == "restart":
+        from TinyCTX.commands.restart import run
         run(args)
 
     elif args.command == "status":
