@@ -121,6 +121,8 @@ All cross-layer communication uses these frozen dataclasses/enums. No business l
 
 ---
 
+**Fixed bug (`/model` couldn't resolve caller identity):** `modules/sysops/__main__.py`'s `_resolve_model_caller()` read session state's `"author_id"` and passed it to `UserStore.get_by_platform(platform, author_id)`. But `"author_id"` in session state is the TinyCTX **username** (`runtime.py`'s `_compute_state_delta()` sets `mapping["author_id"] = msg.author.username`), while `get_by_platform` expects a platform-native user_id (Discord snowflake, etc.) as its second argument — a different key entirely, so the lookup essentially never matched and `/model` always reported "Cannot resolve your identity for this conversation." Fixed by looking the caller up via `runtime.users.get_user(author_id)` (username lookup) instead.
+
 **Fixed bug (agent.db path mismatch):** `AgentCycle.run()` and `gateway.handle_lane_branch()` previously opened their own `ConversationDB` at `workspace/agent.db`, while `Runtime` (which writes every inbound user node) uses `data/agent.db`. Since `workspace/` and `data/` are different directories, this meant every cycle read/wrote an effectively empty, wrong-path SQLite file — any `add_node(parent_id=...)` referencing a node `Runtime.push()` had actually written failed `FOREIGN KEY constraint failed` (the parent row only existed in the other file). Fixed: `agent.py` now opens `data/agent.db` (same as `runtime.py` and `modules/memory/__main__.py`, which were already correct); `gateway/__main__.py`'s `handle_lane_branch` now reuses `request.app["runtime"].db` instead of opening a second connection at all.
 
 ## Database (`db.py`)

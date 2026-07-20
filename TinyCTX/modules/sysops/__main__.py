@@ -106,13 +106,16 @@ def _resolve_model_caller(runtime, node_id: str):
     if not node_id:
         return None
     state, _ = runtime.db.load_session_state(node_id)
-    platform = state.get("platform")
+    # NOTE: session state's "author_id" is the TinyCTX username (see
+    # runtime.py's _compute_state_delta — mapping["author_id"] =
+    # msg.author.username), not the platform-native user_id. Look it up
+    # via get_user(), not get_by_platform() (which expects a platform user_id
+    # and would never match a username).
     author_id = state.get("author_id")
-    if not platform or not author_id:
+    if not author_id:
         return None
     try:
-        from TinyCTX.contracts import Platform
-        return runtime.users.get_by_platform(Platform(platform), author_id)
+        return runtime.users.get_user(author_id)
     except Exception:
         logger.debug("[sysops] failed to resolve /model caller for node %s", node_id, exc_info=True)
         return None
