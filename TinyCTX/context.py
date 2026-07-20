@@ -738,6 +738,15 @@ class Context:
         surviving_tags: set[str] = set().union(*(e.tags for e in merged)) if merged else set()
         invalidated_tags = frozenset(seen_tags - surviving_tags)
 
+        # Write back into state BEFORE post_assemble runs, so a post_assemble
+        # hook can read ctx.state["invalidated_tags"] (e.g. to persist a
+        # "this tagged content is gone" note via db.set_state for next turn).
+        self.state["tokens_used_pre_trim"] = tokens_pre_trim
+        self.state["tokens_used"]          = tokens_used
+        self.state["budget_trimmed"]       = was_trimmed
+        self.state["invalidated_tags"]     = invalidated_tags
+        self.state["surviving_tags"]       = frozenset(surviving_tags)
+
         # 6. Render HistoryEntry -> OpenAI-format dict (the one and only render pass).
         messages: list[dict] = [self._render(e) for e in merged]
 
@@ -746,12 +755,6 @@ class Context:
             result = fn(messages, self)
             if result is not None:
                 messages = result
-
-        # Write back into state for hooks that still read these keys (backwards compat).
-        self.state["tokens_used_pre_trim"] = tokens_pre_trim
-        self.state["tokens_used"]          = tokens_used
-        self.state["budget_trimmed"]       = was_trimmed
-        self.state["invalidated_tags"]     = invalidated_tags
 
         meta = AssembleMeta(
             tokens_pre_trim=tokens_pre_trim,
