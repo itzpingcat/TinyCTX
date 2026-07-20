@@ -402,6 +402,6 @@ Non-Docker launches (`onboard`'s direct `python main.py` spawn) instead set `TIN
 
 Key packages: `aiohttp`, `rich`, `questionary`, `mcp`, `tiktoken`, `structlog`, `tenacity`, `ddgs`, `playwright`, `pdfplumber`, `python-docx`, `croniter`, `python-dotenv`, `discord.py`, `jinja2`, `numpy`.
 
-Python ≥ 3.11 required.
+Python ≥ 3.14 required.
 
 Install: `pip install -e .` then `python -m TinyCTX onboard`.

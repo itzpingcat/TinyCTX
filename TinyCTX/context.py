@@ -19,9 +19,19 @@ set_tail(node_id) exists solely to advance the cursor as the cycle writes
 tool-call and tool-result nodes mid-turn.
 
 assemble() returns (messages, AssembleMeta) where AssembleMeta is a small
-dataclass carrying tokens_pre_trim, tokens_used, and was_trimmed. Callers
-(AgentCycle) read meta.tokens_used directly — nothing is side-channelled
-through self.state.
+dataclass carrying tokens_pre_trim, tokens_used, was_trimmed, and
+invalidated_tags. Callers (AgentCycle) read meta fields directly — nothing
+essential is side-channelled through self.state (some fields are also
+mirrored into self.state for hook back-compat).
+
+Dialogue entries (HistoryEntry) carry a .tags field and stay as HistoryEntry
+objects through filter_turn, transform_turn, the adjacent-message merge, AND
+the token-budget trim loop — rendering to OpenAI-format dicts happens exactly
+once, as the last step before HOOK_POST_ASSEMBLE. meta.invalidated_tags is a
+plain set-diff (tags seen at any point this turn minus tags still present on
+a surviving entry) computed after trimming is fully resolved, letting a
+module know — one turn later, via db.set_state — that content it tagged
+(e.g. a loaded skill) is now gone, without inferring that from string content.
 
 Session state is loaded by AgentCycle at construction time via
 db.load_session_state(); Context does not call it. _load_state_from_db()
@@ -40,7 +50,7 @@ import json
 import tiktoken
 import uuid
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 
 import logging
@@ -74,7 +84,23 @@ HOOK_POST_ASSEMBLE      = "post_assemble"        # fn(messages, ctx) -> list[dic
 #   agent calls ctx.assemble()
 #     → HOOK_PRE_ASSEMBLE (sync, e.g. cache warm)
 #     → HOOK_FILTER_TURN / HOOK_TRANSFORM_TURN  (per entry)
-#     → HOOK_POST_ASSEMBLE (final reshape)
+#     → adjacent-message merge + token-budget trim   (still HistoryEntry — see below)
+#     → render to OpenAI-format dicts
+#     → HOOK_POST_ASSEMBLE (final reshape — genuinely final: runs after merge/trim/render)
+#
+# NOTE: dialogue entries stay as HistoryEntry (carrying .tags) all the way through
+# filter_turn, transform_turn, the adjacent-message merge, AND the token-budget
+# trim loop. Rendering to plain OpenAI-format dicts (_render()) happens only once,
+# as the very last step before HOOK_POST_ASSEMBLE. This means a tag survives iff
+# it's still present on some entry in the fully-trimmed list — no need to infer
+# survival from string content, and no shadow keys needed to smuggle .tags through
+# dict form. See AssembleMeta.invalidated_tags for the turn-level result.
+#
+# Any transform_turn hook that destroys/replaces an entry's substantive content
+# (e.g. ctx_tools' trim/tokenade stubbing tool output) MUST clear entry.tags on
+# the copy it returns — otherwise a tag will look like it "survived" a turn whose
+# actual content is gone. Cosmetic edits (e.g. token_sanitize stripping control
+# tokens, cot_strip removing <think> blocks) should leave tags alone.
 
 
 # ---------------------------------------------------------------------------
@@ -83,9 +109,21 @@ HOOK_POST_ASSEMBLE      = "post_assemble"        # fn(messages, ctx) -> list[dic
 
 @dataclass
 class AssembleMeta:
-    tokens_pre_trim: int
-    tokens_used:     int
-    was_trimmed:     bool
+    tokens_pre_trim:   int
+    tokens_used:       int
+    was_trimmed:       bool
+    # Tags (see HistoryEntry.tags) that were present somewhere in the loaded
+    # dialogue at the start of this assemble() call but are absent from every
+    # surviving entry by the end — i.e. dropped by filter_turn, gutted by a
+    # destructive transform_turn (which clears tags on its copy), or popped by
+    # the token-budget trim loop. Modules that tag entries for their own
+    # bookkeeping (e.g. "skill:foo" on a use_skill result) read this to learn,
+    # after the fact, that the tagged content is gone this turn — then persist
+    # that via db.set_state for a prompt provider to act on next turn. This is
+    # diagnostic-only, computed after trimming is fully done; it must never be
+    # used to decide whether to trim (that would reintroduce a circular
+    # trim-depends-on-content-depends-on-trim dependency).
+    invalidated_tags:  frozenset[str] = field(default_factory=frozenset)
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +143,16 @@ class HistoryEntry:
                    message includes image or file attachments.
 
     parent_id is the DB node_id of this entry's parent.
+
+    tags is an opaque set of module-assigned labels (e.g. "skill:foo") used to
+    track whether specific content survived context assembly. Tags are derived
+    from structured data (the originating tool call's name/arguments), never
+    from parsing content. Any hook that destroys/replaces an entry's
+    substantive content must clear tags on the copy it returns — see the
+    HOOK_* comments above. Tags ride along through filter_turn, transform_turn,
+    the adjacent-message merge, and the token-budget trim loop; they are
+    dropped when the entry is finally rendered to an OpenAI-format dict
+    (they have no meaning to the LLM API).
     """
     role:         str
     content:      str | list     # str for most roles; list[dict] for user+attachments
@@ -114,6 +162,7 @@ class HistoryEntry:
     tool_call_id: str | None     = None
     author_id:    str | None     = None  # TinyCTX username of sender; None for assistant/tool/system
     parent_id:    str | None     = None  # DB node_id of parent node
+    tags:         frozenset[str] = field(default_factory=frozenset)
 
     @staticmethod
     def user(content: str | list, author_id: str | None = None) -> HistoryEntry:
@@ -498,10 +547,18 @@ class Context:
         History is always loaded from the DB ancestor walk.
 
         Stage order (sync):
-          1. pre_assemble   — hooks may mutate self.dialogue or warm caches
-          2. filter_turn    — drop turns
-          3. transform_turn — replace/summarise turns
-          4. post_assemble  — reshape final message list
+          1. pre_assemble        — hooks may mutate self.dialogue or warm caches
+          2. filter_turn         — drop turns
+          3. transform_turn      — replace/summarise turns
+          4. adjacent-turn merge — still HistoryEntry; unions .tags on merge
+          5. token-budget trim   — still HistoryEntry; pops/truncates oldest first
+          6. render              — HistoryEntry -> OpenAI-format dict (only now)
+          7. post_assemble       — final reshape of the rendered dict list
+
+        Entries (dialogue AND synthetic system/footer prompt entries) stay as
+        HistoryEntry objects — carrying .tags — all the way through steps 2-5.
+        This is what lets AssembleMeta.invalidated_tags be a plain set-diff
+        instead of needing to infer survival from rendered dict content.
         """
         # Load session state and put it in ctx.state["session"] for hook compat.
         session_state, delta_depth = self._db.load_session_state(self._tail_node_id)
@@ -521,6 +578,13 @@ class Context:
         self.dialogue = source
 
         n = len(source)
+        # Accumulates every tag seen on ANY intermediate version of any entry
+        # during the per-entry loop below — not just the pre-hook snapshot.
+        # Tags are typically assigned BY a transform_turn hook (e.g. the skills
+        # module tagging a use_skill result), so a tag that gets added and then
+        # destructively cleared within this same pass must still count as
+        # "was present this turn" or it can never show up as invalidated.
+        seen_tags: set[str] = set()
 
         # 1. pre_assemble (sync)
         for _, _, fn in self._hooks[HOOK_PRE_ASSEMBLE]:
@@ -539,11 +603,11 @@ class Context:
             if content is not None:
                 resolved.append((slot, content))
 
-        # Build system block
-        messages: list[dict] = []
+        # Build system block as a synthetic entry (never trimmed — trim skips role=system).
+        entries: list[HistoryEntry] = []
         system_lines = [c for s, c in resolved if s.role == ROLE_SYSTEM]
         if system_lines:
-            messages.append({"role": ROLE_SYSTEM, "content": "\n\n".join(system_lines)})
+            entries.append(HistoryEntry(role=ROLE_SYSTEM, content="\n\n".join(system_lines)))
 
         # Non-system prompts (e.g. role=user footer) are deferred until after
         # dialogue history so they land on the latest user message, not the first.
@@ -552,6 +616,7 @@ class Context:
         # 2 & 3. filter + transform per dialogue entry
         for entry in source:
             age = n - 1 - entry.index
+            seen_tags |= entry.tags
 
             drop = False
             for _, _, fn in self._hooks[HOOK_FILTER_TURN]:
@@ -565,6 +630,7 @@ class Context:
                 result = fn(entry, age, self)
                 if result is not None:
                     entry = result
+                    seen_tags |= entry.tags
 
             if entry.role == ROLE_USER and entry.author_id is None:
                 if entry.parent_id is not None:
@@ -580,7 +646,7 @@ class Context:
                 raw = entry.content
                 # Fullwidth 【】 delimiters are visually distinct from ASCII []
                 # and cannot be spoofed by user content after bracket sanitization.
-                prefix = f"\u3010{label}\u3011: "  # 【label】:
+                prefix = f"【{label}】: "  # 【label】:
                 if isinstance(raw, str):
                     labelled_content: str | list = prefix + _sanitize_brackets(raw)
                 else:
@@ -595,99 +661,109 @@ class Context:
                     else:
                         blocks.insert(0, {"type": "text", "text": prefix})
                     labelled_content = blocks
-                from dataclasses import replace
                 entry = replace(entry, content=labelled_content)
 
-            messages.append(self._render(entry))
+            entries.append(entry)
 
-        # 4. post_assemble
-        # Insert deferred non-system prompts (e.g. footer) BEFORE the last
-        # user message so the merge produces: <footer>\n\n[user message].
+        # Insert deferred non-system prompts (e.g. footer) as synthetic entries
+        # BEFORE the last user entry so the merge produces: <footer>\n\n[user message].
         # Priority is respected within the deferred set.
         if deferred_prompts:
             sorted_deferred = sorted(deferred_prompts, key=lambda x: x[0].priority)
-            # Find the last user message index in messages
             last_user_idx = next(
-                (i for i in range(len(messages) - 1, -1, -1)
-                 if messages[i]["role"] == ROLE_USER),
+                (i for i in range(len(entries) - 1, -1, -1)
+                 if entries[i].role == ROLE_USER),
                 None,
             )
+            synthetic = [HistoryEntry(role=s.role, content=c) for s, c in sorted_deferred]
             if last_user_idx is not None:
-                for slot, content in reversed(sorted_deferred):
-                    messages.insert(last_user_idx, {"role": slot.role, "content": content})
+                entries[last_user_idx:last_user_idx] = synthetic
             else:
-                for slot, content in sorted_deferred:
-                    messages.append({"role": slot.role, "content": content})
+                entries.extend(synthetic)
 
-        for _, _, fn in self._hooks[HOOK_POST_ASSEMBLE]:
-            result = fn(messages, self)
-            if result is not None:
-                messages = result
-
-        # Merge adjacent same-role non-tool messages.
-        merged: list[dict] = []
-        for m in messages:
+        # 4. Merge adjacent same-role non-tool entries (still HistoryEntry — tags union).
+        merged: list[HistoryEntry] = []
+        for m in entries:
             prev = merged[-1] if merged else None
             can_merge = (
                 prev is not None
-                and m["role"] == prev["role"]
-                and m["role"] in (ROLE_USER, ROLE_ASSISTANT)
-                and not m.get("tool_calls")
-                and not prev.get("tool_calls")
-                and isinstance(m.get("content"), str)
-                and isinstance(prev.get("content"), str)
+                and m.role == prev.role
+                and m.role in (ROLE_USER, ROLE_ASSISTANT)
+                and not m.tool_calls
+                and not prev.tool_calls
+                and isinstance(m.content, str)
+                and isinstance(prev.content, str)
             )
             if can_merge:
-                prev["content"] = (prev["content"] + "\n\n" + m["content"]).strip()
+                prev.content = (prev.content + "\n\n" + m.content).strip()
+                prev.tags = prev.tags | m.tags
             else:
-                merged.append(dict(m))
+                merged.append(replace(m))
 
-        # Token budget enforcement
-        tokens_pre_trim = self._count_tokens(merged, tools)
+        # 5. Token budget enforcement (still HistoryEntry).
+        tokens_pre_trim = self._count_tokens_entries(merged, tools)
         tokens_used     = tokens_pre_trim
         was_trimmed     = False
 
         while tokens_used > self.token_limit:
             was_trimmed = True
             drop_idx = next(
-                (i for i, m in enumerate(merged) if m["role"] != ROLE_SYSTEM),
+                (i for i, e in enumerate(merged) if e.role != ROLE_SYSTEM),
                 None,
             )
             if drop_idx is None:
                 break
 
-            if merged[drop_idx].get("tool_calls"):
-                call_ids = {tc["id"] for tc in merged[drop_idx]["tool_calls"]}
-                if merged[drop_idx].get("content", "").strip():
-                    merged[drop_idx] = {
-                        k: v for k, v in merged[drop_idx].items()
-                        if k != "tool_calls"
-                    }
+            if merged[drop_idx].tool_calls:
+                call_ids = {tc["id"] for tc in merged[drop_idx].tool_calls}
+                if isinstance(merged[drop_idx].content, str) and merged[drop_idx].content.strip():
+                    merged[drop_idx] = replace(merged[drop_idx], tool_calls=[])
                 else:
                     merged.pop(drop_idx)
                 i = drop_idx
                 while (
                     i < len(merged)
-                    and merged[i]["role"] == ROLE_TOOL
-                    and merged[i].get("tool_call_id") in call_ids
+                    and merged[i].role == ROLE_TOOL
+                    and merged[i].tool_call_id in call_ids
                 ):
                     merged.pop(i)
             else:
                 merged.pop(drop_idx)
 
-            tokens_used = self._count_tokens(merged, tools)
+            tokens_used = self._count_tokens_entries(merged, tools)
+
+        # Tag survival: any tag seen on any intermediate entry version during
+        # this turn's processing but absent from every surviving entry after
+        # filter/transform/merge/trim is invalidated.
+        surviving_tags: set[str] = set().union(*(e.tags for e in merged)) if merged else set()
+        invalidated_tags = frozenset(seen_tags - surviving_tags)
+
+        # 6. Render HistoryEntry -> OpenAI-format dict (the one and only render pass).
+        messages: list[dict] = [self._render(e) for e in merged]
+
+        # 7. post_assemble — genuinely final now: runs after merge + trim + render.
+        for _, _, fn in self._hooks[HOOK_POST_ASSEMBLE]:
+            result = fn(messages, self)
+            if result is not None:
+                messages = result
 
         # Write back into state for hooks that still read these keys (backwards compat).
         self.state["tokens_used_pre_trim"] = tokens_pre_trim
         self.state["tokens_used"]          = tokens_used
         self.state["budget_trimmed"]       = was_trimmed
+        self.state["invalidated_tags"]     = invalidated_tags
 
         meta = AssembleMeta(
             tokens_pre_trim=tokens_pre_trim,
             tokens_used=tokens_used,
             was_trimmed=was_trimmed,
+            invalidated_tags=invalidated_tags,
         )
-        return merged, meta
+        return messages, meta
+
+    def _count_tokens_entries(self, entries: list[HistoryEntry], tools: list[dict] | None) -> int:
+        """Render entries to dict form just for counting — doesn't mutate entries."""
+        return self._count_tokens([self._render(e) for e in entries], tools)
 
     def _render(self, entry: HistoryEntry) -> dict:
         if entry.role == ROLE_TOOL:
