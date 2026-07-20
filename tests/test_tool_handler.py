@@ -11,6 +11,14 @@ from TinyCTX.utils.tool_handler import ToolCallHandler
 from TinyCTX.utils.bm25 import BM25, _tokenise
 
 
+class _FakeCaller:
+    """Minimal stand-in for the caller object execute_tool_call() now requires
+    (needs .permission_level and .username; mirrors TinyCTX.users.models.User)."""
+    def __init__(self, permission_level: int = 100, username: str = "test-caller"):
+        self.permission_level = permission_level
+        self.username = username
+
+
 # ---------------------------------------------------------------------------
 # BM25 unit tests
 # ---------------------------------------------------------------------------
@@ -388,19 +396,21 @@ class TestExecuteToolSync:
             """Add two numbers."""
             return str(a + b)
 
-        # execute_tool_call dispatches via self.tools (not self.enabled),
-        # so deferred tools can still be called once the agent loop invokes them.
-        self.handler.register_tool(add)
+        # execute_tool_call now requires the tool to be in self.enabled (not
+        # just self.tools), so register it as always_on.
+        self.handler.register_tool(add, always_on=True)
         result = await self.handler.execute_tool_call({
             "id": "call1",
             "function": {"name": "add", "arguments": '{"a": 3, "b": 4}'}
-        })
+        }, _FakeCaller())
         assert result["success"] is True
         assert result["result"] == "7"
 
     @pytest.mark.asyncio
-    async def test_execute_deferred_tool_still_callable(self):
-        """A deferred (not enabled) tool must still execute when called."""
+    async def test_execute_deferred_tool_not_callable(self):
+        """A deferred (not enabled) tool is rejected until enabled — this is
+        the current permission model: execute_tool_call checks self.enabled,
+        not just self.tools."""
         def multiply(a: int, b: int) -> str:
             """Multiply."""
             return str(a * b)
@@ -410,7 +420,16 @@ class TestExecuteToolSync:
         result = await self.handler.execute_tool_call({
             "id": "c1",
             "function": {"name": "multiply", "arguments": '{"a": 6, "b": 7}'}
-        })
+        }, _FakeCaller())
+        assert result["success"] is False
+        assert "not found" in result["error"]
+
+        # Once enabled, the same call succeeds.
+        self.handler.enable("multiply")
+        result = await self.handler.execute_tool_call({
+            "id": "c1",
+            "function": {"name": "multiply", "arguments": '{"a": 6, "b": 7}'}
+        }, _FakeCaller())
         assert result["success"] is True
         assert result["result"] == "42"
 
@@ -419,7 +438,7 @@ class TestExecuteToolSync:
         result = await self.handler.execute_tool_call({
             "id": "call1",
             "function": {"name": "nonexistent", "arguments": "{}"}
-        })
+        }, _FakeCaller())
         assert result["success"] is False
         assert "not found" in result["error"]
 
@@ -429,11 +448,11 @@ class TestExecuteToolSync:
             """A function."""
             return x
 
-        self.handler.register_tool(fn)
+        self.handler.register_tool(fn, always_on=True)
         result = await self.handler.execute_tool_call({
             "id": "call1",
             "function": {"name": "fn", "arguments": "not valid json {{{"}
-        })
+        }, _FakeCaller())
         assert result["success"] is False
 
     @pytest.mark.asyncio
@@ -443,11 +462,11 @@ class TestExecuteToolSync:
             """Greet."""
             return f"hi {name}"
 
-        self.handler.register_tool(greet)
+        self.handler.register_tool(greet, always_on=True)
         result = await self.handler.execute_tool_call({
             "id": "c1",
             "function": {"name": "greet", "arguments": {"name": "world"}}
-        })
+        }, _FakeCaller())
         assert result["success"] is True
         assert result["result"] == "hi world"
 
@@ -457,11 +476,11 @@ class TestExecuteToolSync:
             """Explodes."""
             raise ValueError("intentional failure")
 
-        self.handler.register_tool(boom)
+        self.handler.register_tool(boom, always_on=True)
         result = await self.handler.execute_tool_call({
             "id": "c1",
             "function": {"name": "boom", "arguments": '{"x": "test"}'}
-        })
+        }, _FakeCaller())
         assert result["success"] is False
         assert "intentional failure" in result["error"]
 
@@ -483,11 +502,11 @@ class TestExecuteToolAsync:
             await asyncio.sleep(0)
             return str(a + b)
 
-        self.handler.register_tool(slow_add)
+        self.handler.register_tool(slow_add, always_on=True)
         result = await self.handler.execute_tool_call({
             "id": "c1",
             "function": {"name": "slow_add", "arguments": '{"a": 10, "b": 5}'}
-        })
+        }, _FakeCaller())
         assert result["success"] is True
         assert result["result"] == "15"
 
@@ -497,10 +516,10 @@ class TestExecuteToolAsync:
             """Async explodes."""
             raise RuntimeError("async failure")
 
-        self.handler.register_tool(async_boom)
+        self.handler.register_tool(async_boom, always_on=True)
         result = await self.handler.execute_tool_call({
             "id": "c1",
             "function": {"name": "async_boom", "arguments": '{"x": "hi"}'}
-        })
+        }, _FakeCaller())
         assert result["success"] is False
         assert "async failure" in result["error"]
