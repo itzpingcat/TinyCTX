@@ -180,6 +180,8 @@ After hook processing, adjacent same-role messages are merged. Then token budget
 - `budget_tokens` enables Anthropic extended thinking (forces `temperature=1`).
 - `cache_prompts` injects `cache_control: ephemeral` on the last system message.
 
+**Per-model context overhead → `n_ctx` hint:** `ModelConfig.context_overhead` (config/`__main__.py`, default `0`) is added to the global `context:` token budget (`Config.context`) to produce a suggested context window sent to the backend as `n_ctx` on every chat request (`LLM.context_length` → `payload["n_ctx"]` in `_stream_with_retry`), for llama.cpp/llama-swap-style servers that read it. `agent.py`'s `_build_llm()` is the only wiring site for the main cycle's `LLM` instances (`context_length=self.config.context + mc.context_overhead`); `modules/memory/__main__.py`'s separate librarian `LLM(...)` construction does not pass `context_length`, so librarian calls omit `n_ctx` (server default applies) unless that call site is updated too.
+
 `Embedder` — async OpenAI-compatible embedding client. `embed(texts, priority=10)` batches automatically; `embed_one(text, priority=10)` is the single-string convenience wrapper.
 
 ### Priority queue

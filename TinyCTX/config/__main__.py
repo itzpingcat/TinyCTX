@@ -22,6 +22,12 @@ class ModelConfig:
     model:       str
     base_url:    str
     kind:        str   = "chat"       # "chat" | "embedding"
+    # context_overhead: added on top of the global `context:` token budget
+    # (Config.context) to get this model's suggested n_ctx, sent to the API
+    # on every request (see ai.py LLM.stream). Use this to give headroom for
+    # a model's chat-template/tool-schema overhead beyond the shared history
+    # budget — e.g. a model with a verbose system prompt or large tool
+    # definitions can set a higher context_overhead than a leaner one.
     api_key_env: str   = "ANTHROPIC_API_KEY"
     _resolved_api_key: str | None = field(default=None, init=False, repr=False, compare=False)
     max_tokens:       int        = 2048
@@ -31,6 +37,7 @@ class ModelConfig:
     cache_prompts:      bool        = False  # Anthropic prompt caching on last system message
     vision:             bool        = False  # Back-compat alias for multimodal chat models
     tokens_per_image:   int | None  = None   # Flat token cost per image_url block (None = vision disabled)
+    context_overhead:   int         = 0      # Added to the global context: budget to suggest this model's n_ctx to the API
 
     def __post_init__(self) -> None:
         # Back-compat: older configs/tests use `vision: true` without specifying
@@ -381,6 +388,10 @@ def _parse_model(raw: dict) -> ModelConfig:
 
     vision = bool(raw.get("vision", False))
 
+    context_overhead = int(raw.get("context_overhead", 0))
+    if context_overhead < 0:
+        raise ValueError(f"context_overhead must be >= 0, got {context_overhead}")
+
     return ModelConfig(
         model=raw["model"],
         base_url=raw["base_url"],
@@ -393,6 +404,7 @@ def _parse_model(raw: dict) -> ModelConfig:
         cache_prompts=bool(raw.get("cache_prompts", False)),
         vision=vision,
         tokens_per_image=tokens_per_image,
+        context_overhead=context_overhead,
     )
 
 

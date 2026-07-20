@@ -233,6 +233,7 @@ class LLM:
         budget_tokens:    int | None = None,
         reasoning_effort: str | None = None,
         cache_prompts:    bool       = False,
+        context_length:   int | None = None,
     ) -> None:
         self.model            = model
         self.endpoint         = f"{base_url.rstrip('/')}/chat/completions"
@@ -243,6 +244,11 @@ class LLM:
         self.budget_tokens    = budget_tokens
         self.reasoning_effort = reasoning_effort
         self.cache_prompts    = cache_prompts
+        # Suggested context window for this model (global context: budget +
+        # ModelConfig.context_overhead) — sent to the backend as `n_ctx` so a
+        # llama.cpp/llama-swap server can size/select accordingly. None means
+        # "don't send it" (server default applies).
+        self.context_length   = context_length
 
     async def stream(
         self,
@@ -329,6 +335,10 @@ class LLM:
         # llama.cpp specific flag
         if self.cache_prompts:
             payload["cache_prompt"] = True
+        # llama.cpp / llama-swap specific hint — suggested context window
+        # (global context: budget + this model's context_overhead).
+        if self.context_length is not None:
+            payload["n_ctx"] = self.context_length
 
         headers = {
             "Content-Type":  "application/json",
