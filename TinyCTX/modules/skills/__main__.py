@@ -610,6 +610,7 @@ def register_agent(cycle) -> None:
 
         if paths == ["*"]:
             collapsed = sorted(expanded)
+            unknown   = []
             _save_expanded(agent, set())
         else:
             collapsed = sorted(p for p in paths if p in expanded)
