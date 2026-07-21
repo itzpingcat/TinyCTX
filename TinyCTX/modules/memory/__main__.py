@@ -30,7 +30,7 @@ Pressure-based ingest
 After each turn, tokens written to the DB on this branch (assistant +
 tool nodes) are accumulated in session state under the key
 'memory_tokens_since_ingest'. When the total crosses
-ingest_pressure_ratio * config.context (floored by ingest_pressure_min_tokens),
+ingest_pressure_ratio * cycle.context.token_limit (floored by ingest_pressure_min_tokens),
 a "branch" queue message is dispatched so the librarian ingests only this
 branch's unvisited nodes, and the counter resets to zero.
 

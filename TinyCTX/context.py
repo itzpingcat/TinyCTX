@@ -10,7 +10,7 @@ The Context class owns:
 
 Constructor
 -----------
-Context(db, tail_node_id, token_limit, image_tokens_per_block)
+Context(db, tail_node_id, token_limit, image_tokens_per_block, token_fuzz)
 
 All required fields are supplied at construction time. db and tail_node_id
 must be provided — there is no lazy/optional wiring path.
@@ -211,7 +211,7 @@ class Context:
     Assembles a list[dict] suitable for the LLM API from dialogue history
     and registered prompt providers, passing turns through a hook pipeline.
 
-    Constructor: Context(db, tail_node_id, token_limit, image_tokens_per_block)
+    Constructor: Context(db, tail_node_id, token_limit, image_tokens_per_block, token_fuzz)
 
     All fields are required at construction time — no post-construction wiring.
     set_tail(node_id) is the only setter that exists, used mid-turn to advance
@@ -226,11 +226,13 @@ class Context:
         tail_node_id: str,
         token_limit: int = 16384,
         image_tokens_per_block: int | None = 280,
+        token_fuzz: float = 1.1,
     ) -> None:
         self._db = db
         self._tail_node_id: str = tail_node_id
         self.token_limit = token_limit
         self._image_tokens_per_block: int | None = image_tokens_per_block
+        self.token_fuzz = token_fuzz
 
         self.dialogue: list[HistoryEntry] = []
 
@@ -533,7 +535,7 @@ class Context:
             for m in messages
         ) + tool_tokens
 
-        return int(raw * 1.05)
+        return int(raw * self.token_fuzz)
 
     # ------------------------------------------------------------------
     # Assembly (sync) — returns (messages, AssembleMeta)

@@ -98,8 +98,9 @@ class AgentCycle:
         self.context = Context(
             db=self.db,
             tail_node_id=node_id,
-            token_limit=self.config.context,
+            token_limit=getattr(primary_mc, "context", 16384),
             image_tokens_per_block=getattr(primary_mc, "tokens_per_image", 280),
+            token_fuzz=self.config.token_fuzz,
         )
 
         # Wire modules into this cycle turn
@@ -236,7 +237,6 @@ class AgentCycle:
             model=mc.model,
             max_tokens=mc.max_tokens,
             temperature=mc.temperature,
-            context_length=self.config.context + mc.context_overhead,
         )
 
     async def _stream_inference(self, messages, tools, model_chain, abort_event, meta):

@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import yaml
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class ModelConfig:
@@ -22,12 +24,6 @@ class ModelConfig:
     model:       str
     base_url:    str
     kind:        str   = "chat"       # "chat" | "embedding"
-    # context_overhead: added on top of the global `context:` token budget
-    # (Config.context) to get this model's suggested n_ctx, sent to the API
-    # on every request (see ai.py LLM.stream). Use this to give headroom for
-    # a model's chat-template/tool-schema overhead beyond the shared history
-    # budget — e.g. a model with a verbose system prompt or large tool
-    # definitions can set a higher context_overhead than a leaner one.
     api_key_env: str   = "ANTHROPIC_API_KEY"
     _resolved_api_key: str | None = field(default=None, init=False, repr=False, compare=False)
     max_tokens:       int        = 2048
@@ -37,7 +33,7 @@ class ModelConfig:
     cache_prompts:      bool        = False  # Anthropic prompt caching on last system message
     vision:             bool        = False  # Back-compat alias for multimodal chat models
     tokens_per_image:   int | None  = None   # Flat token cost per image_url block (None = vision disabled)
-    context_overhead:   int         = 0      # Added to the global context: budget to suggest this model's n_ctx to the API
+    context:            int         = 16384  # Token budget for conversation history when this model is primary (Context.token_limit)
 
     def __post_init__(self) -> None:
         # Back-compat: older configs/tests use `vision: true` without specifying
@@ -283,7 +279,7 @@ class Config:
     logging:         LoggingConfig           = field(default_factory=LoggingConfig)
     max_tool_cycles: int                     = 20
     parallel:        int                     = 3     # max concurrent LLM/embedding requests in flight
-    context:         int                     = 16384
+    token_fuzz:      float                   = 1.1   # multiplier applied to counted tokens to account for tokenizer inaccuracy
     attachments:     AttachmentConfig        = field(default_factory=AttachmentConfig)
     permissions:     PermissionsConfig       = field(default_factory=PermissionsConfig)
     tool_overrides:  dict[str, ToolOverrideConfig] = field(default_factory=dict)
@@ -359,7 +355,7 @@ def _parse_tool_overrides(raw: dict) -> dict[str, ToolOverrideConfig]:
     return overrides
 
 
-def _parse_model(raw: dict) -> ModelConfig:
+def _parse_model(raw: dict, default_context: int = 16384) -> ModelConfig:
     if not raw.get("base_url"):
         raise ValueError("Model config missing required field: base_url")
     if not raw.get("model"):
@@ -388,9 +384,9 @@ def _parse_model(raw: dict) -> ModelConfig:
 
     vision = bool(raw.get("vision", False))
 
-    context_overhead = int(raw.get("context_overhead", 0))
-    if context_overhead < 0:
-        raise ValueError(f"context_overhead must be >= 0, got {context_overhead}")
+    context = int(raw.get("context", default_context))
+    if context <= 0:
+        raise ValueError(f"context must be > 0, got {context}")
 
     return ModelConfig(
         model=raw["model"],
@@ -404,15 +400,15 @@ def _parse_model(raw: dict) -> ModelConfig:
         cache_prompts=bool(raw.get("cache_prompts", False)),
         vision=vision,
         tokens_per_image=tokens_per_image,
-        context_overhead=context_overhead,
+        context=context,
     )
 
 
 # Known top-level keys — everything else goes into Config.extra
 _KNOWN_KEYS = {
     "models", "llm", "router", "bridges", "gateway", "workspace", "data",
-    "logging", "max_tool_cycles", "parallel", "context", "attachments", "permissions",
-    "tool_overrides",
+    "logging", "max_tool_cycles", "parallel", "token_fuzz", "attachments", "permissions",
+    "tool_overrides", "context",  # "context" is the deprecated legacy top-level key
 }
 
 
@@ -428,10 +424,25 @@ def load(path="config.yaml") -> Config:
     if not models_raw:
         raise ValueError("Config missing required section: [models]")
 
+    # Legacy fallback: pre-refactor configs set a single top-level `context:`
+    # applying to all models. That key is deprecated in favor of per-model
+    # `context:` under each models.<name> entry, but if present it's still
+    # honored as the default for any model that doesn't set its own.
+    legacy_context = raw.get("context")
+    if legacy_context is not None:
+        logger.warning(
+            "config.yaml: top-level 'context:' is deprecated — set 'context:' "
+            "per model under models.<name> instead. Using %r as the default "
+            "for any model that doesn't specify its own.", legacy_context,
+        )
+        default_context = int(legacy_context)
+    else:
+        default_context = 16384
+
     models: dict[str, ModelConfig] = {}
     for name, m in models_raw.items():
         try:
-            models[name] = _parse_model(m)
+            models[name] = _parse_model(m, default_context=default_context)
         except ValueError as exc:
             raise ValueError(f"models.{name}: {exc}") from exc
 
@@ -543,7 +554,7 @@ def load(path="config.yaml") -> Config:
         logging=LoggingConfig(level=log_raw.get("level", "INFO")),
         max_tool_cycles=int(raw.get("max_tool_cycles", 20)),
         parallel=parallel,
-        context=int(raw.get("context", 16384)),
+        token_fuzz=float(raw.get("token_fuzz", 1.1)),
         attachments=attachments,
         permissions=permissions,
         tool_overrides=tool_overrides,

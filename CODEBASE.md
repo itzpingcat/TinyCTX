@@ -180,7 +180,9 @@ After hook processing, adjacent same-role messages are merged. Then token budget
 - `budget_tokens` enables Anthropic extended thinking (forces `temperature=1`).
 - `cache_prompts` injects `cache_control: ephemeral` on the last system message.
 
-**Per-model context overhead → `n_ctx` hint:** `ModelConfig.context_overhead` (config/`__main__.py`, default `0`) is added to the global `context:` token budget (`Config.context`) to produce a suggested context window sent to the backend as `n_ctx` on every chat request (`LLM.context_length` → `payload["n_ctx"]` in `_stream_with_retry`), for llama.cpp/llama-swap-style servers that read it. `agent.py`'s `_build_llm()` is the only wiring site for the main cycle's `LLM` instances (`context_length=self.config.context + mc.context_overhead`); `modules/memory/__main__.py`'s separate librarian `LLM(...)` construction does not pass `context_length`, so librarian calls omit `n_ctx` (server default applies) unless that call site is updated too.
+**Per-model context budget:** `ModelConfig.context` (config/`__main__.py`, default `16384`) is a per-model token budget for conversation history. `agent.py`'s cycle setup wires the *primary* model's `context` value into `Context(token_limit=...)`, which `context.py`'s trim loop enforces directly. There is no `n_ctx` hint sent to the backend — llama.cpp/llama-swap-style servers must be sized/configured on their own end; TinyCTX no longer sends a suggested context window (this `n_ctx`/`context_overhead` mechanism was removed as dead weight — it never actually constrained what got sent, only advised the backend, and the backend's own config is the real source of truth for its context window).
+
+**Token-count fuzz factor:** `Config.token_fuzz` (default `1.1`) is a global multiplier applied to every counted-token total in `Context._count_tokens` (`context.py`), to pad for tokenizer estimation error. Configurable via top-level `token_fuzz:` in config.yaml.
 
 `Embedder` — async OpenAI-compatible embedding client. `embed(texts, priority=10)` batches automatically; `embed_one(text, priority=10)` is the single-string convenience wrapper.
 
