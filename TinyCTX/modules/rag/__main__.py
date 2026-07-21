@@ -355,7 +355,7 @@ def register_agent(cycle) -> None:
             max_results: Maximum results to return per databank (0 = use module default).
         """
         if not isinstance(targets, list) or not targets:
-            return "[rag_search error: targets must be a non-empty list of databank names]"
+            return "Error: targets must be a non-empty list of databank names"
 
         k = int(max_results) if max_results and int(max_results) > 0 else top_k
         _sync_discovery()
@@ -364,8 +364,8 @@ def register_agent(cycle) -> None:
         if unknown:
             available = sorted(_stores.keys()) or ["(none)"]
             return (
-                f"[rag_search error: unknown databank(s) {unknown}. "
-                f"Available: {available}]"
+                f"Error: unknown databank(s) {unknown}. "
+                f"Available: {available}"
             )
 
         all_parts: list[str] = []
@@ -376,7 +376,7 @@ def register_agent(cycle) -> None:
                 all_parts.append(block)
 
         if not all_parts:
-            return "[rag_search: no results found in the specified databank(s)]"
+            return "No results found in the specified databank(s)"
         return "\n\n".join(all_parts)
 
     cycle.tool_handler.register_tool(rag_search, always_on=True, min_permission=25)
@@ -402,23 +402,23 @@ def register_agent(cycle) -> None:
                      Pass [] to clear all auto-inject databanks.
         """
         if not isinstance(targets, list):
-            return "[set_auto_rag_databanks error: targets must be a list]"
+            return "Error: targets must be a list"
 
         targets = [str(t) for t in targets]
         unknown = [t for t in targets if t and t not in _stores]
         if unknown:
             available = sorted(_stores.keys()) or ["(none)"]
             return (
-                f"[set_auto_rag_databanks error: unknown databank(s) {unknown}. "
-                f"Available: {available}]"
+                f"Error: unknown databank(s) {unknown}. "
+                f"Available: {available}"
             )
 
         tail = cycle.context.tail_node_id
         cycle.db.set_state(tail, "rag_auto_targets", targets)
 
         if not targets:
-            return "[auto-rag cleared — no databanks will be injected automatically]"
-        return f"[auto-rag set to: {targets}]"
+            return "Auto-rag cleared — no databanks will be injected automatically"
+        return f"Auto-rag set to: {targets}"
 
     cycle.tool_handler.register_tool(set_auto_rag_databanks, always_on=False, min_permission=25)
 
@@ -433,7 +433,7 @@ def register_agent(cycle) -> None:
         Args: (none)
         """
         if not _databanks:
-            return "[no databanks found — add folders or worldinfo JSON files to workspace/rag/]"
+            return "No databanks found — add folders or worldinfo JSON files to workspace/rag/"
         lines = ["Available databanks:"]
         for name, bank in sorted(_databanks.items()):
             lines.append(f"  {name}  ({bank.kind})")

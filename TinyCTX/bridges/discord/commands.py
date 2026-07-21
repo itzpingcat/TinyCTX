@@ -138,7 +138,7 @@ async def _dispatch_with_args(
     arg_values: list,
 ) -> None:
     """Collect typed Discord param values and dispatch through CommandRegistry."""
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer(ephemeral=False)
 
     channel = interaction.channel
     if isinstance(channel, discord.DMChannel):

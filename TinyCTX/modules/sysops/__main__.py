@@ -148,7 +148,7 @@ def _model_list_text(db, config, node_id: str) -> str:
         if name == override:
             tags.append("current override")
         suffix = f"  ({', '.join(tags)})" if tags else ""
-        lines.append(f"  {name}{suffix}")
+        lines.append(f"- {name}{suffix}")
     return "\n".join(lines)
 
 

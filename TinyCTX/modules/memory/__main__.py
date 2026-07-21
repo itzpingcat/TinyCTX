@@ -402,20 +402,20 @@ async def call_librarian(prompt: str = "", file_path: str = "") -> str:
         try:
             file_text = p.read_text(encoding="utf-8", errors="replace")
         except Exception as exc:
-            return f"[librarian: could not read '{file_path}': {exc}]"
+            return f"Librarian: could not read '{file_path}': {exc}"
         combined = f"<file name=\"{p.name}\">\n{file_text}\n</file>"
         if prompt.strip():
             combined = f"{combined}\n\n{prompt.strip()}"
         _runner.queue.put_nowait({"type": "targeted", "prompt": combined})
-        return f"[librarian: file agent queued — '{p.name}']"
+        return f"Librarian: file agent queued — '{p.name}'"
     elif prompt.strip():
         assert _runner is not None
         _runner.queue.put_nowait({"type": "targeted", "prompt": prompt.strip()})
-        return f"[librarian: targeted agent queued — '{prompt[:60]}']"
+        return f"Librarian: targeted agent queued — '{prompt[:60]}'"
     else:
         assert _runner is not None
         _runner.queue.put_nowait({"type": "trigger"})
-        return "[librarian: node ingest triggered]"
+        return "Librarian: node ingest triggered"
 
 
 # ---------------------------------------------------------------------------

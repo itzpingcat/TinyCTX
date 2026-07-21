@@ -122,7 +122,7 @@ class _MCPServer:
             else:
                 # Fallback: JSON-encode non-text blocks
                 parts.append(json.dumps(block.model_dump() if hasattr(block, "model_dump") else str(block)))
-        return "\n".join(parts) if parts else "[no output]"
+        return "\n".join(parts) if parts else "No output"
 
     async def stop(self) -> None:
         if self._cm_stack:
@@ -294,7 +294,7 @@ def _register_one_tool(agent, srv: _MCPServer, tool, tools_cfg: dict) -> None:
         try:
             return await srv.call_tool(tool.name, kwargs)
         except Exception as exc:
-            return f"[mcp error: {exc}]"
+            return f"MCP error: {exc}"
 
     # Register bypassing auto-introspection — inject schema directly
     agent.tool_handler.tools[fn_name] = {

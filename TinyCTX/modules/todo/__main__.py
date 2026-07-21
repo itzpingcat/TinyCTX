@@ -111,7 +111,7 @@ def register_agent(agent) -> None:
             todos: List of task objects. Each must have 'content' (str) and 'status' (pending|in_progress|completed).
         """
         if not isinstance(todos, list):
-            return "[error: todos must be a list of {content, status} objects]"
+            return "Error: todos must be a list of {content, status} objects"
 
         # Validate and normalize
         clean: list[dict[str, str]] = []
@@ -131,7 +131,7 @@ def register_agent(agent) -> None:
             clean.append({"content": content.strip(), "status": status})
 
         if errors:
-            return "[error: invalid items]\n" + "\n".join(errors)
+            return "Error: invalid items\n" + "\n".join(errors)
 
         # Load previous for diff reporting
         old = _load_todos(todo_path)
@@ -151,7 +151,7 @@ def register_agent(agent) -> None:
             parts.append(f"{counts['completed']} completed")
 
         summary = ", ".join(parts) if parts else "empty"
-        return f"[todo list updated: {len(clean)} tasks — {summary}]"
+        return f"Todo list updated: {len(clean)} tasks — {summary}"
 
     def todo_read() -> str:
         """Read the current task list without modifying it.
@@ -160,7 +160,7 @@ def register_agent(agent) -> None:
         """
         todos = _load_todos(todo_path)
         if not todos:
-            return "[no tasks — use todo_write to create a task list]"
+            return "No tasks — use todo_write to create a task list"
         return _format_todo_list(todos)
 
     # Register tools

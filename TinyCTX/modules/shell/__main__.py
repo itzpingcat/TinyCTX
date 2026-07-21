@@ -141,8 +141,8 @@ def _annotate_exit(command: str, code: int) -> str:
     if sem:
         is_err, msg = sem(code)
         if not is_err:
-            return f"[{msg}]" if msg else ""
-    return f"[exit {code}]"
+            return f"({msg})" if msg else ""
+    return f"(exit {code})"
 
 
 # ---------------------------------------------------------------------------
@@ -214,11 +214,11 @@ def _run_sandbox(command: str, sandbox_url: str, timeout: int) -> str:
     try:
         with urllib.request.urlopen(req, timeout=timeout + 5) as resp:
             body = json.loads(resp.read().decode())
-            return body.get("output", "[error: sandbox returned no output field]")
+            return body.get("output", "Error: sandbox returned no output field")
     except urllib.error.URLError as exc:
-        return f"[error: cannot reach sandbox at {sandbox_url} — {exc.reason}]"
+        return f"Error: cannot reach sandbox at {sandbox_url} — {exc.reason}"
     except Exception as exc:
-        return f"[error: sandbox request failed — {exc}]"
+        return f"Error: sandbox request failed — {exc}"
 
 
 # ---------------------------------------------------------------------------
@@ -250,17 +250,17 @@ def _run_local(command: str, cwd: Path, timeout: int) -> str:
         if result.stdout:
             parts.append(result.stdout.rstrip())
         if result.stderr:
-            parts.append(f"[stderr]\n{result.stderr.rstrip()}")
+            parts.append(f"stderr:\n{result.stderr.rstrip()}")
         annotation = _annotate_exit(command, result.returncode)
         if annotation:
             parts.append(annotation)
-        return "\n".join(parts) if parts else "[no output]"
+        return "\n".join(parts) if parts else "No output"
     except subprocess.TimeoutExpired:
-        return f"[error: timed out after {timeout}s]"
+        return f"Error: timed out after {timeout}s"
     except FileNotFoundError as exc:
-        return f"[error: shell not found — {exc}]"
+        return f"Error: shell not found — {exc}"
     except Exception as exc:
-        return f"[error: {exc}]"
+        return f"Error: {exc}"
 
 
 # ---------------------------------------------------------------------------
@@ -292,9 +292,9 @@ def register_agent(agent) -> None:
         hit = _check_blacklist(command, blacklist)
         if hit:
             logger.warning("shell: blocked command (pattern: %s): %.120s", hit, command)
-            return f"[blocked: command matched blacklist pattern '{hit}']"
+            return f"Blocked: command matched blacklist pattern '{hit}'"
         warn = _destructive_warning(command)
-        prefix = f"[{warn}]\n" if warn else ""
+        prefix = f"{warn}\n" if warn else ""
         effective_timeout = min(call_timeout, max_timeout) if call_timeout is not None else default_timeout
         if local or not sandbox_url:
             output = _run_local(command, workspace, effective_timeout)
@@ -331,7 +331,7 @@ def register_agent(agent) -> None:
             # Checked inside tool_handler via min_permission, but we guard
             # explicitly here too so the error message is clear.
             if agent.config.permissions.level < 80:
-                return "[blocked: backend_access=True requires permission level 80]"
+                return "Blocked: backend_access=True requires permission level 80"
             return _dispatch(command, local=True, call_timeout=timeout)
         return _dispatch(command, call_timeout=timeout)
 

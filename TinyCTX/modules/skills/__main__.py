@@ -555,9 +555,9 @@ def register_agent(cycle) -> None:
             try:
                 text = skill.skill_md.read_text(encoding="utf-8")
                 body = _skill_body(text)
-                return f"# Skill: {name}\n\n{body}" if body else f"[skill '{name}' has no instructions body]"
+                return f"# Skill: {name}\n\n{body}" if body else f"Skill '{name}' has no instructions body"
             except Exception as exc:
-                return f"[error reading skill '{name}': {exc}]"
+                return f"Error reading skill '{name}': {exc}"
 
         # --- case-insensitive fallback ---
         name_lower  = name.lower()
@@ -572,9 +572,9 @@ def register_agent(cycle) -> None:
         available_skills = ", ".join(sorted(skills.keys())) or "(none)"
         available_cats   = ", ".join(sorted(categories.keys())) or "(none)"
         return (
-            f"[error: '{name}' not found.\n"
+            f"Error: '{name}' not found.\n"
             f"  Skills: {available_skills}\n"
-            f"  Categories: {available_cats}]"
+            f"  Categories: {available_cats}"
         )
 
     _sk_vis = str(cfg.get("tools", {}).get("use_skill", "always_on")).lower().strip()
@@ -602,11 +602,11 @@ def register_agent(cycle) -> None:
                    Pass ["*"] to collapse all expanded categories at once.
         """
         if ephemeral:
-            return "[collapse_skill_categories: ephemeral mode is on — nothing to collapse]"
+            return "Ephemeral mode is on — nothing to collapse"
 
         expanded = _load_expanded(agent)
         if not expanded:
-            return "[collapse_skill_categories: no categories are currently expanded]"
+            return "No categories are currently expanded"
 
         if paths == ["*"]:
             collapsed = sorted(expanded)
@@ -622,7 +622,7 @@ def register_agent(cycle) -> None:
             parts.append(f"Collapsed: {', '.join(collapsed)}")
         if unknown:
             parts.append(f"Not expanded (ignored): {', '.join(unknown)}")
-        return "\n".join(parts) if parts else "[collapse_skill_categories: nothing changed]"
+        return "\n".join(parts) if parts else "Nothing changed"
 
     agent.tool_handler.register_tool(
         collapse_skill_categories,
