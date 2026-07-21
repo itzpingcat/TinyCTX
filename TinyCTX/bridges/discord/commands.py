@@ -163,6 +163,11 @@ async def _dispatch_with_args(
         "runtime":     bridge._runtime,
         "cursor":      node_id,
         "send":        _send,
+        # Real caller identity for this invocation — do NOT rely on cursor's
+        # session-state author_id downstream (that's whoever last spoke on
+        # this branch, not necessarily this interaction's user).
+        "caller_platform": "discord",
+        "caller_user_id":  str(interaction.user.id),
     }
 
     # Convert typed values back to strings for the text-dispatch path.
@@ -301,6 +306,8 @@ async def handle_command_interaction(
         "runtime":     bridge._runtime,
         "cursor":      node_id,
         "send":        _send_reply,
+        "caller_platform": "discord",
+        "caller_user_id":  str(interaction.user.id),
     }
 
     text    = f"/{namespace} {sub}".strip() if sub else f"/{namespace}"

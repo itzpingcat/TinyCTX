@@ -102,9 +102,50 @@ def _resolve_model_node_id(context: dict) -> str:
     return (context.get("node_id") or context.get("cursor") or "").strip()
 
 
-def _resolve_model_caller(runtime, node_id: str):
+def _resolve_model_caller(runtime, node_id: str, context: dict | None = None):
+    """
+    Resolve the user who actually issued /model right now.
+
+    Preferred: an explicit caller identity supplied by the bridge in
+    `context` — either an already-resolved User object (context["caller"],
+    used by the gateway) or a platform/user_id pair (context["caller_platform"]
+    + context["caller_user_id"], used by Discord). Bridges that supply this
+    are giving us the true requester.
+
+    Fallback (legacy, unreliable): infer from node_id's session state
+    "author_id". This is whoever authored the *last message on the branch*,
+    not necessarily whoever just ran /model — a bridge that doesn't push a
+    node for the slash command itself (e.g. the gateway's
+    /v1/lane/command, which dispatches against the pre-existing cursor) will
+    silently attribute the command to the wrong person on any branch with
+    more than one participant. Only used if the bridge didn't supply an
+    explicit caller.
+    """
+    context = context or {}
+
+    caller = context.get("caller")
+    if caller is not None:
+        return caller
+
+    platform = context.get("caller_platform")
+    user_id = context.get("caller_user_id")
+    if platform and user_id:
+        try:
+            from TinyCTX.contracts import Platform
+            return runtime.users.get_by_platform(Platform(platform), str(user_id))
+        except Exception:
+            logger.debug(
+                "[sysops] failed to resolve /model caller via platform=%s user_id=%s",
+                platform, user_id, exc_info=True,
+            )
+            return None
+
     if not node_id:
         return None
+    logger.debug(
+        "[sysops] /model: no explicit caller in context for node %s — "
+        "falling back to last-speaker inference (may be wrong)", node_id,
+    )
     state, _ = runtime.db.load_session_state(node_id)
     # NOTE: session state's "author_id" is the TinyCTX username (see
     # runtime.py's _compute_state_delta — mapping["author_id"] =
@@ -168,7 +209,7 @@ def _register_model_command(runtime) -> None:
 
     async def _cmd_model(args: list[str], context: dict) -> None:
         node_id = _resolve_model_node_id(context)
-        caller = _resolve_model_caller(runtime, node_id)
+        caller = _resolve_model_caller(runtime, node_id, context)
         if caller is None:
             await _model_reply(context, "⛔ Cannot resolve your identity for this conversation.")
             return

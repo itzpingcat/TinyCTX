@@ -137,7 +137,39 @@ class CommandRegistry:
             await entry.handler(args, context)
         except Exception:
             logger.exception("[commands] handler for /%s %s raised", namespace, sub)
+        else:
+            self._record_command_introspection(namespace, sub, args, context)
         return True
+
+    @staticmethod
+    def _record_command_introspection(namespace: str, sub: str, args: list[str], context: dict) -> None:
+        """
+        command_introspection: append this command invocation to session
+        state (key "command_introspection_log") so agent.py's AgentCycle.run()
+        can surface it to the LLM on its next turn. /reset is excluded — a
+        reset starts a fresh branch and there's nothing for the old branch's
+        LLM to be told about. Best-effort: silently no-ops if the flag is
+        off, or if this bridge's context doesn't carry what we need
+        (runtime + a node_id/cursor to attach the note to).
+        """
+        if namespace == "reset":
+            return
+        runtime = context.get("runtime")
+        if runtime is None:
+            return
+        config = getattr(runtime, "config", None)
+        if not getattr(config, "command_introspection", False):
+            return
+        node_id = (context.get("node_id") or context.get("cursor") or "").strip()
+        if not node_id:
+            return
+        cmd_str = f"/{namespace}" + (f" {sub}" if sub else "") + (" " + " ".join(args) if args else "")
+        try:
+            log = list(runtime.db.get_state(node_id, "command_introspection_log", []) or [])
+            log.append(cmd_str.strip())
+            runtime.db.set_state(node_id, "command_introspection_log", log)
+        except Exception:
+            logger.exception("[commands] command_introspection: failed to record %r", cmd_str)
 
     def _find(self, namespace: str, sub: str) -> _Entry | None:
         for e in self._entries:

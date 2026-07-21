@@ -45,6 +45,7 @@ class AgentCycle:
         self.models: dict[str, LLM] = {}
         self.tool_handler = None
         self.caller = None        # User; set in run()
+        self._pending_command_log_text: str | None = None  # command_introspection staging
 
         # Extra events enqueued by tools (e.g. present()) to be yielded
         # immediately after the AgentToolResult for that tool call.
@@ -74,7 +75,26 @@ class AgentCycle:
 
         # Load session state (model choice, enabled tools, etc.)
         state, _ = self.db.load_session_state(node_id)
-        
+
+        # command_introspection: surface any slash commands run on this branch
+        # since the LLM's last turn (recorded by CommandRegistry.dispatch into
+        # session state — see utils/commands.py). Written as a synthetic
+        # history entry so it shows up in this turn's assembled context, then
+        # cleared from this node onward so it isn't re-injected forever.
+        if getattr(self.config, "command_introspection", False):
+            cmd_log = state.get("command_introspection_log") or []
+            if cmd_log:
+                lines = "\n".join(f"- {entry}" for entry in cmd_log)
+                self._pending_command_log_text = (
+                    f"[System note: the following slash command(s) were run on this "
+                    f"branch since your last turn]\n{lines}"
+                )
+                self.db.set_state(node_id, "command_introspection_log", [])
+            else:
+                self._pending_command_log_text = None
+        else:
+            self._pending_command_log_text = None
+
         # Build LLMs based on primary + fallbacks
         primary_name = state.get("model") or self.config.llm.primary
         model_chain = [primary_name] + list(self.config.llm.fallback)
@@ -103,6 +123,12 @@ class AgentCycle:
             token_fuzz=self.config.token_fuzz,
         )
 
+        if self._pending_command_log_text:
+            self.context.add(HistoryEntry.assistant(
+                content=self._pending_command_log_text,
+            ))
+            self._pending_command_log_text = None
+
         # Wire modules into this cycle turn
         self.module_registry.register_agent(self)
 
@@ -128,6 +154,7 @@ class AgentCycle:
         for cycle_num in range(max_cycles):
             logger.debug("[agent] cycle %d, node %s", cycle_num + 1, node_id)
             if abort_event.is_set():
+                self._record_error_introspection("[aborted]")
                 yield AgentError(message="[aborted]", **meta)
                 return
 
@@ -157,6 +184,7 @@ class AgentCycle:
 
             logger.debug("[agent] post-inference: error=%s tool_calls=%d", error, len(tool_calls_list))
             if error:
+                self._record_error_introspection(f"[LLM error: {error}]")
                 yield AgentError(message=f"[LLM error: {error}]", **meta)
                 return
 
@@ -229,6 +257,26 @@ class AgentCycle:
                 logger.exception("[agent] post-turn hook '%s' raised", getattr(hook, '__name__', hook))
 
     # --- Internal Helpers ---
+
+    def _record_error_introspection(self, message: str) -> None:
+        """
+        error_introspection: write the error into the conversation as an
+        assistant-role history entry — matching what the bridge would have
+        shown the user as plain text (e.g. Discord's raw error string) —
+        so it survives into the next turn's assembled context as something
+        the LLM itself "said", rather than a system/user note. Otherwise
+        AgentError is relayed to the bridge/console and then lost; the LLM
+        never learns its last turn errored. No-op if the flag is off or
+        context isn't built yet.
+        """
+        if not getattr(self.config, "error_introspection", False):
+            return
+        if self.context is None:
+            return
+        try:
+            self.context.add(HistoryEntry.assistant(content=message))
+        except Exception:
+            logger.exception("[agent] error_introspection: failed to record error")
 
     def _build_llm(self, mc) -> LLM:
         return LLM(

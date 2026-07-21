@@ -283,6 +283,16 @@ class Config:
     attachments:     AttachmentConfig        = field(default_factory=AttachmentConfig)
     permissions:     PermissionsConfig       = field(default_factory=PermissionsConfig)
     tool_overrides:  dict[str, ToolOverrideConfig] = field(default_factory=dict)
+    # When True, AgentError events (LLM error, abort) are written into the
+    # conversation as a node so the LLM can see, on its next turn, that its
+    # previous turn errored out — instead of the error vanishing silently
+    # once it's been relayed to the bridge/console. See agent.py's AgentCycle.run().
+    error_introspection:   bool               = False
+    # When True, slash-command usage (excluding /reset) is recorded into
+    # session state and surfaced to the LLM as a system-ish note on its next
+    # turn, so it's aware a command was run on its branch. See
+    # utils/commands.py's CommandRegistry.dispatch() and agent.py's run().
+    command_introspection: bool               = False
     # Catch-all for unknown top-level keys (e.g. mcp:, custom module config, etc.)
     # Modules access this via agent.config.extra.get("mcp", {})
     extra:           dict                    = field(default_factory=dict)
@@ -409,6 +419,7 @@ _KNOWN_KEYS = {
     "models", "llm", "router", "bridges", "gateway", "workspace", "data",
     "logging", "max_tool_cycles", "parallel", "token_fuzz", "attachments", "permissions",
     "tool_overrides", "context",  # "context" is the deprecated legacy top-level key
+    "error_introspection", "command_introspection",
 }
 
 
@@ -558,6 +569,8 @@ def load(path="config.yaml") -> Config:
         attachments=attachments,
         permissions=permissions,
         tool_overrides=tool_overrides,
+        error_introspection=bool(raw.get("error_introspection", False)),
+        command_introspection=bool(raw.get("command_introspection", False)),
         extra=extra,
     )
     setattr(cfg, "_source_path", p.resolve())
