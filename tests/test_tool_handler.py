@@ -251,22 +251,33 @@ class TestToolsSearch:
         fn.__doc__ = description
         self.handler.register_tool(fn, always_on=always_on)
 
-    def test_search_enables_matching_tool(self):
+    def test_search_lists_matching_tool_as_candidate(self):
+        """Fuzzy match doesn't enable — it lists the tool as a candidate to
+        re-search for by exact name (see tools_search docstring)."""
         self._add("web_search", "Search the web for information")
         result = self.handler.tools_search("web search")
-        assert "web_search" in self.handler.enabled
+        assert "web_search" not in self.handler.enabled
         assert "web_search" in result
+
+    def test_search_exact_name_enables_immediately(self):
+        """An exact tool-name match is a one-step enable, unlike a fuzzy query."""
+        self._add("web_search", "Search the web for information")
+        result = self.handler.tools_search("web_search")
+        assert "web_search" in self.handler.enabled
+        assert "Enabled" in result
 
     def test_search_matches_description(self):
         self._add("fetch_page", "Download and return the HTML of a URL")
-        self.handler.tools_search("HTML")
-        assert "fetch_page" in self.handler.enabled
+        result = self.handler.tools_search("HTML")
+        assert "fetch_page" not in self.handler.enabled
+        assert "fetch_page" in result
 
     def test_search_case_insensitive(self):
         """BM25 tokeniser lowercases everything so queries are case-insensitive."""
         self._add("screenshot", "Take a screenshot of the page")
-        self.handler.tools_search("SCREENSHOT")
-        assert "screenshot" in self.handler.enabled
+        result = self.handler.tools_search("SCREENSHOT")
+        assert "screenshot" not in self.handler.enabled
+        assert "screenshot" in result
 
     def test_search_no_match_returns_message(self):
         """A query with no BM25-positive matches returns a no-results message."""
@@ -283,27 +294,31 @@ class TestToolsSearch:
         assert "No new" in result or "Already" in result
 
     def test_search_ranks_best_match_first(self):
-        """The tool most relevant to the query should be enabled."""
+        """The tool most relevant to the query should be listed first among candidates."""
         self._add("read_file", "Read the contents of a file from disk")
-        self._add("web_search", "Search the web for information")
-        self.handler.tools_search("read file contents")
-        assert "read_file" in self.handler.enabled
+        self._add("view_file", "View a file with line numbers")
+        result = self.handler.tools_search("read file")
+        assert "read_file" not in self.handler.enabled
+        assert result.index("read_file") < result.index("view_file")
 
     def test_search_multiple_matches(self):
-        """Both tools sharing query terms should be enabled."""
+        """Both tools sharing query terms should be listed as candidates."""
         self._add("click", "Click an element on the page")
         self._add("double_click", "Double click an element on the page")
-        self.handler.tools_search("click element")
-        assert "click" in self.handler.enabled
-        assert "double_click" in self.handler.enabled
+        result = self.handler.tools_search("click element")
+        assert "click" not in self.handler.enabled
+        assert "double_click" not in self.handler.enabled
+        assert "click" in result
+        assert "double_click" in result
 
     def test_underscore_names_matched_as_words(self):
         """web_search is tokenised as ['web', 'search'] so query 'search' hits it."""
         self._add("web_search", "Search the web for current information")
         self._add("view", "Read a file with line numbers")
-        self.handler.tools_search("search")
-        assert "web_search" in self.handler.enabled
-        assert "view" not in self.handler.enabled
+        result = self.handler.tools_search("search")
+        assert "web_search" not in self.handler.enabled
+        assert "web_search" in result
+        assert "view" not in result
 
     def test_tools_search_itself_always_on(self):
         """tools_search should always be in the tool definitions."""

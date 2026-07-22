@@ -54,14 +54,15 @@ class TestBM25Ranking:
         hits = dict(bm25.search("read file"))
         assert hits["view"] > 0.0
 
-    def test_nonmatching_doc_has_zero_score(self):
+    def test_nonmatching_doc_excluded_from_results(self):
+        """Zero-score (non-matching) docs are filtered out of search()."""
         corpus = {
             "view": "read a file with line numbers",
             "shell": "run shell commands",
         }
         bm25 = BM25(corpus)
         hits = dict(bm25.search("read file"))
-        assert hits["shell"] == 0.0
+        assert "shell" not in hits
 
     def test_more_occurrences_of_rare_term_ranks_higher(self):
         corpus = {
@@ -71,7 +72,8 @@ class TestBM25Ranking:
         }
         bm25 = BM25(corpus)
         hits = dict(bm25.search("xylophone"))
-        assert hits["many"] > hits["one"] > hits["none"] == 0.0
+        assert hits["many"] > hits["one"] > 0.0
+        assert "none" not in hits
 
     def test_multi_term_query_sums_contributions(self):
         corpus = {
@@ -81,7 +83,8 @@ class TestBM25Ranking:
         }
         bm25 = BM25(corpus)
         hits = dict(bm25.search("apple banana"))
-        assert hits["both"] > hits["one_only"] > hits["neither"] == 0.0
+        assert hits["both"] > hits["one_only"] > 0.0
+        assert "neither" not in hits
 
     def test_results_sorted_descending(self):
         corpus = {
@@ -105,14 +108,13 @@ class TestBM25Ranking:
         hits = bm25.search("cat", top_k=2)
         assert len(hits) == 2
 
-    def test_top_k_can_include_zero_score_docs(self):
-        """The implementation sorts and slices the full scored list, so a
-        top_k larger than the match count still returns zero-score docs."""
+    def test_top_k_never_includes_zero_score_docs(self):
+        """Zero-score docs are excluded even when top_k exceeds the match count."""
         corpus = {"a": "cat", "b": "dog"}
         bm25 = BM25(corpus)
         hits = bm25.search("cat", top_k=10)
-        assert len(hits) == 2
-        assert dict(hits)["b"] == 0.0
+        assert len(hits) == 1
+        assert dict(hits)["a"] > 0.0
 
 
 class TestBM25EdgeCases:
