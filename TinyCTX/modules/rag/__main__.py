@@ -195,8 +195,6 @@ def _resolve_path(rel: str, workspace: Path) -> Path:
 
 def _sync_discovery() -> None:
     """Re-scan the rag directory and register any new databanks. Idempotent."""
-    global _databanks, _stores, _indexers
-
     rag_dir   = _resolve_path(_cfg["rag_dir"], _workspace)
     cache_dir = _resolve_path(_cfg["cache_dir"], _workspace)
     extensions: set[str] = _cfg["_extensions"]
