@@ -168,6 +168,9 @@ async def _dispatch_with_args(
         # this branch, not necessarily this interaction's user).
         "caller_platform": "discord",
         "caller_user_id":  str(interaction.user.id),
+        # Same buffer _send() already appends to — command_introspection
+        # reads this after dispatch() returns, no separate capture needed.
+        "get_output":  lambda: "\n".join(reply_parts),
     }
 
     # Convert typed values back to strings for the text-dispatch path.
@@ -308,6 +311,7 @@ async def handle_command_interaction(
         "send":        _send_reply,
         "caller_platform": "discord",
         "caller_user_id":  str(interaction.user.id),
+        "get_output":  lambda: "\n".join(reply_parts),
     }
 
     text    = f"/{namespace} {sub}".strip() if sub else f"/{namespace}"

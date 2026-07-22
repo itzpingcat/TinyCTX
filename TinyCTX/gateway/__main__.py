@@ -487,6 +487,7 @@ async def handle_lane_command(request: web.Request) -> web.Response:
         "agent":     None,   # no per-lane agent in new arch
         "theme_c":   lambda _k: "",
         "caller":    caller,
+        "get_output": console.get_output,
     }
 
     handled = await runtime.commands.dispatch(text, context)

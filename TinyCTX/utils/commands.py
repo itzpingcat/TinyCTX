@@ -142,15 +142,25 @@ class CommandRegistry:
         return True
 
     @staticmethod
-    def _record_command_introspection(namespace: str, sub: str, args: list[str], context: dict) -> None:
+    def _record_command_introspection(
+        namespace: str, sub: str, args: list[str], context: dict,
+    ) -> None:
         """
-        command_introspection: append this command invocation to session
-        state (key "command_introspection_log") so agent.py's AgentCycle.run()
-        can surface it to the LLM on its next turn. /reset is excluded — a
-        reset starts a fresh branch and there's nothing for the old branch's
-        LLM to be told about. Best-effort: silently no-ops if the flag is
-        off, or if this bridge's context doesn't carry what we need
-        (runtime + a node_id/cursor to attach the note to).
+        command_introspection: append this command invocation + its reply
+        text to session state (key "command_introspection_log") so
+        agent.py's AgentCycle.run() can replay it to the LLM on its next
+        turn as a real [user: /cmd] -> [assistant: reply] exchange. /reset
+        is excluded — a reset starts a fresh branch and there's nothing for
+        the old branch's LLM to be told about.
+
+        Reply text comes from context["get_output"] — a zero-arg callable
+        bridges already populate for their own purposes (the gateway reads
+        it to return the HTTP response, Discord reads it to send the
+        followup). We just call the same accessor after the handler runs
+        rather than re-capturing anything ourselves, so there's no
+        monkey-patching of "send"/"console" needed here. Best-effort:
+        silently no-ops if the flag is off, or if this bridge's context
+        doesn't carry what we need (runtime + a node_id/cursor + get_output).
         """
         if namespace == "reset":
             return
@@ -164,12 +174,48 @@ class CommandRegistry:
         if not node_id:
             return
         cmd_str = f"/{namespace}" + (f" {sub}" if sub else "") + (" " + " ".join(args) if args else "")
+        get_output = context.get("get_output")
+        output_str = (get_output() if callable(get_output) else "") or ""
+        output_str = output_str.strip() or "(no output)"
+        author_id = CommandRegistry._resolve_caller_username(runtime, context)
         try:
             log = list(runtime.db.get_state(node_id, "command_introspection_log", []) or [])
-            log.append(cmd_str.strip())
+            log.append({"cmd": cmd_str.strip(), "output": output_str, "author_id": author_id})
             runtime.db.set_state(node_id, "command_introspection_log", log)
         except Exception:
             logger.exception("[commands] command_introspection: failed to record %r", cmd_str)
+
+    @staticmethod
+    def _resolve_caller_username(runtime, context: dict) -> str | None:
+        """
+        Resolve the TinyCTX username of whoever actually ran the command, so
+        the replayed [user: ...] turn gets the same 【username】 prefix real
+        dialogue gets (see context.py's assemble — a user entry with no
+        author_id is missing that prefix entirely and logs an error).
+        Mirrors sysops/__main__.py's _resolve_model_caller preference order:
+        an already-resolved User (context["caller"]) beats a platform/user_id
+        pair (context["caller_platform"] + "caller_user_id"). Returns None
+        if the bridge supplied neither — callers should treat that as
+        "unattributable" rather than guessing.
+        """
+        caller = context.get("caller")
+        if caller is not None:
+            return getattr(caller, "username", None)
+
+        platform = context.get("caller_platform")
+        user_id = context.get("caller_user_id")
+        if platform and user_id:
+            try:
+                from TinyCTX.contracts import Platform
+                user = runtime.users.get_by_platform(Platform(platform), str(user_id))
+                return user.username if user else None
+            except Exception:
+                logger.debug(
+                    "[commands] command_introspection: failed to resolve username for "
+                    "platform=%s user_id=%s", platform, user_id, exc_info=True,
+                )
+                return None
+        return None
 
     def _find(self, namespace: str, sub: str) -> _Entry | None:
         for e in self._entries:

@@ -45,7 +45,7 @@ class AgentCycle:
         self.models: dict[str, LLM] = {}
         self.tool_handler = None
         self.caller = None        # User; set in run()
-        self._pending_command_log_text: str | None = None  # command_introspection staging
+        self._pending_command_log: list[dict] | None = None  # command_introspection staging
 
         # Extra events enqueued by tools (e.g. present()) to be yielded
         # immediately after the AgentToolResult for that tool call.
@@ -78,22 +78,19 @@ class AgentCycle:
 
         # command_introspection: surface any slash commands run on this branch
         # since the LLM's last turn (recorded by CommandRegistry.dispatch into
-        # session state — see utils/commands.py). Written as a synthetic
-        # history entry so it shows up in this turn's assembled context, then
-        # cleared from this node onward so it isn't re-injected forever.
+        # session state — see utils/commands.py). Replayed as real [user: /cmd]
+        # -> [assistant: reply] turn pairs, one pair per command, in the order
+        # they were run — same shape as if the LLM had been there watching it
+        # happen live. Cleared from this node onward so it isn't replayed again.
         if getattr(self.config, "command_introspection", False):
             cmd_log = state.get("command_introspection_log") or []
             if cmd_log:
-                lines = "\n".join(f"- {entry}" for entry in cmd_log)
-                self._pending_command_log_text = (
-                    f"[System note: the following slash command(s) were run on this "
-                    f"branch since your last turn]\n{lines}"
-                )
+                self._pending_command_log = list(cmd_log)
                 self.db.set_state(node_id, "command_introspection_log", [])
             else:
-                self._pending_command_log_text = None
+                self._pending_command_log = None
         else:
-            self._pending_command_log_text = None
+            self._pending_command_log = None
 
         # Build LLMs based on primary + fallbacks
         primary_name = state.get("model") or self.config.llm.primary
@@ -123,11 +120,19 @@ class AgentCycle:
             token_fuzz=self.config.token_fuzz,
         )
 
-        if self._pending_command_log_text:
-            self.context.add(HistoryEntry.assistant(
-                content=self._pending_command_log_text,
-            ))
-            self._pending_command_log_text = None
+        if self._pending_command_log:
+            for entry in self._pending_command_log:
+                # author_id may be None if the bridge didn't supply a caller
+                # identity (see utils/commands.py's _resolve_caller_username)
+                # — falls back to "unknown" rather than silently dropping the
+                # 【prefix】 (a None author_id on a user entry with a parent
+                # logs an error in context.py's assemble()).
+                self.context.add(HistoryEntry.user(
+                    content=entry["cmd"],
+                    author_id=entry.get("author_id") or "unknown",
+                ))
+                self.context.add(HistoryEntry.assistant(content=entry["output"]))
+            self._pending_command_log = None
 
         # Wire modules into this cycle turn
         self.module_registry.register_agent(self)
@@ -155,6 +160,7 @@ class AgentCycle:
             logger.debug("[agent] cycle %d, node %s", cycle_num + 1, node_id)
             if abort_event.is_set():
                 self._record_error_introspection("[aborted]")
+                meta["tail_node_id"] = self.context.tail_node_id
                 yield AgentError(message="[aborted]", **meta)
                 return
 
@@ -185,6 +191,7 @@ class AgentCycle:
             logger.debug("[agent] post-inference: error=%s tool_calls=%d", error, len(tool_calls_list))
             if error:
                 self._record_error_introspection(f"[LLM error: {error}]")
+                meta["tail_node_id"] = self.context.tail_node_id
                 yield AgentError(message=f"[LLM error: {error}]", **meta)
                 return
 
