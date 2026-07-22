@@ -44,12 +44,23 @@ jobs:
 
   release:
     needs: [lint, test]
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
       with:
         fetch-depth: 0
+    - name: Check for new commits since last nightly
+      id: check
+      run: |
+        last_tag=$(git tag --list 'nightly-*' --sort=-creatordate | head -n1)
+        if [ -z "$last_tag" ] || ! git diff --quiet "$last_tag" HEAD; then
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+        fi
     - name: Tag and publish nightly release
+      if: steps.check.outputs.skip != 'true'
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
