@@ -60,6 +60,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from types import ModuleType
+    from TinyCTX.modules.memory.graph import GraphDatabase
 
 logger = logging.getLogger(__name__)
 
@@ -446,7 +447,7 @@ def _count_entry_tokens(entry) -> int:
 # ---------------------------------------------------------------------------
 
 def register_runtime(runtime) -> None:
-    global _graph_database, _runner, _workspace, _data_path, _graph_db, _tools, _pinned_prio, _token_budget, _pinned_user_scan, _graph_embedder
+    global _graph_database, _runner, _workspace, _data_path, _graph_db, _tools, _pinned_prio, _token_budget, _pinned_user_scan
 
     _workspace = Path(runtime.config.workspace.path).expanduser().resolve()
     _workspace.mkdir(parents=True, exist_ok=True)
