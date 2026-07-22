@@ -368,6 +368,32 @@ class DiscordBridge:
     # Attachment / forwarded-message helpers
     # ------------------------------------------------------------------
 
+    def _embed_to_text(self, embed: discord.Embed) -> str:
+        """Render a single Discord embed as plain text (title/url/description/fields/footer)."""
+        lines: list[str] = []
+        if embed.title:
+            lines.append(embed.title)
+        if embed.url:
+            lines.append(embed.url)
+        if embed.description:
+            lines.append(embed.description)
+        for field in embed.fields:
+            name  = field.name or ""
+            value = field.value or ""
+            lines.append(f"{name}: {value}")
+        if embed.footer and embed.footer.text:
+            lines.append(embed.footer.text)
+        return "\n".join(lines)
+
+    def _embeds_to_text(self, embeds) -> str:
+        """Render a message's embeds as a plain-text block, so agents can read embed content."""
+        blocks: list[str] = []
+        for embed in embeds or []:
+            block = self._embed_to_text(embed)
+            if block:
+                blocks.append(f"[embed]\n{block}")
+        return "\n".join(blocks)
+
     async def _extract_forwarded(
         self, message: discord.Message
     ) -> tuple[str, tuple]:
@@ -401,8 +427,13 @@ class DiscordBridge:
                 )
                 lines.append(f"> [attachment: {a.filename}]")
 
-        for _ in getattr(snap, "embeds", []):
-            lines.append("> [embed]")
+        for embed in getattr(snap, "embeds", []):
+            block = self._embed_to_text(embed)
+            if block:
+                for line in block.splitlines():
+                    lines.append(f"> {line}" if line else ">")
+            else:
+                lines.append("> [embed]")
 
         for sticker in getattr(snap, "stickers", []):
             lines.append(f"> [sticker: {sticker.name}]")
@@ -550,6 +581,9 @@ class DiscordBridge:
                 return
             text        = message.content.strip()
             attachments = await self._fetch_attachments(message)
+            embed_text  = self._embeds_to_text(message.embeds)
+            if embed_text:
+                text = f"{text}\n{embed_text}".strip()
             fwd_text, fwd_attachments = await self._extract_forwarded(message)
             if fwd_text:
                 text = f"{text}\n{fwd_text}".strip()
@@ -614,6 +648,9 @@ class DiscordBridge:
         bot_id     = self._client.user.id if self._client.user else None
         text        = await humanize_mentions(raw_text, self._client)
         attachments = await self._fetch_attachments(message)
+        embed_text  = self._embeds_to_text(message.embeds)
+        if embed_text:
+            text = f"{text}\n{embed_text}".strip()
         fwd_text, fwd_attachments = await self._extract_forwarded(message)
         if fwd_text:
             text = f"{text}\n{fwd_text}".strip()
@@ -734,6 +771,9 @@ class DiscordBridge:
 
         text        = message.content.strip()
         attachments = await self._fetch_attachments(message)
+        embed_text  = self._embeds_to_text(message.embeds)
+        if embed_text:
+            text = f"{text}\n{embed_text}".strip()
         fwd_text, fwd_attachments = await self._extract_forwarded(message)
         if fwd_text:
             text = f"{text}\n{fwd_text}".strip()

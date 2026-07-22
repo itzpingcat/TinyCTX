@@ -11,7 +11,8 @@ created once on the first register_agent call and shared across all cycles.
 
 Auto-rag state is stored in session state under the key "rag_auto_targets"
 (a list of databank name strings). set_auto_rag_databanks writes this key
-via db.update_node_state_delta; the pre-assemble hook reads it each turn.
+via db.set_state (merge-write — safe alongside other modules' state on the
+same node); the pre-assemble hook reads it each turn via db.get_state.
 
 Databank layout (workspace/rag/):
     lore/            <- FilesDataBank "lore"
@@ -31,7 +32,6 @@ register_runtime is not used by this module (no commands or runtime hooks needed
 from __future__ import annotations
 
 import atexit
-import json
 import logging
 from pathlib import Path
 
@@ -271,8 +271,7 @@ def register_agent(cycle) -> None:
             return
 
         # Read auto-rag targets from session state
-        state, _ = cycle.db.load_session_state(ctx.tail_node_id)
-        targets: list[str] = state.get("rag_auto_targets") or []
+        targets: list[str] = cycle.db.get_state(ctx.tail_node_id, "rag_auto_targets") or []
         if not targets:
             return
 
@@ -356,7 +355,7 @@ def register_agent(cycle) -> None:
             max_results: Maximum results to return per databank (0 = use module default).
         """
         if not isinstance(targets, list) or not targets:
-            return "[rag_search error: targets must be a non-empty list of databank names]"
+            return "Error: targets must be a non-empty list of databank names"
 
         k = int(max_results) if max_results and int(max_results) > 0 else top_k
         _sync_discovery()
@@ -365,8 +364,8 @@ def register_agent(cycle) -> None:
         if unknown:
             available = sorted(_stores.keys()) or ["(none)"]
             return (
-                f"[rag_search error: unknown databank(s) {unknown}. "
-                f"Available: {available}]"
+                f"Error: unknown databank(s) {unknown}. "
+                f"Available: {available}"
             )
 
         all_parts: list[str] = []
@@ -377,7 +376,7 @@ def register_agent(cycle) -> None:
                 all_parts.append(block)
 
         if not all_parts:
-            return "[rag_search: no results found in the specified databank(s)]"
+            return "No results found in the specified databank(s)"
         return "\n\n".join(all_parts)
 
     cycle.tool_handler.register_tool(rag_search, always_on=True, min_permission=25)
@@ -403,26 +402,23 @@ def register_agent(cycle) -> None:
                      Pass [] to clear all auto-inject databanks.
         """
         if not isinstance(targets, list):
-            return "[set_auto_rag_databanks error: targets must be a list]"
+            return "Error: targets must be a list"
 
         targets = [str(t) for t in targets]
         unknown = [t for t in targets if t and t not in _stores]
         if unknown:
             available = sorted(_stores.keys()) or ["(none)"]
             return (
-                f"[set_auto_rag_databanks error: unknown databank(s) {unknown}. "
-                f"Available: {available}]"
+                f"Error: unknown databank(s) {unknown}. "
+                f"Available: {available}"
             )
 
         tail = cycle.context.tail_node_id
-        cycle.db.update_node_state_delta(
-            tail,
-            json.dumps({"rag_auto_targets": targets}),
-        )
+        cycle.db.set_state(tail, "rag_auto_targets", targets)
 
         if not targets:
-            return "[auto-rag cleared — no databanks will be injected automatically]"
-        return f"[auto-rag set to: {targets}]"
+            return "Auto-rag cleared — no databanks will be injected automatically"
+        return f"Auto-rag set to: {targets}"
 
     cycle.tool_handler.register_tool(set_auto_rag_databanks, always_on=False, min_permission=25)
 
@@ -437,7 +433,7 @@ def register_agent(cycle) -> None:
         Args: (none)
         """
         if not _databanks:
-            return "[no databanks found — add folders or worldinfo JSON files to workspace/rag/]"
+            return "No databanks found — add folders or worldinfo JSON files to workspace/rag/"
         lines = ["Available databanks:"]
         for name, bank in sorted(_databanks.items()):
             lines.append(f"  {name}  ({bank.kind})")

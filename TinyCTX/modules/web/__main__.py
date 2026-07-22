@@ -80,22 +80,22 @@ def _check_ssrf(url: str) -> Optional[str]:
     try:
         parsed = urlparse(url)
     except Exception:
-        return "[error: invalid URL]"
+        return "Error: invalid URL"
     if parsed.scheme.lower() not in ("http", "https"):
-        return f"[error: scheme '{parsed.scheme}' is not allowed; use http or https]"
+        return f"Error: scheme '{parsed.scheme}' is not allowed; use http or https"
     host = parsed.hostname or ""
     if not host:
-        return "[error: URL has no host]"
+        return "Error: URL has no host"
     # Block bare IP literals that are private
     if _is_private_ip(host):
-        return f"[error: requests to private/loopback addresses are not allowed ({host})]"
+        return f"Error: requests to private/loopback addresses are not allowed ({host})"
     # Resolve hostname and check each resulting IP
     try:
         infos = socket.getaddrinfo(host, None)
         for info in infos:
             addr = info[4][0]
             if _is_private_ip(str(addr)):
-                return f"[error: hostname '{host}' resolves to a private address ({addr}) — request blocked]"
+                return f"Error: hostname '{host}' resolves to a private address ({addr}) — request blocked"
     except socket.gaierror:
         pass  # unresolvable host — let aiohttp handle it
     return None
@@ -667,7 +667,7 @@ def register_agent(agent) -> None:
             )
             return "\n".join(lines)
         except Exception as e:
-            return f"[error: {e}]"
+            return f"Error: {e}"
 
     # http_request removed — deprecated.
 
@@ -736,7 +736,7 @@ def register_agent(agent) -> None:
             return f"{title_line}{url} (status {status})\n\n{content}{suffix}"
 
         except Exception as e:
-            return f"[error: {e}]"
+            return f"Error: {e}"
 
     async def click(target: str, nth: int = 0, exact: bool | None = None) -> str:
         """
@@ -754,7 +754,7 @@ def register_agent(agent) -> None:
             await loc.click(timeout=st["settings"]["timeout_ms"])
             return f"Clicked: {target!r} (nth={nth})"
         except Exception as e:
-            return f"[error: {e}]"
+            return f"Error: {e}"
 
     async def type_text(
         target: str,
@@ -798,7 +798,7 @@ def register_agent(agent) -> None:
 
             return f"Typed into: {target!r} (nth={nth})"
         except Exception as e:
-            return f"[error: {e}]"
+            return f"Error: {e}"
 
     async def extract_text(target: str = "", nth: int = 0, exact: bool | None = None) -> str:
         """
@@ -820,7 +820,7 @@ def register_agent(agent) -> None:
             await loc.wait_for(state="attached", timeout=st["settings"]["timeout_ms"])
             return await loc.inner_text(timeout=st["settings"]["timeout_ms"])
         except Exception as e:
-            return f"[error: {e}]"
+            return f"Error: {e}"
 
     async def extract_html(target: str = "", nth: int = 0, exact: bool | None = None) -> str:
         """
@@ -840,7 +840,7 @@ def register_agent(agent) -> None:
             await loc.wait_for(state="attached", timeout=st["settings"]["timeout_ms"])
             return await loc.inner_html(timeout=st["settings"]["timeout_ms"])
         except Exception as e:
-            return f"[error: {e}]"
+            return f"Error: {e}"
 
     async def screenshot_browser(target: str | None = None, filename: str | None = None, nth: int = 0, exact: bool | None = None) -> str:
         """
@@ -864,7 +864,7 @@ def register_agent(agent) -> None:
             safe_name = f"screenshot_{int(time.time())}.png"
         path = (st["downloads_dir"] / safe_name).resolve()
         if not str(path).startswith(str(st["downloads_dir"].resolve())):
-            return "[error: filename escapes downloads directory]"
+            return "Error: filename escapes downloads directory"
 
         try:
             if target:
@@ -875,7 +875,7 @@ def register_agent(agent) -> None:
                 await page.screenshot(path=str(path), full_page=True)
                 return f"Page screenshot saved to {path}"
         except Exception as e:
-            return f"[error: {e}]"
+            return f"Error: {e}"
 
     async def wait_for(
         target: str,
@@ -898,7 +898,7 @@ def register_agent(agent) -> None:
             await loc.wait_for(state=state, timeout=st["settings"]["timeout_ms"])  # type: ignore[arg-type]
             return f"Element {target!r} reached state '{state}' (nth={nth})"
         except Exception as e:
-            return f"[error: {e}]"
+            return f"Error: {e}"
 
     async def manage_browser(action: str, key: str | None = None, value: str | None = None) -> str:
         """

@@ -30,7 +30,7 @@ Pressure-based ingest
 After each turn, tokens written to the DB on this branch (assistant +
 tool nodes) are accumulated in session state under the key
 'memory_tokens_since_ingest'. When the total crosses
-ingest_pressure_ratio * config.context (floored by ingest_pressure_min_tokens),
+ingest_pressure_ratio * cycle.context.token_limit (floored by ingest_pressure_min_tokens),
 a "branch" queue message is dispatched so the librarian ingests only this
 branch's unvisited nodes, and the counter resets to zero.
 
@@ -402,20 +402,20 @@ async def call_librarian(prompt: str = "", file_path: str = "") -> str:
         try:
             file_text = p.read_text(encoding="utf-8", errors="replace")
         except Exception as exc:
-            return f"[librarian: could not read '{file_path}': {exc}]"
+            return f"Librarian: could not read '{file_path}': {exc}"
         combined = f"<file name=\"{p.name}\">\n{file_text}\n</file>"
         if prompt.strip():
             combined = f"{combined}\n\n{prompt.strip()}"
         _runner.queue.put_nowait({"type": "targeted", "prompt": combined})
-        return f"[librarian: file agent queued — '{p.name}']"
+        return f"Librarian: file agent queued — '{p.name}'"
     elif prompt.strip():
         assert _runner is not None
         _runner.queue.put_nowait({"type": "targeted", "prompt": prompt.strip()})
-        return f"[librarian: targeted agent queued — '{prompt[:60]}']"
+        return f"Librarian: targeted agent queued — '{prompt[:60]}'"
     else:
         assert _runner is not None
         _runner.queue.put_nowait({"type": "trigger"})
-        return "[librarian: node ingest triggered]"
+        return "Librarian: node ingest triggered"
 
 
 # ---------------------------------------------------------------------------
@@ -709,10 +709,9 @@ def register_agent(cycle) -> None:
             )
 
         # Persist updated counter as a state_delta on the final tail node.
-        cycle.db.update_node_state_delta(
-            final_tail,
-            json.dumps({"memory_tokens_since_ingest": tokens_since}),
-        )
+        # set_state merge-writes just this key so it can't clobber another
+        # module's key already written on final_tail this turn.
+        cycle.db.set_state(final_tail, "memory_tokens_since_ingest", tokens_since)
 
     cycle.post_turn_hooks.append(_pressure_hook)
 

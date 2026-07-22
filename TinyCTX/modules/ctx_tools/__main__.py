@@ -272,7 +272,11 @@ def _register_trim(context, config):
             return None
 
         if age > trim_after:
-            return _copy(entry, content=f"[trimmed — tool output, {age} turns ago]")
+            # Content is being fully discarded — any tag this entry carried
+            # (e.g. "skill:foo" from use_skill) no longer describes anything
+            # real, so it must not survive into AssembleMeta.invalidated_tags
+            # as "present."
+            return _copy(entry, content=f"[trimmed — tool output, {age} turns ago]", tags=frozenset())
 
         if age > truncate_after and len(entry.content) > max_chars:
             half    = max_chars // 2
@@ -282,7 +286,8 @@ def _register_trim(context, config):
                 + f"\n... [{omitted} chars omitted] ...\n"
                 + entry.content[-half:]
             )
-            return _copy(entry, content=content)
+            # Truncation is also destructive to the tagged content — clear tags.
+            return _copy(entry, content=content, tags=frozenset())
 
         return None
 
@@ -337,7 +342,7 @@ def _register_tokenade(context, config):
             entry.role, entry.index, count, threshold,
         )
         stub = f"[Suspected Tokenade Blocked. Blocked ~{count} tokens.]"
-        return _copy(entry, content=stub, tool_calls=[])
+        return _copy(entry, content=stub, tool_calls=[], tags=frozenset())
 
     context.register_hook("transform_turn", transform_turn, priority=1)
 
@@ -351,4 +356,5 @@ def _copy(entry, **overrides):
         index=entry.index,
         tool_calls=overrides.get("tool_calls", entry.tool_calls),
         tool_call_id=entry.tool_call_id,
+        tags=overrides.get("tags", entry.tags),
     )

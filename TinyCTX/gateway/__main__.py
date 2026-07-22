@@ -456,25 +456,61 @@ async def handle_lane_command(request: web.Request) -> web.Response:
 
     console = _StringConsole()
 
+    # Resolve the *actual* caller for this request, same trust model as
+    # POST /v1/lane/message: cli_username (trusted because CLI access
+    # requires the gateway api_key) or the generic API user. This used to be
+    # missing entirely — commands like /model fell back to inferring the
+    # caller from node_id's session state, i.e. whoever authored the last
+    # message on that branch, which is wrong for any command run by someone
+    # other than the last speaker. See sysops/__main__.py's
+    # _resolve_model_caller for the consumer side.
+    cli_username = (body.get("cli_username") or "").strip()
+    if cli_username:
+        caller = runtime.users.get_user(cli_username)
+        if caller is None:
+            raise web.HTTPBadRequest(
+                content_type="application/json",
+                body=json.dumps({"error": f"cli_username {cli_username!r} not found"}),
+            )
+    else:
+        caller = runtime.users.resolve_user(
+            platform=Platform.API,
+            user_id="api-client",
+            username="api",
+            display_name="API Client",
+        )
+
     context: dict = {
         "node_id":   node_id,
         "console":   console,
         "runtime":   runtime,
         "agent":     None,   # no per-lane agent in new arch
         "theme_c":   lambda _k: "",
+        "caller":    caller,
+        "get_output": console.get_output,
     }
 
     handled = await runtime.commands.dispatch(text, context)
     output  = console.get_output()
 
+    # command_introspection (utils/commands.py) may have written real nodes
+    # for this command onto the branch and left the new tail here. Return it
+    # like /v1/lane/message does, so the caller advances its cursor past
+    # them — otherwise those nodes end up orphaned off the branch the caller
+    # keeps talking on.
+    new_tail = context.get("_command_introspection_tail")
+
     logger.info(
-        "gateway: /v1/lane/command node_id=%s text=%r handled=%s",
-        node_id, text, handled,
+        "gateway: /v1/lane/command node_id=%s text=%r handled=%s new_tail=%s",
+        node_id, text, handled, new_tail,
     )
 
+    resp_body = {"handled": handled, "output": output}
+    if new_tail:
+        resp_body["node_id"] = new_tail
     return web.Response(
         content_type="application/json",
-        body=json.dumps({"handled": handled, "output": output}),
+        body=json.dumps(resp_body),
     )
 
 

@@ -138,7 +138,7 @@ async def _dispatch_with_args(
     arg_values: list,
 ) -> None:
     """Collect typed Discord param values and dispatch through CommandRegistry."""
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer(ephemeral=False)
 
     channel = interaction.channel
     if isinstance(channel, discord.DMChannel):
@@ -163,6 +163,14 @@ async def _dispatch_with_args(
         "runtime":     bridge._runtime,
         "cursor":      node_id,
         "send":        _send,
+        # Real caller identity for this invocation — do NOT rely on cursor's
+        # session-state author_id downstream (that's whoever last spoke on
+        # this branch, not necessarily this interaction's user).
+        "caller_platform": "discord",
+        "caller_user_id":  str(interaction.user.id),
+        # Same buffer _send() already appends to — command_introspection
+        # reads this after dispatch() returns, no separate capture needed.
+        "get_output":  lambda: "\n".join(reply_parts),
     }
 
     # Convert typed values back to strings for the text-dispatch path.
@@ -173,6 +181,15 @@ async def _dispatch_with_args(
     if not handled:
         await interaction.followup.send("⚠️ Command not found.", ephemeral=True)
         return
+
+    # command_introspection may have written real nodes for this command
+    # onto the branch (see utils/commands.py) and left the new tail in ctx —
+    # advance our stored cursor past them, same as we do after a normal
+    # message exchange, so the next message attaches after them instead of
+    # orphaning them off the branch.
+    new_tail = ctx.get("_command_introspection_tail")
+    if new_tail and cursor_key:
+        bridge._store.set(cursor_key, new_tail)
 
     if reply_parts:
         combined = "\n".join(reply_parts)
@@ -301,6 +318,9 @@ async def handle_command_interaction(
         "runtime":     bridge._runtime,
         "cursor":      node_id,
         "send":        _send_reply,
+        "caller_platform": "discord",
+        "caller_user_id":  str(interaction.user.id),
+        "get_output":  lambda: "\n".join(reply_parts),
     }
 
     text    = f"/{namespace} {sub}".strip() if sub else f"/{namespace}"
@@ -309,6 +329,10 @@ async def handle_command_interaction(
     if not handled:
         await interaction.followup.send("⚠️ Command not found.", ephemeral=True)
         return
+
+    new_tail = ctx.get("_command_introspection_tail")
+    if new_tail and cursor_key:
+        bridge._store.set(cursor_key, new_tail)
 
     if reply_parts:
         combined = "\n".join(reply_parts)

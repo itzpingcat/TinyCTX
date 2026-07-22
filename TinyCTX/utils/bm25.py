@@ -126,5 +126,6 @@ class BM25:
             (self._ids[i], self._score(i, terms))
             for i in range(self._N)
         ]
+        scores = [s for s in scores if s[1] > 0.0]
         scores.sort(key=lambda x: x[1], reverse=True)
         return scores[:top_k]

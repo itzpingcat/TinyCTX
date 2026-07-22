@@ -49,7 +49,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from TinyCTX.context import HOOK_PRE_ASSEMBLE_ASYNC
+from TinyCTX.context import HOOK_PRE_ASSEMBLE_ASYNC, HOOK_TRANSFORM_TURN, HOOK_POST_ASSEMBLE, ROLE_TOOL
 
 logger = logging.getLogger(__name__)
 
@@ -343,11 +343,59 @@ def _expand_category_text(node: CategoryNode, depth: int = 0) -> str:
 
 _STATE_KEY = "skills_expanded_categories"
 
+# ---------------------------------------------------------------------------
+# "Skill fell out of context" tracking
+# ---------------------------------------------------------------------------
+# A use_skill() tool result gets tagged f"{_TAG_PREFIX}{name}" — derived from
+# the ORIGINATING TOOL CALL's name/arguments (structured data, never parsed
+# from the result's content). If that tagged entry later gets dropped or
+# gutted (by ctx_tools' trim/tokenade, by dedup, or by the final token-budget
+# loop), Context.assemble() reports it via AssembleMeta.invalidated_tags —
+# see context.py's "Tag survival" comment. A post_assemble hook here reads
+# ctx.state["invalidated_tags"] (set before post_assemble runs) and persists
+# the dropped skill names; a footer prompt surfaces the reminder once on the
+# NEXT turn, then clears it. This never needs to inspect string content.
+
+_TAG_PREFIX = "skill:"
+_STATE_KEY_DROPPED  = "skills_dropped"    # names to surface once, then clear
+_STATE_KEY_RESIDENT = "skills_resident"   # names currently believed present
+
+# NOTE on why "resident" tracking exists: the DB node backing a use_skill()
+# result is never deleted just because ctx_tools trims it out of one turn's
+# assembled view. That means the SAME entry gets independently re-tagged and
+# re-aged-out on every subsequent turn forever — without tracking which
+# skills were previously resident, invalidated_tags would report "foo" as
+# dropped on every single turn after the first, not just once. Resident
+# tracking turns "is X currently invalidated" (true forever once it ages out)
+# into "did X just transition from present to gone" (true exactly once).
+
+
+def _load_names(agent, key: str) -> list[str]:
+    try:
+        raw = agent.db.get_state(agent.context.tail_node_id, key, "[]")
+        return json.loads(raw)
+    except Exception:
+        return []
+
+
+def _save_names(agent, key: str, names: list[str]) -> None:
+    try:
+        agent.db.set_state(agent.context.tail_node_id, key, json.dumps(sorted(set(names))))
+    except Exception as exc:
+        logger.warning("[skills] failed to persist %s: %s", key, exc)
+
+
+def _load_dropped(agent) -> list[str]:
+    return _load_names(agent, _STATE_KEY_DROPPED)
+
+
+def _save_dropped(agent, names: list[str]) -> None:
+    _save_names(agent, _STATE_KEY_DROPPED, names)
+
 
 def _load_expanded(agent) -> set[str]:
     try:
-        state, _ = agent.db.load_session_state(agent.context.tail_node_id)
-        raw = state.get(_STATE_KEY, "[]")
+        raw = agent.db.get_state(agent.context.tail_node_id, _STATE_KEY, "[]")
         return set(json.loads(raw))
     except Exception:
         return set()
@@ -355,9 +403,12 @@ def _load_expanded(agent) -> set[str]:
 
 def _save_expanded(agent, expanded: set[str]) -> None:
     try:
-        agent.db.update_node_state_delta(
+        # set_state merge-writes just this key onto the tail node, so it
+        # can't clobber another module's key already written on this node.
+        agent.db.set_state(
             agent.context.tail_node_id,
-            json.dumps({_STATE_KEY: json.dumps(sorted(expanded))}),
+            _STATE_KEY,
+            json.dumps(sorted(expanded)),
         )
     except Exception as exc:
         logger.warning("[skills] failed to persist expanded categories: %s", exc)
@@ -504,9 +555,9 @@ def register_agent(cycle) -> None:
             try:
                 text = skill.skill_md.read_text(encoding="utf-8")
                 body = _skill_body(text)
-                return f"# Skill: {name}\n\n{body}" if body else f"[skill '{name}' has no instructions body]"
+                return f"# Skill: {name}\n\n{body}" if body else f"Skill '{name}' has no instructions body"
             except Exception as exc:
-                return f"[error reading skill '{name}': {exc}]"
+                return f"Error reading skill '{name}': {exc}"
 
         # --- case-insensitive fallback ---
         name_lower  = name.lower()
@@ -521,9 +572,9 @@ def register_agent(cycle) -> None:
         available_skills = ", ".join(sorted(skills.keys())) or "(none)"
         available_cats   = ", ".join(sorted(categories.keys())) or "(none)"
         return (
-            f"[error: '{name}' not found.\n"
+            f"Error: '{name}' not found.\n"
             f"  Skills: {available_skills}\n"
-            f"  Categories: {available_cats}]"
+            f"  Categories: {available_cats}"
         )
 
     _sk_vis = str(cfg.get("tools", {}).get("use_skill", "always_on")).lower().strip()
@@ -551,14 +602,15 @@ def register_agent(cycle) -> None:
                    Pass ["*"] to collapse all expanded categories at once.
         """
         if ephemeral:
-            return "[collapse_skill_categories: ephemeral mode is on — nothing to collapse]"
+            return "Ephemeral mode is on — nothing to collapse"
 
         expanded = _load_expanded(agent)
         if not expanded:
-            return "[collapse_skill_categories: no categories are currently expanded]"
+            return "No categories are currently expanded"
 
         if paths == ["*"]:
             collapsed = sorted(expanded)
+            unknown   = []
             _save_expanded(agent, set())
         else:
             collapsed = sorted(p for p in paths if p in expanded)
@@ -570,12 +622,102 @@ def register_agent(cycle) -> None:
             parts.append(f"Collapsed: {', '.join(collapsed)}")
         if unknown:
             parts.append(f"Not expanded (ignored): {', '.join(unknown)}")
-        return "\n".join(parts) if parts else "[collapse_skill_categories: nothing changed]"
+        return "\n".join(parts) if parts else "Nothing changed"
 
     agent.tool_handler.register_tool(
         collapse_skill_categories,
         always_on=False,   # deferred
         min_permission=25,
+    )
+
+    # ------------------------------------------------------------------
+    # Tag use_skill() results — structural, from the tool call's own
+    # name/arguments, never from the result content.
+    # ------------------------------------------------------------------
+    # Runs at priority -100 so it's the very first transform_turn hook —
+    # well before ctx_tools' dedup (0), tokenade (1), token_sanitize (2),
+    # cot_strip (5), trim (10) — so those hooks see (and can correctly
+    # clear) the tag if they gut the entry's content.
+
+    def _tag_use_skill_results(entry, age, ctx):
+        if entry.role != ROLE_TOOL or not entry.tool_call_id:
+            return None
+        for e in ctx.dialogue:
+            for tc in e.tool_calls:
+                if tc["id"] != entry.tool_call_id or tc["name"] != "use_skill":
+                    continue
+                args = tc["arguments"]
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except (json.JSONDecodeError, ValueError):
+                        args = {}
+                skill_name = args.get("name")
+                if not skill_name:
+                    return None
+                from dataclasses import replace as _replace
+                return _replace(entry, tags=entry.tags | {f"{_TAG_PREFIX}{skill_name}"})
+        return None
+
+    agent.context.register_hook(HOOK_TRANSFORM_TURN, _tag_use_skill_results, priority=-100)
+
+    # ------------------------------------------------------------------
+    # Capture invalidated skill tags -> persisted "skills_dropped" state
+    # ------------------------------------------------------------------
+
+    def _capture_dropped_skills(messages, ctx):
+        invalidated = ctx.state.get("invalidated_tags") or frozenset()
+        surviving   = ctx.state.get("surviving_tags") or frozenset()
+
+        invalidated_now = {t[len(_TAG_PREFIX):] for t in invalidated if t.startswith(_TAG_PREFIX)}
+        surviving_now   = {t[len(_TAG_PREFIX):] for t in surviving   if t.startswith(_TAG_PREFIX)}
+
+        resident = set(_load_names(agent, _STATE_KEY_RESIDENT))
+
+        # Only a skill that WAS resident and is now invalidated counts as a
+        # fresh drop worth reporting — this is the one-time transition, not
+        # "is it currently gone" (which stays true forever once it ages out).
+        newly_dropped = resident & invalidated_now
+        new_resident  = (resident - newly_dropped) | surviving_now
+
+        _save_names(agent, _STATE_KEY_RESIDENT, list(new_resident))
+
+        if newly_dropped:
+            existing = set(_load_dropped(agent))
+            _save_dropped(agent, list(existing | newly_dropped))
+        return None
+
+    agent.context.register_hook(HOOK_POST_ASSEMBLE, _capture_dropped_skills)
+
+    # ------------------------------------------------------------------
+    # Footer — surfaces the reminder once, then clears it
+    # ------------------------------------------------------------------
+
+    def _dropped_skills_footer(ctx) -> str | None:
+        session = ctx.state.get("session", {}) if ctx is not None else {}
+        names = session.get(_STATE_KEY_DROPPED)
+        try:
+            names = json.loads(names) if isinstance(names, str) else (names or [])
+        except (json.JSONDecodeError, ValueError):
+            names = []
+        if not names:
+            return None
+
+        # Surface once: clear immediately so it doesn't repeat next turn.
+        _save_dropped(agent, [])
+
+        listed = ", ".join(f'"{n}"' for n in names)
+        return (
+            f"<skill_reminder>The following skill(s) fell out of context and may no "
+            f"longer be loaded: {listed}. Call use_skill(name) again if you still "
+            f"need their instructions.</skill_reminder>"
+        )
+
+    agent.context.register_prompt(
+        "skills_dropped_footer",
+        _dropped_skills_footer,
+        role="user",
+        priority=int(cfg.get("dropped_footer_priority", 50)),
     )
 
     # ------------------------------------------------------------------

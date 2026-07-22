@@ -74,7 +74,7 @@ class AgentCycle:
 
         # Load session state (model choice, enabled tools, etc.)
         state, _ = self.db.load_session_state(node_id)
-        
+
         # Build LLMs based on primary + fallbacks
         primary_name = state.get("model") or self.config.llm.primary
         model_chain = [primary_name] + list(self.config.llm.fallback)
@@ -98,8 +98,9 @@ class AgentCycle:
         self.context = Context(
             db=self.db,
             tail_node_id=node_id,
-            token_limit=self.config.context,
+            token_limit=getattr(primary_mc, "context", 16384),
             image_tokens_per_block=getattr(primary_mc, "tokens_per_image", 280),
+            token_fuzz=self.config.token_fuzz,
         )
 
         # Wire modules into this cycle turn
@@ -127,6 +128,8 @@ class AgentCycle:
         for cycle_num in range(max_cycles):
             logger.debug("[agent] cycle %d, node %s", cycle_num + 1, node_id)
             if abort_event.is_set():
+                self._record_error_introspection("[aborted]")
+                meta["tail_node_id"] = self.context.tail_node_id
                 yield AgentError(message="[aborted]", **meta)
                 return
 
@@ -156,6 +159,8 @@ class AgentCycle:
 
             logger.debug("[agent] post-inference: error=%s tool_calls=%d", error, len(tool_calls_list))
             if error:
+                self._record_error_introspection(f"[LLM error: {error}]")
+                meta["tail_node_id"] = self.context.tail_node_id
                 yield AgentError(message=f"[LLM error: {error}]", **meta)
                 return
 
@@ -228,6 +233,26 @@ class AgentCycle:
                 logger.exception("[agent] post-turn hook '%s' raised", getattr(hook, '__name__', hook))
 
     # --- Internal Helpers ---
+
+    def _record_error_introspection(self, message: str) -> None:
+        """
+        error_introspection: write the error into the conversation as an
+        assistant-role history entry — matching what the bridge would have
+        shown the user as plain text (e.g. Discord's raw error string) —
+        so it survives into the next turn's assembled context as something
+        the LLM itself "said", rather than a system/user note. Otherwise
+        AgentError is relayed to the bridge/console and then lost; the LLM
+        never learns its last turn errored. No-op if the flag is off or
+        context isn't built yet.
+        """
+        if not getattr(self.config, "error_introspection", False):
+            return
+        if self.context is None:
+            return
+        try:
+            self.context.add(HistoryEntry.assistant(content=message))
+        except Exception:
+            logger.exception("[agent] error_introspection: failed to record error")
 
     def _build_llm(self, mc) -> LLM:
         return LLM(

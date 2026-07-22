@@ -137,7 +137,107 @@ class CommandRegistry:
             await entry.handler(args, context)
         except Exception:
             logger.exception("[commands] handler for /%s %s raised", namespace, sub)
+        else:
+            self._record_command_introspection(namespace, sub, args, context)
         return True
+
+    @staticmethod
+    def _record_command_introspection(
+        namespace: str, sub: str, args: list[str], context: dict,
+    ) -> None:
+        """
+        command_introspection: write this command invocation + its reply as
+        two real DB nodes — [user: /cmd] -> [assistant: reply] — right on
+        the branch, at the moment the command actually happened. /reset is
+        excluded — a reset starts a fresh branch and there's nothing for the
+        old branch's LLM to be told about.
+
+        This used to stash a log in session state for AgentCycle.run() to
+        replay on the *next* turn — indirect, order-fragile (state is a
+        single merge-written key, so concurrent commands on sibling
+        branches could stomp each other), and it inserted the replay in the
+        wrong position (right before whatever the next real message
+        happened to be, not at the time the command actually ran). Writing
+        the nodes directly here means they land in true chronological
+        order and are picked up by context.assemble() exactly like any
+        other turn — no separate replay step in agent.py needed.
+
+        Sets context["_command_introspection_tail"] to the new tail node id
+        on success. Bridges MUST check this after dispatch() returns and
+        advance their own cursor to it (same as they already do for
+        /v1/lane/message's returned tail) — otherwise the next real message
+        attaches to the pre-command node and these two nodes end up
+        orphaned on a dead branch. See gateway/__main__.py's
+        handle_lane_command and bridges/discord/commands.py for the two
+        current bridges wired up to do this.
+
+        Reply text comes from context["get_output"] — a zero-arg callable
+        bridges already populate for their own purposes (the gateway reads
+        it to return the HTTP response, Discord reads it to send the
+        followup) — so no capture/monkey-patching is needed here.
+
+        Best-effort: silently no-ops if the flag is off, or if this
+        bridge's context doesn't carry what we need (runtime + a
+        node_id/cursor + get_output).
+        """
+        if namespace == "reset":
+            return
+        runtime = context.get("runtime")
+        if runtime is None:
+            return
+        config = getattr(runtime, "config", None)
+        if not getattr(config, "command_introspection", False):
+            return
+        node_id = (context.get("node_id") or context.get("cursor") or "").strip()
+        if not node_id:
+            return
+        cmd_str = f"/{namespace}" + (f" {sub}" if sub else "") + (" " + " ".join(args) if args else "")
+        get_output = context.get("get_output")
+        output_str = (get_output() if callable(get_output) else "") or ""
+        output_str = output_str.strip() or "(no output)"
+        author_id = CommandRegistry._resolve_caller_username(runtime, context)
+        try:
+            user_node = runtime.db.add_node(
+                parent_id=node_id, role="user", content=cmd_str.strip(), author_id=author_id,
+            )
+            assistant_node = runtime.db.add_node(
+                parent_id=user_node.id, role="assistant", content=output_str,
+            )
+            context["_command_introspection_tail"] = assistant_node.id
+        except Exception:
+            logger.exception("[commands] command_introspection: failed to record %r", cmd_str)
+
+    @staticmethod
+    def _resolve_caller_username(runtime, context: dict) -> str | None:
+        """
+        Resolve the TinyCTX username of whoever actually ran the command, so
+        the replayed [user: ...] turn gets the same 【username】 prefix real
+        dialogue gets (see context.py's assemble — a user entry with no
+        author_id is missing that prefix entirely and logs an error).
+        Mirrors sysops/__main__.py's _resolve_model_caller preference order:
+        an already-resolved User (context["caller"]) beats a platform/user_id
+        pair (context["caller_platform"] + "caller_user_id"). Returns None
+        if the bridge supplied neither — callers should treat that as
+        "unattributable" rather than guessing.
+        """
+        caller = context.get("caller")
+        if caller is not None:
+            return getattr(caller, "username", None)
+
+        platform = context.get("caller_platform")
+        user_id = context.get("caller_user_id")
+        if platform and user_id:
+            try:
+                from TinyCTX.contracts import Platform
+                user = runtime.users.get_by_platform(Platform(platform), str(user_id))
+                return user.username if user else None
+            except Exception:
+                logger.debug(
+                    "[commands] command_introspection: failed to resolve username for "
+                    "platform=%s user_id=%s", platform, user_id, exc_info=True,
+                )
+                return None
+        return None
 
     def _find(self, namespace: str, sub: str) -> _Entry | None:
         for e in self._entries:

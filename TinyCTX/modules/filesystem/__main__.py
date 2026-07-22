@@ -161,8 +161,8 @@ def register_agent(agent) -> None:
             return None
         if abs_key not in file_read_state:
             return (
-                f"[error: {p.name} has not been read yet. "
-                "Use view() to read the file before writing to it.]"
+                f"Error: {p.name} has not been read yet. "
+                "Use view() to read the file before writing to it."
             )
         try:
             current_mtime = p.stat().st_mtime
@@ -171,9 +171,9 @@ def register_agent(agent) -> None:
         recorded_mtime = file_read_state[abs_key]["mtime"]
         if current_mtime > recorded_mtime:
             return (
-                f"[error: {p.name} has been modified since it was last read "
+                f"Error: {p.name} has been modified since it was last read "
                 "(possibly by a linter, formatter, or the user). "
-                "Read it again with view() before editing.]"
+                "Read it again with view() before editing."
             )
         return None
 
@@ -237,12 +237,12 @@ def register_agent(agent) -> None:
         """
         p = resolve(path)
         if not p.exists():
-            return f"[error: not found: {p}]"
+            return f"Error: not found: {p}"
         if p.is_dir():
             entries = sorted(p.iterdir(), key=lambda e: (e.is_file(), e.name))
             if not entries:
-                return f"[empty directory: {p}]"
-            return f"[{p}]\n" + "\n".join(f"  {e.name}{'/' if e.is_dir() else ''}" for e in entries)
+                return f"Empty directory: {p}"
+            return f"{p}\n" + "\n".join(f"  {e.name}{'/' if e.is_dir() else ''}" for e in entries)
 
         # --- image handling ---
         mime = _image_mime(p)
@@ -250,7 +250,7 @@ def register_agent(agent) -> None:
             try:
                 raw = p.read_bytes()
             except OSError as exc:
-                return f"[error: could not read {p}: {exc}]"
+                return f"Error: could not read {p}: {exc}"
             b64 = base64.b64encode(raw).decode()
             # Return a sentinel that agent._execute_tool knows how to unwrap.
             return f"{IMAGE_BLOCK_PREFIX}{mime};{b64}"
@@ -271,7 +271,7 @@ def register_agent(agent) -> None:
                     view_range = range_parts
                 parsed_range = (int(view_range[0]), int(view_range[1]))
             except (ValueError, IndexError):
-                return "[error: view_range must be [start, end] or 'start,end' integers]"
+                return "Error: view_range must be [start, end] or 'start,end' integers"
 
         # --- document handling (PDF / DOCX text extraction) ---
         ext = p.suffix.lower()
@@ -279,13 +279,13 @@ def register_agent(agent) -> None:
             try:
                 raw_doc = p.read_bytes()
             except OSError as exc:
-                return f"[error: could not read {p}: {exc}]"
+                return f"Error: could not read {p}: {exc}"
             from TinyCTX.utils import attachments
             extracted = getattr(attachments, _DOC_EXTRACTORS[ext])(raw_doc)
             if extracted is None:
                 return (
-                    f"[error: could not extract text from {p.name} -- "
-                    "pdfplumber/python-docx not installed, or extraction failed]"
+                    f"Error: could not extract text from {p.name} -- "
+                    "pdfplumber/python-docx not installed, or extraction failed"
                 )
             lines = extracted.splitlines()
             total = len(lines)
@@ -293,7 +293,7 @@ def register_agent(agent) -> None:
                 start = parsed_range[0] - 1
                 end = parsed_range[1] if parsed_range[1] != -1 else total
                 lines = lines[start:end]
-            return f"[{p} | {total} lines, extracted text]\n" + "\n".join(
+            return f"{p} | {total} lines, extracted text\n" + "\n".join(
                 f"{i:>6}\t{l}" for i, l in enumerate(lines, 1)
             )
 
@@ -304,11 +304,11 @@ def register_agent(agent) -> None:
                 text = os.fdopen(fd, "r", encoding="utf-8").read()
             except UnicodeDecodeError:
                 os.close(fd)
-                return "[error: binary file, cannot read as text]"
+                return "Error: binary file, cannot read as text"
         except OSError as exc:
             if exc.errno == 40:  # ELOOP — final component is a symlink
-                return f"[error: {p.name} is a symlink — not followed]"
-            return f"[error: could not open {p}: {exc}]"
+                return f"Error: {p.name} is a symlink — not followed"
+            return f"Error: could not open {p}: {exc}"
 
         lines = text.splitlines()
         total = len(lines)
@@ -321,7 +321,7 @@ def register_agent(agent) -> None:
             end = parsed_range[1] if parsed_range[1] != -1 else total
             lines = lines[start:end]
 
-        return f"[{p} | {total} lines]\n" + "\n".join(
+        return f"{p} | {total} lines\n" + "\n".join(
             f"{i:>6}\t{l}" for i, l in enumerate(lines, 1)
         )
 
@@ -367,7 +367,7 @@ def register_agent(agent) -> None:
             action = "appended"
 
         _update_after_write(p)
-        return f"[{action} {p} ({len(content)} chars)]"
+        return f"{action.capitalize()} {p} ({len(content)} chars)"
 
     def edit_file(path: str, old_str: str, new_str: str = "", replace_all: bool = False) -> str:
         """Replace a string in an existing file. By default old_str must appear exactly once.
@@ -381,7 +381,7 @@ def register_agent(agent) -> None:
         """
         p = resolve(path, for_write=True)
         if not p.exists():
-            return f"[error: file not found: {p}]"
+            return f"Error: file not found: {p}"
 
         # Staleness check — edit_file always targets existing files.
         err = _check_staleness(p)
@@ -394,32 +394,32 @@ def register_agent(agent) -> None:
                 original = f.read()
         except OSError as exc:
             if exc.errno == 40:
-                return f"[error: {p.name} is a symlink — not followed]"
-            return f"[error: could not open {p}: {exc}]"
+                return f"Error: {p.name} is a symlink — not followed"
+            return f"Error: could not open {p}: {exc}"
 
         # Quote normalization — match even if file uses curly quotes and
         # the LLM sent straight quotes (or vice versa).
         actual_old = _find_actual_string(original, old_str)
         if actual_old is None:
-            return f"[error: old_str not found in {p}]"
+            return f"Error: old_str not found in {p}"
 
         # Strip trailing whitespace from new_str to prevent phantom diffs.
         clean_new = _strip_trailing_ws(new_str)
 
         count = original.count(actual_old)
         if count > 1 and not replace_all:
-            return f"[error: old_str appears {count} times — add more context to make it unique, or set replace_all=true]"
+            return f"Error: old_str appears {count} times — add more context to make it unique, or set replace_all=true"
         if replace_all:
             fd = os.open(p, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(original.replace(actual_old, clean_new))
             _update_after_write(p)
-            return f"[replaced {count} occurrences in {p}]"
+            return f"Replaced {count} occurrences in {p}"
         fd = os.open(p, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(original.replace(actual_old, clean_new, 1))
         _update_after_write(p)
-        return f"[replaced 1 occurrence in {p}]"
+        return f"Replaced 1 occurrence in {p}"
 
     # ------------------------------------------------------------------
     # grep — ripgrep wrapper with Python fallback
@@ -477,9 +477,9 @@ def register_agent(agent) -> None:
             )
             return result.stdout.rstrip()
         except FileNotFoundError:
-            return "[error: ripgrep not found]"
+            return "Error: ripgrep not found"
         except subprocess.TimeoutExpired:
-            return "[error: grep timed out after 30s]"
+            return "Error: grep timed out after 30s"
 
     def _run_py_grep(
         pattern: str,
@@ -496,7 +496,7 @@ def register_agent(agent) -> None:
         try:
             regex = re.compile(pattern, flags)
         except re.error as exc:
-            return f"[error: invalid regex — {exc}]"
+            return f"Error: invalid regex — {exc}"
 
         globs = []
         if include_glob:
@@ -572,7 +572,7 @@ def register_agent(agent) -> None:
         """
         search_path = resolve(path) if path else workspace
         if not search_path.exists():
-            return f"[error: path not found: {search_path}]"
+            return f"Error: path not found: {search_path}"
         effective_limit = limit if limit > 0 else _GREP_DEFAULT_LIMIT
 
         if _has_rg:
@@ -596,7 +596,7 @@ def register_agent(agent) -> None:
             )
 
         if not raw:
-            return "[no matches]"
+            return "No matches"
 
         # Apply limit (rg doesn't have a built-in result cap)
         lines = raw.splitlines()
@@ -614,7 +614,7 @@ def register_agent(agent) -> None:
         result = "\n".join(rel_lines)
         if output_mode == "files":
             n = len(rel_lines)
-            header = f"[{n} file{'s' if n != 1 else ''} matched]"
+            header = f"{n} file{'s' if n != 1 else ''} matched"
             if truncated:
                 header += f" (truncated to {effective_limit}, use limit= for more)"
             return f"{header}\n{result}"
@@ -624,10 +624,10 @@ def register_agent(agent) -> None:
                 parts = line.rsplit(":", 1)
                 if len(parts) == 2 and parts[1].isdigit():
                     total += int(parts[1])
-            return f"[{total} matches across {len(rel_lines)} files]\n{result}"
+            return f"{total} matches across {len(rel_lines)} files\n{result}"
         else:
             if truncated:
-                result += f"\n[truncated to {effective_limit} lines]"
+                result += f"\nTruncated to {effective_limit} lines"
             return result
 
     # ------------------------------------------------------------------
@@ -650,13 +650,13 @@ def register_agent(agent) -> None:
         """
         search_path = resolve(path) if path else workspace
         if not search_path.exists():
-            return f"[error: path not found: {search_path}]"
+            return f"Error: path not found: {search_path}"
         effective_limit = limit if limit > 0 else _GLOB_DEFAULT_LIMIT
 
         try:
             matches = list(search_path.glob(pattern))
         except ValueError as exc:
-            return f"[error: invalid glob pattern — {exc}]"
+            return f"Error: invalid glob pattern — {exc}"
 
         # Filter out VCS directories
         matches = [
@@ -676,7 +676,7 @@ def register_agent(agent) -> None:
         matches = matches[:effective_limit]
 
         if not matches:
-            return "[no files found]"
+            return "No files found"
 
         # Relativize paths
         rel_paths = []
@@ -686,7 +686,7 @@ def register_agent(agent) -> None:
             except ValueError:
                 rel_paths.append(str(m))
 
-        header = f"[{len(rel_paths)} file{'s' if len(rel_paths) != 1 else ''} found]"
+        header = f"{len(rel_paths)} file{'s' if len(rel_paths) != 1 else ''} found"
         if truncated:
             header += f" (truncated to {effective_limit}, use limit= for more)"
         return f"{header}\n" + "\n".join(rel_paths)

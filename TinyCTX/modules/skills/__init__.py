@@ -19,5 +19,9 @@ EXTENSION_META = {
         # Approximate max tokens per skill entry in the index prompt.
         # name + description should comfortably fit in ~60 tokens.
         "index_priority": 5,    # system prompt priority (after soul, before memory)
+        # role=user priority for the "skill fell out of context" reminder
+        # footer (see _dropped_skills_footer). Purely cosmetic ordering
+        # relative to other role=user prompts.
+        "dropped_footer_priority": 50,
     },
 }
