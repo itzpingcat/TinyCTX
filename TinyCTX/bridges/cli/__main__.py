@@ -210,6 +210,15 @@ class CLIBridge:
         if not data.get("handled", False):
             return False
 
+        # command_introspection may have written real nodes for this command
+        # onto the branch (see utils/commands.py) and returned the new tail —
+        # advance our cursor past them, same as we do for /v1/lane/message,
+        # so the next thing we send attaches after them instead of orphaning
+        # them off the branch.
+        new_node_id = (data.get("node_id") or "").strip()
+        if new_node_id:
+            self._cursor = new_node_id
+
         output = (data.get("output") or "").strip()
         if output:
             # Render each line; use tool_ok color as neutral command output.

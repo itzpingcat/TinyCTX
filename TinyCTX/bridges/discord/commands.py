@@ -182,6 +182,15 @@ async def _dispatch_with_args(
         await interaction.followup.send("⚠️ Command not found.", ephemeral=True)
         return
 
+    # command_introspection may have written real nodes for this command
+    # onto the branch (see utils/commands.py) and left the new tail in ctx —
+    # advance our stored cursor past them, same as we do after a normal
+    # message exchange, so the next message attaches after them instead of
+    # orphaning them off the branch.
+    new_tail = ctx.get("_command_introspection_tail")
+    if new_tail and cursor_key:
+        bridge._store.set(cursor_key, new_tail)
+
     if reply_parts:
         combined = "\n".join(reply_parts)
         for i in range(0, len(combined), bridge._max_len):
@@ -320,6 +329,10 @@ async def handle_command_interaction(
     if not handled:
         await interaction.followup.send("⚠️ Command not found.", ephemeral=True)
         return
+
+    new_tail = ctx.get("_command_introspection_tail")
+    if new_tail and cursor_key:
+        bridge._store.set(cursor_key, new_tail)
 
     if reply_parts:
         combined = "\n".join(reply_parts)

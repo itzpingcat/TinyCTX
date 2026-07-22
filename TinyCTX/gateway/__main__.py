@@ -493,14 +493,24 @@ async def handle_lane_command(request: web.Request) -> web.Response:
     handled = await runtime.commands.dispatch(text, context)
     output  = console.get_output()
 
+    # command_introspection (utils/commands.py) may have written real nodes
+    # for this command onto the branch and left the new tail here. Return it
+    # like /v1/lane/message does, so the caller advances its cursor past
+    # them — otherwise those nodes end up orphaned off the branch the caller
+    # keeps talking on.
+    new_tail = context.get("_command_introspection_tail")
+
     logger.info(
-        "gateway: /v1/lane/command node_id=%s text=%r handled=%s",
-        node_id, text, handled,
+        "gateway: /v1/lane/command node_id=%s text=%r handled=%s new_tail=%s",
+        node_id, text, handled, new_tail,
     )
 
+    resp_body = {"handled": handled, "output": output}
+    if new_tail:
+        resp_body["node_id"] = new_tail
     return web.Response(
         content_type="application/json",
-        body=json.dumps({"handled": handled, "output": output}),
+        body=json.dumps(resp_body),
     )
 
 

@@ -146,21 +146,39 @@ class CommandRegistry:
         namespace: str, sub: str, args: list[str], context: dict,
     ) -> None:
         """
-        command_introspection: append this command invocation + its reply
-        text to session state (key "command_introspection_log") so
-        agent.py's AgentCycle.run() can replay it to the LLM on its next
-        turn as a real [user: /cmd] -> [assistant: reply] exchange. /reset
-        is excluded — a reset starts a fresh branch and there's nothing for
-        the old branch's LLM to be told about.
+        command_introspection: write this command invocation + its reply as
+        two real DB nodes — [user: /cmd] -> [assistant: reply] — right on
+        the branch, at the moment the command actually happened. /reset is
+        excluded — a reset starts a fresh branch and there's nothing for the
+        old branch's LLM to be told about.
+
+        This used to stash a log in session state for AgentCycle.run() to
+        replay on the *next* turn — indirect, order-fragile (state is a
+        single merge-written key, so concurrent commands on sibling
+        branches could stomp each other), and it inserted the replay in the
+        wrong position (right before whatever the next real message
+        happened to be, not at the time the command actually ran). Writing
+        the nodes directly here means they land in true chronological
+        order and are picked up by context.assemble() exactly like any
+        other turn — no separate replay step in agent.py needed.
+
+        Sets context["_command_introspection_tail"] to the new tail node id
+        on success. Bridges MUST check this after dispatch() returns and
+        advance their own cursor to it (same as they already do for
+        /v1/lane/message's returned tail) — otherwise the next real message
+        attaches to the pre-command node and these two nodes end up
+        orphaned on a dead branch. See gateway/__main__.py's
+        handle_lane_command and bridges/discord/commands.py for the two
+        current bridges wired up to do this.
 
         Reply text comes from context["get_output"] — a zero-arg callable
         bridges already populate for their own purposes (the gateway reads
         it to return the HTTP response, Discord reads it to send the
-        followup). We just call the same accessor after the handler runs
-        rather than re-capturing anything ourselves, so there's no
-        monkey-patching of "send"/"console" needed here. Best-effort:
-        silently no-ops if the flag is off, or if this bridge's context
-        doesn't carry what we need (runtime + a node_id/cursor + get_output).
+        followup) — so no capture/monkey-patching is needed here.
+
+        Best-effort: silently no-ops if the flag is off, or if this
+        bridge's context doesn't carry what we need (runtime + a
+        node_id/cursor + get_output).
         """
         if namespace == "reset":
             return
@@ -179,9 +197,13 @@ class CommandRegistry:
         output_str = output_str.strip() or "(no output)"
         author_id = CommandRegistry._resolve_caller_username(runtime, context)
         try:
-            log = list(runtime.db.get_state(node_id, "command_introspection_log", []) or [])
-            log.append({"cmd": cmd_str.strip(), "output": output_str, "author_id": author_id})
-            runtime.db.set_state(node_id, "command_introspection_log", log)
+            user_node = runtime.db.add_node(
+                parent_id=node_id, role="user", content=cmd_str.strip(), author_id=author_id,
+            )
+            assistant_node = runtime.db.add_node(
+                parent_id=user_node.id, role="assistant", content=output_str,
+            )
+            context["_command_introspection_tail"] = assistant_node.id
         except Exception:
             logger.exception("[commands] command_introspection: failed to record %r", cmd_str)
 

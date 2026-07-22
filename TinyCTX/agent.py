@@ -45,7 +45,6 @@ class AgentCycle:
         self.models: dict[str, LLM] = {}
         self.tool_handler = None
         self.caller = None        # User; set in run()
-        self._pending_command_log: list[dict] | None = None  # command_introspection staging
 
         # Extra events enqueued by tools (e.g. present()) to be yielded
         # immediately after the AgentToolResult for that tool call.
@@ -76,22 +75,6 @@ class AgentCycle:
         # Load session state (model choice, enabled tools, etc.)
         state, _ = self.db.load_session_state(node_id)
 
-        # command_introspection: surface any slash commands run on this branch
-        # since the LLM's last turn (recorded by CommandRegistry.dispatch into
-        # session state — see utils/commands.py). Replayed as real [user: /cmd]
-        # -> [assistant: reply] turn pairs, one pair per command, in the order
-        # they were run — same shape as if the LLM had been there watching it
-        # happen live. Cleared from this node onward so it isn't replayed again.
-        if getattr(self.config, "command_introspection", False):
-            cmd_log = state.get("command_introspection_log") or []
-            if cmd_log:
-                self._pending_command_log = list(cmd_log)
-                self.db.set_state(node_id, "command_introspection_log", [])
-            else:
-                self._pending_command_log = None
-        else:
-            self._pending_command_log = None
-
         # Build LLMs based on primary + fallbacks
         primary_name = state.get("model") or self.config.llm.primary
         model_chain = [primary_name] + list(self.config.llm.fallback)
@@ -119,20 +102,6 @@ class AgentCycle:
             image_tokens_per_block=getattr(primary_mc, "tokens_per_image", 280),
             token_fuzz=self.config.token_fuzz,
         )
-
-        if self._pending_command_log:
-            for entry in self._pending_command_log:
-                # author_id may be None if the bridge didn't supply a caller
-                # identity (see utils/commands.py's _resolve_caller_username)
-                # — falls back to "unknown" rather than silently dropping the
-                # 【prefix】 (a None author_id on a user entry with a parent
-                # logs an error in context.py's assemble()).
-                self.context.add(HistoryEntry.user(
-                    content=entry["cmd"],
-                    author_id=entry.get("author_id") or "unknown",
-                ))
-                self.context.add(HistoryEntry.assistant(content=entry["output"]))
-            self._pending_command_log = None
 
         # Wire modules into this cycle turn
         self.module_registry.register_agent(self)
