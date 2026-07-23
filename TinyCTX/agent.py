@@ -261,6 +261,7 @@ class AgentCycle:
             model=mc.model,
             max_tokens=mc.max_tokens,
             temperature=mc.temperature,
+            timeout=mc.timeout,
         )
 
     async def _stream_inference(self, messages, tools, model_chain, abort_event, meta):

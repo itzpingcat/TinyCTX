@@ -34,6 +34,7 @@ class ModelConfig:
     vision:             bool        = False  # Back-compat alias for multimodal chat models
     tokens_per_image:   int | None  = None   # Flat token cost per image_url block (None = vision disabled)
     context:            int         = 16384  # Token budget for conversation history when this model is primary (Context.token_limit)
+    timeout:            int         = 60     # Seconds allowed between chunks/bytes with no data before aborting (aiohttp sock_read)
 
     def __post_init__(self) -> None:
         # Back-compat: older configs/tests use `vision: true` without specifying
