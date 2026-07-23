@@ -64,7 +64,7 @@
         "pinned_user_scan": 3,
 
         # Token budget for the <memory> block injected into system prompt
-        "memory_block_tokens": 4096,
+        "memory_block_tokens": 2048,
 
         # LLM model key for librarian agents (defaults to primary)
         "librarian_model": "",
