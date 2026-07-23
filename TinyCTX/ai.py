@@ -239,7 +239,7 @@ class LLM:
         self.api_key          = api_key
         self.max_tokens       = max_tokens
         self.temperature      = temperature
-        self.timeout          = aiohttp.ClientTimeout(total=timeout)
+        self.timeout          = aiohttp.ClientTimeout(total=None, sock_read=timeout)
         self.budget_tokens    = budget_tokens
         self.reasoning_effort = reasoning_effort
         self.cache_prompts    = cache_prompts
