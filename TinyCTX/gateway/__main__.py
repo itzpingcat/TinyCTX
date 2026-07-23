@@ -185,6 +185,16 @@ async def handle_lane_message(request: web.Request) -> web.StreamResponse:
         raise web.HTTPBadRequest(content_type="application/json",
                                  body=json.dumps({"error": "node_id required"}))
 
+    # node_id may be a client-persisted cursor (e.g. the CLI bridge's
+    # data/cursors/cli file) that has gone stale — e.g. agent.db was deleted
+    # and recreated out from under it. Rather than let add_node's parent_id
+    # FK blow up mid-stream, fall back to root like /v1/lane/open does.
+    if runtime.db.get_node(node_id) is None:
+        logger.warning(
+            "gateway: lane message node_id=%s not found — resetting to root", node_id
+        )
+        node_id = runtime.db.get_root().id
+
     text = body.get("text", "").strip()
     if not text and not body.get("attachments"):
         raise web.HTTPBadRequest(content_type="application/json",
@@ -453,6 +463,14 @@ async def handle_lane_command(request: web.Request) -> web.Response:
     if not text.startswith("/"):
         raise web.HTTPBadRequest(content_type="application/json",
                                  body=json.dumps({"error": "text must start with /"}))
+
+    # Same staleness guard as /v1/lane/message: node_id may be a stale
+    # client-persisted cursor if agent.db was deleted/recreated.
+    if runtime.db.get_node(node_id) is None:
+        logger.warning(
+            "gateway: lane command node_id=%s not found — resetting to root", node_id
+        )
+        node_id = runtime.db.get_root().id
 
     console = _StringConsole()
 

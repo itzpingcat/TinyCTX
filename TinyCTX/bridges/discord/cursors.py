@@ -59,6 +59,40 @@ class CursorStore:
         return dict(self._cursors)
 
     # ------------------------------------------------------------------
+    # Reconciliation — drop cursors pointing at nodes that no longer
+    # exist in the DB (e.g. agent.db was deleted/replaced out from under
+    # the bot, so old node_ids are now dangling).
+    # ------------------------------------------------------------------
+
+    def reconcile(self, db) -> None:
+        """Drop any cursor / msg-node entries whose node_id is missing from db.
+
+        Safe to call on every startup: cheap when the DB is intact (all
+        lookups hit), and self-heals to a blank cursor state when the DB
+        was wiped, instead of letting stale node_ids blow up later as FK
+        errors on the first turn.
+        """
+        stale_cursors = [k for k, node_id in self._cursors.items() if db.get_node(node_id) is None]
+        for k in stale_cursors:
+            del self._cursors[k]
+        if stale_cursors:
+            logger.warning(
+                "CursorStore: dropped %d stale cursor(s) pointing at missing nodes: %s",
+                len(stale_cursors), stale_cursors,
+            )
+            self._save(self._cursor_file, self._cursors)
+
+        stale_msg_nodes = [k for k, node_id in self._msg_nodes.items() if db.get_node(node_id) is None]
+        for k in stale_msg_nodes:
+            del self._msg_nodes[k]
+        if stale_msg_nodes:
+            logger.warning(
+                "CursorStore: dropped %d stale msg-node mapping(s) pointing at missing nodes",
+                len(stale_msg_nodes),
+            )
+            self._save(self._msg_node_file, self._msg_nodes)
+
+    # ------------------------------------------------------------------
     # Message → node map (discord_message_id -> db_node_id)
     # ------------------------------------------------------------------
 

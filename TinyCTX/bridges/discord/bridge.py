@@ -148,6 +148,7 @@ class DiscordBridge:
         cursors_dir = data_path / "cursors"
         cursors_dir.mkdir(parents=True, exist_ok=True)
         self._store = CursorStore(cursors_dir)
+        self._store.reconcile(self._runtime.db)
 
         # Compat rules
         _bridge_dir  = Path(__file__).parent
