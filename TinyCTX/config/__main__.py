@@ -35,6 +35,8 @@ class ModelConfig:
     tokens_per_image:   int | None  = None   # Flat token cost per image_url block (None = vision disabled)
     context:            int         = 16384  # Token budget for conversation history when this model is primary (Context.token_limit)
     timeout:            int         = 60     # Seconds allowed between chunks/bytes with no data before aborting (aiohttp sock_read)
+    query_template:     str         = "{text}"  # embedding models only: wraps search queries before embedding
+    document_template:  str         = "{text}"  # embedding models only: wraps indexed content before embedding
 
     def __post_init__(self) -> None:
         # Back-compat: older configs/tests use `vision: true` without specifying
@@ -412,6 +414,8 @@ def _parse_model(raw: dict, default_context: int = 16384) -> ModelConfig:
         vision=vision,
         tokens_per_image=tokens_per_image,
         context=context,
+        query_template=raw.get("query_template", "{text}"),
+        document_template=raw.get("document_template", "{text}"),
     )
 
 

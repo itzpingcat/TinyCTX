@@ -385,7 +385,7 @@ async def _hybrid_search(
     q_vec = None
     if embedder is not None:
         try:
-            q_vec = await embedder.embed_one(query, priority=5)
+            q_vec = await embedder.embed_one(query, priority=5, kind="query")
         except Exception as exc:
             logger.warning("[rag/databanks] embed failed for '%s': %s — BM25 only", bank_name, exc)
     try:

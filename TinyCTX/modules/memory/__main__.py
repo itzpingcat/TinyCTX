@@ -486,8 +486,7 @@ async def _passive_rag_uuids(visible: set, query: str) -> list[str]:
     vec_ranks = {}
     if _runner and _runner._embedder is not None and len(_graph_db.vector_index):
         try:
-            qvec = await _runner._embedder.embed_one(
-                _cfg.get("embed_query_template", "{text}").format(text=query), priority=5)
+            qvec = await _runner._embedder.embed_one(query, priority=5, kind="query")
             allowed = _graph_db.scoped_uuids(visible)
             for rank, (uid, _s) in enumerate(
                     _graph_db.vector_index.search(qvec, k=len(allowed) or top_k, min_p=min_p, allowed=allowed), 1):

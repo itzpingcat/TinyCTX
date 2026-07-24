@@ -47,11 +47,10 @@ async def refresh_embeddings(cfg, conn, write_lock, embedder, graph_db) -> int:
     if not dirty:
         return 0
 
-    doc_tmpl = cfg.get("embed_document_template", "{text}")
     n = 0
     for uid, content in dirty:
         try:
-            vec = await embedder.embed_one(doc_tmpl.format(text=content), priority=15)
+            vec = await embedder.embed_one(content, priority=15, kind="document")
         except Exception as exc:
             logger.warning("[memory/deduper] embed failed for %s: %s", uid[:8], exc)
             continue

@@ -462,21 +462,26 @@ class Embedder:
 
     def __init__(
         self,
-        base_url:   str,
-        api_key:    str,
-        model:      str,
-        batch_size: int = 32,
-        timeout:    int = 60,
+        base_url:          str,
+        api_key:           str,
+        model:             str,
+        batch_size:        int = 32,
+        timeout:           int = 60,
+        query_template:    str = "{text}",
+        document_template: str = "{text}",
     ) -> None:
-        self.model      = model
-        self.endpoint   = f"{base_url.rstrip('/')}/embeddings"
-        self.api_key    = api_key
-        self.batch_size = batch_size
-        self.timeout    = aiohttp.ClientTimeout(total=timeout)
+        self.model             = model
+        self.endpoint          = f"{base_url.rstrip('/')}/embeddings"
+        self.api_key           = api_key
+        self.batch_size        = batch_size
+        self.timeout           = aiohttp.ClientTimeout(total=timeout)
+        self.query_template    = query_template
+        self.document_template = document_template
 
     @classmethod
     def from_config(cls, cfg: "ModelConfig", batch_size: int = 32, timeout: int = 60) -> "Embedder":  # noqa: F821
-        """Build an Embedder from a ModelConfig with kind='embedding'."""
+        """Build an Embedder from a ModelConfig with kind='embedding'. Templates
+        (query_template/document_template) come from the ModelConfig itself."""
         api_key = cfg.api_key  # resolves from env or returns "" for N/A
         return cls(
             base_url=cfg.base_url,
@@ -484,12 +489,19 @@ class Embedder:
             model=cfg.model,
             batch_size=batch_size,
             timeout=timeout,
+            query_template=cfg.query_template,
+            document_template=cfg.document_template,
         )
 
-    async def embed(self, texts: list[str], priority: int = 10) -> list[list[float]]:
+    async def embed(self, texts: list[str], priority: int = 10, kind: str = "document") -> list[list[float]]:
         """
         Embed a list of strings. Returns one float vector per input text,
         in the same order as the input. Batches automatically.
+
+        `kind` selects which template wraps each text before embedding:
+        "query" uses `query_template`, "document" (default) uses
+        `document_template`. Both default to "{text}" (no-op) unless set
+        at construction time.
 
         `priority` controls admission order when multiple requests are in
         flight at once (lower runs first, ties are FIFO).
@@ -498,6 +510,9 @@ class Embedder:
         """
         if not texts:
             return []
+
+        tmpl = self.query_template if kind == "query" else self.document_template
+        texts = [tmpl.format(text=t) for t in texts]
 
         async def _run():
             results: list[list[float]] = []
@@ -508,9 +523,9 @@ class Embedder:
 
         return await _enqueue(priority, _run)
 
-    async def embed_one(self, text: str, priority: int = 10) -> list[float]:
+    async def embed_one(self, text: str, priority: int = 10, kind: str = "document") -> list[float]:
         """Convenience wrapper — embed a single string."""
-        vecs = await self.embed([text], priority=priority)
+        vecs = await self.embed([text], priority=priority, kind=kind)
         return vecs[0]
 
     async def _call(self, texts: list[str]) -> list[list[float]]:

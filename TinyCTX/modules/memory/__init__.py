@@ -17,8 +17,6 @@ EXTENSION_META = {
 
         # --- embedding (single model; "" = BM25-only) ---
         "embedding_model":        "",
-        "embed_query_template":   "{text}",
-        "embed_document_template": "{text}",
 
         # --- passive RAG + memory block ---
         "passive_rag_enabled":   True,
@@ -59,7 +57,7 @@ EXTENSION_META = {
         # --- deduper ---
         "dedup_enabled":        True,
         "dedup_interval_hours": 6,
-        "similarity_threshold": 0.90,
+        "similarity_threshold": 0.965,
         "dedup_batch_count":    8,
     },
 }

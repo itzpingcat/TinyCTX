@@ -225,9 +225,7 @@ async def search_memory(query: str, top_k: int = 5) -> str:
     vec_ranks: dict[str, int] = {}
     if _embedder is not None and len(_graph_db.vector_index):
         try:
-            qvec = await _embedder.embed_one(
-                _cfg.get("embed_query_template", "{text}").format(text=query), priority=5
-            )
+            qvec = await _embedder.embed_one(query, priority=5, kind="query")
             allowed = _graph_db.scoped_uuids(visible)
             hits = _graph_db.vector_index.search(qvec, k=len(allowed) or top_k, min_p=min_p, allowed=allowed)
             for rank, (uid, _score) in enumerate(hits, start=1):
