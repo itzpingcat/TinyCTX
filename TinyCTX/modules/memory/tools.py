@@ -156,6 +156,15 @@ async def _touch(uid: str):
     await _aset(uid, "updated_at", now_ts())
 
 
+async def _edge_exists(src_uid: str, tgt_uid: str, relation: str) -> bool:
+    r = await _conn.execute(
+        "MATCH (a:Entity {uuid:$s})-[r:Relation]->(b:Entity {uuid:$t}) "
+        "WHERE r.relation = $rel RETURN 1 LIMIT 1",
+        parameters={"s": src_uid, "t": tgt_uid, "rel": relation},
+    )
+    return bool(r and r.has_next())
+
+
 def _mark_embed_stale(uid: str) -> None:
     """Drop the node from the live vector index; the embed pass re-adds it once
     re-embedded. Combined with embed_hash='' this is the dirty-set signal."""
@@ -549,21 +558,32 @@ async def _merge_internal(c: dict, d: dict, merged_description: str, verdict: st
         )
         return f"Aliased '{d['name']}' -> '{c['name']}'."
 
-    # duplicate: re-point out-edges then in-edges, skipping self and existing pairs
-    await _conn.execute(
-        "MATCH (d:Entity {uuid:$d})-[r:Relation]->(x:Entity), (c:Entity {uuid:$c}) "
-        "WHERE x.uuid <> $c "
-        "AND NOT EXISTS { MATCH (c)-[r2:Relation]->(x) WHERE r2.relation = r.relation } "
-        "CREATE (c)-[:Relation {relation:r.relation, weight:r.weight, created_at:r.created_at, updated_at:$now}]->(x)",
-        parameters={"d": d_uid, "c": c_uid, "now": now},
-    )
-    await _conn.execute(
-        "MATCH (x:Entity)-[r:Relation]->(d:Entity {uuid:$d}), (c:Entity {uuid:$c}) "
-        "WHERE x.uuid <> $c "
-        "AND NOT EXISTS { MATCH (x)-[r2:Relation]->(c) WHERE r2.relation = r.relation } "
-        "CREATE (x)-[:Relation {relation:r.relation, weight:r.weight, created_at:r.created_at, updated_at:$now}]->(c)",
-        parameters={"d": d_uid, "c": c_uid, "now": now},
-    )
+    # duplicate: re-point out-edges then in-edges, skipping self-edges and any
+    # (relation, other-endpoint) pair the canonical already has (collapse onto
+    # existing same-type relations). Done with explicit existence checks rather
+    # than an EXISTS{} subquery for engine portability.
+    out_edges = _graph_db._edges_from(d_uid, None)
+    for e in out_edges:
+        x = e["target_uuid"]
+        if x == c_uid:
+            continue
+        if not await _edge_exists(c_uid, x, e["relation"]):
+            await _conn.execute(
+                "MATCH (c:Entity {uuid:$c}), (x:Entity {uuid:$x}) "
+                "CREATE (c)-[:Relation {relation:$rel, weight:$w, created_at:$now, updated_at:$now}]->(x)",
+                parameters={"c": c_uid, "x": x, "rel": e["relation"], "w": e.get("weight", 0.5), "now": now},
+            )
+    in_edges = _graph_db._edges_to(d_uid, None)
+    for e in in_edges:
+        x = e["source_uuid"]
+        if x == c_uid:
+            continue
+        if not await _edge_exists(x, c_uid, e["relation"]):
+            await _conn.execute(
+                "MATCH (x:Entity {uuid:$x}), (c:Entity {uuid:$c}) "
+                "CREATE (x)-[:Relation {relation:$rel, weight:$w, created_at:$now, updated_at:$now}]->(c)",
+                parameters={"x": x, "c": c_uid, "rel": e["relation"], "w": e.get("weight", 0.5), "now": now},
+            )
     await _aset(c_uid, "description", merged_description)
     await _aset(c_uid, "embed_content", embed_content_for(c["name"], c["entity_type"], merged_description))
     await _aset(c_uid, "embed_hash", "")
@@ -692,11 +712,12 @@ def _current_mention(uid: str) -> float:
 
 
 def _bump_mention(uids: list[str], amount: float) -> None:
-    """Read-path bump via the sync connection (mention is agent-read-only)."""
+    """Read-path bump via the sync connection (mention is agent-read-only).
+    mention is always initialised to 0.0 on add, so no coalesce is needed."""
     for uid in uids:
         try:
             _graph_db.safe_execute(
-                "MATCH (e:Entity {uuid:$u}) SET e.mention = coalesce(e.mention, 0.0) + $a",
+                "MATCH (e:Entity {uuid:$u}) SET e.mention = e.mention + $a",
                 {"u": uid, "a": amount},
             )
         except Exception:
