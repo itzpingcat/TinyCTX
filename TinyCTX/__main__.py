@@ -4,9 +4,9 @@ __main__.py — `tinyctx` CLI entrypoint.
 Usage
 -----
   tinyctx onboard          Setup wizard
-  tinyctx start            Start the gateway daemon
+  tinyctx start [-w]       Start the gateway daemon (-w streams docker logs)
   tinyctx stop             Stop the daemon
-  tinyctx restart          Restart the daemon
+  tinyctx restart [-w]     Restart the daemon (-w streams docker logs)
   tinyctx status           Show daemon health
   tinyctx launch cli       Attach interactive CLI to running daemon
 """
@@ -38,6 +38,8 @@ def main() -> None:
                          help="Path to a .tinyctx instance directory")
     p_start.add_argument("--config", metavar="PATH",
                          help="Path to config.yaml")
+    p_start.add_argument("-w", "--watch", action="store_true",
+                         help="Stream docker logs after starting (Ctrl+C stops streaming, not the daemon)")
 
     # stop
     p_stop = sub.add_parser("stop", help="Stop the gateway daemon")
@@ -50,6 +52,8 @@ def main() -> None:
                            help="Path to a .tinyctx instance directory")
     p_restart.add_argument("--config", metavar="PATH",
                            help="Path to config.yaml")
+    p_restart.add_argument("-w", "--watch", action="store_true",
+                           help="Stream docker logs after restarting (Ctrl+C stops streaming, not the daemon)")
 
     # status
     p_status = sub.add_parser("status", help="Show daemon health")
