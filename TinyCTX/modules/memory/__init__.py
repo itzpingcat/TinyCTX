@@ -54,7 +54,7 @@ EXTENSION_META = {
         "decay_min_effective_mention": 0.5,
         "decay_max_edges":         1,
         "decay_stale_days":        90,
-        "fuzzy_name_threshold":    90,
+        "fuzzy_name_threshold":    95,
 
         # --- deduper ---
         "dedup_enabled":        True,

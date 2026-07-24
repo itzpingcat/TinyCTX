@@ -27,10 +27,16 @@ def build_prompt(issue) -> str:
     if kind == "too_long":
         return (
             f"The description of '{name}' (UUID {uid}) is very long ({length} chars). "
-            "Read it with search_memory. If it bundles several distinct facts, move "
-            "the peripheral ones into their own specialized entities linked with "
-            "memory_set_relationship, and trim this description via "
-            "memory_update_entity_description."
+            "Read it with search_memory, then shorten it WITHOUT LOSING INFORMATION. "
+            "Do NOT delete facts. You may only:\n"
+            "  1. MOVE peripheral facts into their own more specific entities "
+            "(memory_add_entity for a new entity if needed, then link with "
+            "memory_set_relationship), leaving a pointer via the relationship; and/or\n"
+            "  2. REMOVE genuinely DUPLICATED data — facts already stated elsewhere in "
+            "this same description or already captured on a linked entity.\n"
+            "Then rewrite the trimmed description with memory_update_entity_description "
+            "(a unified diff). Every fact must still exist somewhere in the graph "
+            "afterward — relocating and de-duplicating only, never destroying."
         )
     return (
         f"The description of '{name}' (UUID {uid}) is very short ({length} chars). "

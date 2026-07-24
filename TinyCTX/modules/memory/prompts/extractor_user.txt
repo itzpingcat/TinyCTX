@@ -1,3 +1,5 @@
-Extract durable knowledge from the conversation below and record it in the graph. Lines are formatted 【author】: content.
+Extract durable entities and relationships from the conversation excerpt below and integrate them into the knowledge graph. Lines are formatted 【author】: content.
 
+<conversation>
 {batch_text}
+</conversation>
