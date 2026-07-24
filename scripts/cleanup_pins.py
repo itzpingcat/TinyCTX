@@ -1,18 +1,21 @@
 ﻿#!/usr/bin/env python3
 """
-cleanup_global_pins.py — Interactive audit of global-pinned entities.
+cleanup_pins.py — Interactive audit of pinned entities.
 
-For each global-pinned entity, shows its full details and asks:
-  k  keep   — leave pinned:global as-is
+For each pinned entity matching the chosen target, shows its full details
+and asks:
+  k  keep   — leave pinned:<target> as-is
   u  unpin  — clear pinned_target (entity stays in graph, just not pinned)
   d  delete — remove entity from graph entirely
   q  quit   — stop and checkpoint whatever was done so far
 
 Usage:
-    python scripts/cleanup_global_pins.py
-    python scripts/cleanup_global_pins.py --config path/to/config.yaml
-    python scripts/cleanup_global_pins.py --db path/to/graph.lbug
-    python scripts/cleanup_global_pins.py --dry-run   # preview only, no writes
+    python scripts/cleanup_pins.py                       # global pins (default)
+    python scripts/cleanup_pins.py --target global
+    python scripts/cleanup_pins.py --target kamie         # a specific user's pins
+    python scripts/cleanup_pins.py --config path/to/config.yaml
+    python scripts/cleanup_pins.py --db path/to/graph.lbug
+    python scripts/cleanup_pins.py --dry-run              # preview only, no writes
 
 Config resolution (when --config isn't given or doesn't exist): resolved via
 utils/instance.py, same as the CLI (--dir / CWD .tinyctx / ~/.tinyctx).
@@ -122,11 +125,14 @@ def _open(args):
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Audit and clean up global-pinned entities")
+    parser = argparse.ArgumentParser(description="Audit and clean up pinned entities")
+    parser.add_argument("--target",  default="global", help="pinned_target to review: 'global' or a username (default: global)")
     parser.add_argument("--config",  default="config.yaml")
     parser.add_argument("--db",      default="")
     parser.add_argument("--dry-run", action="store_true", help="Preview only, no writes")
     args = parser.parse_args()
+
+    target = args.target
 
     kg_path, graph_database, gdb, write_conn = _open(args)
     print(f"db: {kg_path}")
@@ -134,24 +140,24 @@ def main() -> None:
         print("(dry-run mode -- no changes will be written)\n")
 
     entities = gdb.list_entities()
-    global_pins = [e for e in entities if e.get("pinned_target") == "global"]
-    global_pins.sort(key=lambda e: -(e.get("priority") or 0))
+    pins = [e for e in entities if e.get("pinned_target") == target]
+    pins.sort(key=lambda e: -(e.get("priority") or 0))
 
-    if not global_pins:
-        print("No global-pinned entities found.")
+    if not pins:
+        print(f"No entities pinned to '{target}' found.")
         gdb.close()
         write_conn.close()
         graph_database.close()
         return
 
-    total = len(global_pins)
-    print(f"{total} global-pinned entities to review.\n")
+    total = len(pins)
+    print(f"{total} entities pinned to '{target}' to review.\n")
     print("Commands:  k=keep  u=unpin  d=delete  q=quit\n")
     print("-" * 60)
 
     kept = unpinned = deleted = repinned = 0
 
-    for i, e in enumerate(global_pins, 1):
+    for i, e in enumerate(pins, 1):
         uid = e["uuid"]
         full = gdb.get_entity(uid)
         if not full:
