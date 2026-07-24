@@ -4,7 +4,7 @@ commands/onboard.py — `tinyctx onboard`
 Thin wrapper around the onboard package.
 
 Resolves the target instance directory the same way every other command
-does (commands/_instance.py: --dir, else .tinyctx/ in CWD, else
+does (utils/instance.py: --dir, else .tinyctx/ in CWD, else
 ~/.tinyctx) and hands it to the onboard wizard via TINYCTX_INSTANCE_DIR,
 since onboard/helpers.py needs it before argparse runs inside
 onboard.__main__.main().
@@ -15,7 +15,7 @@ import argparse
 import os
 import sys
 
-from TinyCTX.commands._instance import resolve_instance_dir
+from TinyCTX.utils.instance import resolve_instance_dir
 
 
 def run(args: argparse.Namespace) -> None:

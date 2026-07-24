@@ -706,7 +706,7 @@ async def run_detached(
     username: TinyCTX username resolved and (optionally) elevated by launch.py.
               Forwarded in every message body so the gateway can author messages
               as that user rather than the generic api-client.
-    instance_dir: resolved .tinyctx instance directory (see commands/_instance.py),
+    instance_dir: resolved .tinyctx instance directory (see utils/instance.py),
                   used only to locate this instance's cursor file under data/cursors/.
                   Falls back to ~/.tinyctx if not supplied (back-compat).
     """

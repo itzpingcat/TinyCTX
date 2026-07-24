@@ -74,23 +74,12 @@ def _delete(conn, uid: str) -> None:
     )
 
 
-def _find_config(given: str) -> Path:
-    p = Path(given)
-    if p.exists():
-        return p
-    here = Path(__file__).resolve().parent
-    for parent in [here, *here.parents]:
-        candidate = parent / "config.yaml"
-        if candidate.exists():
-            return candidate
-    return p
-
-
 def _open(args):
     if args.db:
         kg_path = Path(args.db).expanduser().resolve()
     else:
-        config_path = _find_config(args.config)
+        from TinyCTX.utils.instance import resolve_instance_dir, config_path_for
+        config_path = Path(args.config) if Path(args.config).exists() else config_path_for(resolve_instance_dir())
         if not config_path.exists():
             print(f"[error] Config not found: {config_path.resolve()}")
             sys.exit(1)

@@ -25,13 +25,13 @@ TinyCTX/
 ├── config/             Config loading (YAML → dataclasses)
 ├── users/              UserStore + User/PlatformIdentity models (SQLite)
 ├── commands/
-│   ├── _instance.py     Shared instance-directory resolution (--dir / CWD .tinyctx / ~/.tinyctx)
 │   ├── launch.py        tinyctx launch — attaches a bridge client
 │   ├── start.py         tinyctx start  — docker compose up for the resolved instance
 │   ├── stop.py          tinyctx stop   — docker compose down for the resolved instance
 │   ├── status.py        tinyctx status
 │   └── onboard.py       tinyctx onboard — delegates to onboard/
 ├── utils/
+│   ├── instance.py      Shared instance-directory resolution (--dir / CWD .tinyctx / ~/.tinyctx)
 │   ├── tool_handler.py  ToolCallHandler — register/enable/execute tools
 │   ├── commands.py      CommandRegistry — slash-command dispatch for bridges
 │   ├── attachments.py   Attachment processing (images, PDFs, text, binary)
@@ -369,7 +369,7 @@ YAML-based. Loaded from `<instance>/config.yaml` by default (see Instance Layout
 
 ---
 
-## Instance Layout (`commands/_instance.py`)
+## Instance Layout (`utils/instance.py`)
 
 An *instance* is a self-contained directory holding one agent's config, workspace, and internal data. Resolved by every CLI command the same way: `--dir` flag → nearest ancestor of CWD literally named `.tinyctx` → `.tinyctx/` child of CWD → `~/.tinyctx`. This is what makes multiple concurrent agents possible — each just needs its own instance directory.
 
@@ -377,7 +377,7 @@ An *instance* is a self-contained directory holding one agent's config, workspac
 <instance>/                 e.g. ~/.tinyctx, or anywhere via --dir
 ├── config.yaml             Loaded by default from here (workspace.path / data.path default relative to this file)
 ├── .env                     Optional. KEY=VALUE per line (e.g. DISCORD_BOT_TOKEN=...). Loaded via
-│                            `commands/_instance.py`'s `load_instance_env()` — with override=True, so
+│                            `utils/instance.py`'s `load_instance_env()` — with override=True, so
 │                            values here win over anything already exported in the shell/global env.
 │                            Loaded by `main.py` (direct/non-Docker launch) and `commands/start.py`
 │                            (Docker launch — populates the host process env before `docker compose up`,
@@ -398,7 +398,7 @@ An *instance* is a self-contained directory holding one agent's config, workspac
     └── memory/                LadybugDB graph (graph.lbug), librarian.log, dedup_cache.db
 ```
 
-Docker Compose (`compose.yaml`, always at the repo root, shared across instances) is invoked with `-f <repo>/compose.yaml -p <project>` plus env vars (`TINYCTX_CONFIG_FILE`, `TINYCTX_WORKSPACE`, `TINYCTX_DATA`, `TINYCTX_PORT`, `TINYCTX_INSTANCE`, `TINYCTX_TAG`) computed by `commands/_instance.py` from the resolved instance dir — see `compose_env()`. `TINYCTX_TAG` is a separate, short (6 hex char) hash from `TINYCTX_INSTANCE` because Docker bridge interface names are capped at 15 chars (`IFNAMSIZ`) on Linux.
+Docker Compose (`compose.yaml`, always at the repo root, shared across instances) is invoked with `-f <repo>/compose.yaml -p <project>` plus env vars (`TINYCTX_CONFIG_FILE`, `TINYCTX_WORKSPACE`, `TINYCTX_DATA`, `TINYCTX_PORT`, `TINYCTX_INSTANCE`, `TINYCTX_TAG`) computed by `utils/instance.py` from the resolved instance dir — see `compose_env()`. `TINYCTX_TAG` is a separate, short (6 hex char) hash from `TINYCTX_INSTANCE` because Docker bridge interface names are capped at 15 chars (`IFNAMSIZ`) on Linux.
 
 Non-Docker launches (`onboard`'s direct `python main.py` spawn) instead set `TINYCTX_CONFIG_FILE` in the subprocess env; `main.py` reads it if present, else defaults to `config.yaml` relative to CWD.
 

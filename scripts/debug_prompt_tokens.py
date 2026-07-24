@@ -14,7 +14,7 @@ config.yaml's `rag:`/`memory:` blocks, falling back to each module's own
 default when unset.
 
 The instance directory (and its workspace/) is auto-resolved the same way
-commands/_instance.py resolves it for start/stop/status/launch. EM.md
+utils/instance.py resolves it for start/stop/status/launch. EM.md
 defaults to living next to modules/equipment_manifest instead of the
 workspace, per equipment_manifest's own _resolve_em_path.
 
@@ -34,7 +34,7 @@ import tiktoken
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from TinyCTX.commands._instance import resolve_instance_dir
+from TinyCTX.utils.instance import resolve_instance_dir
 
 DEFAULT_FILES = ["SOUL.md", "AGENTS.md", "TOOLS.md", "EM.md"]
 

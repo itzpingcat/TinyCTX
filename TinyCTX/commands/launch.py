@@ -7,7 +7,7 @@ Reads gateway host/port/api_key directly from config.yaml and calls
 the bridge's run_detached() entry point.
 
 Default config path: resolved instance directory's config.yaml
-(see commands/_instance.py). Override with --dir or --config.
+(see utils/instance.py). Override with --dir or --config.
 
 Flags
 -----
@@ -42,7 +42,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from TinyCTX.commands._instance import resolve_instance_dir, config_path_for
+from TinyCTX.utils.instance import resolve_instance_dir, config_path_for
 
 
 def _prompt_elevate(username: str, current_level: int) -> bool:

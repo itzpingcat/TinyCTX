@@ -5,7 +5,7 @@ Starts the TinyCTX stack using Docker Compose and waits until the
 gateway responds to /v1/health.
 
 The instance directory (config.yaml, workspace/, data/) is resolved via
-commands/_instance.py: --dir, else .tinyctx/ in the current directory,
+utils/instance.py: --dir, else .tinyctx/ in the current directory,
 else ~/.tinyctx. The Docker Compose file itself always lives at the repo
 root (shared across all instances) and is invoked with -f/-p plus env
 vars pointing at this instance's directories, so multiple instances can
@@ -30,7 +30,7 @@ import time
 import os
 from pathlib import Path
 
-from TinyCTX.commands._instance import (
+from TinyCTX.utils.instance import (
     resolve_instance_dir,
     config_path_for,
     project_name_for,

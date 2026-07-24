@@ -1,7 +1,7 @@
 """
 tests/test_instance.py
 
-Tests for commands/_instance.py — shared instance-directory resolution
+Tests for utils/instance.py — shared instance-directory resolution
 and path-derivation helpers.
 
 Run with:
@@ -13,7 +13,7 @@ import os
 
 import pytest
 
-from TinyCTX.commands._instance import (
+from TinyCTX.utils.instance import (
     bridge_tag_for,
     compose_env,
     config_path_for,
@@ -70,7 +70,7 @@ class TestResolveInstanceDir:
         fake_home.mkdir()
         monkeypatch.chdir(cwd_dir)
         monkeypatch.setattr(
-            "TinyCTX.commands._instance.Path.home", lambda: fake_home
+            "TinyCTX.utils.instance.Path.home", lambda: fake_home
         )
         expected = (fake_home / ".tinyctx").resolve()
         assert resolve_instance_dir() == expected

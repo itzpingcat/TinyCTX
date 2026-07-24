@@ -275,7 +275,7 @@ def register_agent(agent) -> None:
     max_timeout     = int(_extra.get("max_timeout", 1200))
     # Default to sandbox. Operators set null explicitly for bare-metal / dev.
     # The sandbox container name is TINYCTX_INSTANCE (hashed per-instance, see
-    # commands/_instance.py::project_name_for) + "_sandbox" — falls back to
+    # utils/instance.py::project_name_for) + "_sandbox" — falls back to
     # "tinyctx" to match compose.yaml's own default when unset.
     _default_sandbox_url = f"http://{os.environ.get('TINYCTX_INSTANCE', 'tinyctx')}_sandbox:8700"
     sandbox_url = _extra.get("sandbox_url", _default_sandbox_url) or None
