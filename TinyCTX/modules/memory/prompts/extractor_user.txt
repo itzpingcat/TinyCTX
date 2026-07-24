@@ -1,0 +1,3 @@
+Extract durable knowledge from the conversation below and record it in the graph. Lines are formatted 【author】: content.
+
+{batch_text}

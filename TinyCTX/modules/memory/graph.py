@@ -1,73 +1,51 @@
-﻿"""
+"""
 modules/memory/graph.py
 
-LadybugDB schema initialisation, database lifetime management, and low-level
-graph access helpers.
+LadybugDB schema, database lifetime management, an in-memory vector index, and
+low-level scope-aware graph accessors for the v2 memory system.
 (LadybugDB is the community-maintained fork of KùzuDB.)
 
-Schema
-------
-GraphMeta — key/value store for graph-level metadata (e.g. embedding_dim,
-            embed_model name). Used to detect schema/model drift on startup.
+Schema (v2)
+-----------
+GraphMeta — key/value metadata; holds `schema_version`.
+Entity    — typed knowledge nodes. `scope` and `pinned` use the scope grammar
+            (scopes.py). `mention` is a DOUBLE (passive RAG bumps fractionally).
+            `created_at` / `updated_at` / `mention` are agent-read-only.
+Relation  — directed labelled edges. Hard-deleted on removal (no soft-delete
+            column — the old `superseded_at` is gone; tools always DETACH DELETE).
 
-Entity    — typed knowledge nodes.
-Relation  — directional labelled edges between entities.
+Embeddings
+----------
+Dimension depends on the configured model (which may change), so the column is
+DOUBLE[] (variable length) and cosine is computed in Python. A single embedding
+model is used (the old second `graph_*` model is dropped). Staleness is detected
+by a SHA-256 content hash: any write that changes name/type/description zeroes
+`embed_hash`, marking the row for lazy re-embed. The VectorIndex is an in-memory
+matrix cache invalidated by a dirty set the writers populate — we never rescan
+the table to detect staleness.
 
-Embedding notes
----------------
-Ladybug FLOAT[N] arrays support HNSW indexing but require a fixed dimension N
-known at schema-creation time. Because the embedding dimension depends on the
-configured model (which may change), we use DOUBLE[] (variable-length list)
-for the embedding column. Cosine similarity is computed in Python at query
-time, exactly as the memory module does. This trades some speed for full
-schema flexibility — fine at knowledge-graph scale.
-
-When no embedding model is configured, the embedding column is left NULL on
-all nodes and only keyword search is available.
-
-Connection usage
-----------------
-GraphDatabase owns the single ladybug.Database and is the only place that
-opens, checkpoints, or closes it.
-
-The librarian uses an AsyncConnection vended by GraphDatabase for all writes.
-The main agent tools use a sync Connection vended by GraphDatabase for reads.
-
-Ladybug supports concurrent readers with one writer via MVCC; both connection
-types are created from the same underlying Database object.
-
-Checkpoint behaviour
---------------------
-Ladybug's default CHECKPOINT_THRESHOLD is 16 MB, which a small knowledge
-graph never reaches, so the WAL would accumulate indefinitely and the main
-.lbug files would never be written during normal operation.
-
-We lower the threshold to 500 KB at schema-init time so automatic checkpointing
-fires frequently. LibrarianRunner also calls GraphDatabase.checkpoint() via a
-done-callback after each agent task completes, ensuring the WAL is flushed
-to disk promptly after every write batch.
+Connection & WAL machinery are carried forward from v1 unchanged in behaviour.
 """
 from __future__ import annotations
 
 import hashlib
 import logging
 import math
+import re
 import time
 import uuid
 from pathlib import Path
-from typing import Any, TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from typing import Any as _QueryResult  # placeholder for ladybug QueryResult
+from typing import Any
 
 logger = logging.getLogger(__name__)
+
+SCHEMA_VERSION = "2"
 
 # ---------------------------------------------------------------------------
 # Schema DDL
 # ---------------------------------------------------------------------------
 
 _SCHEMA_DDL = [
-    # Graph-level metadata
     """
     CREATE NODE TABLE IF NOT EXISTS GraphMeta (
         key STRING,
@@ -75,53 +53,39 @@ _SCHEMA_DDL = [
         PRIMARY KEY (key)
     )
     """,
-
-    # Knowledge nodes
     """
     CREATE NODE TABLE IF NOT EXISTS Entity (
-        uuid                STRING,
-        name                STRING,
-        entity_type         STRING,
-        description         STRING,
-        pinned_target       STRING,
-        priority            INT64,
-        mention_count       INT64,
-        created_at          DOUBLE,
-        updated_at          DOUBLE,
-        embed_model         STRING,
-        embed_content       STRING,
-        embed_hash          STRING,
-        embedding           DOUBLE[],
-        graph_embed_model   STRING,
-        graph_embed_content STRING,
-        graph_embed_hash    STRING,
-        graph_embedding     DOUBLE[],
+        uuid           STRING,
+        name           STRING,
+        entity_type    STRING,
+        description    STRING,
+        scope          STRING,
+        pinned         STRING,
+        mention        DOUBLE,
+        created_at     DOUBLE,
+        updated_at     DOUBLE,
+        embed_hash     STRING,
+        embed_content  STRING,
+        embedding      DOUBLE[],
         PRIMARY KEY (uuid)
     )
     """,
-
-    # Relationship edges (single table, all types via 'relation' property)
     """
     CREATE REL TABLE IF NOT EXISTS Relation (
         FROM Entity TO Entity,
-        relation     STRING,
-        weight       DOUBLE,
-        description  STRING,
-        created_at   DOUBLE,
-        superseded_at DOUBLE
+        relation    STRING,
+        weight      DOUBLE,
+        created_at  DOUBLE,
+        updated_at  DOUBLE
     )
     """,
 ]
 
-# Checkpoint threshold in bytes. Ladybug's default is 16 MB, which a small
-# knowledge graph never reaches. 500 KB ensures the WAL is flushed to the main
-# .lbug files after every modest write batch.
+# Ladybug's default checkpoint threshold (16 MB) is never reached by a small
+# graph, so the WAL would grow forever. Lower it so checkpoints fire often.
 _CHECKPOINT_THRESHOLD_BYTES = 500 * 1024  # 500 KB
 
-# ---------------------------------------------------------------------------
-# Valid entity types and suggested relation vocabulary
-# ---------------------------------------------------------------------------
-
+# Suggested (not enforced) entity types.
 ENTITY_TYPES = {
     "Person", "Concept", "Preference", "Fact", "Event", "Location",
     "Organization", "Project", "Technology", "Rule", "Directive", "Role",
@@ -133,143 +97,23 @@ ENTITY_TYPES = {
 # ---------------------------------------------------------------------------
 
 def init_schema(conn) -> None:
-    """
-    Create all tables if they don't exist and lower the checkpoint threshold.
-    Safe to call on every startup.
-    conn may be a sync ladybug.Connection or async ladybug.AsyncConnection —
-    callers must await if async (handled externally).
-    """
+    """Create tables if absent and stamp the schema version. Idempotent."""
     for ddl in _SCHEMA_DDL:
         conn.execute(ddl.strip())
-
-    logger.info("[memory/graph] schema initialised")
-
-
-
-def migrate_schema(conn) -> None:
-    """
-    Add graph_embedding and pinned_target columns to an existing Entity table.
-    Safe to call on every startup; skips columns that already exist.
-    """
-    # --- migration: graph_embedding columns ---
-    already = False
     try:
-        r = conn.execute(
-            "MATCH (m:GraphMeta {key: \'migration_graph_embedding_v1\'}) RETURN m.val LIMIT 1"
-        )
-        already = r.has_next()
+        r = conn.execute("MATCH (m:GraphMeta {key: 'schema_version'}) RETURN m.val LIMIT 1")
+        if not (r and r.has_next()):
+            conn.execute(
+                "CREATE (m:GraphMeta {key: 'schema_version', val: $v})",
+                parameters={"v": SCHEMA_VERSION},
+            )
     except Exception:
         pass
+    logger.info("[memory/graph] schema v%s initialised", SCHEMA_VERSION)
 
-    if not already:
-        cols_to_add = [
-            ("graph_embed_model",   "STRING"),
-            ("graph_embed_content", "STRING"),
-            ("graph_embed_hash",    "STRING"),
-            ("graph_embedding",     "DOUBLE[]"),
-        ]
-        for col, dtype in cols_to_add:
-            try:
-                conn.execute(f"ALTER TABLE Entity ADD {col} {dtype}")
-                logger.info("[memory/graph] migration: added column %s %s", col, dtype)
-            except Exception as exc:
-                if "already exist" in str(exc).lower() or "duplicate" in str(exc).lower():
-                    logger.debug("[memory/graph] migration: column %s already present", col)
-                else:
-                    logger.warning("[memory/graph] migration: unexpected error adding %s: %s", col, exc)
-
-        try:
-            conn.execute(
-                "CREATE (m:GraphMeta {key: \'migration_graph_embedding_v1\', val: \'done\'})"
-            )
-        except Exception:
-            pass
-
-        logger.info("[memory/graph] migration: graph_embedding columns ready")
-
-    # --- migration: pinned_target column ---
-    already_pt = False
-    try:
-        r = conn.execute(
-            "MATCH (m:GraphMeta {key: \'migration_pinned_target_v1\'}) RETURN m.val LIMIT 1"
-        )
-        already_pt = r.has_next()
-    except Exception:
-        pass
-
-    if not already_pt:
-        try:
-            conn.execute("ALTER TABLE Entity ADD pinned_target STRING")
-            logger.info("[memory/graph] migration: added column pinned_target STRING")
-        except Exception as exc:
-            if "already exist" in str(exc).lower() or "duplicate" in str(exc).lower():
-                logger.debug("[memory/graph] migration: column pinned_target already present")
-            else:
-                logger.warning("[memory/graph] migration: unexpected error adding pinned_target: %s", exc)
-
-        # Backfill: existing pinned=true entities become pinned_target='global'
-        try:
-            conn.execute(
-                "MATCH (e:Entity) WHERE e.pinned = true SET e.pinned_target = 'global'"
-            )
-            logger.info("[memory/graph] migration: backfilled pinned_target for existing pinned entities")
-        except Exception as exc:
-            logger.warning("[memory/graph] migration: backfill failed (old pinned col may not exist): %s", exc)
-
-        try:
-            conn.execute(
-                "CREATE (m:GraphMeta {key: \'migration_pinned_target_v1\', val: \'done\'})"
-            )
-        except Exception:
-            pass
-
-        logger.info("[memory/graph] migration: pinned_target ready")
-
-    # --- migration: decay columns (last_read_at, decay_score) ---
-    already_decay = False
-    try:
-        r = conn.execute(
-            "MATCH (m:GraphMeta {key: \'migration_decay_v1\'}) RETURN m.val LIMIT 1"
-        )
-        already_decay = r.has_next()
-    except Exception:
-        pass
-
-    if not already_decay:
-        cols_to_add = [
-            ("last_read_at", "DOUBLE"),
-            ("decay_score",  "DOUBLE"),
-        ]
-        for col, dtype in cols_to_add:
-            try:
-                conn.execute(f"ALTER TABLE Entity ADD {col} {dtype}")
-                logger.info("[memory/graph] migration: added column %s %s", col, dtype)
-            except Exception as exc:
-                if "already exist" in str(exc).lower() or "duplicate" in str(exc).lower():
-                    logger.debug("[memory/graph] migration: column %s already present", col)
-                else:
-                    logger.warning("[memory/graph] migration: unexpected error adding %s: %s", col, exc)
-
-        # Backfill: last_read_at defaults to updated_at (best available guess).
-        try:
-            conn.execute(
-                "MATCH (e:Entity) WHERE e.last_read_at IS NULL SET e.last_read_at = e.updated_at"
-            )
-            logger.info("[memory/graph] migration: backfilled last_read_at from updated_at")
-        except Exception as exc:
-            logger.warning("[memory/graph] migration: last_read_at backfill failed: %s", exc)
-
-        try:
-            conn.execute(
-                "CREATE (m:GraphMeta {key: \'migration_decay_v1\', val: \'done\'})"
-            )
-        except Exception:
-            pass
-
-        logger.info("[memory/graph] migration: decay columns ready")
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Small helpers
 # ---------------------------------------------------------------------------
 
 def new_uuid() -> str:
@@ -295,83 +139,37 @@ class _EmptyResult:
 
 async def execute_with_retry(conn, query: str, parameters: dict | None = None):
     """
-    Await conn.execute(), tolerating a None return.
-
-    ladybug.AsyncConnection.execute() is documented to always return a
-    QueryResult, but on a still-empty/freshly-initialised on-disk database it
-    has been observed to return None instead of a QueryResult with zero rows
-    for MATCH queries that touch no data. That's a deterministic "no rows"
-    case (an empty graph stays empty on retry), not a transient failure, so
-    treat None the same as a QueryResult with has_next() == False rather than
-    retrying or raising.
+    Await conn.execute(), tolerating a None return on a freshly-initialised DB
+    (ladybug returns None instead of an empty QueryResult for some MATCH queries
+    that touch no data — a deterministic "no rows" case, not a transient error).
     """
     result = await conn.execute(query, parameters=parameters) if parameters is not None \
         else await conn.execute(query)
     if result is None:
-        logger.debug(
-            "[memory/graph] conn.execute() returned None (treating as empty result): %s",
-            query.strip().splitlines()[0][:80],
-        )
         return _EmptyResult()
     return result
 
 
 def embed_hash(content: str) -> str:
-    """SHA-256 of the content string used to detect embedding staleness."""
+    """SHA-256 of the embed content used to detect staleness."""
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
-def embed_content_for(
-    name: str,
-    description: str,
-    *,
-    doc_template: str = "{text}",
-) -> str:
-    """Format name+description via doc_template (use {text} as placeholder)."""
-    body = f"{name} {description}"
-    return doc_template.format(text=body)
-
-
-def embed_content_with_edges(
-    name: str,
-    description: str,
-    edges_out: list[dict],
-    *,
-    doc_template: str = "{text}",
-) -> str:
+def embed_content_for(name: str, entity_type: str, description: str) -> str:
     """
-    Build the embedding string for a graph node, including its 1-hop outgoing
-    neighbourhood so that structurally different nodes with similar text
-    descriptions are pushed apart in embedding space.
-
-    Each active outgoing edge contributes a short natural-language phrase:
-        RELATION_TYPE -> target_name
-    becomes
-        "relation type -> target name"
-
-    The resulting string is passed through doc_template before being sent to
-    the embedding model, exactly like the plain embed_content_for path.
+    Canonical embed string: name, type and description. This is exactly the text
+    hashed for `embed_hash`; scope / pin / mention are NOT included because they
+    do not change semantics.
     """
-    body = f"{name} {description}"
-    if edges_out:
-        edge_phrases = [
-            f"{e['relation'].replace('_', ' ').lower()} -> {e['target_name']}"
-            for e in edges_out
-            if e.get("relation") and e.get("target_name")
-        ]
-        if edge_phrases:
-            body = body + "\nEdges: " + "; ".join(edge_phrases)
-    return doc_template.format(text=body)
+    return f"{name} ({entity_type})\n{description}".strip()
 
 
 # ---------------------------------------------------------------------------
-# Cosine similarity
+# Cosine similarity (numpy fast path, pure-Python fallback)
 # ---------------------------------------------------------------------------
 
-if TYPE_CHECKING:
-    import numpy as _np
 try:
-    import numpy as _np  # type: ignore[no-redef]
+    import numpy as _np  # type: ignore
     _NUMPY = True
 except ImportError:
     _NUMPY = False
@@ -381,38 +179,108 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
     if not a or not b or len(a) != len(b):
         return 0.0
     if _NUMPY:
-        va = _np.array(a, dtype=_np.float64)
-        vb = _np.array(b, dtype=_np.float64)
+        va = _np.asarray(a, dtype=_np.float64)
+        vb = _np.asarray(b, dtype=_np.float64)
         na = _np.linalg.norm(va)
         nb = _np.linalg.norm(vb)
         if na == 0 or nb == 0:
             return 0.0
         return float(_np.dot(va, vb) / (na * nb))
     dot = sum(x * y for x, y in zip(a, b))
-    mag_a = math.sqrt(sum(x * x for x in a))
-    mag_b = math.sqrt(sum(x * x for x in b))
-    if mag_a == 0 or mag_b == 0:
+    ma = math.sqrt(sum(x * x for x in a))
+    mb = math.sqrt(sum(x * x for x in b))
+    if ma == 0 or mb == 0:
         return 0.0
-    return dot / (mag_a * mag_b)
+    return dot / (ma * mb)
 
 
 def top_k_cosine(
     query_vec: list[float],
-    rows: list[tuple[str, list[float]]],  # [(uuid, embedding), ...]
+    rows: list[tuple[str, list[float]]],
     k: int,
 ) -> list[tuple[str, float]]:
-    """
-    Return top-k (uuid, score) pairs by cosine similarity, descending.
-    Skips rows with null/empty embeddings.
-    """
-    scored = []
-    for uid, emb in rows:
-        if not emb:
-            continue
-        score = cosine_similarity(query_vec, emb)
-        scored.append((uid, score))
+    """Top-k (uuid, score) by cosine, descending; skips empty embeddings."""
+    scored = [(uid, cosine_similarity(query_vec, emb)) for uid, emb in rows if emb]
     scored.sort(key=lambda x: x[1], reverse=True)
     return scored[:k]
+
+
+# ---------------------------------------------------------------------------
+# VectorIndex — in-memory matrix cache with dirty-set invalidation
+# ---------------------------------------------------------------------------
+
+class VectorIndex:
+    """
+    Holds `{uuid: embedding}` and answers cosine queries. Invalidation is driven
+    by callers: `upsert` when a row is (re)embedded, `remove` on delete. A numpy
+    matrix is rebuilt lazily on the next search after any mutation; without numpy
+    it falls back to per-row cosine.
+
+    `search` can restrict to an `allowed` uuid set (scope filtering) and applies
+    `min_p` BEFORE truncating to `k`, so a low-similarity node never rides a
+    small candidate pool into the results.
+    """
+
+    def __init__(self) -> None:
+        self._vecs: dict[str, list[float]] = {}
+        self._dirty = True
+        self._matrix = None            # numpy 2D array, rows aligned to _uids
+        self._uids: list[str] = []
+
+    def __len__(self) -> int:
+        return len(self._vecs)
+
+    def upsert(self, uid: str, vec: list[float]) -> None:
+        if vec:
+            self._vecs[uid] = list(vec)
+            self._dirty = True
+
+    def remove(self, uid: str) -> None:
+        if self._vecs.pop(uid, None) is not None:
+            self._dirty = True
+
+    def clear(self) -> None:
+        self._vecs.clear()
+        self._dirty = True
+
+    def _rebuild(self) -> None:
+        self._uids = list(self._vecs.keys())
+        if _NUMPY and self._uids:
+            self._matrix = _np.asarray([self._vecs[u] for u in self._uids], dtype=_np.float64)
+        else:
+            self._matrix = None
+        self._dirty = False
+
+    def search(
+        self,
+        query_vec: list[float],
+        k: int,
+        min_p: float = 0.0,
+        allowed: set[str] | None = None,
+    ) -> list[tuple[str, float]]:
+        if not query_vec or not self._vecs:
+            return []
+        if self._dirty:
+            self._rebuild()
+
+        if _NUMPY and self._matrix is not None and self._matrix.shape[0] == len(self._uids):
+            q = _np.asarray(query_vec, dtype=_np.float64)
+            qn = _np.linalg.norm(q)
+            if qn == 0:
+                return []
+            mat = self._matrix
+            norms = _np.linalg.norm(mat, axis=1)
+            norms[norms == 0] = 1.0
+            sims = (mat @ q) / (norms * qn)
+            scored = list(zip(self._uids, (float(s) for s in sims)))
+        else:
+            scored = [(u, cosine_similarity(query_vec, v)) for u, v in self._vecs.items()]
+
+        if allowed is not None:
+            scored = [(u, s) for u, s in scored if u in allowed]
+        scored = [(u, s) for u, s in scored if s >= min_p]   # min_p BEFORE top-k
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return scored[:k]
 
 
 # ---------------------------------------------------------------------------
@@ -420,167 +288,103 @@ def top_k_cosine(
 # ---------------------------------------------------------------------------
 
 def _is_wal_error(exc: BaseException) -> bool:
-    """
-    Return True when *exc* looks like the 'Cannot read size of file … .wal'
-    IO error that ladybug raises when the WAL has been deleted mid-session.
-    """
     msg = " ".join(str(a) for a in getattr(exc, "args", (str(exc),))).lower()
     return ".wal" in msg and ("no such file" in msg or "cannot read" in msg or "error 2" in msg)
 
 
 # ---------------------------------------------------------------------------
-# GraphDatabase — owns the ladybug.Database lifetime
+# GraphDatabase — owns the ladybug.Database lifetime + the VectorIndex
 # ---------------------------------------------------------------------------
 
 class GraphDatabase:
-    """
-    Owns the single ladybug.Database for the memory module.
-
-    Responsibilities:
-      - Open (or recover) the database on construction
-      - Checkpoint and close cleanly on shutdown
-      - Rebuild mid-session if a WAL error is detected
-      - Vend sync and async connections to callers
-
-    All ladybug imports are local so the module can be imported without
-    ladybug installed (e.g. for type checking or testing stubs).
-    """
+    """Single owner of the ladybug.Database: open/recover/checkpoint/close, and
+    the process-wide VectorIndex."""
 
     def __init__(self, graph_path: Path, max_concurrent: int = 4) -> None:
-        self._graph_path    = graph_path
+        self._graph_path = graph_path
         self._max_concurrent = max_concurrent
+        self.vector_index = VectorIndex()
 
         graph_path.parent.mkdir(parents=True, exist_ok=True)
         self._db = self._open_db(graph_path)
-
-        # Apply schema immediately so callers get a ready-to-use database.
         self._apply_schema()
-
-    # ------------------------------------------------------------------
-    # Open / recover
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _open_db(graph_path: Path):
-        """
-        Open (or create) a ladybug.Database at *graph_path*.
-
-        On failure, wipe auxiliary files (including any stale .wal) adjacent
-        to the DB file and retry once with a fresh database.
-        """
         import ladybug
-
         try:
             return ladybug.Database(str(graph_path), checkpoint_threshold=_CHECKPOINT_THRESHOLD_BYTES)
         except Exception as exc:
-            logger.warning(
-                "[memory/graph] DB failed to open (%s) — wiping auxiliary files and retrying",
-                exc,
-            )
-            parent = graph_path.parent
-            stem   = graph_path.name
+            logger.warning("[memory/graph] DB open failed (%s) — wiping aux files and retrying", exc)
+            parent, stem = graph_path.parent, graph_path.name
             for p in parent.iterdir():
                 if p.name.startswith(stem) and p.name != stem:
                     try:
                         p.unlink()
-                        logger.info("[memory/graph] deleted stale file %s", p)
-                    except OSError as del_exc:
-                        logger.warning("[memory/graph] could not delete %s: %s", p, del_exc)
+                    except OSError:
+                        pass
             return ladybug.Database(str(graph_path), checkpoint_threshold=_CHECKPOINT_THRESHOLD_BYTES)
 
     def _apply_schema(self) -> None:
-        """Run schema DDL and configuration on a fresh sync connection, then close it."""
         import ladybug
         conn = ladybug.Connection(self._db)
         try:
             init_schema(conn)
-            migrate_schema(conn)
         finally:
             conn.close()
 
     def rebuild(self, stale_write_conn=None) -> None:
-        """
-        Rebuild the database after a mid-session WAL error.
-
-        Closes *stale_write_conn* if provided (best-effort), wipes auxiliary
-        files, reopens the database, and re-applies the schema.  The caller
-        must discard any connections obtained before this call and request
-        fresh ones via new_read_conn() / new_async_write_conn().
-        """
-        logger.warning("[memory/graph] WAL missing mid-session — rebuilding database")
-
+        logger.warning("[memory/graph] WAL missing mid-session — rebuilding")
         if stale_write_conn is not None:
             try:
                 stale_write_conn.close()
             except Exception:
                 pass
-
         self._db = self._open_db(self._graph_path)
         self._apply_schema()
-        logger.info("[memory/graph] database rebuilt successfully after WAL loss")
-
-    # ------------------------------------------------------------------
-    # Connection factories
-    # ------------------------------------------------------------------
+        logger.info("[memory/graph] database rebuilt after WAL loss")
 
     def new_read_conn(self):
-        """
-        Return a new sync ladybug.Connection for read operations.
-
-        If a WAL error fires on open, rebuild the database first and retry.
-        """
         import ladybug
-
         try:
             return ladybug.Connection(self._db)
         except Exception as exc:
             if _is_wal_error(exc):
-                logger.warning(
-                    "[memory/graph] new_read_conn: WAL error (%s) — rebuilding", exc
-                )
                 self.rebuild()
                 return ladybug.Connection(self._db)
             raise
 
     def new_async_write_conn(self):
-        """
-        Return a new ladybug.AsyncConnection for write operations (librarian).
-        """
         import ladybug
-
-        return ladybug.AsyncConnection(
-            self._db,
-            max_concurrent_queries=self._max_concurrent,
-        )
-
-    # ------------------------------------------------------------------
-    # Checkpoint
-    # ------------------------------------------------------------------
+        return ladybug.AsyncConnection(self._db, max_concurrent_queries=self._max_concurrent)
 
     def checkpoint(self) -> None:
-        """
-        Flush the WAL into the main database files.
-
-        Opens a fresh sync connection so there is no active transaction
-        conflict. Safe to call at any time; logs a warning on failure rather
-        than raising (checkpoint is best-effort outside of shutdown).
-        """
         import ladybug
-
         try:
             conn = ladybug.Connection(self._db)
             conn.execute("CHECKPOINT")
             conn.close()
-            logger.debug("[memory/graph] checkpoint complete")
         except Exception as exc:
             logger.warning("[memory/graph] checkpoint failed: %s", exc)
 
-    # ------------------------------------------------------------------
-    # Shutdown
-    # ------------------------------------------------------------------
+    def warm_index(self) -> None:
+        """Load already-embedded rows into the VectorIndex on cold start. No
+        recompute — only rows whose embedding is present are loaded."""
+        try:
+            conn = self.new_read_conn()
+            r = conn.execute("MATCH (e:Entity) WHERE e.embedding IS NOT NULL RETURN e.uuid, e.embedding")
+            n = 0
+            while r and r.has_next():
+                row = r.get_next()
+                if row[1]:
+                    self.vector_index.upsert(row[0], row[1])
+                    n += 1
+            conn.close()
+            logger.info("[memory/graph] vector index warmed with %d embeddings", n)
+        except Exception as exc:
+            logger.warning("[memory/graph] warm_index failed: %s", exc)
 
     def close(self) -> None:
-        """Checkpoint then close the database."""
         self.checkpoint()
         try:
             self._db.close()
@@ -589,55 +393,31 @@ class GraphDatabase:
 
 
 # ---------------------------------------------------------------------------
-# GraphDB — sync read accessor for the main agent tools
+# GraphDB — sync, scope-aware read accessor for the tools
 # ---------------------------------------------------------------------------
 
 class GraphDB:
-    """
-    Sync graph accessor for use in the main agent's tool implementations.
-
-    Holds a sync ladybug.Connection obtained from a GraphDatabase.  On a
-    mid-session WAL error, safe_execute asks the owning GraphDatabase to
-    rebuild and then opens a fresh connection automatically.
-    """
+    """Sync read accessor. Every public read takes a `visible` scope set and
+    filters `WHERE e.scope IN visible`, so no read path can return an
+    out-of-scope node. On a WAL error it rebuilds and retries once."""
 
     def __init__(self, graph_database: GraphDatabase) -> None:
-        self._gdb  = graph_database
+        self._gdb = graph_database
         self._conn = graph_database.new_read_conn()
 
-    # ------------------------------------------------------------------
-    # Safe execute — retries once after a mid-session WAL rebuild
-    # ------------------------------------------------------------------
+    @property
+    def vector_index(self) -> VectorIndex:
+        return self._gdb.vector_index
 
     def safe_execute(self, query: str, parameters: dict | None = None) -> Any:
-        """
-        Execute *query* on the current connection.
-
-        On a WAL-missing error the GraphDatabase is rebuilt, a fresh
-        connection is opened, and the query is retried once.  Any other
-        exception propagates normally.
-        """
-        kwargs: dict = {}
-        if parameters:
-            kwargs["parameters"] = parameters
-
+        kwargs: dict = {"parameters": parameters} if parameters else {}
         try:
             return self._conn.execute(query, **kwargs)
         except Exception as exc:
             if _is_wal_error(exc):
-                logger.warning(
-                    "[memory/graph] WAL error on read query — rebuilding: %s", exc
-                )
-                try:
-                    self._gdb.rebuild()
-                    self._conn = self._gdb.new_read_conn()
-                    logger.info("[memory/graph] connection rebuilt; retrying query")
-                    return self._conn.execute(query, **kwargs)
-                except Exception as retry_exc:
-                    logger.error(
-                        "[memory/graph] query still failing after rebuild: %s", retry_exc
-                    )
-                    raise retry_exc from exc
+                self._gdb.rebuild()
+                self._conn = self._gdb.new_read_conn()
+                return self._conn.execute(query, **kwargs)
             raise
 
     def close(self) -> None:
@@ -646,262 +426,168 @@ class GraphDB:
         except Exception:
             pass
 
-    # ------------------------------------------------------------------
-    # Read operations
-    # ------------------------------------------------------------------
+    # -- helpers ------------------------------------------------------------
 
-    def get_entity(self, uid: str) -> dict | None:
-        r = self.safe_execute(
-            "MATCH (e:Entity {uuid: $uid}) RETURN e.*",
-            parameters={"uid": uid},
-        )
-        if not r.has_next():
+    @staticmethod
+    def _rows_to_dicts(result, cols: list[str]) -> list[dict]:
+        rows = []
+        while result and result.has_next():
+            rows.append(dict(zip(cols, result.get_next())))
+        return rows
+
+    @staticmethod
+    def _scope_ok(scope, visible: set[str] | None) -> bool:
+        return visible is None or (scope in visible)
+
+    # -- entity reads (scope-filtered) --------------------------------------
+
+    def get_entity(self, uid: str, visible: set[str] | None = None) -> dict | None:
+        r = self.safe_execute("MATCH (e:Entity {uuid: $uid}) RETURN e.*", {"uid": uid})
+        if not (r and r.has_next()):
             return None
         row = r.get_next()
-        col_names = r.get_column_names()
-        entity = dict(zip(col_names, row))
-
-        entity["edges_out"] = self._active_edges_from(uid)
-        entity["edges_in"]  = self._active_edges_to(uid)
+        entity = dict(zip(r.get_column_names(), row))
+        if not self._scope_ok(entity.get("e.scope"), visible):
+            return None
+        entity["edges_out"] = self._edges_from(uid, visible)
+        entity["edges_in"] = self._edges_to(uid, visible)
         return entity
 
-    def find_entity(self, name: str | None = None, entity_type: str | None = None) -> list[dict]:
-        if name and entity_type:
-            r = self.safe_execute(
-                "MATCH (e:Entity) WHERE e.name CONTAINS $name AND e.entity_type = $et RETURN e.uuid, e.name, e.entity_type, e.description LIMIT 10",
-                parameters={"name": name, "et": entity_type},
-            )
-        elif name:
-            r = self.safe_execute(
-                "MATCH (e:Entity) WHERE e.name CONTAINS $name RETURN e.uuid, e.name, e.entity_type, e.description LIMIT 10",
-                parameters={"name": name},
-            )
-        elif entity_type:
-            r = self.safe_execute(
-                "MATCH (e:Entity) WHERE e.entity_type = $et RETURN e.uuid, e.name, e.entity_type, e.description LIMIT 10",
-                parameters={"et": entity_type},
-            )
-        else:
-            return []
-        return self._rows_to_dicts(r, ["uuid", "name", "entity_type", "description"])
-
-    def list_entities(self, entity_type: str | None = None, pinned_only: bool = False) -> list[dict]:
-        clauses = []
-        params: dict[str, Any] = {}
-        if entity_type:
-            clauses.append("e.entity_type = $et")
-            params["et"] = entity_type
-        if pinned_only:
-            clauses.append("e.pinned_target IS NOT NULL")
-        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    def get_entity_slim(self, uid: str, visible: set[str] | None = None) -> dict | None:
         r = self.safe_execute(
-            f"MATCH (e:Entity) {where} RETURN e.uuid, e.name, e.entity_type, e.description, e.pinned_target, e.priority ORDER BY e.priority DESC",
-            parameters=params if params else None,
+            "MATCH (e:Entity {uuid: $uid}) RETURN e.uuid, e.name, e.entity_type, e.description, e.scope",
+            {"uid": uid},
         )
-        return self._rows_to_dicts(r, ["uuid", "name", "entity_type", "description", "pinned_target", "priority"])
-
-    def get_pinned_entities_full(self) -> list[dict]:
-        """
-        Return full entity dicts (including edges) for all pinned entities,
-        ordered by priority descending. Used by the memory block assembler.
-        """
-        r = self.safe_execute(
-            "MATCH (e:Entity) WHERE e.pinned_target IS NOT NULL RETURN e.uuid ORDER BY e.priority DESC"
-        )
-        uuids = [row[0] for row in self._drain(r)]
-        results = []
-        for uid in uuids:
-            entity = self.get_entity(uid)
-            if entity:
-                results.append(entity)
-        return results
-
-    def get_entity_slim(self, uid: str) -> dict | None:
-        """Fetch name/type/description only — no edges. Used for linked-node rendering."""
-        r = self.safe_execute(
-            "MATCH (e:Entity {uuid: $uid}) "
-            "RETURN e.uuid, e.name, e.entity_type, e.description",
-            parameters={"uid": uid},
-        )
-        if not r.has_next():
+        if not (r and r.has_next()):
             return None
         row = r.get_next()
-        return {"uuid": row[0], "name": row[1], "entity_type": row[2], "description": row[3]}
+        if not self._scope_ok(row[4], visible):
+            return None
+        return {"uuid": row[0], "name": row[1], "entity_type": row[2], "description": row[3], "scope": row[4]}
 
-    def traverse(
-        self,
-        uid: str,
-        hops: int = 1,
-        relation_filter: str | None = None,
-    ) -> list[dict]:
-        """Walk outward from uid up to N hops, active edges only."""
-        visited: set[str] = {uid}
-        frontier: set[str] = {uid}
-        all_edges: list[dict] = []
-
-        for _ in range(hops):
-            if not frontier:
-                break
-            next_frontier: set[str] = set()
-            for src in frontier:
-                for edge in self._active_edges_from(src):
-                    tgt = edge["target_uuid"]
-                    if relation_filter and edge["relation"] != relation_filter:
-                        continue
-                    if tgt not in visited:
-                        next_frontier.add(tgt)
-                        visited.add(tgt)
-                    all_edges.append(edge)
-            frontier = next_frontier
-
-        return all_edges
-
-    def get_stats(self) -> dict:
-        entity_count = self.safe_execute(
-            "MATCH (e:Entity) RETURN count(e)"
-        ).get_next()[0]
-
-        edge_count = self.safe_execute(
-            "MATCH ()-[r:Relation]->() WHERE r.superseded_at IS NULL RETURN count(r)"
-        ).get_next()[0]
-
-        superseded_edge_count = self.safe_execute(
-            "MATCH ()-[r:Relation]->() WHERE r.superseded_at IS NOT NULL RETURN count(r)"
-        ).get_next()[0]
-
-        pinned_count = self.safe_execute(
-            "MATCH (e:Entity) WHERE e.pinned_target IS NOT NULL RETURN count(e)"
-        ).get_next()[0]
-
-        avg_priority_row = self.safe_execute(
-            "MATCH (e:Entity) RETURN avg(e.priority)"
-        ).get_next()[0]
-        avg_priority = round(float(avg_priority_row), 1) if avg_priority_row is not None else 0.0
-
-        embedded_count = self.safe_execute(
-            "MATCH (e:Entity) WHERE e.embedding IS NOT NULL RETURN count(e)"
-        ).get_next()[0]
-
+    def find_by_name(self, name: str, visible: set[str] | None = None) -> list[dict]:
+        """Substring name match, scope-filtered. Used for exact-match resolution."""
         r = self.safe_execute(
-            "MATCH (e:Entity) RETURN e.entity_type, count(e) ORDER BY count(e) DESC"
+            "MATCH (e:Entity) WHERE e.name =~ $rx "
+            "RETURN e.uuid, e.name, e.entity_type, e.description, e.scope LIMIT 25",
+            {"rx": f"(?i).*{_regex_escape(name)}.*"},
         )
+        out = self._rows_to_dicts(r, ["uuid", "name", "entity_type", "description", "scope"])
+        return [e for e in out if self._scope_ok(e["scope"], visible)]
+
+    def name_exists_in_scope(self, name: str, scope: str) -> str | None:
+        """Return the uuid of an entity with this exact name in this exact scope,
+        or None. Used by memory_add_entity's atomic uniqueness check."""
+        r = self.safe_execute(
+            "MATCH (e:Entity) WHERE e.name = $n AND e.scope = $s RETURN e.uuid LIMIT 1",
+            {"n": name, "s": scope},
+        )
+        if r and r.has_next():
+            return r.get_next()[0]
+        return None
+
+    def scoped_uuids(self, visible: set[str]) -> set[str]:
+        """All uuids visible in `visible` — used to constrain vector search."""
+        r = self.safe_execute("MATCH (e:Entity) RETURN e.uuid, e.scope")
+        out: set[str] = set()
+        while r and r.has_next():
+            uid, scope = r.get_next()
+            if scope in visible:
+                out.add(uid)
+        return out
+
+    def bm25_corpus(self, visible: set[str]) -> list[tuple[str, str]]:
+        """[(uuid, text)] for BM25 over the visible scope only."""
+        r = self.safe_execute("MATCH (e:Entity) RETURN e.uuid, e.name, e.entity_type, e.description, e.scope")
+        out = []
+        while r and r.has_next():
+            uid, name, et, desc, scope = r.get_next()
+            if scope in visible:
+                out.append((uid, f"{name or ''} {et or ''} {desc or ''}"))
+        return out
+
+    def pinned_entities(self, visible: set[str]) -> list[dict]:
+        """Full dicts (with edges) for pinned entities whose pin target is in the
+        visible set, most-recently-updated first."""
+        r = self.safe_execute(
+            "MATCH (e:Entity) WHERE e.pinned <> '' AND e.pinned IS NOT NULL "
+            "RETURN e.uuid, e.pinned ORDER BY e.updated_at DESC"
+        )
+        results = []
+        while r and r.has_next():
+            uid, pin = r.get_next()
+            if pin in visible:
+                ent = self.get_entity(uid, visible)
+                if ent:
+                    results.append(ent)
+        return results
+
+    def get_stats(self, visible: set[str]) -> dict:
+        r = self.safe_execute("MATCH (e:Entity) RETURN e.uuid, e.entity_type, e.scope, e.pinned, e.mention, e.embedding")
         by_type: dict[str, int] = {}
-        while r.has_next():
-            row = r.get_next()
-            by_type[row[0]] = row[1]
-
-        r2 = self.safe_execute(
-            "MATCH (e:Entity) WHERE e.mention_count > 0 "
-            "RETURN e.name, e.entity_type, e.mention_count "
-            "ORDER BY e.mention_count DESC LIMIT 5"
-        )
-        top_mentioned: list[dict] = []
-        while r2.has_next():
-            row = r2.get_next()
-            top_mentioned.append({"name": row[0], "entity_type": row[1], "mention_count": row[2]})
-
+        pinned_by_scope: dict[str, int] = {}
+        entity_count = embedded = 0
+        vis_uuids: set[str] = set()
+        while r and r.has_next():
+            uid, et, scope, pin, mention, emb = r.get_next()
+            if scope not in visible:
+                continue
+            vis_uuids.add(uid)
+            entity_count += 1
+            by_type[et] = by_type.get(et, 0) + 1
+            if pin:
+                pinned_by_scope[pin] = pinned_by_scope.get(pin, 0) + 1
+            if emb:
+                embedded += 1
+        edge_count = self._count_visible_edges(vis_uuids)
         return {
-            "entity_count":           entity_count,
-            "active_edge_count":      edge_count,
-            "superseded_edge_count":  superseded_edge_count,
-            "pinned_count":           pinned_count,
-            "avg_priority":           avg_priority,
-            "embedded_count":         embedded_count,
-            "by_type":                by_type,
-            "top_mentioned":          top_mentioned,
+            "entity_count": entity_count,
+            "edge_count": edge_count,
+            "pinned_by_scope": pinned_by_scope,
+            "embedded_count": embedded,
+            "by_type": by_type,
         }
 
-    def all_entities_for_bm25(self) -> list[tuple[str, str]]:
-        """Return [(uuid, text)] for BM25 indexing — name + description concatenated."""
-        r = self.safe_execute(
-            "MATCH (e:Entity) RETURN e.uuid, e.name, e.entity_type, e.description"
-        )
-        results = []
-        while r.has_next():
-            row = r.get_next()
-            uid, name, etype, desc = row[0], row[1] or "", row[2] or "", row[3] or ""
-            results.append((uid, f"{name} {etype} {desc}"))
-        return results
+    def _count_visible_edges(self, vis_uuids: set[str]) -> int:
+        if not vis_uuids:
+            return 0
+        r = self.safe_execute("MATCH (a:Entity)-[:Relation]->(b:Entity) RETURN a.uuid, b.uuid")
+        n = 0
+        while r and r.has_next():
+            a, b = r.get_next()
+            if a in vis_uuids and b in vis_uuids:
+                n += 1
+        return n
 
-    def all_entities_with_embeddings(self) -> list[tuple[str, list[float]]]:
-        """Return [(uuid, embedding)] for all entities that have embeddings."""
-        r = self.safe_execute(
-            "MATCH (e:Entity) WHERE e.embedding IS NOT NULL RETURN e.uuid, e.embedding"
-        )
-        results = []
-        while r.has_next():
-            row = r.get_next()
-            emb = row[1]
-            if emb:
-                results.append((row[0], emb))
-        return results
+    # -- edge reads (both endpoints must be visible) ------------------------
 
-    def all_entities_with_graph_embeddings(self) -> list[tuple[str, list[float]]]:
-        """
-        Return [(uuid, embedding)] for dedup, preferring graph_embedding.
-        Falls back to the regular search embedding when graph_embedding is NULL.
-        """
-        r = self.safe_execute(
-            "MATCH (e:Entity) RETURN e.uuid, e.graph_embedding, e.embedding"
-        )
-        results = []
-        while r.has_next():
-            row = r.get_next()
-            uid, graph_emb, search_emb = row[0], row[1], row[2]
-            emb = graph_emb if graph_emb else search_emb
-            if emb:
-                results.append((uid, emb))
-        return results
-
-    def bump_mention_count(self, uids: list[str]) -> None:
-        for uid in uids:
-            self.safe_execute(
-                "MATCH (e:Entity {uuid: $uid}) SET e.mention_count = e.mention_count + 1",
-                parameters={"uid": uid},
-            )
-
-    def bump_last_read(self, uids: list[str], ts: float) -> None:
-        """Stamp last_read_at on the given entities. Used by kg_search to mark
-        entities as actively recalled (distinct from updated_at, which tracks
-        content edits) so the decay sweep can weigh read-recency."""
-        for uid in uids:
-            self.safe_execute(
-                "MATCH (e:Entity {uuid: $uid}) SET e.last_read_at = $ts",
-                parameters={"uid": uid, "ts": ts},
-            )
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _active_edges_from(self, uid: str) -> list[dict]:
+    def _edges_from(self, uid: str, visible: set[str] | None) -> list[dict]:
         r = self.safe_execute(
             "MATCH (a:Entity {uuid: $uid})-[r:Relation]->(b:Entity) "
-            "WHERE r.superseded_at IS NULL "
-            "RETURN b.uuid, b.name, r.relation, r.weight, r.description",
-            parameters={"uid": uid},
+            "RETURN b.uuid, b.name, b.scope, r.relation, r.weight",
+            {"uid": uid},
         )
-        return self._rows_to_dicts(r, ["target_uuid", "target_name", "relation", "weight", "description"])
+        out = []
+        while r and r.has_next():
+            tgt, tname, tscope, rel, w = r.get_next()
+            if self._scope_ok(tscope, visible):
+                out.append({"target_uuid": tgt, "target_name": tname, "relation": rel, "weight": w})
+        return out
 
-    def _active_edges_to(self, uid: str) -> list[dict]:
+    def _edges_to(self, uid: str, visible: set[str] | None) -> list[dict]:
         r = self.safe_execute(
             "MATCH (a:Entity)-[r:Relation]->(b:Entity {uuid: $uid}) "
-            "WHERE r.superseded_at IS NULL "
-            "RETURN a.uuid, a.name, r.relation, r.weight, r.description",
-            parameters={"uid": uid},
+            "RETURN a.uuid, a.name, a.scope, r.relation, r.weight",
+            {"uid": uid},
         )
-        return self._rows_to_dicts(r, ["source_uuid", "source_name", "relation", "weight", "description"])
+        out = []
+        while r and r.has_next():
+            src, sname, sscope, rel, w = r.get_next()
+            if self._scope_ok(sscope, visible):
+                out.append({"source_uuid": src, "source_name": sname, "relation": rel, "weight": w})
+        return out
 
-    @staticmethod
-    def _rows_to_dicts(result, col_names: list[str]) -> list[dict]:
-        rows = []
-        while result.has_next():
-            rows.append(dict(zip(col_names, result.get_next())))
-        return rows
 
-    @staticmethod
-    def _drain(result) -> list:
-        rows = []
-        while result.has_next():
-            rows.append(result.get_next())
-        return rows
+def _regex_escape(s: str) -> str:
+    """Escape a string for use inside a Cypher =~ regex literal."""
+    return re.sub(r"([.^$*+?()\[\]{}|\\])", r"\\\1", s)
