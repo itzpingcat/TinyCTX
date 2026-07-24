@@ -486,6 +486,17 @@ class GraphDB:
             return r.get_next()[0]
         return None
 
+    def all_scopes(self) -> set[str]:
+        """Every distinct scope present in the graph. Used by the /memory stats
+        diagnostic command to show full totals rather than one cycle's view."""
+        r = self.safe_execute("MATCH (e:Entity) RETURN DISTINCT e.scope")
+        out: set[str] = set()
+        while r and r.has_next():
+            s = r.get_next()[0]
+            if s:
+                out.add(s)
+        return out
+
     def scoped_uuids(self, visible: set[str]) -> set[str]:
         """All uuids visible in `visible` — used to constrain vector search."""
         r = self.safe_execute("MATCH (e:Entity) RETURN e.uuid, e.scope")

@@ -237,6 +237,45 @@ async def test_vector_search_and_embedding_pass(tmp_path):
         gdbase.close()
 
 
+async def test_dedup_progress_in_stats(tmp_path):
+    from TinyCTX.modules.memory import deduper
+
+    class DupEmbedder:
+        async def embed_one(self, text, priority=10):
+            # near-identical vectors for the two "Atlas" nodes -> a candidate pair
+            return [1.0, 0.0] if "atlas" in text.lower() else [0.0, 1.0]
+
+    class DupLLM:
+        async def stream(self, messages, tools=None, priority=10):
+            from TinyCTX.ai import TextDelta
+            import re
+            uuids = re.findall(r"UUID (\S+)", messages[-1]["content"])
+            payload = "[]"
+            if len(uuids) >= 2:
+                payload = ('[{"canonical":"%s","duplicate":"%s","merged_description":"m","verdict":"duplicate"}]'
+                           % (uuids[0], uuids[1]))
+            yield TextDelta(text=payload)
+
+    gdbase, graph_db = _make_graph(tmp_path, embedder=DupEmbedder(),
+                                   cfg={"similarity_threshold": 0.9})
+    try:
+        with tools.scope_context({"global"}):
+            await tools.memory_add_entity("Atlas One", "Project", "atlas alpha", "global")
+            await tools.memory_add_entity("Atlas Two", "Project", "atlas beta", "global")
+            await tools.memory_add_entity("Salsa", "Concept", "unrelated", "global")
+        await deduper.run_dedup_cycle(tools._cfg, tmp_path, tools._conn, tools._write_lock,
+                                      DupLLM(), DupEmbedder(), graph_db, None)
+        prog = deduper.dedup_progress()
+        assert prog["running"] is False
+        assert prog["pairs"] >= 1 and prog["groups_done"] == prog["groups_total"] >= 1
+        with tools.scope_context({"global"}):
+            stats = await tools.memory_stats()
+        assert "Dedup:" in stats and "suspected" in stats
+    finally:
+        graph_db.close()
+        gdbase.close()
+
+
 async def test_edge_visibility_requires_both_endpoints(tmp_path):
     gdbase, graph_db = _make_graph(tmp_path)
     try:

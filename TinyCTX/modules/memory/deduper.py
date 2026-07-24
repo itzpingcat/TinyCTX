@@ -177,61 +177,102 @@ class DedupCache:
 
 
 # ---------------------------------------------------------------------------
+# Live progress (read by memory_stats / the /memory stats command)
+# ---------------------------------------------------------------------------
+
+_progress: dict = {
+    "running": False,
+    "pairs": 0,          # suspected-duplicate candidate pairs this run
+    "groups_total": 0,   # LLM verification calls to make (one per batch/clique)
+    "groups_done": 0,    # verification calls completed
+    "merges": 0,         # merges applied this run
+    "started_at": None,
+    "finished_at": None,
+}
+
+
+def dedup_progress() -> dict:
+    """Snapshot of the current/last dedup run for diagnostics."""
+    return dict(_progress)
+
+
+def _reset_progress() -> None:
+    import time
+    _progress.update(running=True, pairs=0, groups_total=0, groups_done=0,
+                     merges=0, started_at=time.time(), finished_at=None)
+
+
+def _finish_progress() -> None:
+    import time
+    _progress["running"] = False
+    _progress["finished_at"] = time.time()
+
+
+# ---------------------------------------------------------------------------
 # Dedup cycle
 # ---------------------------------------------------------------------------
 
 async def run_dedup_cycle(cfg, data_dir, conn, write_lock, llm, embedder, graph_db, agent_logger) -> None:
     from TinyCTX.ai import TextDelta, LLMError
 
-    await refresh_embeddings(cfg, conn, write_lock, embedder, graph_db)
-
-    threshold = float(cfg.get("similarity_threshold", 0.90))
-    batch_count = int(cfg.get("dedup_batch_count", 8))
-
-    vectors = dict(graph_db.vector_index._vecs)  # snapshot
-    if len(vectors) < 2:
-        return
-    cache = DedupCache(Path(data_dir) / "dedup_cache.db")
+    _reset_progress()
     try:
-        pairs = [p for p in candidate_pairs(vectors, threshold) if not cache.is_cached(*p)]
-        # drop already-aliased pairs
-        pairs = [p for p in pairs if not _is_aliased(graph_db, *p)]
-        if not pairs:
-            return
-        groups = clique_edge_cover(pairs, batch_count)
+        await refresh_embeddings(cfg, conn, write_lock, embedder, graph_db)
 
-        for group in groups:
-            ents = [graph_db.get_entity_slim(u, None) for u in group]
-            ents = [e for e in ents if e]
-            if len(ents) < 2:
-                continue
-            prompt = _read("dedup_group_user.txt").format(entities=_render_group(ents))
-            system = _read("dedup_system.txt")
-            text_chunks: list[str] = []
-            async for event in llm.stream(
-                [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
-                tools=[], priority=15,
-            ):
-                if isinstance(event, TextDelta):
-                    text_chunks.append(event.text)
-                elif isinstance(event, LLMError):
-                    break
-            ops = parse_merge_ops("".join(text_chunks))
-            confirmed = {(o["canonical"], o["duplicate"]) for o in ops}
-            for op in ops:
-                c = graph_db.get_entity_slim(op["canonical"], None)
-                d = graph_db.get_entity_slim(op["duplicate"], None)
-                if c and d and c["uuid"] != d["uuid"]:
-                    async with write_lock:
-                        await _tools._merge_internal(c, d, op["merged_description"] or c["description"], op["verdict"])
-            # cache the group's pairs that were NOT merged as distinct
-            for i in range(len(group)):
-                for j in range(i + 1, len(group)):
-                    a, b = group[i], group[j]
-                    if (a, b) not in confirmed and (b, a) not in confirmed:
-                        cache.mark_distinct(a, b)
+        threshold = float(cfg.get("similarity_threshold", 0.90))
+        batch_count = int(cfg.get("dedup_batch_count", 8))
+
+        vectors = dict(graph_db.vector_index._vecs)  # snapshot
+        if len(vectors) < 2:
+            return
+        cache = DedupCache(Path(data_dir) / "dedup_cache.db")
+        try:
+            pairs = [p for p in candidate_pairs(vectors, threshold) if not cache.is_cached(*p)]
+            # drop already-aliased pairs
+            pairs = [p for p in pairs if not _is_aliased(graph_db, *p)]
+            _progress["pairs"] = len(pairs)
+            if not pairs:
+                return
+            groups = clique_edge_cover(pairs, batch_count)
+            _progress["groups_total"] = len(groups)
+
+            for group in groups:
+                ents = [graph_db.get_entity_slim(u, None) for u in group]
+                ents = [e for e in ents if e]
+                if len(ents) < 2:
+                    _progress["groups_done"] += 1
+                    continue
+                prompt = _read("dedup_group_user.txt").format(entities=_render_group(ents))
+                system = _read("dedup_system.txt")
+                text_chunks: list[str] = []
+                async for event in llm.stream(
+                    [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+                    tools=[], priority=15,
+                ):
+                    if isinstance(event, TextDelta):
+                        text_chunks.append(event.text)
+                    elif isinstance(event, LLMError):
+                        break
+                _progress["groups_done"] += 1
+                ops = parse_merge_ops("".join(text_chunks))
+                confirmed = {(o["canonical"], o["duplicate"]) for o in ops}
+                for op in ops:
+                    c = graph_db.get_entity_slim(op["canonical"], None)
+                    d = graph_db.get_entity_slim(op["duplicate"], None)
+                    if c and d and c["uuid"] != d["uuid"]:
+                        async with write_lock:
+                            await _tools._merge_internal(c, d, op["merged_description"] or c["description"], op["verdict"])
+                        _progress["merges"] += 1
+                # cache the group's pairs that were NOT merged as distinct
+                for i in range(len(group)):
+                    for j in range(i + 1, len(group)):
+                        a, b = group[i], group[j]
+                        if (a, b) not in confirmed and (b, a) not in confirmed:
+                            cache.mark_distinct(a, b)
+        finally:
+            cache.close()
     finally:
-        cache.close()
+        _finish_progress()
 
 
 def _is_aliased(graph_db, a: str, b: str) -> bool:

@@ -271,7 +271,22 @@ async def memory_stats() -> str:
             lines.append(f"  {issue}: {n}")
     else:
         lines.append("Reviewer backlog: empty")
+    lines.append(_dedup_status_line())
     return "\n".join(lines)
+
+
+def _dedup_status_line() -> str:
+    """One-line dedup progress: suspected pairs and verification-call progress."""
+    from TinyCTX.modules.memory.deduper import dedup_progress
+    p = dedup_progress()
+    pairs, done, total, merges = p["pairs"], p["groups_done"], p["groups_total"], p["merges"]
+    if p["running"]:
+        return (f"Dedup: running — {pairs} suspected duplicate pairs across {total} batches "
+                f"→ {done}/{total} LLM calls done, {merges} merged")
+    if p["finished_at"] is None:
+        return "Dedup: idle (no run yet this session)"
+    return (f"Dedup: idle — last run: {pairs} suspected pairs across {total} batches, "
+            f"{done}/{total} LLM calls, {merges} merged")
 
 
 # ---------------------------------------------------------------------------

@@ -361,6 +361,19 @@ def register_runtime(runtime) -> None:
 
     runtime.commands.register("memory", "librarian", _cmd_librarian,
                               help="Trigger the memory librarian. Optional: a prompt for priority review.")
+
+    async def _cmd_stats(args, context):
+        # Diagnostics command: show full totals across every scope in the graph,
+        # plus live dedup progress.
+        with _tools.scope_context(_graph_db.all_scopes() | {"global"}):
+            result = await _tools.memory_stats()
+        send = context.get("send")
+        if callable(send):
+            await send(result)
+
+    runtime.commands.register("memory", "stats", _cmd_stats,
+                              help="Show memory graph diagnostics: entity/edge counts, "
+                                   "pins, reviewer backlog, and live dedup progress.")
     logger.info("[memory] ready — graph: %s | embedder: %s", graph_path, emb_model or "none")
 
 
