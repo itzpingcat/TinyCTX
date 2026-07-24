@@ -74,7 +74,7 @@ async def kg_add_entity(
         name: Display name of the entity.
         entity_type: One of: Person, Concept, Preference, Fact, Event,
             Location, Organization, Project, Technology, Rule, Directive, Role.
-        description: 1-3 sentence factual description.
+        description: text info.
         priority: 0-100 importance score (default 40).
         pinned: Pin scope — "global" (always inject into system prompt) or
             "user" (inject only when pinned_target user is active). Leave empty
