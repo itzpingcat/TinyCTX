@@ -57,7 +57,7 @@ EXTENSION_META = {
         # --- deduper ---
         "dedup_enabled":        True,
         "dedup_interval_hours": 6,
-        "similarity_threshold": 0.965,
+        "similarity_threshold": 0.85,
         "dedup_batch_count":    8,
     },
 }
