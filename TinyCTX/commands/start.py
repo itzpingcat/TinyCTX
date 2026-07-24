@@ -45,7 +45,7 @@ from TinyCTX.utils.instance import (
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _COMPOSE_FILE = _REPO_ROOT / "compose.yaml"
 
-_POLL_TIMEOUT = 15.0
+_POLL_TIMEOUT = 60.0
 _POLL_INTERVAL = 0.25
 
 

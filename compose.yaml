@@ -149,10 +149,10 @@ services:
 
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://127.0.0.1:8700/health"]
-      interval: 15s
-      timeout: 3s
+      interval: 2s
+      timeout: 2s
       retries: 3
-      start_period: 10s
+      start_period: 1s
 
 
 # ── networks ────────────────────────────────────────────────────────────────
