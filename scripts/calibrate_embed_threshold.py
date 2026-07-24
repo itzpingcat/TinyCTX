@@ -17,9 +17,14 @@ near-neighbors at any threshold — that's what a "collapsed" embedding space
 looks like (see the 18637-pairs-for-nothing dedup run this is calibrating
 against).
 
+Runs as a single batch request by default (matches rag/indexer.py's
+embed(chunks)). Pass --sequential to embed one-at-a-time instead, e.g. to
+check whether a problem is specific to batching.
+
 Usage:
     python scripts/calibrate_embed_threshold.py
     python scripts/calibrate_embed_threshold.py --model embed
+    python scripts/calibrate_embed_threshold.py --sequential
     python scripts/calibrate_embed_threshold.py --config path/to/config.yaml
     python scripts/calibrate_embed_threshold.py --dir path/to/instance
 
@@ -84,10 +89,11 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--model", help="Embedding model name from config.yaml's models: section (skips the prompt)")
     p.add_argument("--config", help="Explicit path to config.yaml")
     p.add_argument("--dir", help="Explicit instance directory (containing config.yaml)")
-    p.add_argument("--batch", action="store_true",
-                    help="Embed all test texts in one batch request instead of one-at-a-time "
-                         "(this is what deduper.py's refresh_embeddings does in production — "
-                         "use this to check whether batching itself is the problem)")
+    p.add_argument("--sequential", action="store_true",
+                    help="Embed one text per request instead of a single batch request. "
+                         "Default is batch, since that's what rag/indexer.py does in production "
+                         "and is the mode most likely to expose server-side batching bugs; use "
+                         "--sequential to isolate whether a problem is batching-specific.")
     return p.parse_args()
 
 
@@ -125,23 +131,23 @@ def _pick_model(cfg: "_config.Config", requested: str | None) -> str:
     return name
 
 
-async def _run(model_name: str, cfg: "_config.Config", batch: bool) -> None:
+async def _run(model_name: str, cfg: "_config.Config", sequential: bool) -> None:
     model_cfg = cfg.get_embedding_model(model_name)
     embedder = Embedder.from_config(model_cfg)
 
     print(f"\nModel: {model_cfg.model} @ {model_cfg.base_url}")
     print(f"document_template: {model_cfg.document_template!r}")
     print(f"query_template:     {model_cfg.query_template!r}")
-    print(f"mode: {'single batch request' if batch else 'sequential (one request per text)'}\n")
+    print(f"mode: {'sequential (one request per text)' if sequential else 'single batch request'}\n")
 
     flat_texts = [t for _, a, b in TEST_PAIRS for t in (a, b)]
-    if batch:
-        # Mirrors what refresh_embeddings() actually does in deduper.py.
-        vectors = await embedder.embed(flat_texts, kind="document")
-    else:
+    if sequential:
         # No batching — isolates whether a bug lives in the server/_call()'s
         # handling of multi-text requests vs. the model/template itself.
         vectors = [await embedder.embed_one(t, kind="document") for t in flat_texts]
+    else:
+        # Single batch request — mirrors rag/indexer.py's embedder.embed(chunks).
+        vectors = await embedder.embed(flat_texts, kind="document")
 
     scores: dict[str, list[float]] = {"duplicate": [], "distinct": [], "unrelated": []}
     print(f"{'label':<10} {'similarity':>10}   pair")
@@ -184,7 +190,7 @@ def main() -> None:
     args = _parse_args()
     cfg = _load_config(args)
     model_name = _pick_model(cfg, args.model)
-    asyncio.run(_run(model_name, cfg, args.batch))
+    asyncio.run(_run(model_name, cfg, args.sequential))
 
 
 if __name__ == "__main__":
