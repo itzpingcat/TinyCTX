@@ -274,16 +274,29 @@ async def memory_stats() -> str:
 
 
 def _dedup_status_line() -> str:
-    """One-line dedup progress: suspected pairs and verification-call progress."""
+    """One-line dedup progress: suspected pairs and verification-call progress.
+
+    p["running"] is True for the whole span of run_dedup_cycle(), including
+    the brief windows where there's nothing left to report: before any
+    candidate pairs have been computed (pairs == total == 0 — still embedding
+    / scanning) and after every batch has been verified (done >= total > 0 —
+    merges applied, just finishing up). Reporting "running" in those windows
+    reads as if a batch pass is actively in flight when there's really
+    nothing left to do, so those cases are shown as not-running instead.
+    """
     from TinyCTX.modules.memory.deduper import dedup_progress
     p = dedup_progress()
     pairs, done, total, merges = p["pairs"], p["groups_done"], p["groups_total"], p["merges"]
-    if p["running"]:
+    actually_running = p["running"] and total > 0 and done < total
+
+    if actually_running:
         return (f"Dedup: running — {pairs} suspected duplicate pairs across {total} batches "
                 f"→ {done}/{total} LLM calls done, {merges} merged")
-    if p["finished_at"] is None:
+    if p["finished_at"] is None and not p["running"]:
         return "Dedup: idle (no run yet this session)"
-    return (f"Dedup: idle — last run: {pairs} suspected pairs across {total} batches, "
+    if pairs == 0:
+        return "Dedup: not running — no suspected duplicate pairs found"
+    return (f"Dedup: not running — last run: {pairs} suspected pairs across {total} batches, "
             f"{done}/{total} LLM calls, {merges} merged")
 
 
