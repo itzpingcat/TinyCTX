@@ -9,10 +9,13 @@ For each global-pinned entity, shows its full details and asks:
   q  quit   — stop and checkpoint whatever was done so far
 
 Usage:
-    python cleanup_global_pins.py
-    python cleanup_global_pins.py --config path/to/config.yaml
-    python cleanup_global_pins.py --db path/to/graph.lbug
-    python cleanup_global_pins.py --dry-run   # preview only, no writes
+    python scripts/cleanup_global_pins.py
+    python scripts/cleanup_global_pins.py --config path/to/config.yaml
+    python scripts/cleanup_global_pins.py --db path/to/graph.lbug
+    python scripts/cleanup_global_pins.py --dry-run   # preview only, no writes
+
+Config resolution (when --config isn't given or doesn't exist): resolved via
+utils/instance.py, same as the CLI (--dir / CWD .tinyctx / ~/.tinyctx).
 """
 from __future__ import annotations
 
@@ -91,7 +94,7 @@ def _open(args):
             kg_path = (
                 Path(kg_path_raw).expanduser().resolve()
                 if kg_path_raw
-                else Path(cfg.workspace.path) / "memory" / "graph.lbug"
+                else Path(cfg.data.path) / "memory" / "graph.lbug"
             )
         except Exception as e:
             print(f"[error] Failed to load config: {e}")

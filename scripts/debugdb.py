@@ -10,17 +10,18 @@ Subcommands:
   decay   — dry-run decay scoring, shows what the next sweep would delete
 
 Usage:
-    python debugdb.py [subcommand] [--config path] [--db path] [options]
+    python scripts/debugdb.py [subcommand] [--config path] [--db path] [options]
 
-    python debugdb.py                         # dump all
-    python debugdb.py pinned                  # pinned entities only
-    python debugdb.py entity Kamie            # find + inspect by name
-    python debugdb.py entity --uuid abc123    # inspect by UUID prefix
-    python debugdb.py stats                   # graph stats
+    python scripts/debugdb.py                         # dump all
+    python scripts/debugdb.py pinned                  # pinned entities only
+    python scripts/debugdb.py entity Kamie            # find + inspect by name
+    python scripts/debugdb.py entity --uuid abc123    # inspect by UUID prefix
+    python scripts/debugdb.py stats                   # graph stats
 
 DB resolution (same for all subcommands):
   --db path      direct path to graph.lbug
-  --config path  load workspace from config.yaml (default: config.yaml)
+  --config path  path to config.yaml (default: resolved via utils/instance.py,
+                  same as the CLI: --dir / CWD .tinyctx / ~/.tinyctx)
 """
 from __future__ import annotations
 
@@ -234,17 +235,12 @@ def cmd_decay(gdb, args, graph_database=None, memory_cfg=None) -> None:
 # ---------------------------------------------------------------------------
 
 def _find_config(given: str) -> Path:
-    """Resolve config path: use given if it exists, else walk up from __file__ to find it."""
+    """Resolve config path: use given if it exists, else resolve via the instance dir."""
     p = Path(given)
     if p.exists():
         return p
-    # Walk up from this file's directory looking for config.yaml
-    here = Path(__file__).resolve().parent
-    for parent in [here, *here.parents]:
-        candidate = parent / "config.yaml"
-        if candidate.exists():
-            return candidate
-    return p  # fall through to original error
+    from TinyCTX.utils.instance import resolve_instance_dir, config_path_for
+    return config_path_for(resolve_instance_dir())
 
 
 def _resolve_memory_cfg(args) -> dict:
@@ -291,7 +287,7 @@ def _open_db(args):
             kg_path = (
                 Path(kg_path_raw).expanduser().resolve()
                 if kg_path_raw
-                else Path(cfg.workspace.path) / "memory" / "graph.lbug"
+                else Path(cfg.data.path) / "memory" / "graph.lbug"
             )
         except Exception as e:
             print(f"[error] Failed to load config: {e}")
