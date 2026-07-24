@@ -168,6 +168,11 @@ class DedupCache:
         self._con.execute("INSERT OR IGNORE INTO distinct_pairs (uuid_a, uuid_b) VALUES (?, ?)", (a, b))
         self._con.commit()
 
+    def all_distinct_pairs(self) -> set[tuple[str, str]]:
+        """All cached-distinct pairs, fetched once instead of one query per pair."""
+        cur = self._con.execute("SELECT uuid_a, uuid_b FROM distinct_pairs")
+        return {(a, b) for a, b in cur.fetchall()}
+
     def close(self) -> None:
         try:
             self._con.close()
@@ -226,9 +231,13 @@ async def run_dedup_cycle(cfg, data_dir, conn, write_lock, llm, embedder, graph_
             return
         cache = DedupCache(Path(data_dir) / "dedup_cache.db")
         try:
-            pairs = [p for p in candidate_pairs(vectors, threshold) if not cache.is_cached(*p)]
-            # drop already-aliased pairs
-            pairs = [p for p in pairs if not _is_aliased(graph_db, *p)]
+            all_pairs = candidate_pairs(vectors, threshold)
+            distinct_cached = cache.all_distinct_pairs()
+            aliased = _all_aliased_pairs(graph_db)
+            pairs = [
+                p for p in all_pairs
+                if p not in distinct_cached and p not in aliased
+            ]
             _progress["pairs"] = len(pairs)
             if not pairs:
                 return
@@ -274,18 +283,18 @@ async def run_dedup_cycle(cfg, data_dir, conn, write_lock, llm, embedder, graph_
         _finish_progress()
 
 
-def _is_aliased(graph_db, a: str, b: str) -> bool:
+def _all_aliased_pairs(graph_db) -> set[tuple[str, str]]:
+    """All ALIASED_TO edges as (a, b) pairs with a < b, fetched in one query
+    instead of two synchronous DB round-trips per candidate pair (which, at
+    dedup-cycle scale, was blocking the event loop for 10s+ at a time)."""
     r = graph_db.safe_execute(
-        "MATCH (x:Entity {uuid:$a})-[r:Relation {relation:'ALIASED_TO'}]->(y:Entity {uuid:$b}) RETURN 1 LIMIT 1",
-        {"a": a, "b": b},
+        "MATCH (x:Entity)-[r:Relation {relation:'ALIASED_TO'}]->(y:Entity) RETURN x.uuid, y.uuid"
     )
-    if r and r.has_next():
-        return True
-    r = graph_db.safe_execute(
-        "MATCH (x:Entity {uuid:$b})-[r:Relation {relation:'ALIASED_TO'}]->(y:Entity {uuid:$a}) RETURN 1 LIMIT 1",
-        {"a": a, "b": b},
-    )
-    return bool(r and r.has_next())
+    pairs: set[tuple[str, str]] = set()
+    while r and r.has_next():
+        a, b = r.get_next()
+        pairs.add((a, b) if a < b else (b, a))
+    return pairs
 
 
 def _render_group(ents: list[dict]) -> str:
