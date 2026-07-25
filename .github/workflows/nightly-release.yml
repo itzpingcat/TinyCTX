@@ -68,7 +68,7 @@ jobs:
         git tag "$tag"
         git push origin "$tag"
         gh release create "$tag" \
-          --title "Nightly $tag" \
+          --title "$tag" \
           --notes "Automated nightly build. Passed flake8 and pytest on $(date -u +%Y-%m-%d)." \
           --prerelease \
           --target "${{ github.sha }}"
