@@ -5,7 +5,7 @@ Starts the TinyCTX stack using Docker Compose and waits until the
 gateway responds to /v1/health.
 
 The instance directory (config.yaml, workspace/, data/) is resolved via
-commands/_instance.py: --dir, else .tinyctx/ in the current directory,
+utils/instance.py: --dir, else .tinyctx/ in the current directory,
 else ~/.tinyctx. The Docker Compose file itself always lives at the repo
 root (shared across all instances) and is invoked with -f/-p plus env
 vars pointing at this instance's directories, so multiple instances can
@@ -18,6 +18,8 @@ Flags
   --config PATH  Path to config.yaml directly. Overrides --dir/autodetect
                  for config loading only (compose still uses --dir/autodetect
                  for workspace/data paths unless --dir is also given).
+  -w, --watch    Stream `docker compose logs -f` after starting. Ctrl+C
+                 stops the log stream only — the daemon keeps running.
 """
 
 from __future__ import annotations
@@ -30,7 +32,7 @@ import time
 import os
 from pathlib import Path
 
-from TinyCTX.commands._instance import (
+from TinyCTX.utils.instance import (
     resolve_instance_dir,
     config_path_for,
     project_name_for,
@@ -43,7 +45,7 @@ from TinyCTX.commands._instance import (
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _COMPOSE_FILE = _REPO_ROOT / "compose.yaml"
 
-_POLL_TIMEOUT = 15.0
+_POLL_TIMEOUT = 60.0
 _POLL_INTERVAL = 0.25
 
 
@@ -55,6 +57,25 @@ def _health_check(gateway_url: str) -> bool:
             return r.status == 200
     except Exception:
         return False
+
+
+def _stream_logs(project_name: str, env: dict[str, str]) -> None:
+    """Stream `docker compose logs -f` until the user hits Ctrl+C.
+
+    Ctrl+C only stops this log stream (a client process); it does not
+    stop the daemon, since `docker compose logs -f` doesn't touch
+    container state.
+    """
+    print("Streaming logs — Ctrl+C to stop watching (daemon keeps running)...")
+    try:
+        subprocess.run(
+            ["docker", "compose", "-f", str(_COMPOSE_FILE), "-p", project_name, "logs", "-f"],
+            cwd=_REPO_ROOT,
+            env=env,
+        )
+    except KeyboardInterrupt:
+        pass
+    print("Stopped watching logs. TinyCTX is still running.")
 
 
 def _require_docker() -> None:
@@ -102,6 +123,11 @@ def run(args: argparse.Namespace) -> None:
 
     if _health_check(gateway_url):
         print(f"✓ TinyCTX already running — {gateway_url}")
+        if getattr(args, "watch", False):
+            load_instance_env(instance_dir)
+            project_name = project_name_for(instance_dir)
+            env = {**os.environ, **compose_env(instance_dir, port=cfg.gateway.port)}
+            _stream_logs(project_name, env)
         return
 
     _require_docker()
@@ -133,6 +159,8 @@ def run(args: argparse.Namespace) -> None:
             print(f"  Instance: {instance_dir}")
             if api_key:
                 print(f"  API key: {api_key}")
+            if getattr(args, "watch", False):
+                _stream_logs(project_name, env)
             return
 
         time.sleep(_POLL_INTERVAL)

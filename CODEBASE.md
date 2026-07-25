@@ -25,15 +25,18 @@ TinyCTX/
 ├── config/             Config loading (YAML → dataclasses)
 ├── users/              UserStore + User/PlatformIdentity models (SQLite)
 ├── commands/
-│   ├── _instance.py     Shared instance-directory resolution (--dir / CWD .tinyctx / ~/.tinyctx)
 │   ├── launch.py        tinyctx launch — attaches a bridge client
 │   ├── start.py         tinyctx start  — docker compose up for the resolved instance
 │   ├── stop.py          tinyctx stop   — docker compose down for the resolved instance
 │   ├── status.py        tinyctx status
 │   └── onboard.py       tinyctx onboard — delegates to onboard/
 ├── utils/
+│   ├── instance.py      Shared instance-directory resolution (--dir / CWD .tinyctx / ~/.tinyctx)
 │   ├── tool_handler.py  ToolCallHandler — register/enable/execute tools
 │   ├── commands.py      CommandRegistry — slash-command dispatch for bridges
+│                        Handlers reply via EITHER `await context["send"](text)`
+│                        OR `context["console"].print(text)` — a bridge MUST
+│                        supply both keys or send-style handlers go silent.
 │   ├── attachments.py   Attachment processing (images, PDFs, text, binary)
 │   └── bm25.py          BM25 keyword search (used for tool_search and memory)
 │
@@ -184,11 +187,11 @@ After hook processing, adjacent same-role messages are merged. Then token budget
 
 **Token-count fuzz factor:** `Config.token_fuzz` (default `1.1`) is a global multiplier applied to every counted-token total in `Context._count_tokens` (`context.py`), to pad for tokenizer estimation error. Configurable via top-level `token_fuzz:` in config.yaml.
 
-`Embedder` — async OpenAI-compatible embedding client. `embed(texts, priority=10)` batches automatically; `embed_one(text, priority=10)` is the single-string convenience wrapper.
+`Embedder` — async OpenAI-compatible embedding client. `embed_one` is removed — `embed(texts, priority=10, kind="default")` is now the only entry point; callers hand it the full list (even a single item as a one-element list) and it chunks into `batch_size`-sized requests internally. If a whole batch's API call fails, it falls back to embedding that batch's texts individually — those per-item retries run concurrently via `asyncio.gather`, not sequentially, since a `_queue_worker` holds its slot for `embed()`'s entire duration (see Priority queue below) and retrying `batch_size` items one at a time would tie that slot up for `batch_size` extra sequential round trips. An item that still fails on its own comes back as `None` in its slot instead of raising. The outer loop across multiple `batch_size` chunks (for a `texts` list larger than one batch) is still sequential, not concurrent — parallelizing that would let one worker fire many more concurrent HTTP requests than `configure_parallel`'s cap intends. `kind` picks the template: `"query"` → `query_template`, `"document"` → `document_template`, anything else (including the `"default"` default) → no templating (raw text). Callers that cannot tolerate a partial result (e.g. `modules/rag/indexer.py`'s `_index_file()`, which must not mark a file "indexed" when a chunk's embedding actually failed) must check the returned list for `None` themselves and raise/abort — `embed()` itself no longer does that for them.
 
 ### Priority queue
 
-Every `LLM.stream()` / `Embedder.embed()` / `embed_one()` call is admission-controlled by a single module-level priority queue living inside `ai.py` itself — not a separate object, not passed around through `runtime.py`/`agent.py`/modules. Lower `priority` runs first; ties are FIFO (via a monotonic sequence counter, since `heapq` isn't stable on priority alone).
+Every `LLM.stream()` / `Embedder.embed()` call is admission-controlled by a single module-level priority queue living inside `ai.py` itself — not a separate object, not passed around through `runtime.py`/`agent.py`/modules. Lower `priority` runs first; ties are FIFO (via a monotonic sequence counter, since `heapq` isn't stable on priority alone).
 
 - `configure_parallel(n)` sets the max number of concurrent in-flight requests (from `config.parallel`, default 3). Called once at startup in `main.py` right after `config.load()`. Worker tasks spin up lazily on first use — no explicit start call needed anywhere else.
 - Streaming stays live, not buffered: a queued request's generator hasn't started yet, so it emits nothing while waiting. The moment a worker admits it, the real `_stream_with_retry()` generator runs and each event is forwarded to the caller as it's produced — identical token-by-token behavior to a non-queued call, just gated on when it's allowed to start.
@@ -269,6 +272,10 @@ Slash commands registered by `Runtime`:
 - Supports paste refs, slash commands, copy helpers
 - Provider presets for OpenAI, OpenRouter, Ollama, LM Studio, llama.cpp, custom
 - `agent_name` option: set `agent_name: "Aria"` under `bridges.cli.options` to stamp assistant nodes with a custom name (forwarded in every message payload to the gateway)
+- Session start: every launch branches fresh off root (`/v1/lane/branch` → `/v1/lane/open`) so a new session doesn't inherit the last one's context. The pre-launch cursor is held in `_resume_cursor`; `/resume` reattaches to it. Set `default_to_resume: true` under `bridges.cli.options` to reattach automatically instead of branching.
+- Streaming render (`_split_blocks` / `_emit_text` / `_print_block`): **append-only — nothing on screen is ever repainted.** Streamed text is buffered and flushed one markdown block at a time, at block boundaries (blank line outside a fence, or a closing fence). Each block is captured, its surrounding blank lines trimmed, and separated from the next by exactly one blank line.
+  - This replaced a `rich.live.Live` region. Live repaints by moving the cursor up over its own output, which broke two ways: a render taller than the terminal couldn't be scrolled back over, so every refresh reprinted the whole reply (duplicated-message bug); and scrolling mid-reply desynced Rich's cursor position from the real one, smearing output.
+  - **Do not reintroduce `Live` or anything else that repositions the cursor here.** The renderer emits zero cursor-movement escapes; that property is what makes mid-stream scrolling safe.
 
 ### Discord (`bridges/discord/`)
 
@@ -326,7 +333,23 @@ Cursors (`dm:<uid>`, `group:<cid>`, `thread:<tid>`) are persisted in
 
 ### `rag` — indexes `workspace/memory/*.md` files; auto-injects relevant chunks each turn (BM25 or embedding cosine similarity); provides `memory_search` tool; triggers background memory consolidation when context budget is near.
 
-### `memory` — LadybugDB property-graph knowledge store, stored at `<instance>/data/memory/graph.lbug` (not workspace/). A background "librarian" walks unvisited conversation nodes (tracked with DB flags), extracts entities/relationships via sub-agents, and writes to the graph. Main agent uses `kg_search` / `kg_traverse` / `call_librarian` tools. Pinned entities are injected into the system prompt. The librarian identifies the agent by reading `author_id` on assistant nodes (set from session state `agent_name`); this is how it knows which speaker is the agent vs the user in the conversation transcript. Conversation excerpts passed to the buffer agent are rendered by `nodes_to_text()` (`librarian_agents.py`) as `【author】: content` lines (fullwidth brackets, matching `context.py`'s convention); content is passed through `_sanitize_brackets()` first so it cannot forge this delimiter. Deduplication's `dedup_cache.db` also lives under `data/` (`dedup_agents.py`'s `run_dedup_cycle` takes `data_path`, not a workspace path).
+### `memory` (v2) — scoped LadybugDB property-graph knowledge store at `<instance>/data/memory/memory.lbug` (not workspace/). See `modules/memory/PLAN.md` for the full design.
+
+**Schema.** `Entity(uuid, name, entity_type, description, scope, pinned, mention, created_at, updated_at, embed_hash, embed_content, embedding)` and `Relation(relation, weight, created_at, updated_at)`. The old `priority` field, the second `graph_*` embedding model, and the `superseded_at` soft-delete column are all removed. `mention` is a DOUBLE (passive RAG bumps +0.1, `search_memory` +1.0) and, with `created_at`/`updated_at`, is agent-read-only. `GraphMeta.schema_version = "2"`.
+
+**Scoping** (`scopes.py`) is information isolation, not ownership — most nodes are `global`. Grammar `global` | `kind:target` (`user:bob`, `guild:my_server`), reused by the `pinned` field. `resolve_scopes(env, active_users)` computes the per-cycle visible set (global + guild + recent participants); enforcement is at the **query layer** — every read filters `WHERE e.scope IN visible` and an edge is visible only if both endpoints are. The scope set is carried per-task in a `contextvars.ContextVar` (`tools.scope_context`), so concurrent librarians with different scopes don't collide.
+
+**Vector index** (`graph.py VectorIndex`) is an in-memory matrix cache invalidated by a dirty set the writers populate (embed_hash zeroed → removed from index; the embedding pass re-adds). `search()` applies **min-p before top-k** and restricts to an `allowed` uuid set. Cosine via numpy with a pure-Python fallback.
+
+**Tools** (`tools.py`, single file). Main agent: `search_memory` (exact-match short-circuit, else hybrid BM25+vector with **min-p before RRF**), `memory_stats` (scope-filtered + reviewer backlog), `call_librarian`. Librarians additionally get `memory_add_entity` (atomic unique-name-in-scope; returns existing node data on collision), `memory_update_entity_description` (unified-diff apply; distinguishes malformed vs stale-base), `memory_set_entity_pinned`, `memory_set_entity_scope`, `memory_delete_entity`, `memory_set_relationship` (SCREAMING_SNAKE_CASE validated; `/`-groups in `prompts/default_relations.txt` are mutually-exclusive within an ordered pair), `memory_delete_relationship`, `memory_merge_into` (duplicate/alias; shares an internal helper with the deduper).
+
+**Librarians.** `extractor.py` ingests unvisited conversation branches within a resolved write scope (defaults new nodes to `global`, narrows only for sensitive info). `reviewer.py` loads dynamically-registered flaggers from `flaggers/` (orphaned, description_length, too_many_edges, over_pinned, decay_candidate, fuzzy_names), maintaining a **persisted** de-duplicated issue queue (`data/reviewer_queue.json`, key `(flagger_type, sorted(uuids))`, survives restart) drained with an adaptive throttle. `deduper.py` runs the embedding pass plus semantic dedup (candidate pairs → greedy clique-edge-cover → LLM verify → merge; distinct pairs cached in `data/dedup_cache.db`). Shared agent-loop/tool-handler/sanitized `nodes_to_text` plumbing is in `librarian_common.py`. The `【author】: content` rendering + `sanitize_brackets` injection defense and the "never extract from the assistant's own turns" rule are preserved.
+
+**Decay** is no longer an auto-deleter: the `decay_candidate` flagger surfaces stale/quiet/isolated nodes for the Reviewer to *assess* (absolute thresholds, never population-relative), so quiet-but-important data is never mechanically destroyed.
+
+**Migration** (`migrate.py`): one-shot, runs when `graph.lbug` exists and `memory.lbug` doesn't; maps v1→v2 (everything → `global` scope, `pinned_target`→`pinned`, `mention_count`→`mention`, drops `priority`/`graph_*`, skips superseded edges, preserves embeddings only when the hash matches else lazy re-embed), verifies counts, then **renames** the old file to `.migrated.bak` (never deletes; `--purge` removes the backup, `--dry-run` writes nothing).
+
+Superseded modules `decay.py` / `dedup_agents.py` / `librarian_agents.py` are inert deprecation stubs (file deletion was unavailable in the authoring environment). Tests: `tests/test_memory.py` (16 pure-logic + fake-backed scope-isolation tests; live-DB paths need a ladybug + py3.14 environment).
 
 ### `heartbeat` — fires periodic agent turns on a background DB branch at a configured interval. Suppresses `NO_REPLY` replies (same sentinel as `agent.py`'s `NO_REPLY_TOKEN` — unified single marker, was `HEARTBEAT_OK`). Slash command: `/heartbeat run`.
 
@@ -369,7 +392,7 @@ YAML-based. Loaded from `<instance>/config.yaml` by default (see Instance Layout
 
 ---
 
-## Instance Layout (`commands/_instance.py`)
+## Instance Layout (`utils/instance.py`)
 
 An *instance* is a self-contained directory holding one agent's config, workspace, and internal data. Resolved by every CLI command the same way: `--dir` flag → nearest ancestor of CWD literally named `.tinyctx` → `.tinyctx/` child of CWD → `~/.tinyctx`. This is what makes multiple concurrent agents possible — each just needs its own instance directory.
 
@@ -377,7 +400,7 @@ An *instance* is a self-contained directory holding one agent's config, workspac
 <instance>/                 e.g. ~/.tinyctx, or anywhere via --dir
 ├── config.yaml             Loaded by default from here (workspace.path / data.path default relative to this file)
 ├── .env                     Optional. KEY=VALUE per line (e.g. DISCORD_BOT_TOKEN=...). Loaded via
-│                            `commands/_instance.py`'s `load_instance_env()` — with override=True, so
+│                            `utils/instance.py`'s `load_instance_env()` — with override=True, so
 │                            values here win over anything already exported in the shell/global env.
 │                            Loaded by `main.py` (direct/non-Docker launch) and `commands/start.py`
 │                            (Docker launch — populates the host process env before `docker compose up`,
@@ -398,7 +421,7 @@ An *instance* is a self-contained directory holding one agent's config, workspac
     └── memory/                LadybugDB graph (graph.lbug), librarian.log, dedup_cache.db
 ```
 
-Docker Compose (`compose.yaml`, always at the repo root, shared across instances) is invoked with `-f <repo>/compose.yaml -p <project>` plus env vars (`TINYCTX_CONFIG_FILE`, `TINYCTX_WORKSPACE`, `TINYCTX_DATA`, `TINYCTX_PORT`, `TINYCTX_INSTANCE`, `TINYCTX_TAG`) computed by `commands/_instance.py` from the resolved instance dir — see `compose_env()`. `TINYCTX_TAG` is a separate, short (6 hex char) hash from `TINYCTX_INSTANCE` because Docker bridge interface names are capped at 15 chars (`IFNAMSIZ`) on Linux.
+Docker Compose (`compose.yaml`, always at the repo root, shared across instances) is invoked with `-f <repo>/compose.yaml -p <project>` plus env vars (`TINYCTX_CONFIG_FILE`, `TINYCTX_WORKSPACE`, `TINYCTX_DATA`, `TINYCTX_PORT`, `TINYCTX_INSTANCE`, `TINYCTX_TAG`) computed by `utils/instance.py` from the resolved instance dir — see `compose_env()`. `TINYCTX_TAG` is a separate, short (6 hex char) hash from `TINYCTX_INSTANCE` because Docker bridge interface names are capped at 15 chars (`IFNAMSIZ`) on Linux.
 
 Non-Docker launches (`onboard`'s direct `python main.py` spawn) instead set `TINYCTX_CONFIG_FILE` in the subprocess env; `main.py` reads it if present, else defaults to `config.yaml` relative to CWD.
 

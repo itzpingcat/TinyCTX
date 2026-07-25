@@ -24,7 +24,7 @@ import os
 from pathlib import Path
 
 from TinyCTX.config import load as load_config, apply_logging, resolve_log_level
-from TinyCTX.commands._instance import load_instance_env
+from TinyCTX.utils.instance import load_instance_env
 from TinyCTX.contracts import MANUAL_LAUNCH_ATTR
 from TinyCTX.runtime import Runtime
 from TinyCTX.ai import configure_parallel

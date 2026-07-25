@@ -34,7 +34,7 @@ BEGINNER_PROVIDERS_FILE = Path(__file__).parent / "beginner-providers.json"
 # Instance directory this onboarding run targets. Set by commands/onboard.py
 # via TINYCTX_INSTANCE_DIR before this module is imported (mirrors every
 # other CLI command's --dir / CWD-.tinyctx / ~/.tinyctx resolution — see
-# commands/_instance.py). Falls back to ~/.tinyctx directly here only for
+# utils/instance.py). Falls back to ~/.tinyctx directly here only for
 # the case onboard's __main__ is invoked standalone (bypassing commands/onboard.py).
 _instance_dir_env = os.environ.get("TINYCTX_INSTANCE_DIR", "").strip()
 INSTANCE_DIR = Path(_instance_dir_env).expanduser().resolve() if _instance_dir_env else (Path.home() / ".tinyctx")

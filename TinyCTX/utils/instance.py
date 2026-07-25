@@ -1,5 +1,5 @@
 """
-commands/_instance.py — shared instance-directory resolution.
+utils/instance.py — shared instance-directory resolution.
 
 An "instance" is a directory containing config.yaml, workspace/, and
 data/. All CLI commands (start/stop/status/launch/onboard) resolve the

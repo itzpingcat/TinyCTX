@@ -436,8 +436,16 @@ class _CronRunner:
         logger.info("[cron] running job '%s' (reset=%s)", job.name, job.reset_after_run)
         start_ms = _now_ms()
 
-        # 1. Determine the starting cursor
-        if job.reset_after_run or not job.cursor_node_id:
+        # 1. Determine the starting cursor. cursor_node_id is persisted in
+        # CRON.json and can go stale if agent.db was deleted/replaced out
+        # from under it, so verify it still resolves before trusting it —
+        # otherwise add_node's parent_id FK blows up mid-run.
+        if job.reset_after_run or not job.cursor_node_id or not self.runtime.db.get_node(job.cursor_node_id):
+            if job.cursor_node_id and not job.reset_after_run:
+                logger.warning(
+                    "[cron] job '%s' cursor %s no longer exists — resetting to root",
+                    job.name, job.cursor_node_id,
+                )
             parent_id = self.runtime.db.get_root().id
         else:
             parent_id = job.cursor_node_id

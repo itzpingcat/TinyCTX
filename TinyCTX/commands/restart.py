@@ -9,6 +9,8 @@ Flags
                  autodetection (CWD/.tinyctx, then ~/.tinyctx).
   --config PATH  Path to config.yaml directly. Overrides --dir/autodetect
                  for config loading only.
+  -w, --watch    Stream `docker compose logs -f` after restarting. Ctrl+C
+                 stops the log stream only — the daemon keeps running.
 """
 
 from __future__ import annotations

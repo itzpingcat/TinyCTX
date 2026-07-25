@@ -18,7 +18,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from TinyCTX.commands._instance import resolve_instance_dir, project_name_for, compose_env
+from TinyCTX.utils.instance import resolve_instance_dir, project_name_for, compose_env
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _COMPOSE_FILE = _REPO_ROOT / "compose.yaml"

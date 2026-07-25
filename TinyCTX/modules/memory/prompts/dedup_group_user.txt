@@ -1,5 +1,3 @@
-The following {node_count} entity nodes are candidates for deduplication.
-Decide which (if any) refer to the same real-world thing and return merge operations.
-Return [] if all nodes are distinct.
+The following entities are candidates for deduplication. Decide which (if any) refer to the same real-world thing and return merge operations as a JSON array. Return [] if all are distinct.
 
-{nodes_block}
+{entities}

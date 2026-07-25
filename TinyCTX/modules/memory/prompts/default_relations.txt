@@ -1,0 +1,25 @@
+# Default relationship vocabulary for the memory graph.
+# Encouraged, not enforced. One group per line.
+# Members joined by '/' are mutually exclusive within an ordered pair:
+# adding one deletes the others between the same two entities.
+# Single tokens are standalone relations.
+LIKES/DISLIKES
+PRECEDED_BY/FOLLOWED_BY
+IS_A/IS_NOT
+INSTANCE_OF/PART_OF
+PERMITS/PROHIBITS
+SUPERSEDES/DEPENDS_ON/CONFLICTS_WITH
+KNOWS
+SKILLED_IN
+CREATED
+USES
+OWNS
+WORKS_AT
+MEMBER_OF
+CAUSED
+ENFORCES
+LOCATED_IN
+RELATED_TO
+WANTS_TO_KNOW
+WANTS_TO_TEACH
+ALIASED_TO

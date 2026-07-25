@@ -177,10 +177,14 @@ class DataBankIndexer:
 
         embeddings: list[list[float]] | None = None
         if self._embedder is not None:
-            # Let embed() failures propagate — caller decides whether to
-            # keep going. We must not upsert_file() with a "success" hash
-            # when the embedding never happened.
+            # embed() no longer raises on a single bad chunk — it returns
+            # None in that chunk's slot instead so the rest of the batch
+            # still comes back. We still must not upsert_file() with a
+            # "success" hash when any chunk's embedding never happened, so
+            # raise here ourselves to preserve that contract.
             embeddings = await self._embedder.embed(chunks, priority=20)
+            if any(v is None for v in embeddings):
+                raise RuntimeError(f"embedding failed for one or more chunks of {path_str}")
 
         self._store.delete_file(path_str)
         self._store.upsert_file(path_str, content_hash, self._embedding_model, mtime)
