@@ -527,6 +527,13 @@ class Embedder:
             tmpl = "{text}"
         texts = [tmpl.format(text=t) for t in texts]
 
+        async def _embed_one_item(item: str) -> "list[float] | None":
+            try:
+                return (await self._call([item]))[0]
+            except Exception as item_exc:
+                logger.warning("Embedding item failed, leaving it as None: %s", item_exc)
+                return None
+
         async def _run():
             results: list[list[float] | None] = []
             for i in range(0, len(texts), self.batch_size):
@@ -538,12 +545,11 @@ class Embedder:
                         "Embedding batch of %d failed (%s); retrying items individually",
                         len(batch), exc,
                     )
-                    for item in batch:
-                        try:
-                            results.extend(await self._call([item]))
-                        except Exception as item_exc:
-                            logger.warning("Embedding item failed, leaving it as None: %s", item_exc)
-                            results.append(None)
+                    # Concurrent, not sequential: these are independent single-item
+                    # calls, and a worker holds its slot until _run() returns, so
+                    # retrying batch_size items one at a time here would tie up the
+                    # slot for up to batch_size extra sequential round trips.
+                    results.extend(await asyncio.gather(*(_embed_one_item(t) for t in batch)))
             return results
 
         return await _enqueue(priority, _run)
