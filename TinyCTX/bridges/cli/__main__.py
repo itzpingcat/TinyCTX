@@ -155,6 +155,7 @@ class CLIBridge:
         self._api_key: str     = ""
         self._cli_username: str | None = None  # TinyCTX username for this session
         self._cli_agent_name: str | None = None  # agent_name from bridge config
+        self._instance_dir: Path | None = None  # set by run_detached; used for cursor persistence
 
     # --- HTTP helpers ---
 
@@ -465,7 +466,8 @@ class CLIBridge:
                         new_tail = data.get("node_id")
                         if new_tail:
                             self._cursor = new_tail
-                            _save_cli_cursor_path(new_tail)
+                            if self._instance_dir:
+                                _save_cli_cursor_path(self._instance_dir, new_tail)
                         break
 
     async def _prompt(self, prompt_str: str) -> str:
@@ -570,7 +572,8 @@ class CLIBridge:
                         await self._api_post(
                             "/v1/lane/open", {"node_id": new_node_id})
                         self._cursor = new_node_id
-                        _save_cli_cursor_path(new_node_id)
+                        if self._instance_dir:
+                            _save_cli_cursor_path(self._instance_dir, new_node_id)
                         self._console.print(
                             f"[{c('reset')}]  ↺  new session started"
                             f"[/{c('reset')}]")
@@ -720,6 +723,7 @@ async def run_detached(
     bridge._api_key     = api_key
     bridge._cli_username = username  # forwarded in _send()
     bridge._cli_agent_name = (options or {}).get("agent_name") or None  # forwarded in _send()
+    bridge._instance_dir = instance_dir
 
     # Resolve or create the cursor via /v1/lane/open.
     saved_cursor = _load_cli_cursor_path(instance_dir)
