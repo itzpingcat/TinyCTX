@@ -28,9 +28,9 @@ logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Priority queue — process-wide admission control for outbound LLM/embedding
-# requests. All callers go through LLM.stream() / Embedder.embed() /
-# Embedder.embed_one(), passing an optional `priority` (lower runs first,
-# ties are FIFO). The queue itself is module-level state, not an object
+# requests. All callers go through LLM.stream() / Embedder.embed(), passing
+# an optional `priority` (lower runs first, ties are FIFO). The queue itself
+# is module-level state, not an object
 # passed around — configure_parallel() is the only external touchpoint.
 # ---------------------------------------------------------------------------
 
@@ -493,10 +493,13 @@ class Embedder:
             document_template=cfg.document_template,
         )
 
-    async def embed(self, texts: list[str], priority: int = 10, kind: str = "default") -> list[list[float]]:
+    async def embed(self, texts: list[str], priority: int = 10, kind: str = "default") -> list[list[float] | None]:
         """
-        Embed a list of strings. Returns one float vector per input text,
-        in the same order as the input. Batches automatically.
+        Embed a list of strings — hand over everything you have, including a
+        single string wrapped in a one-element list; batching is handled
+        internally in chunks of `batch_size`. Returns one float vector per
+        input text, in the same order as the input, or `None` for a text
+        that could not be embedded.
 
         `kind` selects which template wraps each text before embedding:
         "query" uses `query_template`, "document" uses `document_template`.
@@ -506,7 +509,12 @@ class Embedder:
         `priority` controls admission order when multiple requests are in
         flight at once (lower runs first, ties are FIFO).
 
-        Raises RuntimeError on API error.
+        If a whole batch's API call fails, falls back to embedding that
+        batch's texts one at a time so a single bad item doesn't lose the
+        rest of the batch. An item that still fails on its own gets `None`
+        in its slot instead of raising — callers that need an all-or-nothing
+        guarantee (e.g. not recording a file as indexed) must check for
+        `None` in the result themselves.
         """
         if not texts:
             return []
@@ -520,18 +528,25 @@ class Embedder:
         texts = [tmpl.format(text=t) for t in texts]
 
         async def _run():
-            results: list[list[float]] = []
+            results: list[list[float] | None] = []
             for i in range(0, len(texts), self.batch_size):
                 batch = texts[i : i + self.batch_size]
-                results.extend(await self._call(batch))
+                try:
+                    results.extend(await self._call(batch))
+                except Exception as exc:
+                    logger.warning(
+                        "Embedding batch of %d failed (%s); retrying items individually",
+                        len(batch), exc,
+                    )
+                    for item in batch:
+                        try:
+                            results.extend(await self._call([item]))
+                        except Exception as item_exc:
+                            logger.warning("Embedding item failed, leaving it as None: %s", item_exc)
+                            results.append(None)
             return results
 
         return await _enqueue(priority, _run)
-
-    async def embed_one(self, text: str, priority: int = 10, kind: str = "default") -> list[float]:
-        """Convenience wrapper — embed a single string."""
-        vecs = await self.embed([text], priority=priority, kind=kind)
-        return vecs[0]
 
     async def _call(self, texts: list[str]) -> list[list[float]]:
         payload = {"model": self.model, "input": texts}

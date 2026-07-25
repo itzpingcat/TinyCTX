@@ -144,7 +144,7 @@ async def _run(model_name: str, cfg: "_config.Config", sequential: bool) -> None
     if sequential:
         # No batching — isolates whether a bug lives in the server/_call()'s
         # handling of multi-text requests vs. the model/template itself.
-        vectors = [await embedder.embed_one(t, kind="document") for t in flat_texts]
+        vectors = [(await embedder.embed([t], kind="document"))[0] for t in flat_texts]
     else:
         # Single batch request — mirrors rag/indexer.py's embedder.embed(chunks).
         vectors = await embedder.embed(flat_texts, kind="document")

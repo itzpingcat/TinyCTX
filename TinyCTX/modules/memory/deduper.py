@@ -47,12 +47,13 @@ async def refresh_embeddings(cfg, conn, write_lock, embedder, graph_db) -> int:
     if not dirty:
         return 0
 
+    contents = [content for _, content in dirty]
+    vecs = await embedder.embed(contents, priority=15, kind="document")
+
     n = 0
-    for uid, content in dirty:
-        try:
-            vec = await embedder.embed_one(content, priority=15, kind="document")
-        except Exception as exc:
-            logger.warning("[memory/deduper] embed failed for %s: %s", uid[:8], exc)
+    for (uid, content), vec in zip(dirty, vecs):
+        if vec is None:
+            logger.warning("[memory/deduper] embed failed for %s", uid[:8])
             continue
         h = embed_hash(content)
         async with write_lock:

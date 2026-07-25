@@ -225,11 +225,12 @@ async def search_memory(query: str, top_k: int = 5) -> str:
     vec_ranks: dict[str, int] = {}
     if _embedder is not None and len(_graph_db.vector_index):
         try:
-            qvec = await _embedder.embed_one(query, priority=5, kind="query")
-            allowed = _graph_db.scoped_uuids(visible)
-            hits = _graph_db.vector_index.search(qvec, k=len(allowed) or top_k, min_p=min_p, allowed=allowed)
-            for rank, (uid, _score) in enumerate(hits, start=1):
-                vec_ranks[uid] = rank
+            qvec = (await _embedder.embed([query], priority=5, kind="query"))[0]
+            if qvec is not None:
+                allowed = _graph_db.scoped_uuids(visible)
+                hits = _graph_db.vector_index.search(qvec, k=len(allowed) or top_k, min_p=min_p, allowed=allowed)
+                for rank, (uid, _score) in enumerate(hits, start=1):
+                    vec_ranks[uid] = rank
         except Exception as exc:
             logger.warning("[memory] search_memory vector failed: %s -- BM25 only", exc)
 

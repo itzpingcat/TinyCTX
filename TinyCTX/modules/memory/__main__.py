@@ -486,11 +486,12 @@ async def _passive_rag_uuids(visible: set, query: str) -> list[str]:
     vec_ranks = {}
     if _runner and _runner._embedder is not None and len(_graph_db.vector_index):
         try:
-            qvec = await _runner._embedder.embed_one(query, priority=5, kind="query")
-            allowed = _graph_db.scoped_uuids(visible)
-            for rank, (uid, _s) in enumerate(
-                    _graph_db.vector_index.search(qvec, k=len(allowed) or top_k, min_p=min_p, allowed=allowed), 1):
-                vec_ranks[uid] = rank
+            qvec = (await _runner._embedder.embed([query], priority=5, kind="query"))[0]
+            if qvec is not None:
+                allowed = _graph_db.scoped_uuids(visible)
+                for rank, (uid, _s) in enumerate(
+                        _graph_db.vector_index.search(qvec, k=len(allowed) or top_k, min_p=min_p, allowed=allowed), 1):
+                    vec_ranks[uid] = rank
         except Exception as exc:
             logger.warning("[memory] passive vector failed: %s", exc)
 
