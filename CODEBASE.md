@@ -269,6 +269,7 @@ Slash commands registered by `Runtime`:
 - Supports paste refs, slash commands, copy helpers
 - Provider presets for OpenAI, OpenRouter, Ollama, LM Studio, llama.cpp, custom
 - `agent_name` option: set `agent_name: "Aria"` under `bridges.cli.options` to stamp assistant nodes with a custom name (forwarded in every message payload to the gateway)
+- Streaming render: the Rich `Live` region is `transient` + `vertical_overflow="crop"` and shows only the last screenful (`_tail()`). `_flush_live()` tears the preview down and prints the complete text once. Do not let the live render exceed the terminal height — Rich cannot scroll back above the top edge, so it reprints the whole buffer on every refresh and the reply appears duplicated.
 
 ### Discord (`bridges/discord/`)
 

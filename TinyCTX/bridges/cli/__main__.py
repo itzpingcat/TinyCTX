@@ -268,6 +268,23 @@ class CLIBridge:
             self._console.print(f"{t('agent_label')}:", style=c('agent_label'))
             self._label_printed = True
 
+    def _tail(self, text: str) -> str:
+        """
+        Keep only the last screenful of lines.
+
+        Rich's Live can only repaint the part of its render that is still on
+        screen. If the render is taller than the terminal, it cannot move the
+        cursor back above the top edge, so every refresh re-prints the whole
+        buffer — the message appears over and over, growing each time. Capping
+        the live render to the visible area keeps repainting in-place. The full
+        text is printed once by _flush_live() when the message ends.
+        """
+        max_lines = max(1, self._console.size.height - 4)
+        lines = text.splitlines()
+        if len(lines) <= max_lines:
+            return text
+        return "\n".join(lines[-max_lines:])
+
     def _get_live_render(self, content: str, is_thinking: bool = False,
                            thinking_content: str = "") -> Group:
         c = self._theme.c
@@ -276,12 +293,12 @@ class CLIBridge:
             if self._show_thinking and thinking_content:
                 parts.append(Text(" ⠋ thinking...", style=c('thinking')))
                 parts.append(Markdown(
-                    f"```\n{thinking_content}\n```"
+                    f"```\n{self._tail(thinking_content)}\n```"
                 ))
             elif not content:
                 parts.append(Text(" ⠋ thinking...", style=c('thinking')))
         if content:
-            parts.append(Markdown(_preprocess(content)))
+            parts.append(Markdown(_preprocess(self._tail(content))))
         return Group(*parts)
 
     def _stop_live(self):
@@ -289,13 +306,22 @@ class CLIBridge:
             self._live.stop()
             self._live = None
 
+    def _flush_live(self, text: str) -> None:
+        """Tear down the transient live region and print `text` for real."""
+        self._stop_live()
+        if text:
+            self._console.print(Markdown(_preprocess(text)))
+
     def _ensure_live(self, is_thinking: bool = False):
         if not self._live:
             self._live = Live(
                 self._get_live_render(self._current_content, is_thinking),
                 console=self._console,
                 refresh_per_second=8,
-                vertical_overflow="visible",
+                vertical_overflow="crop",
+                # Erase the streaming preview on stop; _flush_live() then
+                # prints the complete text once, so nothing is duplicated.
+                transient=True,
                 get_renderable=lambda: self._get_live_render(
                     self._current_content, 
                     is_thinking=is_thinking, 
@@ -327,10 +353,7 @@ class CLIBridge:
                     thinking_content=self._thinking_content))
 
         elif isinstance(event, (AgentToolCall, _FakeToolCall)):
-            if self._live:
-                self._live.update(self._get_live_render(
-                    self._current_content, is_thinking=False))
-            self._stop_live()
+            self._flush_live(self._current_content)
             self._current_content = ""
             def _truncate(v, max_chars=80) -> str:
                 r = repr(v)
@@ -355,11 +378,10 @@ class CLIBridge:
             suppressed = getattr(event, "suppressed", False)
             final_text = "" if suppressed else (event.text or self._current_content).strip()
 
-            # 2. Shut down the live display immediately
-            # (This flushes the current state to the console once)
+            # 2. Shut down the live preview and print the final text once.
             if suppressed:
                 self._current_content = ""
-            self._stop_live()
+            self._flush_live(final_text)
 
             # 3. Clean up for next message
             if final_text:
@@ -373,7 +395,8 @@ class CLIBridge:
             self._reply_done.set()
 
         elif isinstance(event, (AgentError, _FakeError)):
-            self._stop_live()
+            self._flush_live(self._current_content)
+            self._current_content = ""
             self._console.print(
                 f"\n[{c('error')}]error: {event.message}[/{c('error')}]\n")
             self._reply_done.set()
