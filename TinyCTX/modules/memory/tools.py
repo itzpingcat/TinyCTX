@@ -304,24 +304,22 @@ def _dedup_status_line() -> str:
 # Tools — write
 # ---------------------------------------------------------------------------
 
-async def memory_add_entity(name: str, entity_type: str, description: str, scope: str = "global") -> str:
+async def memory_add_entity(name: str, entity_type: str, description: str) -> str:
     """
-    Add a new entity. Rejected if an entity with the same name already exists in
-    the same scope — the existing entity's full data is returned so you can
-    update or merge instead.
+    Add a new entity. Always created at scope "global" — call
+    memory_set_entity_scope afterward as a deliberate second step if this
+    entity genuinely needs a narrower (sensitive/personal) scope. Rejected if
+    an entity with the same name already exists in the same scope — the
+    existing entity's full data is returned so you can update or merge
+    instead.
 
     Args:
         name: Display name.
         entity_type: e.g. Person, Project, Fact, Preference, Concept, Event.
         description: Freeform description.
-        scope: Visibility scope (default "global"). Narrow (user:<name>,
-            guild:<name>) ONLY for sensitive/personal info.
     """
+    scope = _scopes.GLOBAL
     visible = current_scopes()
-    if not _scopes.is_valid_scope(scope):
-        return f"Error: invalid scope '{scope}'. Use 'global' or 'kind:target' (e.g. user:bob)."
-    if scope not in visible:
-        return f"Error: scope '{scope}' is not writable in this context. Writable: {sorted(visible)}."
 
     async with _write_lock:
         existing_uid = _graph_db.name_exists_in_scope(name, scope)

@@ -73,7 +73,7 @@ def graph(tmp_path):
 
 async def test_add_and_search_roundtrip(graph):
     with tools.scope_context({"global"}):
-        out = await tools.memory_add_entity("Project Atlas", "Project", "the shared roadmap", "global")
+        out = await tools.memory_add_entity("Project Atlas", "Project", "the shared roadmap")
         assert "Added" in out
         found = await tools.search_memory("Atlas", top_k=5)
     assert "Project Atlas" in found
@@ -81,8 +81,8 @@ async def test_add_and_search_roundtrip(graph):
 
 async def test_atomic_unique_name_in_scope(graph):
     with tools.scope_context({"global"}):
-        await tools.memory_add_entity("Bob", "Person", "first", "global")
-        second = await tools.memory_add_entity("Bob", "Person", "second", "global")
+        await tools.memory_add_entity("Bob", "Person", "first")
+        second = await tools.memory_add_entity("Bob", "Person", "second")
     assert "already exists" in second
     assert "first" in second  # existing entity's data is returned on collision
 
@@ -91,8 +91,9 @@ async def test_same_name_distinct_scopes_allowed(tmp_path):
     gdbase, graph_db = _make_graph(tmp_path)
     try:
         with tools.scope_context({"global", "user:able"}):
-            a = await tools.memory_add_entity("Notes", "Fact", "global notes", "global")
-            b = await tools.memory_add_entity("Notes", "Fact", "able's notes", "user:able")
+            b = await tools.memory_add_entity("Notes", "Fact", "able's notes")
+            await tools.memory_set_entity_scope("Notes", "user:able")
+            a = await tools.memory_add_entity("Notes", "Fact", "global notes")
         assert "Added" in a and "Added" in b
     finally:
         graph_db.close()
@@ -104,9 +105,11 @@ async def test_scope_isolation_end_to_end(tmp_path):
     try:
         # seed nodes in three scopes
         with tools.scope_context({"global", "user:able", "user:carl"}):
-            await tools.memory_add_entity("Global Fact", "Fact", "atlas visible to all", "global")
-            await tools.memory_add_entity("Able Fact", "Fact", "atlas able secret", "user:able")
-            await tools.memory_add_entity("Carl Fact", "Fact", "atlas carl secret", "user:carl")
+            await tools.memory_add_entity("Global Fact", "Fact", "atlas visible to all")
+            await tools.memory_add_entity("Able Fact", "Fact", "atlas able secret")
+            await tools.memory_set_entity_scope("Able Fact", "user:able")
+            await tools.memory_add_entity("Carl Fact", "Fact", "atlas carl secret")
+            await tools.memory_set_entity_scope("Carl Fact", "user:carl")
         # Able's view excludes Carl
         with tools.scope_context({"global", "user:able"}):
             out = await tools.search_memory("atlas", top_k=10)
@@ -126,8 +129,8 @@ async def test_scope_isolation_end_to_end(tmp_path):
 
 async def test_relation_conflict_group_deletion(graph):
     with tools.scope_context({"global"}):
-        await tools.memory_add_entity("A", "Concept", "a", "global")
-        await tools.memory_add_entity("B", "Concept", "b", "global")
+        await tools.memory_add_entity("A", "Concept", "a")
+        await tools.memory_add_entity("B", "Concept", "b")
         await tools.memory_set_relationship("A", "B", "DEPENDS_ON", 0.5)
         out = await tools.memory_set_relationship("A", "B", "SUPERSEDES", 0.9)
         a = await tools.search_memory("A", top_k=1)
@@ -137,8 +140,8 @@ async def test_relation_conflict_group_deletion(graph):
 
 async def test_relation_weight_update_not_duplicated(graph):
     with tools.scope_context({"global"}):
-        await tools.memory_add_entity("A", "Concept", "a", "global")
-        await tools.memory_add_entity("B", "Concept", "b", "global")
+        await tools.memory_add_entity("A", "Concept", "a")
+        await tools.memory_add_entity("B", "Concept", "b")
         await tools.memory_set_relationship("A", "B", "RELATED_TO", 0.3)
         out = await tools.memory_set_relationship("A", "B", "RELATED_TO", 0.8)
         a = await tools.search_memory("A", top_k=1)
@@ -148,8 +151,8 @@ async def test_relation_weight_update_not_duplicated(graph):
 
 async def test_delete_relationship_directional(graph):
     with tools.scope_context({"global"}):
-        await tools.memory_add_entity("A", "Concept", "a", "global")
-        await tools.memory_add_entity("B", "Concept", "b", "global")
+        await tools.memory_add_entity("A", "Concept", "a")
+        await tools.memory_add_entity("B", "Concept", "b")
         await tools.memory_set_relationship("A", "B", "KNOWS", 0.5)
         await tools.memory_set_relationship("B", "A", "KNOWS", 0.5)
         await tools.memory_delete_relationship("A", "B", "KNOWS")
@@ -164,9 +167,9 @@ async def test_delete_relationship_directional(graph):
 
 async def test_merge_duplicate_reparents_and_deletes(graph):
     with tools.scope_context({"global"}):
-        await tools.memory_add_entity("Canon", "Person", "canonical", "global")
-        await tools.memory_add_entity("Dup", "Person", "duplicate", "global")
-        await tools.memory_add_entity("Friend", "Person", "friend", "global")
+        await tools.memory_add_entity("Canon", "Person", "canonical")
+        await tools.memory_add_entity("Dup", "Person", "duplicate")
+        await tools.memory_add_entity("Friend", "Person", "friend")
         await tools.memory_set_relationship("Dup", "Friend", "KNOWS", 0.7)
         out = await tools.memory_merge_into("Canon", "Dup", "merged", "duplicate")
         canon = await tools.search_memory("Canon", top_k=1)
@@ -178,8 +181,8 @@ async def test_merge_duplicate_reparents_and_deletes(graph):
 
 async def test_merge_alias_keeps_both(graph):
     with tools.scope_context({"global"}):
-        await tools.memory_add_entity("Robert", "Person", "full name", "global")
-        await tools.memory_add_entity("Bob", "Person", "nickname", "global")
+        await tools.memory_add_entity("Robert", "Person", "full name")
+        await tools.memory_add_entity("Bob", "Person", "nickname")
         out = await tools.memory_merge_into("Robert", "Bob", "Robert aka Bob", "alias")
         bob = await tools.search_memory("Bob", top_k=1)
     assert "Aliased" in out
@@ -193,7 +196,7 @@ async def test_merge_alias_keeps_both(graph):
 async def test_update_description_diff_and_embed_stale(graph):
     gdbase, graph_db = graph
     with tools.scope_context({"global"}):
-        await tools.memory_add_entity("Doc", "Concept", "line one\nline two\nline three", "global")
+        await tools.memory_add_entity("Doc", "Concept", "line one\nline two\nline three")
         diff = "@@ -1,3 +1,3 @@\n line one\n-line two\n+LINE TWO EDITED\n line three"
         out = await tools.memory_update_entity_description("Doc", diff)
         found = await tools.search_memory("Doc", top_k=1)
@@ -206,7 +209,7 @@ async def test_update_description_diff_and_embed_stale(graph):
 
 async def test_update_description_stale_base_rejected(graph):
     with tools.scope_context({"global"}):
-        await tools.memory_add_entity("Doc2", "Concept", "actual content here", "global")
+        await tools.memory_add_entity("Doc2", "Concept", "actual content here")
         diff = "@@ -1,1 +1,1 @@\n-totally different base\n+new"
         out = await tools.memory_update_entity_description("Doc2", diff)
     assert "did not apply" in out.lower()
@@ -222,8 +225,8 @@ async def test_vector_search_and_embedding_pass(tmp_path):
                                    cfg={"similarity_threshold": 0.9})
     try:
         with tools.scope_context({"global"}):
-            await tools.memory_add_entity("Atlas", "Project", "the atlas roadmap", "global")
-            await tools.memory_add_entity("Pizza", "Concept", "pizza topping notes", "global")
+            await tools.memory_add_entity("Atlas", "Project", "the atlas roadmap")
+            await tools.memory_add_entity("Pizza", "Concept", "pizza topping notes")
         # run the embedding pass to populate embeddings + the vector index
         n = await deduper.refresh_embeddings(tools._cfg, tools._conn, tools._write_lock,
                                              FakeEmbedder(), graph_db)
@@ -260,9 +263,9 @@ async def test_dedup_progress_in_stats(tmp_path):
                                    cfg={"similarity_threshold": 0.9})
     try:
         with tools.scope_context({"global"}):
-            await tools.memory_add_entity("Atlas One", "Project", "atlas alpha", "global")
-            await tools.memory_add_entity("Atlas Two", "Project", "atlas beta", "global")
-            await tools.memory_add_entity("Salsa", "Concept", "unrelated", "global")
+            await tools.memory_add_entity("Atlas One", "Project", "atlas alpha")
+            await tools.memory_add_entity("Atlas Two", "Project", "atlas beta")
+            await tools.memory_add_entity("Salsa", "Concept", "unrelated")
         await deduper.run_dedup_cycle(tools._cfg, tmp_path, tools._conn, tools._write_lock,
                                       DupLLM(), DupEmbedder(), graph_db, None)
         prog = deduper.dedup_progress()
@@ -280,8 +283,9 @@ async def test_edge_visibility_requires_both_endpoints(tmp_path):
     gdbase, graph_db = _make_graph(tmp_path)
     try:
         with tools.scope_context({"global", "user:able"}):
-            await tools.memory_add_entity("Shared", "Project", "global project", "global")
-            await tools.memory_add_entity("AbleNote", "Fact", "able private note", "user:able")
+            await tools.memory_add_entity("Shared", "Project", "global project")
+            await tools.memory_add_entity("AbleNote", "Fact", "able private note")
+            await tools.memory_set_entity_scope("AbleNote", "user:able")
             await tools.memory_set_relationship("Shared", "AbleNote", "RELATED_TO", 0.5)
         # Bill (no user:able) sees Shared but NOT the edge to the invisible AbleNote
         with tools.scope_context({"global", "user:bill"}):

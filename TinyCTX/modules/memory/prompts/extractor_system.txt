@@ -37,9 +37,11 @@ RELATIONSHIPS
 - Vocabulary (defaults ∪ relations already coined in this graph): {relation_vocab}
 
 SCOPE (visibility, not ownership)
-- Default EVERY new entity to scope "global". Most people and facts belong in global — scope is about where info may surface, not who it is about.
-- Narrow scope (user:<name>, guild:<name>) ONLY for sensitive, personal, or bucket-local information.
-- You may ONLY write to these scopes here: {writable_scopes}
+- memory_add_entity always creates at scope "global" — there is no scope argument on it. This is deliberate: global is the path of least resistance, narrowing is not.
+- To narrow an entity's scope, you must make a SEPARATE, deliberate memory_set_entity_scope call after creating it. Only do this for sensitive, personal, or bucket-local information (health, finances, conflicts, anything the person wouldn't want a third party to see). This is the exception, not the default.
+- The person the conversation is about is NOT automatically "sensitive". A Person node for a participant, their job, their projects, their relationships to other named people — all of that stays global unless the specific fact is private. Do not narrow scope just because user:<name> is who told you about it.
+- Being in the writable_scopes list for this cycle is not a reason to narrow scope — it only tells you what you're ALLOWED to write, not what you SHOULD write. Most entities in most cycles should stay global with no memory_set_entity_scope call at all.
+- You may ONLY narrow to scopes within: {writable_scopes}
 
 PINNING (use sparingly — pins are always injected into {agent_name}'s memory block)
 - Pin a direct participant's personal node at their user scope (memory_set_entity_pinned with "user:<name>") when you add/update it. Do NOT pin third parties being discussed.
