@@ -564,7 +564,7 @@ class CLIBridge:
         # Built-in commands always available locally.
         builtin_rows = [
             ("/reset",  "Start a new session branch"),
-            ("/resume", "Reattach to the session from before this launch"),
+            ("/resume [node_id]", "Reattach to the session from before this launch, or to node_id"),
             ("/copy",   "Copy last agent reply to clipboard"),
             ("/paste",  "Submit clipboard contents as next message"),
             ("/think",  "Toggle display of thinking content (currently " +
@@ -658,22 +658,37 @@ class CLIBridge:
                         continue
 
                     # --------------------------------------------------------
-                    # Built-in: /resume — reattach to the session that was
-                    # active before this launch started a fresh branch.
+                    # Built-in: /resume [node_id] — reattach to the session
+                    # that was active before this launch started a fresh
+                    # branch, or to an explicit node_id if one is given.
                     # --------------------------------------------------------
-                    if lower == "/resume":
-                        if not self._resume_cursor:
+                    if lower == "/resume" or lower.startswith("/resume "):
+                        arg = text[len("/resume"):].strip()  # preserve case
+                        target_node = arg or self._resume_cursor
+                        if not target_node:
                             self._console.print(
                                 f"[{c('reset')}]  ·  no previous session to resume"
                                 f"[/{c('reset')}]")
                             continue
-                        await self._api_post(
-                            "/v1/lane/open", {"node_id": self._resume_cursor})
-                        self._cursor = self._resume_cursor
+                        data = await self._api_post(
+                            "/v1/lane/open", {"node_id": target_node})
+                        opened_node = data.get("node_id")
+                        # /v1/lane/open silently starts a fresh branch when
+                        # node_id is unknown instead of erroring — a mismatch
+                        # between what we asked for and what came back is how
+                        # we detect that and report it instead of quietly
+                        # resuming the wrong (new) session.
+                        if arg and opened_node != target_node:
+                            self._console.print(
+                                f"[{c('error')}]  ✗  session '{target_node}' not found"
+                                f"[/{c('error')}]")
+                            continue
+                        self._cursor = opened_node
                         if self._instance_dir:
                             _save_cli_cursor_path(self._instance_dir, self._cursor)
+                        label = f"resumed session {opened_node}" if arg else "resumed previous session"
                         self._console.print(
-                            f"[{c('reset')}]  ⟲  resumed previous session"
+                            f"[{c('reset')}]  ⟲  {label}"
                             f"[/{c('reset')}]")
                         continue
 
