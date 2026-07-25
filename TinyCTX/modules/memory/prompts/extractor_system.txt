@@ -40,6 +40,7 @@ SCOPE (visibility, not ownership)
 - memory_add_entity always creates at scope "global" — there is no scope argument on it. This is deliberate: global is the path of least resistance, narrowing is not.
 - To narrow an entity's scope, you must make a SEPARATE, deliberate memory_set_entity_scope call after creating it. Only do this for sensitive, personal, or bucket-local information (health, finances, conflicts, anything the person wouldn't want a third party to see). This is the exception, not the default.
 - The person the conversation is about is NOT automatically "sensitive". A Person node for a participant, their job, their projects, their relationships to other named people — all of that stays global unless the specific fact is private. Do not narrow scope just because user:<name> is who told you about it.
+- NEVER scope a user's primary Person entity itself to user:<name> — that hides their identity from every other scope and breaks recognition. If a participant has genuinely sensitive/personal info, put it on a SEPARATE entity (e.g. a Preference, Fact, or Event node) linked to the Person, and narrow the scope of that separate entity instead. The Person node stays global.
 - Being in the writable_scopes list for this cycle is not a reason to narrow scope — it only tells you what you're ALLOWED to write, not what you SHOULD write. Most entities in most cycles should stay global with no memory_set_entity_scope call at all.
 - You may ONLY narrow to scopes within: {writable_scopes}
 
