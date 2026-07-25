@@ -37,7 +37,7 @@ class FakeEmbedder:
         "pizza": [0.0, 1.0, 0.0],       # orthogonal
     }
 
-    async def embed_one(self, text: str, priority: int = 10):
+    async def embed_one(self, text: str, priority: int = 10, kind: str = "document"):
         t = text.lower()
         for k, v in self._MAP.items():
             if k in t:
@@ -244,7 +244,7 @@ async def test_dedup_progress_in_stats(tmp_path):
     from TinyCTX.modules.memory import deduper
 
     class DupEmbedder:
-        async def embed_one(self, text, priority=10):
+        async def embed_one(self, text, priority=10, kind: str = "document"):
             # near-identical vectors for the two "Atlas" nodes -> a candidate pair
             return [1.0, 0.0] if "atlas" in text.lower() else [0.0, 1.0]
 

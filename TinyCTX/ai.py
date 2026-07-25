@@ -493,15 +493,15 @@ class Embedder:
             document_template=cfg.document_template,
         )
 
-    async def embed(self, texts: list[str], priority: int = 10, kind: str = "document") -> list[list[float]]:
+    async def embed(self, texts: list[str], priority: int = 10, kind: str = "default") -> list[list[float]]:
         """
         Embed a list of strings. Returns one float vector per input text,
         in the same order as the input. Batches automatically.
 
         `kind` selects which template wraps each text before embedding:
-        "query" uses `query_template`, "document" (default) uses
-        `document_template`. Both default to "{text}" (no-op) unless set
-        at construction time.
+        "query" uses `query_template`, "document" uses `document_template`.
+        Any other value, including the "default" default, applies no
+        templating (raw text).
 
         `priority` controls admission order when multiple requests are in
         flight at once (lower runs first, ties are FIFO).
@@ -511,7 +511,12 @@ class Embedder:
         if not texts:
             return []
 
-        tmpl = self.query_template if kind == "query" else self.document_template
+        if kind == "query":
+            tmpl = self.query_template
+        elif kind == "document":
+            tmpl = self.document_template
+        else:
+            tmpl = "{text}"
         texts = [tmpl.format(text=t) for t in texts]
 
         async def _run():
@@ -523,7 +528,7 @@ class Embedder:
 
         return await _enqueue(priority, _run)
 
-    async def embed_one(self, text: str, priority: int = 10, kind: str = "document") -> list[float]:
+    async def embed_one(self, text: str, priority: int = 10, kind: str = "default") -> list[float]:
         """Convenience wrapper — embed a single string."""
         vecs = await self.embed([text], priority=priority, kind=kind)
         return vecs[0]
