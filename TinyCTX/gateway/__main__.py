@@ -498,9 +498,21 @@ async def handle_lane_command(request: web.Request) -> web.Response:
             display_name="API Client",
         )
 
+    # Handlers reply through one of two conventions and bridges must offer
+    # both. Discord-era handlers await context["send"](text); older ones call
+    # context["console"].print(text). Providing only "console" here meant every
+    # send-style handler (/memory stats, /memory librarian, /heartbeat run, all
+    # of /user *) ran fine, returned handled=True, and produced no output —
+    # the caller saw nothing. Both now funnel into the same _StringConsole, so
+    # get_output() (and therefore the HTTP response and command_introspection)
+    # picks up either style. See bridges/discord/commands.py for the pattern.
+    async def _send(text: str) -> None:
+        console.print(text)
+
     context: dict = {
         "node_id":   node_id,
         "console":   console,
+        "send":      _send,
         "runtime":   runtime,
         "agent":     None,   # no per-lane agent in new arch
         "theme_c":   lambda _k: "",

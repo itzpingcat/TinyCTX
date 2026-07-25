@@ -34,6 +34,9 @@ TinyCTX/
 │   ├── instance.py      Shared instance-directory resolution (--dir / CWD .tinyctx / ~/.tinyctx)
 │   ├── tool_handler.py  ToolCallHandler — register/enable/execute tools
 │   ├── commands.py      CommandRegistry — slash-command dispatch for bridges
+│                        Handlers reply via EITHER `await context["send"](text)`
+│                        OR `context["console"].print(text)` — a bridge MUST
+│                        supply both keys or send-style handlers go silent.
 │   ├── attachments.py   Attachment processing (images, PDFs, text, binary)
 │   └── bm25.py          BM25 keyword search (used for tool_search and memory)
 │
@@ -269,7 +272,10 @@ Slash commands registered by `Runtime`:
 - Supports paste refs, slash commands, copy helpers
 - Provider presets for OpenAI, OpenRouter, Ollama, LM Studio, llama.cpp, custom
 - `agent_name` option: set `agent_name: "Aria"` under `bridges.cli.options` to stamp assistant nodes with a custom name (forwarded in every message payload to the gateway)
-- Streaming render: the Rich `Live` region is `transient` + `vertical_overflow="crop"` and shows only the last screenful (`_tail()`). `_flush_live()` tears the preview down and prints the complete text once. Do not let the live render exceed the terminal height — Rich cannot scroll back above the top edge, so it reprints the whole buffer on every refresh and the reply appears duplicated.
+- Session start: every launch branches fresh off root (`/v1/lane/branch` → `/v1/lane/open`) so a new session doesn't inherit the last one's context. The pre-launch cursor is held in `_resume_cursor`; `/resume` reattaches to it. Set `default_to_resume: true` under `bridges.cli.options` to reattach automatically instead of branching.
+- Streaming render (`_split_blocks` / `_emit_text` / `_print_block`): **append-only — nothing on screen is ever repainted.** Streamed text is buffered and flushed one markdown block at a time, at block boundaries (blank line outside a fence, or a closing fence). Each block is captured, its surrounding blank lines trimmed, and separated from the next by exactly one blank line.
+  - This replaced a `rich.live.Live` region. Live repaints by moving the cursor up over its own output, which broke two ways: a render taller than the terminal couldn't be scrolled back over, so every refresh reprinted the whole reply (duplicated-message bug); and scrolling mid-reply desynced Rich's cursor position from the real one, smearing output.
+  - **Do not reintroduce `Live` or anything else that repositions the cursor here.** The renderer emits zero cursor-movement escapes; that property is what makes mid-stream scrolling safe.
 
 ### Discord (`bridges/discord/`)
 

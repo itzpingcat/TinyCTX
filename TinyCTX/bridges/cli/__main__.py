@@ -16,8 +16,8 @@ run_detached(...)         Real entry point. Called by commands/launch.py.
 
 What is unchanged
 -----------------
-  CLITheme, CLIBridge.__init__, _console, _live, _theme, _reply_done
-  handle_event, _start_reply, _get_live_render, _stop_live, _ensure_live
+  CLITheme, CLIBridge.__init__, _console, _theme, _reply_done
+  handle_event, _start_reply
   _preprocess (code block label injection)
   _read_clipboard_text, _write_clipboard_text
   /copy, /paste, /think built-in slash commands
@@ -51,12 +51,11 @@ if sys.platform == "win32":
     kernel32 = ctypes.windll.kernel32
     kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
 
-from rich.console import Console, Group
+from rich.console import Console
 from rich.logging import RichHandler
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.text import Text
-from rich.live import Live
 
 logger = logging.getLogger(__name__)
 
@@ -107,7 +106,12 @@ class _FakeThinkingChunk:
 class _FakeTextChunk:
     def __init__(self, text): self.text = text
 class _FakeTextFinal:
-    def __init__(self, text): self.text = text
+    # suppressed mirrors AgentTextFinal.suppressed (NO_REPLY sentinel). The
+    # gateway has always sent it in the SSE payload and handle_event has always
+    # read it, but it was never plumbed through here — so NO_REPLY never
+    # registered on the CLI path.
+    def __init__(self, text, suppressed=False):
+        self.text = text; self.suppressed = suppressed
 class _FakeToolCall:
     def __init__(self, tool_name, call_id, args):
         self.tool_name = tool_name; self.call_id = call_id; self.args = args
@@ -134,21 +138,29 @@ class CLIBridge:
             colors=options.get("customcolors") or {} if options else {},
             text=options.get("customtext") or {} if options else {}
         )
-        # force_terminal=True ensures Rich uses ANSI cursor-up for Live updates
-        # on Windows, preventing each live.update() from printing a new line
-        # instead of overwriting in place (which causes response duplication).
+        # force_terminal=True keeps ANSI colour on Windows when stdout isn't
+        # detected as a tty. Output is append-only (see _emit_text), so no
+        # cursor-repositioning behaviour is relied on here.
         self._console     = Console(highlight=False, force_terminal=True)
         self._reply_done  = asyncio.Event()
 
-        self._current_content = ""
-        self._thinking_content = ""
-        self._live: Live | None = None
+        self._current_content = ""    # full streamed reply, kept for _last_reply
+        self._stream_buf      = ""    # streamed text not yet printed (partial block)
+        self._think_buf       = ""    # partial thinking line
+        self._thinking_shown  = False
+        self._printed_block   = False # any block printed yet this reply
         self._cursor: str | None = None   # node_id cursor, managed locally
         self._label_printed   = False
         self._last_reply: str = ""
         self._show_thinking: bool = bool(
             options.get("show_thinking", False) if options else False
         )
+        # default_to_resume: reattach to the previous session on launch instead
+        # of starting a fresh branch. Off by default — see run_detached().
+        self._default_to_resume: bool = bool(
+            options.get("default_to_resume", False) if options else False
+        )
+        self._resume_cursor: str | None = None  # previous session, for /resume
 
         # Set by run_detached before run() is called.
         self._gateway_url: str = ""
@@ -222,9 +234,13 @@ class CLIBridge:
 
         output = (data.get("output") or "").strip()
         if output:
-            # Render each line; use tool_ok color as neutral command output.
+            # markup=False: command output is arbitrary text and may contain
+            # square brackets (dict reprs, log lines, [tags]), which Rich would
+            # otherwise try to parse as style markup and either swallow or error
+            # on. Colour comes from style= instead.
             for line in output.splitlines():
-                self._console.print(f"  [{c('tool_ok')}]{line}[/{c('tool_ok')}]")
+                self._console.print(
+                    f"  {line}", markup=False, style=c('tool_ok'))
         return True
 
     # --- Clipboard helpers ---
@@ -267,93 +283,122 @@ class CLIBridge:
             c = self._theme.c
             self._console.print(f"{t('agent_label')}:", style=c('agent_label'))
             self._label_printed = True
+            self._printed_block = False
 
-    def _tail(self, text: str) -> str:
+    # --- Append-only streaming renderer ---
+    #
+    # Nothing on screen is ever repainted. Each completed markdown block is
+    # printed exactly once and never touched again.
+    #
+    # This replaced a rich.live.Live region, which repainted by moving the
+    # cursor up over its previous output. That had two failure modes:
+    #   * a render taller than the terminal could not be scrolled back over,
+    #     so every refresh re-printed the whole reply — the duplicated-message
+    #     bug;
+    #   * scrolling mid-reply desynced Rich's idea of the cursor position from
+    #     the real one, smearing output across the screen.
+    # Both are structurally impossible when output is append-only.
+    #
+    # Markdown still renders properly because blocks are only flushed at true
+    # block boundaries — a blank line outside a fence, or a closing fence.
+    # Those are exactly markdown's own block separators, so headings, lists,
+    # tables and code fences are always handed to Markdown() as whole units.
+
+    @staticmethod
+    def _split_blocks(buf: str) -> tuple[list[str], str]:
         """
-        Keep only the last screenful of lines.
+        Split `buf` into (complete markdown blocks, unfinished remainder).
 
-        Rich's Live can only repaint the part of its render that is still on
-        screen. If the render is taller than the terminal, it cannot move the
-        cursor back above the top edge, so every refresh re-prints the whole
-        buffer — the message appears over and over, growing each time. Capping
-        the live render to the visible area keeps repainting in-place. The full
-        text is printed once by _flush_live() when the message ends.
+        Only fully-received lines are considered — the text after the last
+        newline is still being streamed and always stays in the remainder.
         """
-        max_lines = max(1, self._console.size.height - 4)
-        lines = text.splitlines()
-        if len(lines) <= max_lines:
-            return text
-        return "\n".join(lines[-max_lines:])
+        lines = buf.split("\n")
+        blocks: list[str] = []
+        cur: list[str] = []
+        in_fence = False
+        cut = 0  # index of the first line not yet flushed
 
-    def _get_live_render(self, content: str, is_thinking: bool = False,
-                           thinking_content: str = "") -> Group:
+        for i, line in enumerate(lines[:-1]):
+            if line.lstrip().startswith("```"):
+                cur.append(line)
+                in_fence = not in_fence
+                if not in_fence:          # fence just closed → block complete
+                    blocks.append("\n".join(cur))
+                    cur = []
+                    cut = i + 1
+                continue
+            if not in_fence and not line.strip():
+                if cur:
+                    blocks.append("\n".join(cur))
+                    cur = []
+                cut = i + 1
+                continue
+            cur.append(line)
+
+        return blocks, "\n".join(lines[cut:])
+
+    def _print_block(self, block: str) -> None:
+        """
+        Render one markdown block and append it to the screen.
+
+        Blocks are rendered independently, so Rich's own inter-block spacing
+        (which it only applies *within* a single Markdown render) is gone. We
+        capture each block, trim the blank lines Rich puts around things like
+        code fences and tables, and re-insert exactly one blank line between
+        blocks — so spacing is uniform no matter how the stream was chunked.
+        """
+        with self._console.capture() as cap:
+            self._console.print(Markdown(_preprocess(block)))
+        body = cap.get().strip("\n")
+        if not body:
+            return
+        if self._printed_block:
+            self._console.file.write("\n")
+        self._console.file.write(body + "\n")
+        self._console.file.flush()
+        self._printed_block = True
+
+    def _emit_text(self, text: str) -> None:
+        """Buffer streamed text and print whole markdown blocks as they close."""
+        self._stream_buf += text
+        blocks, self._stream_buf = self._split_blocks(self._stream_buf)
+        for block in blocks:
+            self._print_block(block)
+
+    def _flush_stream(self) -> None:
+        """Print whatever is left in the buffer (end of message / before a tool)."""
+        rest = self._stream_buf.strip()
+        self._stream_buf = ""
+        if rest:
+            self._print_block(rest)
+
+    def _emit_thinking(self, text: str) -> None:
+        """Print completed thinking lines as dim plain text (never markdown)."""
         c = self._theme.c
-        parts = []
-        if is_thinking:
-            if self._show_thinking and thinking_content:
-                parts.append(Text(" ⠋ thinking...", style=c('thinking')))
-                parts.append(Markdown(
-                    f"```\n{self._tail(thinking_content)}\n```"
-                ))
-            elif not content:
-                parts.append(Text(" ⠋ thinking...", style=c('thinking')))
-        if content:
-            parts.append(Markdown(_preprocess(self._tail(content))))
-        return Group(*parts)
-
-    def _stop_live(self):
-        if self._live:
-            self._live.stop()
-            self._live = None
-
-    def _flush_live(self, text: str) -> None:
-        """Tear down the transient live region and print `text` for real."""
-        self._stop_live()
-        if text:
-            self._console.print(Markdown(_preprocess(text)))
-
-    def _ensure_live(self, is_thinking: bool = False):
-        if not self._live:
-            self._live = Live(
-                self._get_live_render(self._current_content, is_thinking),
-                console=self._console,
-                refresh_per_second=8,
-                vertical_overflow="crop",
-                # Erase the streaming preview on stop; _flush_live() then
-                # prints the complete text once, so nothing is duplicated.
-                transient=True,
-                get_renderable=lambda: self._get_live_render(
-                    self._current_content, 
-                    is_thinking=is_thinking, 
-                    thinking_content=self._thinking_content
-                )
-            )
-            self._live.start()
+        if not self._thinking_shown:
+            self._console.print(f" [{c('thinking')}]⠋ thinking...[/{c('thinking')}]")
+            self._thinking_shown = True
+        if not self._show_thinking:
+            return
+        self._think_buf += text
+        *done, self._think_buf = self._think_buf.split("\n")
+        for line in done:
+            self._console.print(f"   {line}", markup=False, style=c('thinking'))
 
     async def handle_event(self, event) -> None:
         c = self._theme.c
 
         if isinstance(event, (AgentThinkingChunk, _FakeThinkingChunk)):
             self._start_reply()
-            if self._show_thinking and event.text:
-                self._thinking_content += event.text
-            self._ensure_live(is_thinking=True)
-            if self._live:
-                self._live.update(self._get_live_render(
-                    self._current_content, is_thinking=True,
-                    thinking_content=self._thinking_content))
+            self._emit_thinking(event.text or "")
 
         elif isinstance(event, (AgentTextChunk, _FakeTextChunk)):
             self._start_reply()
             self._current_content += event.text
-            self._ensure_live()
-            if self._live:
-                self._live.update(self._get_live_render(
-                    self._current_content,
-                    thinking_content=self._thinking_content))
+            self._emit_text(event.text)
 
         elif isinstance(event, (AgentToolCall, _FakeToolCall)):
-            self._flush_live(self._current_content)
+            self._flush_stream()
             self._current_content = ""
             def _truncate(v, max_chars=80) -> str:
                 r = repr(v)
@@ -364,7 +409,6 @@ class CLIBridge:
                 f"  [{c('tool_call')}]⟶  {event.tool_name}({args_str})[/{c('tool_call')}]")
 
         elif isinstance(event, (AgentToolResult, _FakeToolResult)):
-            self._stop_live()
             status_color = c("tool_error") if event.is_error else c("tool_ok")
             icon = "✗" if event.is_error else "✓"
             preview = (event.output[:100].replace("\n", " ")
@@ -374,28 +418,35 @@ class CLIBridge:
                 end="")
             self._console.print(preview, markup=False, style="bright_black")
         elif isinstance(event, (AgentTextFinal, _FakeTextFinal)):
-            # 1. Capture the text (NO_REPLY suppresses any streamed content)
+            # NO_REPLY: drop the buffer unprinted. The sentinel is a bare token
+            # with no trailing blank line, so _emit_text() will still be holding
+            # it in _stream_buf and nothing has reached the screen yet.
             suppressed = getattr(event, "suppressed", False)
-            final_text = "" if suppressed else (event.text or self._current_content).strip()
-
-            # 2. Shut down the live preview and print the final text once.
             if suppressed:
+                self._stream_buf = ""
                 self._current_content = ""
-            self._flush_live(final_text)
-
-            # 3. Clean up for next message
-            if final_text:
-                self._last_reply = final_text
-            elif suppressed:
                 self._console.print(f"  [{c('tool_ok')}]·  (no reply)[/{c('tool_ok')}]")
+            elif self._current_content:
+                # Already streamed and printed block by block — just flush the tail.
+                self._flush_stream()
+                self._last_reply = self._current_content.strip()
+            else:
+                # Non-streaming provider: the whole reply arrives here at once.
+                final_text = (event.text or "").strip()
+                if final_text:
+                    self._console.print(Markdown(_preprocess(final_text)))
+                    self._last_reply = final_text
 
             self._current_content = ""
-            self._thinking_content = ""
+            self._stream_buf = ""
+            self._think_buf = ""
+            self._thinking_shown = False
             self._label_printed = False
+            self._printed_block = False
             self._reply_done.set()
 
         elif isinstance(event, (AgentError, _FakeError)):
-            self._flush_live(self._current_content)
+            self._flush_stream()
             self._current_content = ""
             self._console.print(
                 f"\n[{c('error')}]error: {event.message}[/{c('error')}]\n")
@@ -459,7 +510,10 @@ class CLIBridge:
                     elif event_type == "text_chunk":
                         await self.handle_event(_FakeTextChunk(data.get("text", "")))
                     elif event_type == "text_final":
-                        await self.handle_event(_FakeTextFinal(data.get("text", "")))
+                        await self.handle_event(_FakeTextFinal(
+                            data.get("text", ""),
+                            bool(data.get("suppressed", False)),
+                        ))
                     elif event_type == "tool_call":
                         await self.handle_event(_FakeToolCall(
                             data.get("tool_name", ""),
@@ -476,7 +530,7 @@ class CLIBridge:
                     elif event_type == "outbound_files":
                         paths = data.get("paths", [])
                         if paths:
-                            self._stop_live()
+                            self._flush_stream()
                             c = self._theme.c
                             self._console.print(
                                 f"  [{c('tool_ok')}]↓  files delivered:[/{c('tool_ok')}]")
@@ -510,6 +564,7 @@ class CLIBridge:
         # Built-in commands always available locally.
         builtin_rows = [
             ("/reset",  "Start a new session branch"),
+            ("/resume", "Reattach to the session from before this launch"),
             ("/copy",   "Copy last agent reply to clipboard"),
             ("/paste",  "Submit clipboard contents as next message"),
             ("/think",  "Toggle display of thinking content (currently " +
@@ -562,7 +617,7 @@ class CLIBridge:
         ))
         self._console.print(
             f"[{self._theme.c('border')}]"
-            "  type a message · /reset · /help · exit"
+            "  type a message · /resume · /reset · /help · exit"
             f"[/{self._theme.c('border')}]\n"
         )
 
@@ -599,6 +654,26 @@ class CLIBridge:
                             _save_cli_cursor_path(self._instance_dir, new_node_id)
                         self._console.print(
                             f"[{c('reset')}]  ↺  new session started"
+                            f"[/{c('reset')}]")
+                        continue
+
+                    # --------------------------------------------------------
+                    # Built-in: /resume — reattach to the session that was
+                    # active before this launch started a fresh branch.
+                    # --------------------------------------------------------
+                    if lower == "/resume":
+                        if not self._resume_cursor:
+                            self._console.print(
+                                f"[{c('reset')}]  ·  no previous session to resume"
+                                f"[/{c('reset')}]")
+                            continue
+                        await self._api_post(
+                            "/v1/lane/open", {"node_id": self._resume_cursor})
+                        self._cursor = self._resume_cursor
+                        if self._instance_dir:
+                            _save_cli_cursor_path(self._instance_dir, self._cursor)
+                        self._console.print(
+                            f"[{c('reset')}]  ⟲  resumed previous session"
                             f"[/{c('reset')}]")
                         continue
 
@@ -748,12 +823,27 @@ async def run_detached(
     bridge._cli_agent_name = (options or {}).get("agent_name") or None  # forwarded in _send()
     bridge._instance_dir = instance_dir
 
-    # Resolve or create the cursor via /v1/lane/open.
+    # Each launch starts a fresh branch by default, so a new session doesn't
+    # silently inherit the previous one's context. The old cursor is kept in
+    # _resume_cursor so /resume can reattach to it. Set default_to_resume: true
+    # under bridges.cli.options to reattach automatically instead.
     saved_cursor = _load_cli_cursor_path(instance_dir)
+    bridge._resume_cursor = saved_cursor
+
     async with aiohttp.ClientSession() as session:
+        open_node = saved_cursor
+        if not (bridge._default_to_resume and saved_cursor):
+            resp = await session.post(
+                f"{gateway_url}/v1/lane/branch",
+                json={"parent_node_id": None},
+                headers=bridge._http_headers(),
+            )
+            resp.raise_for_status()
+            open_node = (await resp.json())["node_id"]
+
         resp = await session.post(
             f"{gateway_url}/v1/lane/open",
-            json={"node_id": saved_cursor},
+            json={"node_id": open_node},
             headers=bridge._http_headers(),
         )
         resp.raise_for_status()
