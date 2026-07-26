@@ -3,6 +3,9 @@ EXTENSION_META = {
     "version": "3.0",
     "description": (
         "Databank retrieval system. Indexes named databank folders under workspace/rag/. "
+        "Markdown files may carry a YAML frontmatter header declaring keyword-triggered "
+        "lore entries (native format, see lorefile.py); legacy SillyTavern lorebook JSON "
+        "is auto-converted into this format on discovery and the original renamed to .bak. "
         "Provides rag_search(query, targets, max_results) and "
         "set_auto_rag_databanks(targets) tools. Auto-rag databanks are injected "
         "into the system prompt every turn via hybrid BM25+vector search."
