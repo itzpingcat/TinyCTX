@@ -363,11 +363,13 @@ def register_agent(cycle) -> None:
           - A subfolder named "lore" -> target name "lore"
           - A lorebook file named "Astraea.json" -> target name "Astraea"
         Use rag_list_databanks() first if you are unsure of the available names.
+        Pass [""] (a single empty string) to search every available databank at once.
 
         Args:
             query:       The topic, question, or keywords to search for.
             targets:     List of databank name strings to search.
                          Example: ["Astraea"] or ["lore", "characters"].
+                         Pass [""] to search all available databanks.
                          Do NOT pass a generic word like "rag" — use the actual databank name.
             max_results: Maximum results to return per databank (0 = use module default).
         """
@@ -376,6 +378,11 @@ def register_agent(cycle) -> None:
 
         k = int(max_results) if max_results and int(max_results) > 0 else top_k
         _sync_discovery()
+
+        if "" in targets:
+            targets = sorted(_state.stores.keys())
+            if not targets:
+                return "No databanks found — add folders or worldinfo JSON files to workspace/rag/"
 
         unknown = [t for t in targets if t not in _state.stores]
         if unknown:
