@@ -282,6 +282,7 @@ class Config:
     logging:         LoggingConfig           = field(default_factory=LoggingConfig)
     max_tool_cycles: int                     = 20
     parallel:        int                     = 3     # max concurrent LLM/embedding requests in flight
+    embed_cache_size: int                    = 2048  # max entries kept in ai.py's in-memory embedding cache (LRU)
     token_fuzz:      float                   = 1.1   # multiplier applied to counted tokens to account for tokenizer inaccuracy
     attachments:     AttachmentConfig        = field(default_factory=AttachmentConfig)
     permissions:     PermissionsConfig       = field(default_factory=PermissionsConfig)

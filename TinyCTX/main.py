@@ -27,7 +27,7 @@ from TinyCTX.config import load as load_config, apply_logging, resolve_log_level
 from TinyCTX.utils.instance import load_instance_env
 from TinyCTX.contracts import MANUAL_LAUNCH_ATTR
 from TinyCTX.runtime import Runtime
-from TinyCTX.ai import configure_parallel
+from TinyCTX.ai import configure_parallel, configure_embed_cache
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +50,9 @@ async def main() -> None:
 
     configure_parallel(cfg.parallel)
     logger.debug("ai.py request queue parallel=%d", cfg.parallel)
+
+    configure_embed_cache(cfg.embed_cache_size)
+    logger.debug("ai.py embed cache size=%d", cfg.embed_cache_size)
 
     logger.debug("creating runtime")
     gw = Runtime(config=cfg)
