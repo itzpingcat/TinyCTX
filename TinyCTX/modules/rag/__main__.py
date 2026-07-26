@@ -12,17 +12,21 @@ created once on the first register_agent call and shared across all cycles.
 Auto-rag state is stored in session state under the key "rag_auto_targets"
 (a list of databank name strings). set_auto_rag_databanks writes this key
 via db.set_state (merge-write — safe alongside other modules' state on the
-same node); the pre-assemble hook reads it each turn via db.get_state.
+same node); the pre-assemble hook reads it each turn via db.get_state, and
+falls back to the "default_auto_targets" config list on branches where that
+key was never written (see the hook for the None-vs-[] distinction).
 
 Databank layout (workspace/rag/):
     lore/            <- FilesDataBank "lore"
     characters/      <- FilesDataBank "characters"
-    my_world.json    <- LoreBookDataBank "my_world"
+    my_world.json    <- legacy lorebook JSON, auto-converted to my_world/ on first discovery
     .cache/          <- SQLite DBs, one per databank (excluded from discovery)
 
-Retrieval is dispatched through the DataBank protocol:
+FilesDataBank is the only databank kind. Retrieval:
     rag_search tool   -> await bank.rag_search(query, store, embedder, top_k, bm25_weight)
-    pre-assemble hook -> bank.auto_inject(text)  [synchronous]
+    pre-assemble hook -> await bank.auto_inject(text, store, embedder, top_k, bm25_weight)
+                         — deterministic keyword-triggered lore matching, merged with
+                         the same hybrid BM25+vector search rag_search uses.
 
 Config is read from EXTENSION_META defaults merged with workspace overrides
 under the "rag" key in the workspace config.
@@ -33,6 +37,7 @@ from __future__ import annotations
 
 import atexit
 import logging
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from TinyCTX.context import HOOK_PRE_ASSEMBLE_ASYNC
@@ -43,15 +48,21 @@ logger = logging.getLogger(__name__)
 # Module-level singleton state — initialized once on first register_agent call
 # ---------------------------------------------------------------------------
 
-_initialized     = False
-_stores:  dict   = {}   # name -> DataStore
-_indexers: dict  = {}   # name -> DataBankIndexer
-_databanks: dict = {}   # name -> DataBank
-_embedder        = None
-_cfg: dict       = {}
-_workspace: Path | None = None
-_strategy        = None
-_model_name_str  = ""
+
+@dataclass
+class _RagState:
+    initialized: bool = False
+    stores:      dict = field(default_factory=dict)  # name -> DataStore
+    indexers:    dict = field(default_factory=dict)  # name -> DataBankIndexer
+    databanks:   dict = field(default_factory=dict)  # name -> FilesDataBank
+    embedder:    object | None = None                # ai.Embedder, or None for BM25-only
+    cfg:         dict = field(default_factory=dict)
+    workspace:   Path | None = None
+    strategy:    object | None = None                # chunkers.ChunkStrategy
+    model_name:  str = ""
+
+
+_state = _RagState()
 
 
 # ---------------------------------------------------------------------------
@@ -116,9 +127,9 @@ async def _do_rag_search(
     bm25_weight: float,
 ) -> list[dict]:
     """Sync the indexer then dispatch to bank.rag_search. Returns [] on any error."""
-    bank    = _databanks.get(name)
-    store   = _stores.get(name)
-    indexer = _indexers.get(name)
+    bank    = _state.databanks.get(name)
+    store   = _state.stores.get(name)
+    indexer = _state.indexers.get(name)
     if bank is None or store is None or indexer is None:
         return []
     try:
@@ -126,7 +137,7 @@ async def _do_rag_search(
     except Exception as exc:
         logger.warning("[rag] sync failed for '%s': %s", name, exc)
         return []
-    return await bank.rag_search(query, store, _embedder, top_k, bm25_weight)
+    return await bank.rag_search(query, store, _state.embedder, top_k, bm25_weight)
 
 
 # ---------------------------------------------------------------------------
@@ -134,34 +145,33 @@ async def _do_rag_search(
 # ---------------------------------------------------------------------------
 
 def _init_singletons(config) -> None:
-    global _initialized, _embedder, _cfg, _workspace, _strategy, _model_name_str
-
-    if _initialized:
+    if _state.initialized:
         return
 
     workspace = Path(config.workspace.path).expanduser().resolve()
     workspace.mkdir(parents=True, exist_ok=True)
-    _workspace = workspace
+    _state.workspace = workspace
 
-    _cfg = _load_cfg(config)
+    _state.cfg = _load_cfg(config)
+    cfg = _state.cfg
 
-    cache_dir = _resolve_path(_cfg["cache_dir"], workspace)
+    cache_dir = _resolve_path(cfg["cache_dir"], workspace)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     extensions: set[str] = {
         ext.lower() if ext.startswith(".") else f".{ext.lower()}"
-        for ext in _cfg.get("indexed_extensions", [".md", ".txt", ".rst"])
+        for ext in cfg.get("indexed_extensions", [".md", ".txt", ".rst"])
     }
-    _cfg["_extensions"] = extensions  # stash for _sync_discovery
+    cfg["_extensions"] = extensions  # stash for _sync_discovery
 
     # Embedder (optional)
-    embedding_model = _cfg.get("embedding_model", "").strip()
+    embedding_model = cfg.get("embedding_model", "").strip()
     if embedding_model:
         try:
             from TinyCTX.ai import Embedder
-            emb_cfg      = config.get_embedding_model(embedding_model)
-            _embedder    = Embedder.from_config(emb_cfg)
-            _model_name_str = (
+            emb_cfg          = config.get_embedding_model(embedding_model)
+            _state.embedder  = Embedder.from_config(emb_cfg)
+            _state.model_name = (
                 config.models[embedding_model].model
                 if embedding_model in config.models
                 else ""
@@ -175,13 +185,13 @@ def _init_singletons(config) -> None:
 
     # Chunking strategy
     from TinyCTX.modules.rag.chunkers import get_strategy
-    chunk_kwargs: dict = _cfg.get("chunk_kwargs") or {}
-    _strategy = get_strategy(_cfg["chunk_strategy"], **chunk_kwargs)
+    chunk_kwargs: dict = cfg.get("chunk_kwargs") or {}
+    _state.strategy = get_strategy(cfg["chunk_strategy"], **chunk_kwargs)
 
-    _initialized = True
+    _state.initialized = True
     logger.info(
         "[rag] ready — strategy: %s | embedder: %s",
-        _cfg["chunk_strategy"], _model_name_str or "BM25 only",
+        cfg["chunk_strategy"], _state.model_name or "BM25 only",
     )
 
     # Initial discovery
@@ -195,9 +205,9 @@ def _resolve_path(rel: str, workspace: Path) -> Path:
 
 def _sync_discovery() -> None:
     """Re-scan the rag directory and register any new databanks. Idempotent."""
-    rag_dir   = _resolve_path(_cfg["rag_dir"], _workspace)
-    cache_dir = _resolve_path(_cfg["cache_dir"], _workspace)
-    extensions: set[str] = _cfg["_extensions"]
+    rag_dir   = _resolve_path(_state.cfg["rag_dir"], _state.workspace)
+    cache_dir = _resolve_path(_state.cfg["cache_dir"], _state.workspace)
+    extensions: set[str] = _state.cfg["_extensions"]
 
     from TinyCTX.modules.rag.databanks import discover_databanks
     from TinyCTX.modules.rag.store import DataStore
@@ -206,31 +216,31 @@ def _sync_discovery() -> None:
     current = discover_databanks(rag_dir, extensions)
 
     for name, bank in current.items():
-        if name in _databanks:
+        if name in _state.databanks:
             continue  # already registered
         db_path = cache_dir / f"{name}.db"
         store   = DataStore(db_path)
         indexer = DataBankIndexer(
             store           = store,
             databank        = bank,
-            strategy        = _strategy,
-            embedder        = _embedder,
-            embedding_model = _model_name_str,
+            strategy        = _state.strategy,
+            embedder        = _state.embedder,
+            embedding_model = _state.model_name,
         )
-        _databanks[name] = bank
-        _stores[name]    = store
-        _indexers[name]  = indexer
+        _state.databanks[name] = bank
+        _state.stores[name]    = store
+        _state.indexers[name]  = indexer
         atexit.register(store.close)
         logger.info("[rag] registered databank '%s' (%s)", name, bank.kind)
 
-    removed = set(_databanks) - set(current)
+    removed = set(_state.databanks) - set(current)
     for name in removed:
         logger.info("[rag] databank '%s' removed from disk", name)
-        _stores.pop(name, None)
-        _indexers.pop(name, None)
-        _databanks.pop(name, None)
+        _state.stores.pop(name, None)
+        _state.indexers.pop(name, None)
+        _state.databanks.pop(name, None)
 
-    logger.debug("[rag] discovery complete — %d databank(s) active", len(_databanks))
+    logger.debug("[rag] discovery complete — %d databank(s) active", len(_state.databanks))
 
 
 # ---------------------------------------------------------------------------
@@ -248,11 +258,12 @@ def register_runtime(runtime) -> None:
 def register_agent(cycle) -> None:
     _init_singletons(cycle.config)
 
-    cfg          = _cfg
+    cfg          = _state.cfg
     top_k        = int(cfg["top_k"])
     bm25_weight  = float(cfg["bm25_weight"])
     budget_tokens = int(cfg["result_budget_tokens"])
     auto_priority = int(cfg["auto_inject_priority"])
+    default_auto_targets = list(cfg.get("default_auto_targets", []))
 
     # Snapshot of auto-rag targets for this turn (populated in pre-assemble hook)
     auto_results_by_bank: dict[str, list[dict]] = {}
@@ -268,8 +279,12 @@ def register_agent(cycle) -> None:
         if ctx.dialogue and ctx.dialogue[-1].role in ("tool", "assistant"):
             return
 
-        # Read auto-rag targets from session state
-        targets: list[str] = cycle.db.get_state(ctx.tail_node_id, "rag_auto_targets") or []
+        # Read auto-rag targets from session state. `None` means this branch
+        # has never touched auto-rag targets at all, so fall back to the
+        # configured default; an explicit [] (from set_auto_rag_databanks([]))
+        # means auto-rag was deliberately cleared and must stay off.
+        raw_targets = cycle.db.get_state(ctx.tail_node_id, "rag_auto_targets")
+        targets: list[str] = raw_targets if raw_targets is not None else default_auto_targets
         if not targets:
             return
 
@@ -294,13 +309,17 @@ def register_agent(cycle) -> None:
             return
 
         for name in targets:
-            if name not in _databanks:
+            if name not in _state.databanks:
                 logger.debug("[rag] auto-inject: unknown databank '%s'", name)
                 continue
 
-            bank = _databanks[name]
+            bank    = _state.databanks[name]
+            store   = _state.stores.get(name)
+            indexer = _state.indexers.get(name)
             try:
-                results = bank.auto_inject(query)
+                if indexer is not None:
+                    await indexer.sync()  # keep the semantic side of auto_inject fresh
+                results = await bank.auto_inject(query, store, _state.embedder, top_k, bm25_weight)
             except Exception as exc:
                 logger.warning("[rag] auto_inject failed for '%s': %s", name, exc)
                 results = []
@@ -358,9 +377,9 @@ def register_agent(cycle) -> None:
         k = int(max_results) if max_results and int(max_results) > 0 else top_k
         _sync_discovery()
 
-        unknown = [t for t in targets if t not in _stores]
+        unknown = [t for t in targets if t not in _state.stores]
         if unknown:
-            available = sorted(_stores.keys()) or ["(none)"]
+            available = sorted(_state.stores.keys()) or ["(none)"]
             return (
                 f"Error: unknown databank(s) {unknown}. "
                 f"Available: {available}"
@@ -386,7 +405,9 @@ def register_agent(cycle) -> None:
     def set_auto_rag_databanks(targets: list) -> str:
         """
         Set which databanks are automatically searched and injected into context each turn.
-        Call with an empty list to disable auto-injection entirely.
+        Call with an empty list to disable auto-injection entirely — this overrides
+        any `default_auto_targets` configured for the module (which otherwise applies
+        on branches where this tool has never been called).
 
         Databank names come from the workspace/rag/ directory:
           - A subfolder named "lore" -> target name "lore"
@@ -403,9 +424,9 @@ def register_agent(cycle) -> None:
             return "Error: targets must be a list"
 
         targets = [str(t) for t in targets]
-        unknown = [t for t in targets if t and t not in _stores]
+        unknown = [t for t in targets if t and t not in _state.stores]
         if unknown:
-            available = sorted(_stores.keys()) or ["(none)"]
+            available = sorted(_state.stores.keys()) or ["(none)"]
             return (
                 f"Error: unknown databank(s) {unknown}. "
                 f"Available: {available}"
@@ -430,10 +451,10 @@ def register_agent(cycle) -> None:
 
         Args: (none)
         """
-        if not _databanks:
+        if not _state.databanks:
             return "No databanks found — add folders or worldinfo JSON files to workspace/rag/"
         lines = ["Available databanks:"]
-        for name, bank in sorted(_databanks.items()):
+        for name, bank in sorted(_state.databanks.items()):
             lines.append(f"  {name}  ({bank.kind})")
         return "\n".join(lines)
 

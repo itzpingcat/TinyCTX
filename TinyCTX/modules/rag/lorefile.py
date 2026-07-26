@@ -7,7 +7,23 @@ as the format for keyword-matched auto-inject entries.
 
 Frontmatter schema (all keys optional):
     name:            str          — display label (prepended to indexed text)
-    keys:            list[str]     — primary trigger keywords
+    mode:            "hybrid" | "vector" | "keyword" | "regex"  (default "hybrid")
+                     — controls how this entry participates in the pre-assemble
+                     auto-inject hook (see modules/rag/databanks.py):
+                       hybrid  — deterministic keyword/constant firing, PLUS this
+                                 entry's chunks can also surface via the passive
+                                 hybrid BM25+vector search (the default).
+                       vector  — semantic-only: never fires by keyword, only
+                                 surfaces via the passive embedding search.
+                       keyword — deterministic-only: keys matched as plain
+                                 substrings/whole-words; never surfaced via the
+                                 passive embedding search.
+                       regex   — deterministic-only, like "keyword", but keys
+                                 are matched as regular expressions instead of
+                                 literal substrings (see compile_regex_key()).
+                     rag_search (the explicit tool) is unaffected by mode — it
+                     always searches the full hybrid index regardless.
+    keys:            list[str]     — primary trigger keywords (or regex patterns, see mode)
     secondary_keys:  list[str]     — secondary keywords for selective logic
     constant:        bool          — always fires regardless of keyword match
     selective:       bool          — whether secondary_keys/selective_logic apply
@@ -55,9 +71,50 @@ def normalize_selective_logic(value) -> int:
     return 0
 
 
+_VALID_MODES = {"hybrid", "vector", "keyword", "regex"}
+
+
+def normalize_mode(value) -> str:
+    """Accept one of the valid mode strings (case-insensitive); default to 'hybrid'."""
+    if isinstance(value, str) and value.strip().lower() in _VALID_MODES:
+        return value.strip().lower()
+    return "hybrid"
+
+
+# SillyTavern's regex-key convention: a key wrapped as /pattern/flags is a
+# regex instead of a literal string. Shared by lorebook-conversion detection
+# (below) and by mode="regex" matching at runtime (modules/rag/databanks.py).
+_REGEX_KEY_RE   = re.compile(r"^/(.*)/([a-zA-Z]*)$", re.DOTALL)
+_REGEX_FLAG_MAP = {"i": re.IGNORECASE, "m": re.MULTILINE, "s": re.DOTALL}
+
+
+def is_regex_key(key: str) -> bool:
+    """True if `key` uses the `/pattern/flags` regex key syntax."""
+    return bool(_REGEX_KEY_RE.match(key))
+
+
+def compile_regex_key(key: str) -> re.Pattern | None:
+    """
+    Compile a lore key as a regex. Accepts the `/pattern/flags` wrapped form,
+    or a bare pattern with no flags. Returns None (and logs a warning) if the
+    pattern fails to compile.
+    """
+    m = _REGEX_KEY_RE.match(key)
+    pattern, flag_chars = (m.group(1), m.group(2)) if m else (key, "")
+    flags = 0
+    for ch in flag_chars:
+        flags |= _REGEX_FLAG_MAP.get(ch, 0)
+    try:
+        return re.compile(pattern, flags)
+    except re.error as exc:
+        logger.warning("[rag/lorefile] invalid regex key %r: %s", key, exc)
+        return None
+
+
 @dataclass
 class LoreEntry:
     name:            str = ""
+    mode:            str = "hybrid"
     keys:            list[str] = field(default_factory=list)
     secondary_keys:  list[str] = field(default_factory=list)
     constant:        bool = False
@@ -96,6 +153,7 @@ def parse_lore_doc(text: str, path: Path | None = None) -> LoreEntry:
 
     return LoreEntry(
         name            = str(meta.get("name") or (path.stem if path else "")),
+        mode            = normalize_mode(meta.get("mode", "hybrid")),
         keys            = [str(k) for k in keys],
         secondary_keys  = [str(k) for k in secondary_keys],
         constant        = bool(meta.get("constant", False)),
@@ -113,6 +171,7 @@ def render_lore_doc(entry: LoreEntry) -> str:
     """Serialize a LoreEntry back into native frontmatter + body markdown text."""
     meta = {
         "name":            entry.name,
+        "mode":            entry.mode,
         "keys":            entry.keys,
         "secondary_keys":  entry.secondary_keys,
         "constant":        entry.constant,
@@ -167,13 +226,20 @@ def convert_lorebook_json(json_path: Path, dest_dir: Path) -> int:
             continue
         uid            = str(e.get("uid", e.get("id", i)))
         comment        = e.get("comment", "") or ""
-        keys           = e.get("key") or e.get("keys", [])
-        secondary_keys = e.get("keysecondary") or e.get("secondary_keys", [])
+        keys           = [str(k) for k in (e.get("key") or e.get("keys", []))]
+        secondary_keys = [str(k) for k in (e.get("keysecondary") or e.get("secondary_keys", []))]
+
+        # Legacy lorebooks never had embeddings — a converted entry is always
+        # deterministic-only. It's "regex" if any key uses ST's /pattern/flags
+        # syntax, else plain "keyword". (Use mode: hybrid/vector manually in
+        # the converted .md file to opt an entry into passive semantic recall.)
+        mode = "regex" if any(is_regex_key(k) for k in keys) else "keyword"
 
         entry = LoreEntry(
             name            = comment or uid,
-            keys            = [str(k) for k in keys],
-            secondary_keys  = [str(k) for k in secondary_keys],
+            mode            = mode,
+            keys            = keys,
+            secondary_keys  = secondary_keys,
             constant        = bool(e.get("constant", False)),
             selective       = bool(e.get("selective", False)),
             selective_logic = normalize_selective_logic(e.get("selectiveLogic", 0)),

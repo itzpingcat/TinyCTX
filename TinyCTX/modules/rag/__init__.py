@@ -8,7 +8,8 @@ EXTENSION_META = {
         "is auto-converted into this format on discovery and the original renamed to .bak. "
         "Provides rag_search(query, targets, max_results) and "
         "set_auto_rag_databanks(targets) tools. Auto-rag databanks are injected "
-        "into the system prompt every turn via hybrid BM25+vector search."
+        "into the system prompt every turn via both deterministic keyword-triggered "
+        "lore matching and hybrid BM25+vector search over the databank's index."
     ),
     "default_config": {
         # --- Databank root ---
@@ -44,5 +45,9 @@ EXTENSION_META = {
         # --- Auto-inject ---
         # System prompt priority for the auto-rag injected block.
         "auto_inject_priority": 25,
+        # Databank names auto-searched/injected every turn on branches that have
+        # never called set_auto_rag_databanks. Once that tool is called on a
+        # branch (even with []), its stored value wins over this default.
+        "default_auto_targets": [],
     },
 }

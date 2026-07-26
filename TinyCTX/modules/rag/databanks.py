@@ -14,11 +14,15 @@ time they're discovered: one native lore markdown doc is written per active
 entry into a same-named folder, and the original JSON is renamed to `.bak`.
 From then on it's just a regular folder databank — no JSON support at runtime.
 
+`FilesDataBank` is the only databank kind (the older `LoreBookDataBank` was
+retired once legacy JSON started auto-converting to folders on discovery),
+so there is no separate protocol/interface layer here — callers just type
+against `FilesDataBank` directly.
+
 Public API
 ----------
-  DataBank (Protocol)        — duck-typed interface
   FilesDataBank(name, root, extensions)
-  discover_databanks(rag_dir, extensions) -> dict[str, DataBank]
+  discover_databanks(rag_dir, extensions) -> dict[str, FilesDataBank]
       Scan workspace/rag/ and return all valid databanks by name.
       Converts and unpacks any legacy lorebook JSON found at the root.
 
@@ -28,10 +32,17 @@ Retrieval interface
       Full embedding/BM25 search against the folder's chunked index. Used by
       the rag_search tool.
 
-  bank.auto_inject(text)
-      Fast, synchronous ST-style keyword matching over any frontmatter
-      entries in the folder, for the pre-assemble hook. Folders with no
-      frontmatter entries simply return [].
+  await bank.auto_inject(text, store, embedder, top_k, bm25_weight)
+      For the pre-assemble hook: deterministic ST-style keyword/regex matching
+      over any frontmatter entries in the folder, plus (when a store is
+      supplied) the same hybrid BM25+vector search rag_search uses — so a
+      databank can passively surface relevant chunks even without keyword
+      hits. Results from both are merged, deduplicated by file path.
+
+      Each entry's frontmatter `mode` (see lorefile.py) controls which half
+      of that applies to it: "keyword"/"regex" entries are deterministic-only
+      (never surfaced by the passive embedding search); "vector" entries are
+      semantic-only (never fire by keyword); "hybrid" (the default) does both.
 """
 from __future__ import annotations
 
@@ -39,61 +50,14 @@ import json
 import logging
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterator, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Iterator
 
-from TinyCTX.modules.rag.lorefile import LoreEntry, parse_lore_doc
+from TinyCTX.modules.rag.lorefile import LoreEntry, compile_regex_key, parse_lore_doc
 
 if TYPE_CHECKING:
     from TinyCTX.modules.rag.store import DataStore
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Protocol
-# ---------------------------------------------------------------------------
-
-@runtime_checkable
-class DataBank(Protocol):
-    """
-    A named, indexable source of text content.
-
-    name         — identifier used in tool calls (e.g. "lore", "characters")
-    kind         — "files" | "lorebook" | etc.
-    iter_files() — yields (path_str, content) pairs for all indexable items
-    """
-
-    @property
-    def name(self) -> str: ...
-
-    @property
-    def kind(self) -> str: ...
-
-    def iter_files(self) -> Iterator[tuple[str, str]]:
-        """
-        Yield (path_str, text_content) for each indexable item.
-        path_str is a stable, unique string key used by the store (e.g. absolute path).
-        text_content is the full text to chunk and index.
-        """
-        ...
-
-    async def rag_search(
-        self,
-        query: str,
-        store: "DataStore",
-        embedder,
-        top_k: int,
-        bm25_weight: float,
-    ) -> list[dict]:
-        """Run a hybrid BM25+vector search and return result dicts."""
-        ...
-
-    def auto_inject(self, text: str) -> list[dict]:
-        """
-        Synchronous retrieval for the pre-assemble hook.
-        Returns result dicts {file, path, text, score}, or [] if not supported.
-        """
-        ...
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +90,11 @@ class FilesDataBank:
         self._name       = name
         self._root       = root
         self._extensions = extensions
+        # path str -> (mtime at parse time, parsed entry). Avoids re-reading
+        # and re-parsing every file on every iter_files()/auto_inject() call
+        # (both walk the whole folder, and auto_inject runs once per turn
+        # per auto-rag target) when nothing on disk has actually changed.
+        self._entry_cache: dict[str, tuple[float, LoreEntry]] = {}
 
     @property
     def name(self) -> str:
@@ -136,18 +105,38 @@ class FilesDataBank:
         return "files"
 
     def _iter_entries(self) -> Iterator[tuple[Path, LoreEntry]]:
+        seen: set[str] = set()
         for path in sorted(self._root.rglob("*")):
             if not path.is_file():
                 continue
             if path.suffix.lower() not in self._extensions:
                 continue
+            key = str(path)
+            try:
+                mtime = path.stat().st_mtime
+            except OSError as exc:
+                logger.warning("[rag/databanks] skipping %s: %s", path, exc)
+                continue
+            seen.add(key)
+
+            cached = self._entry_cache.get(key)
+            if cached is not None and cached[0] == mtime:
+                yield path, cached[1]
+                continue
+
             try:
                 raw = path.read_text(encoding="utf-8")
             except Exception as exc:
                 logger.warning("[rag/databanks] skipping %s: %s", path, exc)
+                self._entry_cache.pop(key, None)
                 continue
             entry = parse_lore_doc(raw, path=path) if path.suffix.lower() == ".md" else LoreEntry(content=raw, path=path)
+            self._entry_cache[key] = (mtime, entry)
             yield path, entry
+
+        # Drop cache entries for files that no longer exist / no longer match.
+        for stale_key in set(self._entry_cache) - seen:
+            self._entry_cache.pop(stale_key, None)
 
     def iter_files(self) -> Iterator[tuple[str, str]]:
         for path, entry in self._iter_entries():
@@ -171,17 +160,56 @@ class FilesDataBank:
         """Hybrid BM25+vector search against this bank's index."""
         return await _hybrid_search(self._name, query, store, embedder, top_k, bm25_weight)
 
-    def auto_inject(self, text: str) -> list[dict]:
-        """ST-style keyword matching over any frontmatter entries in this folder."""
-        results = []
+    async def auto_inject(
+        self,
+        text: str,
+        store: "DataStore | None" = None,
+        embedder=None,
+        top_k: int = 0,
+        bm25_weight: float = 0.3,
+    ) -> list[dict]:
+        """
+        Deterministic ST-style keyword/regex matching over any frontmatter
+        entries in this folder, plus — when `store` is supplied and `top_k` >
+        0 — the same hybrid BM25+vector search rag_search uses, so passively
+        relevant chunks surface even without a keyword hit. Results are
+        merged and deduplicated by file path (keyword/regex hits take
+        priority).
+
+        Each entry's `mode` gates which half applies (see lorefile.py):
+        "vector" entries skip keyword matching entirely; "keyword"/"regex"
+        entries are excluded from the semantic merge below, so they never
+        surface passively except by their own deterministic firing.
+        """
+        results: list[dict] = []
+        seen_paths: set[str] = set()
+        semantic_excluded: set[str] = set()  # resolved paths of deterministic-only entries
+
         for path, entry in self._iter_entries():
             if entry.disabled or not entry.path or entry.path.suffix.lower() != ".md":
                 continue
+
+            resolved = str(path.resolve())
+            if entry.mode in ("keyword", "regex"):
+                semantic_excluded.add(resolved)
+            if entry.mode == "vector":
+                continue  # semantic-only — never fires by keyword/regex
+
             if not (entry.keys or entry.constant):
-                continue  # plain file with no frontmatter — never auto-injected
+                continue  # plain file with no frontmatter — never keyword-triggered
             content = _keyword_match_entry(entry, text)
             if content:
-                results.append({"file": self._name, "path": str(path), "text": content, "score": 1.0})
+                results.append({"file": self._name, "path": resolved, "text": content, "score": 1.0})
+                seen_paths.add(resolved)
+
+        if store is not None and top_k > 0:
+            semantic = await _hybrid_search(self._name, text, store, embedder, top_k, bm25_weight)
+            for r in semantic:
+                if r["path"] in semantic_excluded or r["path"] in seen_paths:
+                    continue
+                results.append(r)
+                seen_paths.add(r["path"])
+
         return results
 
     def __repr__(self) -> str:
@@ -196,26 +224,35 @@ def _keyword_match_entry(entry: LoreEntry, text: str) -> str | None:
     """
     Return `entry.content` if it fires against `text`, else None.
     Follows SillyTavern selectiveLogic from world-info.js:33-38.
+
+    mode == "regex" matches keys as regular expressions (compile_regex_key);
+    every other mode matches them as literal substrings/whole-words, same as
+    before mode existed.
     """
     if entry.constant:
         return entry.content
 
-    primary_hit = _any_key_matches(entry.keys, text, entry.case_sensitive, entry.whole_words)
+    if entry.mode == "regex":
+        any_matches = lambda keys: _any_regex_matches(keys, text)              # noqa: E731
+        all_matches = lambda keys: _all_regex_matches(keys, text)              # noqa: E731
+    else:
+        any_matches = lambda keys: _any_key_matches(                           # noqa: E731
+            keys, text, entry.case_sensitive, entry.whole_words)
+        all_matches = lambda keys: _all_keys_match(                            # noqa: E731
+            keys, text, entry.case_sensitive, entry.whole_words)
+
+    primary_hit = any_matches(entry.keys)
 
     if not entry.selective:
         fired = primary_hit
     elif entry.selective_logic == 0:  # AND_ANY
-        secondary_hit = _any_key_matches(entry.secondary_keys, text, entry.case_sensitive, entry.whole_words)
-        fired = primary_hit or secondary_hit
+        fired = primary_hit or any_matches(entry.secondary_keys)
     elif entry.selective_logic == 1:  # NOT_ALL
-        all_secondary = _all_keys_match(entry.secondary_keys, text, entry.case_sensitive, entry.whole_words)
-        fired = primary_hit and not all_secondary
+        fired = primary_hit and not all_matches(entry.secondary_keys)
     elif entry.selective_logic == 2:  # NOT_ANY
-        secondary_hit = _any_key_matches(entry.secondary_keys, text, entry.case_sensitive, entry.whole_words)
-        fired = primary_hit and not secondary_hit
+        fired = primary_hit and not any_matches(entry.secondary_keys)
     elif entry.selective_logic == 3:  # AND_ALL
-        all_secondary = _all_keys_match(entry.secondary_keys, text, entry.case_sensitive, entry.whole_words)
-        fired = primary_hit and all_secondary
+        fired = primary_hit and all_matches(entry.secondary_keys)
     else:
         fired = primary_hit
 
@@ -251,6 +288,26 @@ def _all_keys_match(keys: list[str], text: str, case_sensitive: bool, whole_word
             if not re.search(r"\b" + re.escape(needle) + r"\b", haystack if cs else text, flags):
                 return False
         elif needle not in haystack:
+            return False
+    return True
+
+
+def _any_regex_matches(keys: list[str], text: str) -> bool:
+    """mode == 'regex' equivalent of _any_key_matches: keys are patterns, not literals."""
+    for key in keys:
+        pattern = compile_regex_key(key)
+        if pattern is not None and pattern.search(text):
+            return True
+    return False
+
+
+def _all_regex_matches(keys: list[str], text: str) -> bool:
+    """mode == 'regex' equivalent of _all_keys_match."""
+    if not keys:
+        return False
+    for key in keys:
+        pattern = compile_regex_key(key)
+        if pattern is None or not pattern.search(text):
             return False
     return True
 
@@ -334,9 +391,9 @@ def _convert_and_backup(json_path: Path, dest_dir: Path) -> bool:
 # Discovery
 # ---------------------------------------------------------------------------
 
-def discover_databanks(rag_dir: Path, extensions: set[str]) -> dict[str, "DataBank"]:
+def discover_databanks(rag_dir: Path, extensions: set[str]) -> dict[str, "FilesDataBank"]:
     """
-    Scan `rag_dir` and return a dict of {name: DataBank} for all valid sources.
+    Scan `rag_dir` and return a dict of {name: FilesDataBank} for all valid sources.
 
     Rules:
       - A subdirectory of rag_dir                -> FilesDataBank named after the folder.
@@ -352,7 +409,7 @@ def discover_databanks(rag_dir: Path, extensions: set[str]) -> dict[str, "DataBa
     if not rag_dir.exists():
         return {}
 
-    result: dict[str, DataBank] = {}
+    result: dict[str, FilesDataBank] = {}
 
     for entry in sorted(rag_dir.iterdir()):
         if entry.name.startswith(".") or entry.name == ".cache":
@@ -369,7 +426,7 @@ def discover_databanks(rag_dir: Path, extensions: set[str]) -> dict[str, "DataBa
             dest_dir = rag_dir / entry.stem
             if not _convert_and_backup(entry, dest_dir):
                 continue
-            bank: DataBank = FilesDataBank(name=entry.stem, root=dest_dir, extensions=extensions)
+            bank: FilesDataBank = FilesDataBank(name=entry.stem, root=dest_dir, extensions=extensions)
             result[entry.stem] = bank
             logger.debug("[rag/databanks] discovered converted lorebook folder: %s", entry.stem)
 

@@ -38,7 +38,7 @@ from pathlib import Path
 
 from TinyCTX.modules.rag.store import DataStore
 from TinyCTX.modules.rag.chunkers import ChunkStrategy
-from TinyCTX.modules.rag.databanks import DataBank
+from TinyCTX.modules.rag.databanks import FilesDataBank
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +59,7 @@ class DataBankIndexer:
     def __init__(
         self,
         store:           DataStore,
-        databank:        DataBank,
+        databank:        FilesDataBank,
         strategy:        ChunkStrategy,
         embedder,                          # ai.Embedder | None
         embedding_model: str = "",
