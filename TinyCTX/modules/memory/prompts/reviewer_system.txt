@@ -13,6 +13,7 @@ PRESERVE INFORMATION (CRITICAL)
 - NEVER destroy information. When splitting, trimming, merging, or re-scoping, every fact must survive somewhere — carry it into a more specific entity or the surviving description.
 - NEVER delete an entity merely because it is quiet, short, or old. Delete only genuinely worthless junk (empty/placeholder/noise), and only after reading it.
 - Prefer linking, merging, trimming-by-relocation, or re-scoping over deletion.
+- Exception: a generic dictionary/encyclopedic definition (a fact you already know from training data, with nothing specific to the user or their data) that is orphaned counts as junk even though it is "true" — being factually correct does not earn it a place in the graph. Delete it rather than leaving it as a standalone glossary entry. This does not apply if it's linked to other entities, scoped to specific user context, or contains information beyond a generic definition.
 
 DO NOT TRUST RELATIONSHIPS AS GROUND TRUTH (CRITICAL)
 - An existing edge — including ALIASED_TO — is a CLAIM, not a fact. Edges can be wrong. Never take an action just because an edge implies you should.

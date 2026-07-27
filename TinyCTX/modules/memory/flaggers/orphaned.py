@@ -21,18 +21,11 @@ def scan(graph_db, cfg) -> list[dict]:
 
 def build_prompt(issue) -> str:
     return (
-        "This entity is orphaned (no relationships). Decide what to do with it:\n\n"
-        "1. If it holds worthwhile information connected to the user's context, "
-        "find related entities and link it with memory_set_relationship.\n"
-        "2. If it is a generic dictionary/encyclopedic definition (a fact you "
-        "already know from training data, not something specific to the user "
-        "or their data) and it has no relationships, delete it with "
-        "memory_delete_entity — it doesn't need to occupy space in the "
-        "knowledge graph.\n"
-        "3. If it is otherwise junk, delete it with memory_delete_entity.\n\n"
-        "Do not keep an entity just because it is 'true' — an orphaned generic "
-        "definition is still low-value unless linked to something specific.\n\n"
+        "This entity is orphaned (no relationships). Decide whether it holds "
+        "worthwhile information that should be linked to related entities, or "
+        "whether it is junk that should be deleted.\n\n"
         f"Entity: {issue['detail']}\n"
         f"UUID: {issue['entity_uuids'][0]}\n\n"
-        "Use search_memory to find related entities."
+        "Use search_memory to find related entities and memory_set_relationship "
+        "to link it, or memory_delete_entity if it has no value."
     )
