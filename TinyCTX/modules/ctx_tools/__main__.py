@@ -147,23 +147,26 @@ def _register_token_sanitize(context, config):
     Patterns are loaded from ctx_tools/token_blacklist.txt at startup.
     Edit that file to add/remove patterns — no code changes needed.
 
-    Config keys (all optional):
-        token_sanitize_enabled  -- bool, default True
-        token_sanitize_roles    -- list[str], default ["tool", "user"]
+    Config keys (all optional, under the "token_sanitize" sub-dict):
+        enabled        -- bool, default True
+        roles          -- list[str], default ["tool", "user"]
+        blacklist_path -- str, default ctx_tools/token_blacklist.txt
     """
     import logging
     _logger = logging.getLogger(__name__)
 
-    enabled = config.get("token_sanitize_enabled", True)
+    sanitize_cfg = config.get("token_sanitize", {})
+
+    enabled = sanitize_cfg.get("enabled", True)
     if not enabled:
         return
 
-    blacklist_path = Path(config.get("token_blacklist_path", str(_BLACKLIST_PATH)))
+    blacklist_path = Path(sanitize_cfg.get("blacklist_path", str(_BLACKLIST_PATH)))
     pattern = _load_token_blacklist(blacklist_path)
     if pattern is None:
         return
 
-    roles: set[str] = set(config.get("token_sanitize_roles", ["tool", "user"]))
+    roles: set[str] = set(sanitize_cfg.get("roles", ["tool", "user"]))
 
     def transform_turn(entry, age, ctx):
         if entry.role not in roles:
@@ -230,9 +233,10 @@ def _register_cot_strip(context, config):
 
 
 def _register_trim(context, config):
-    trim_after     = config.get("tool_trim_after", 10)
-    truncate_after = config.get("tool_output_truncate_after", 2)
-    max_chars      = config.get("max_tool_output_chars", 2000)
+    tool_output_cfg = config.get("tool_output", {})
+    trim_after     = tool_output_cfg.get("trim_after", 10)
+    truncate_after = tool_output_cfg.get("truncate_after", 2)
+    max_chars      = tool_output_cfg.get("max_chars", 2000)
 
     trimmed_calls: set[str] = set()
 

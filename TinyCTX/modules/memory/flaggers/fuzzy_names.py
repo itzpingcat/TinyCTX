@@ -48,7 +48,7 @@ def _is_not_linked(graph_db, a: str, b: str) -> bool:
 
 
 def scan(graph_db, cfg) -> list[dict]:
-    threshold = float(cfg.get("fuzzy_name_threshold", 90))
+    threshold = float(cfg.get("flaggers", {}).get("fuzzy_name_threshold", 90))
     ents = all_entities(graph_db)
     issues = []
     for a, b, score in similar_name_pairs(ents, threshold):

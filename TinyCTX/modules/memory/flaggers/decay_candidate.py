@@ -30,9 +30,10 @@ def effective_mention(mention: float, updated_at: float, half_life_days: float, 
 
 def scan(graph_db, cfg) -> list[dict]:
     half_life = float(cfg.get("mention_half_life_days", 30))
-    min_eff = float(cfg.get("decay_min_effective_mention", 0.5))
-    max_edges = int(cfg.get("decay_max_edges", 1))
-    stale_days = float(cfg.get("decay_stale_days", 90))
+    flaggers_cfg = cfg.get("flaggers", {})
+    min_eff = float(flaggers_cfg.get("decay_min_effective_mention", 0.5))
+    max_edges = int(flaggers_cfg.get("decay_max_edges", 1))
+    stale_days = float(flaggers_cfg.get("decay_stale_days", 90))
     now = time.time()
     counts = edge_counts(graph_db)
     issues = []

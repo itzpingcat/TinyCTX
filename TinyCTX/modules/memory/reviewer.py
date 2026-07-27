@@ -155,9 +155,10 @@ async def run_reviewer_cycle(cfg, graph_db, conn, write_lock, llm, queue: Review
     if added:
         logger.info("[memory/reviewer] enqueued %d new issue(s)", added)
 
-    base = float(cfg.get("reviewer_base_delay", 30))
-    min_delay = float(cfg.get("reviewer_min_delay", 2))
-    target = int(cfg.get("reviewer_target_len", 10))
+    reviewer_cfg = cfg.get("reviewer", {})
+    base = float(reviewer_cfg.get("base_delay", 30))
+    min_delay = float(reviewer_cfg.get("min_delay", 2))
+    target = int(reviewer_cfg.get("target_len", 10))
     vocab = await _tools.relation_vocab()
 
     while True:

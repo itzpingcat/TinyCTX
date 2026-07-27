@@ -224,8 +224,9 @@ async def run_dedup_cycle(cfg, data_dir, conn, write_lock, llm, embedder, graph_
     try:
         await refresh_embeddings(cfg, conn, write_lock, embedder, graph_db)
 
-        threshold = float(cfg.get("similarity_threshold", 0.90))
-        batch_count = int(cfg.get("dedup_batch_count", 8))
+        dedup_cfg = cfg.get("dedup", {})
+        threshold = float(dedup_cfg.get("similarity_threshold", 0.90))
+        batch_count = int(dedup_cfg.get("batch_count", 8))
 
         vectors = dict(graph_db.vector_index._vecs)  # snapshot
         if len(vectors) < 2:
