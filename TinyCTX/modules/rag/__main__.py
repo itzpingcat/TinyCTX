@@ -264,6 +264,14 @@ def register_agent(cycle) -> None:
     budget_tokens = int(cfg["result_budget_tokens"])
     auto_priority = int(cfg["auto_inject_priority"])
     default_auto_targets = list(cfg.get("default_auto_targets", []))
+    # Escape hatch: the semantic half of auto-inject costs a real embed() call
+    # (network round trip) on every qualifying turn, competing with the main
+    # cycle's own LLM call in ai.py's shared priority queue — on a
+    # `parallel: 1` deployment this can materially add latency under
+    # concurrent load. Set to false to fall back to the old, zero-network-call
+    # keyword/regex-only auto-inject; rag_search (the explicit tool) is never
+    # affected either way.
+    auto_inject_semantic = bool(cfg.get("auto_inject_semantic", True))
 
     # Snapshot of auto-rag targets for this turn (populated in pre-assemble hook)
     auto_results_by_bank: dict[str, list[dict]] = {}
@@ -313,13 +321,16 @@ def register_agent(cycle) -> None:
                 logger.debug("[rag] auto-inject: unknown databank '%s'", name)
                 continue
 
-            bank    = _state.databanks[name]
-            store   = _state.stores.get(name)
-            indexer = _state.indexers.get(name)
+            bank = _state.databanks[name]
             try:
-                if indexer is not None:
-                    await indexer.sync()  # keep the semantic side of auto_inject fresh
-                results = await bank.auto_inject(query, store, _state.embedder, top_k, bm25_weight)
+                if auto_inject_semantic:
+                    store   = _state.stores.get(name)
+                    indexer = _state.indexers.get(name)
+                    if indexer is not None:
+                        await indexer.sync()  # keep the semantic side of auto_inject fresh
+                    results = await bank.auto_inject(query, store, _state.embedder, top_k, bm25_weight)
+                else:
+                    results = await bank.auto_inject(query)  # keyword/regex-only, no embed() call
             except Exception as exc:
                 logger.warning("[rag] auto_inject failed for '%s': %s", name, exc)
                 results = []

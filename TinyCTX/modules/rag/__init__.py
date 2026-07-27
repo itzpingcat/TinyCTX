@@ -49,5 +49,15 @@ EXTENSION_META = {
         # never called set_auto_rag_databanks. Once that tool is called on a
         # branch (even with []), its stored value wins over this default.
         "default_auto_targets": [],
+        # Whether auto-inject's passive half also runs the hybrid BM25+vector
+        # search (in addition to deterministic keyword/regex/constant firing).
+        # This costs a real embed() network call on every qualifying turn,
+        # sharing ai.py's process-wide priority queue with the main LLM call
+        # and everything else — on a low `parallel:` deployment this can add
+        # meaningful per-turn latency under concurrent load. Set to false to
+        # fall back to keyword/regex-only auto-inject (no embed() call at all);
+        # rag_search (the explicit tool) always does the full hybrid search
+        # regardless of this setting.
+        "auto_inject_semantic": True,
     },
 }
