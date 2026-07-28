@@ -192,6 +192,101 @@ class TestWhitelistGate:
 
 
 # ---------------------------------------------------------------------------
+# {arg} placeholder — free-text whitelist arguments without injection
+# ---------------------------------------------------------------------------
+
+class TestArgPlaceholder:
+    """Unit tests directly against _whitelist_glob_to_regex/_check_whitelist:
+    faster and more precise than going through the full tool pipeline for
+    checking exactly which strings the {arg} character class accepts."""
+
+    def _patterns(self, *lines):
+        return [shell_mod._whitelist_glob_to_regex(line) for line in lines]
+
+    def test_plain_text_argument_matches(self):
+        patterns = self._patterns('echo "{arg}"')
+        assert shell_mod._check_whitelist('echo "cat"', patterns)
+
+    def test_sentence_with_punctuation_and_apostrophe_matches(self):
+        patterns = self._patterns('echo "{arg}"')
+        assert shell_mod._check_whitelist('echo "it\'s a nice day, right?"', patterns)
+
+    def test_trailing_chained_command_does_not_match(self):
+        patterns = self._patterns('echo "{arg}"')
+        assert not shell_mod._check_whitelist('echo "cat"; rm -rf /', patterns)
+
+    def test_quote_breakout_attempt_does_not_match(self):
+        patterns = self._patterns('echo "{arg}"')
+        assert not shell_mod._check_whitelist('echo "cat" "; rm -rf /"', patterns)
+
+    def test_command_substitution_characters_do_not_match(self):
+        patterns = self._patterns('echo "{arg}"')
+        assert not shell_mod._check_whitelist('echo "$(whoami)"', patterns)
+        assert not shell_mod._check_whitelist('echo "`whoami`"', patterns)
+
+    def test_pipe_and_semicolon_and_ampersand_do_not_match(self):
+        patterns = self._patterns('echo "{arg}"')
+        for injected in ('echo "cat" | mail x@y.com', 'echo "cat" & rm -rf /', 'echo "cat" > /etc/passwd'):
+            assert not shell_mod._check_whitelist(injected, patterns)
+
+    @pytest.mark.asyncio
+    async def test_end_to_end_through_shell_tool(self, tmp_path, monkeypatch):
+        agent = _register(
+            tmp_path, monkeypatch, caller_level=20,
+            whitelist_lines=['echo "{arg}"'],
+        )
+        ok = await _call(agent, command='echo "hello there"')
+        assert "Blocked" not in ok["result"]
+        assert "hello there" in ok["result"]
+
+        blocked = await _call(agent, command='echo "hello"; rm -rf /tmp')
+        assert "Blocked" in blocked["result"]
+
+
+# ---------------------------------------------------------------------------
+# The shipped whitelist.txt (real file, not a fixture)
+# ---------------------------------------------------------------------------
+
+class TestRealWhitelistFile:
+    @pytest.mark.asyncio
+    async def test_echo_arg_and_date_are_enabled_by_default(self, tmp_path, monkeypatch):
+        # Only isolate the blacklist here — deliberately exercise the real
+        # shipped whitelist.txt so a future edit that breaks it fails a test.
+        bl_path = tmp_path / "blacklist.txt"
+        bl_path.write_text("")
+        real_load_blacklist = shell_mod._load_blacklist
+        monkeypatch.setattr(shell_mod, "_load_blacklist", lambda path=bl_path: real_load_blacklist(path))
+
+        extra = {"shell": {"sandbox_url": None}}
+        workspace = tmp_path / "workspace"
+        workspace.mkdir(exist_ok=True)
+        config = _FakeConfig(workspace, extra=extra)
+        caller = _FakeCaller(20)  # between default use_whitelist=10 and neutral=45
+        agent = _FakeAgent(caller, config)
+        shell_mod.register_agent(agent)
+
+        echo_result = await _call(agent, command='echo "public status ok"')
+        assert "Blocked" not in echo_result["result"]
+        assert "public status ok" in echo_result["result"]
+
+        date_result = await _call(agent, command="date")
+        assert "Blocked" not in date_result["result"]
+
+        for cmd in ("ps", "ps -eo pid,comm"):
+            ps_result = await _call(agent, command=cmd)
+            assert "Blocked" not in ps_result["result"], cmd
+
+        cal_result = await _call(agent, command="cal")
+        assert "Blocked" in cal_result["result"]  # commented out, not installed everywhere
+
+        # Never whitelisted: these show full ARGV (and, for -e, environment)
+        # of whatever else is running in the shared sandbox container.
+        for leaky in ("ps aux", "ps -ef", "ps -eo pid,args", "ps e"):
+            leak_result = await _call(agent, command=leaky)
+            assert "Blocked" in leak_result["result"], leaky
+
+
+# ---------------------------------------------------------------------------
 # Blacklist + bypass_blacklist
 # ---------------------------------------------------------------------------
 

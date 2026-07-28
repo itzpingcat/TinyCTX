@@ -107,6 +107,50 @@ def _check_blacklist(command: str, patterns: list[re.Pattern]) -> str | None:
 # Whitelist (reduced-permission commands — see permissions.use_whitelist)
 # ---------------------------------------------------------------------------
 
+# Placeholder for a free-text argument in a whitelist pattern, e.g.
+# `echo "{arg}"`. Expands to a restricted, allowlisted character class —
+# NOT ".*" like `*` does — so it can hold arbitrary natural-language text
+# without ever containing a shell metacharacter. Letters, digits, spaces,
+# and a small set of punctuation for normal sentences; notably excludes
+# ; & | ` $ ( ) < > " \ * ? [ ] { } ~ # = and newlines, so nothing captured
+# by {arg} can terminate the intended command or start a new one.
+_ARG_TOKEN = "{arg}"
+_ARG_CLASS = r"[A-Za-z0-9 ,.!?:'-]*"
+
+
+def _whitelist_glob_to_regex(pattern: str) -> re.Pattern:
+    """Like `_glob_to_regex`, plus support for the `{arg}` placeholder.
+
+    `*`/`?` behave exactly as in the blacklist (`*` -> match-anything,
+    including shell metacharacters) and remain available for matching
+    fixed command families, but are unsafe for capturing free text a
+    reduced-permission caller controls — use `{arg}` for that instead.
+
+    `{arg}` is only injection-safe when wrapped in double quotes in the
+    pattern (e.g. `echo "{arg}"`): the class excludes `"`, so the match
+    can't contain a stray closing quote, and it excludes every shell
+    metacharacter, so nothing inside can end the command or chain another
+    one. An unquoted `{arg}` risks a bash syntax error (not injection —
+    just a broken command) if the text contains an apostrophe.
+    """
+    parts = []
+    i, n = 0, len(pattern)
+    while i < n:
+        if pattern.startswith(_ARG_TOKEN, i):
+            parts.append(_ARG_CLASS)
+            i += len(_ARG_TOKEN)
+            continue
+        ch = pattern[i]
+        if ch == '*':
+            parts.append('.*')
+        elif ch == '?':
+            parts.append('.')
+        else:
+            parts.append(re.escape(ch))
+        i += 1
+    return re.compile(''.join(parts), re.IGNORECASE)
+
+
 def _load_whitelist(path: Path = _WHITELIST_PATH) -> list[re.Pattern]:
     if not path.exists():
         logger.debug("shell: whitelist not found at %s — no reduced-permission commands available", path)
@@ -115,7 +159,7 @@ def _load_whitelist(path: Path = _WHITELIST_PATH) -> list[re.Pattern]:
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if line and not line.startswith("#"):
-            patterns.append(_glob_to_regex(line))
+            patterns.append(_whitelist_glob_to_regex(line))
     logger.debug("shell: loaded %d whitelist patterns", len(patterns))
     return patterns
 
