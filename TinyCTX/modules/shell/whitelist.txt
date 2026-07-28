@@ -1,0 +1,30 @@
+# ============================================================
+# Shell Module Whitelist
+#
+# Commands here are allowed for callers below the "neutral" permission
+# level (see extra.shell.permissions in config.yaml), letting them run a
+# small set of safe, specific commands without full shell access.
+#
+# Matching:
+# - Case-insensitive
+# - Glob-style patterns (*, ?)
+# - Each pattern must match the ENTIRE command (anchored), NOT a substring
+#   like the blacklist. "git status" does NOT match "git status; rm -rf /".
+# - Still subject to the blacklist afterwards (unless bypass_blacklist).
+#
+# WARNING: wildcards here are dangerous for reduced-permission access —
+# a pattern like "git *" fullmatches "git status; rm -rf /" because "*"
+# consumes the whole rest of the string. Prefer exact, literal commands
+# (no wildcards) unless you fully understand the risk.
+#
+# Empty by default: no reduced-permission commands are allowed until an
+# operator opts in by uncommenting or adding entries below.
+# ============================================================
+
+# --- Examples (uncomment to enable) ---
+# pwd
+# ls
+# ls -la
+# git status
+# git log
+# git diff

@@ -17,6 +17,17 @@ Execution modes:
 
 The blacklist is enforced here, before any dispatch, in both modes.
 The sandbox itself runs whatever it receives — it trusts the agent.
+
+Permission tiers (see `_ShellPermissions` below, configured via
+extra.shell.permissions in config.yaml):
+  use_whitelist     — min caller level to invoke the tool at all. Below
+                       `neutral`, every command must match whitelist.txt.
+  neutral           — min caller level for unrestricted commands (still
+                       subject to the blacklist unless bypass_blacklist).
+  bypass_blacklist  — min caller level that skips the blacklist check.
+  access_backend    — min caller level for backend_access=True.
+All four are resolved from the *actual caller* (agent.caller.permission_level),
+captured once per cycle — never from a static config value.
 """
 from __future__ import annotations
 
@@ -31,12 +42,26 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable
 from pathlib import Path
+from typing import NamedTuple
 
 logger = logging.getLogger(__name__)
 
 _IS_WINDOWS = platform.system() == "Windows"
 
 _BLACKLIST_PATH = Path(__file__).parent / "blacklist.txt"
+_WHITELIST_PATH = Path(__file__).parent / "whitelist.txt"
+
+
+# ---------------------------------------------------------------------------
+# Permission tiers
+# ---------------------------------------------------------------------------
+
+class _ShellPermissions(NamedTuple):
+    use_whitelist: int
+    neutral: int
+    bypass_blacklist: int
+    access_backend: int
+
 
 # ---------------------------------------------------------------------------
 # Blacklist
@@ -76,6 +101,35 @@ def _check_blacklist(command: str, patterns: list[re.Pattern]) -> str | None:
         if p.search(normalized):
             return p.pattern
     return None
+
+
+# ---------------------------------------------------------------------------
+# Whitelist (reduced-permission commands — see permissions.use_whitelist)
+# ---------------------------------------------------------------------------
+
+def _load_whitelist(path: Path = _WHITELIST_PATH) -> list[re.Pattern]:
+    if not path.exists():
+        logger.debug("shell: whitelist not found at %s — no reduced-permission commands available", path)
+        return []
+    patterns = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            patterns.append(_glob_to_regex(line))
+    logger.debug("shell: loaded %d whitelist patterns", len(patterns))
+    return patterns
+
+
+def _check_whitelist(command: str, patterns: list[re.Pattern]) -> bool:
+    """True if `command` is fully covered by a whitelist entry.
+
+    Unlike the blacklist (which searches for a dangerous substring anywhere
+    in the command), a whitelist entry must match the ENTIRE command. A
+    substring match would let e.g. a `git status` entry also pass
+    `git status; rm -rf /` — anchoring on the full string closes that.
+    """
+    normalized = command.strip().lower()
+    return any(p.fullmatch(normalized) for p in patterns)
 
 
 # ---------------------------------------------------------------------------
@@ -280,19 +334,47 @@ def register_agent(agent) -> None:
     _default_sandbox_url = f"http://{os.environ.get('TINYCTX_INSTANCE', 'tinyctx')}_sandbox:8700"
     sandbox_url = _extra.get("sandbox_url", _default_sandbox_url) or None
 
+    _perm_raw = _extra.get("permissions", {}) or {}
+    permissions = _ShellPermissions(
+        use_whitelist=int(_perm_raw.get("use_whitelist", 10)),
+        neutral=int(_perm_raw.get("neutral", 45)),
+        bypass_blacklist=int(_perm_raw.get("bypass_blacklist", 90)),
+        access_backend=int(_perm_raw.get("access_backend", 80)),
+    )
+
     if sandbox_url:
         logger.info("shell: dispatching via sandbox at %s", sandbox_url)
     else:
         logger.info("shell: dispatching locally (no sandbox configured)")
 
     blacklist = _load_blacklist()
+    whitelist = _load_whitelist()
+
+    # Caller's permission level for this cycle, resolved once. Mirrors
+    # modules/sysops/__main__.py's caller_level snapshot: agent.caller is
+    # set before register_agent runs and never changes mid-cycle, so this
+    # closure-captured int always reflects the actual caller.
+    #
+    # This replaces the old (broken) backend_access check, which read
+    # agent.config.permissions.level — an attribute PermissionsConfig never
+    # defines (it only has minimal_tokens: bool). That check either raised
+    # AttributeError on every backend_access=True call or, if it silently
+    # resolved to something falsy, granted backend access to everyone
+    # regardless of who was actually calling.
+    caller_level = agent.caller.permission_level
 
     def _dispatch(command: str, local: bool = False, call_timeout: int | None = None) -> str:
-        """Shared pipeline: blacklist → warning → dispatch."""
-        hit = _check_blacklist(command, blacklist)
-        if hit:
-            logger.warning("shell: blocked command (pattern: %s): %.120s", hit, command)
-            return f"Blocked: command matched blacklist pattern '{hit}'"
+        """Shared pipeline: whitelist gate → blacklist → warning → dispatch."""
+        if caller_level < permissions.neutral and not _check_whitelist(command, whitelist):
+            return (
+                f"Blocked: permission level {caller_level} may only run whitelisted "
+                f"commands. Full shell access requires permission level {permissions.neutral}."
+            )
+        if caller_level < permissions.bypass_blacklist:
+            hit = _check_blacklist(command, blacklist)
+            if hit:
+                logger.warning("shell: blocked command (pattern: %s): %.120s", hit, command)
+                return f"Blocked: command matched blacklist pattern '{hit}'"
         warn = _destructive_warning(command)
         prefix = f"{warn}\n" if warn else ""
         effective_timeout = min(call_timeout, max_timeout) if call_timeout is not None else default_timeout
@@ -303,7 +385,16 @@ def register_agent(agent) -> None:
         return prefix + output
 
     def shell(command: str, timeout: int | None = None, backend_access: bool = False) -> str:
-        """Run a shell command.
+        if backend_access:
+            if caller_level < permissions.access_backend:
+                return (
+                    f"Blocked: backend_access=True requires permission level "
+                    f"{permissions.access_backend} (yours is {caller_level})."
+                )
+            return _dispatch(command, local=True, call_timeout=timeout)
+        return _dispatch(command, call_timeout=timeout)
+
+    shell.__doc__ = f"""Run a shell command.
 
         By default runs in the isolated sandbox container, which has outbound
         internet access (HTTP/S, git, pip, npm, etc.) but is NETWORK-ISOLATED:
@@ -317,22 +408,19 @@ def register_agent(agent) -> None:
           - LAN services (192.168.x.x, 10.x.x.x)
           - Internal APIs (ComfyUI, local databases, self-hosted services)
           - Docker host or sibling containers by hostname
-        Requires permission level 80. Blacklist still applies in both modes.
+        Requires permission level {permissions.access_backend}. Blacklist still applies in both modes.
+
+        Callers below permission level {permissions.neutral} may only run commands
+        matching an entry in whitelist.txt; every other command is blocked
+        regardless of mode.
 
         Args:
             command: The shell command to run.
             timeout: Optional per-call timeout in seconds. Capped at the
-                     configured maximum (default 1200s).
+                     configured maximum (default {max_timeout}s).
             backend_access: If True, run in the main container with full
                             network access and access to its own backend
-                            files (requires permission level 80).
+                            files (requires permission level {permissions.access_backend}).
         """
-        if backend_access:
-            # Checked inside tool_handler via min_permission, but we guard
-            # explicitly here too so the error message is clear.
-            if agent.config.permissions.level < 80:
-                return "Blocked: backend_access=True requires permission level 80"
-            return _dispatch(command, local=True, call_timeout=timeout)
-        return _dispatch(command, call_timeout=timeout)
 
-    agent.tool_handler.register_tool(shell, always_on=True, min_permission=45)
+    agent.tool_handler.register_tool(shell, always_on=True, min_permission=permissions.use_whitelist)
