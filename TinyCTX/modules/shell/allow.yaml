@@ -5,12 +5,47 @@
 # must be covered by some rule here, and then deny.yaml still gets a say
 # (deny beats allow, same as the old whitelist behaviour).
 #
-# An allow rule must account for the command COMPLETELY:
+# ---- What "safe" means here ----
+#
+# The bar for this file: you could hand this tier to a stranger on Discord and
+# let them run it against your machine, and nothing bad happens. Concretely, a
+# command qualifies only if it CANNOT:
+#
+#   - read the filesystem            (cat, grep, ls, head, find — all fail)
+#   - write or delete anything       (rm, mv, tee, anything with -o FILE)
+#   - reach the network              (curl, wget, ping, dig)
+#   - disclose system or user state  (env, printenv, id, whoami, hostname,
+#                                     uname, ps, df, uptime, ip, ifconfig)
+#   - change system state            (anything in deny.yaml, and more)
+#   - run for an unbounded time or produce unbounded output
+#
+# Note how much that excludes. `cat` is not safe — it reads secrets. `grep` is
+# not safe for the same reason. `ps` is not safe: it discloses what else is
+# running in the shared container, and its argv can carry another caller's
+# tokens. `whoami` and `uname` are mild but still disclosure, so they are out
+# too. This list is short because the bar is high, which is the point.
+#
+# The result is a closure property worth stating plainly: NO command below can
+# read a file, the network, or the environment. The only data that can enter a
+# pipeline at this tier is text the caller typed. So a pipeline of these
+# commands can only ever transform the caller's own input — there is nothing
+# sensitive for it to reach.
+#
+# Two patterns enforce that mechanically:
+#   - `max_args: 0` on the stdin filters. With no operands they physically
+#     cannot name a file; they read stdin or nothing.
+#   - Explicit `allowed_flags` everywhere. Omitting the key permits NO flags,
+#     which is the safe default. Several otherwise-harmless tools grow teeth
+#     through one flag (`sort -o FILE` writes, `date -s` sets the clock,
+#     `wc --files0-from=F` reads files, `shuf -o FILE` writes) — those flags
+#     are excluded by not being listed.
+#
+# ---- Rule fields ----
 #   command         executable basename; str or list
 #   subcommand      permitted first operands (`git` **status**)
 #   allowed_flags   the only flags permitted; omit to permit none
 #   max_args        operand ceiling (after the subcommand); omit to permit none
-#   arg_matches     regex every operand must match
+#   arg_matches     regex every operand must match (anchor it)
 #
 # Flags are matched canonically: `allowed_flags: [-l, -a]` covers `-l -a`,
 # `-la` and `-al` without listing every spelling.
@@ -21,16 +56,15 @@
 # ---- On arguments ----
 # The old whitelist.txt needed an `{arg}` placeholder that expanded to a
 # hand-built character class, because it matched raw command text and had to
-# stop a caller from writing `"; rm -rf /`. That is gone. Arguments are now
-# parser leaves: in `echo "hello; rm -rf /"` the whole quoted span is ONE
-# operand, and the `;` is text. There is nothing to escape, so callers get
-# their apostrophes, quotes and semicolons back.
+# stop a caller writing `"; rm -rf /`. That is gone. Arguments are now parser
+# leaves: in `echo "hello; rm -rf /"` the whole quoted span is ONE operand and
+# the `;` is text. There is nothing to escape, so callers get their
+# apostrophes, quotes and semicolons back.
 #
 # WARNING (carried over from whitelist.txt): allow-listing a command
 # guarantees it can't damage the system or leak data through execution. It
-# does NOT vet what a caller chooses to say through it — `echo` happily
-# echoes anything. Moderating that output is a separate concern from this
-# file.
+# does NOT vet what a caller chooses to say through it — `echo` happily echoes
+# anything. Moderating that output is a separate concern from this file.
 # ============================================================
 
 version: 1
@@ -59,78 +93,167 @@ constructs:
 
 rules:
 
+  # ----------------------------------------------------------------
+  # Emit literal text
+  # ----------------------------------------------------------------
   - id: echo
     action: allow
     command: echo
+    allowed_flags: ["-n", "-e"]
     max_args: 8
     message: "echo literal text"
 
+  # ----------------------------------------------------------------
+  # Clock and calendar
+  # ----------------------------------------------------------------
+  # -s/--set changes the system clock, -r reads a file's mtime, and -f reads a
+  # file of date strings. All three are excluded by not being listed.
   - id: date
     action: allow
     command: date
-    max_args: 0
+    allowed_flags: ["-u", "-R", "-I", "-d"]
+    max_args: 2
+    arg_matches: '^[+A-Za-z0-9 %:,./_-]{1,64}$'
     message: "current date and time"
 
-  # ps / ps -eo pid,comm only.
-  #
-  # The sandbox is ONE container shared for the whole instance's lifetime,
-  # across every caller and every conversation branch — not per-request
-  # isolated. Backgrounding is permitted at the neutral tier, and
-  # subprocess.run only waits for the immediate bash child, so a backgrounded
-  # process outlives its request and stays visible to ps. Its full argv can
-  # carry secrets, e.g. `API_TOKEN=sk-... some-server &`.
-  #   - Safe: plain `ps` and `ps -eo pid,comm`. Linux's short CMD/COMM column
-  #     is the executable name only, never argv (verified: a process invoked
-  #     as `sleep --my-secret-token=X` shows up as just "sleep").
-  #   - NEVER allow `ps aux` / `ps -ef` / `-o args=` / `-o cmd=` / `-o
-  #     command=` / any "e" flag — those print the full command line and, with
-  #     -e, the environment. That is exactly the leak above.
-  # Requires the procps package — verify `which ps` in your actual sandbox
-  # container before relying on this (sandbox/Dockerfile doesn't list procps
-  # explicitly; it may or may not be pulled in transitively).
-  - id: ps-bare
-    action: allow
-    command: ps
-    max_args: 0
-    message: "process list"
-
-  - id: ps-pid-comm
-    action: allow
-    command: ps
-    allowed_flags: ["-e", "-o"]
-    max_args: 1
-    arg_matches: '^pid,comm$'
-    message: "process list, pid and executable name only"
-
-  # --- Other examples (uncomment to enable) ---
-  #
-  # Note what the rule schema buys you over the old one-line-per-command
-  # whitelist: `git status`, `git log --oneline`, `git log --oneline -n 5`
-  # and `git diff --stat` are all covered by the single entry below, and
-  # `git push` is not.
-  #
-  # - id: git-read-only
-  #   action: allow
-  #   command: git
-  #   subcommand: [status, log, diff, show, branch]
-  #   allowed_flags: ["--oneline", "--stat", "--graph", "--no-color", "-n"]
-  #   max_args: 3
-  #   arg_matches: '^[A-Za-z0-9._/-]+$'
-  #   message: "read-only git"
-  #
-  # - id: pwd
-  #   action: allow
-  #   command: [pwd, whoami]
-  #   max_args: 0
-  #   message: "current directory / user"
-  #
-  # - id: ls
-  #   action: allow
-  #   command: ls
-  #   allowed_flags: ["-l", "-a", "-h", "-t", "-r"]
-  #   max_args: 1
-  #   arg_matches: '^[A-Za-z0-9._/-]+$'
-  #   message: "directory listing"
-  #
   # cal is NOT installed by default in sandbox/Dockerfile (needs
-  # bsdmainutils/ncal) — verify before enabling.
+  # bsdmainutils/ncal) — verify before relying on it. Harmless if absent: the
+  # command simply fails.
+  - id: cal
+    action: allow
+    command: cal
+    allowed_flags: ["-3", "-y", "-m"]
+    max_args: 2
+    arg_matches: '^[0-9]{1,4}$'
+    message: "calendar"
+
+  # ----------------------------------------------------------------
+  # Arithmetic and sequences
+  # ----------------------------------------------------------------
+  # arithmetic_expansion ($((...))) is not an allowed construct at this tier,
+  # so expr is the only way to do maths here. It operates purely on its own
+  # arguments and touches nothing else.
+  - id: expr
+    action: allow
+    command: expr
+    max_args: 6
+    arg_matches: '^[A-Za-z0-9 _.:()+*/%=<>!-]{1,64}$'
+    message: "arithmetic and string expressions"
+
+  # The 4-digit cap is not about safety, it's about output size: `seq 1
+  # 99999999` would flood the reply and the model's context. Command output
+  # is not truncated anywhere downstream, so bound it here.
+  - id: seq
+    action: allow
+    command: seq
+    max_args: 3
+    arg_matches: '^-?[0-9]{1,4}$'
+    message: "number sequence"
+
+  # Likewise digit-capped: factoring a 20-digit number burns the whole timeout.
+  - id: factor
+    action: allow
+    command: factor
+    max_args: 4
+    arg_matches: '^[0-9]{1,12}$'
+    message: "prime factorisation"
+
+  # ----------------------------------------------------------------
+  # String manipulation (no filesystem access despite appearances)
+  # ----------------------------------------------------------------
+  # basename and dirname are pure string operations on the argument text. They
+  # do not stat, open, or resolve anything — `basename /etc/passwd` prints
+  # "passwd" whether or not that file exists.
+  - id: path-strings
+    action: allow
+    command: [basename, dirname]
+    max_args: 2
+    arg_matches: '^[A-Za-z0-9 ._/-]{1,128}$'
+    message: "path string manipulation"
+
+  # tr cannot open files at all — it is strictly stdin to stdout — so its
+  # operands are safe regardless of content. Quote character sets
+  # (`tr '[:upper:]' '[:lower:]'`); unquoted brackets read as a glob and are
+  # rejected before rules are consulted.
+  - id: tr
+    action: allow
+    command: tr
+    allowed_flags: ["-d", "-s", "-c"]
+    max_args: 2
+    arg_matches: '^[A-Za-z0-9\[\]:^\\-]{1,64}$'
+    message: "translate or delete characters"
+
+  # ----------------------------------------------------------------
+  # Stdin-only filters
+  # ----------------------------------------------------------------
+  # `max_args: 0` is doing the security work: with no operands these cannot
+  # name a file, so they can only ever process what a pipeline handed them —
+  # and every possible upstream in this file emits the caller's own text.
+  #
+  # Deliberately absent: head, tail, cut, nl, fold. Each needs a count operand
+  # (`head -n 5`), so max_args: 0 is impossible and `head FILE` could not be
+  # ruled out by argument shape alone. Not worth weakening the guarantee.
+  #
+  # Caveat: run bare rather than in a pipeline, these block on stdin until the
+  # call times out. Use them downstream of a pipe.
+  #
+  # shuf is deliberately absent: `shuf -r` repeats its input forever, and its
+  # only useful bounded form (`shuf -n 5`) needs a count operand that
+  # max_args: 0 forbids. Nothing lost, one unbounded-output hole closed.
+  - id: reorder-filters
+    action: allow
+    command: [rev, tac]
+    max_args: 0
+    message: "reverse piped text"
+
+  - id: sort-filters
+    action: allow
+    command: ["sort", uniq]
+    allowed_flags: ["-r", "-n", "-u", "-f", "-b", "-c", "-d", "-i"]
+    max_args: 0
+    message: "sort or dedupe piped text"
+
+  - id: wc
+    action: allow
+    command: wc
+    allowed_flags: ["-l", "-w", "-c", "-m"]
+    max_args: 0
+    message: "count piped lines, words or characters"
+
+  - id: checksum
+    action: allow
+    command: [md5sum, sha1sum, sha256sum, cksum]
+    max_args: 0
+    message: "checksum of piped text"
+
+  # ----------------------------------------------------------------
+  # Deliberately NOT here
+  # ----------------------------------------------------------------
+  # ps / ps -eo pid,comm were allow-listed by the old whitelist.txt. They fail
+  # this file's bar on two counts: the process list discloses what else is
+  # running in the container, and — as whitelist.txt's own header documented
+  # at length — a backgrounded process's argv can carry another caller's
+  # secrets (`API_TOKEN=sk-... some-server &`). The old file mitigated the
+  # second point by permitting only the COMM column; the first point stands
+  # regardless, so both entries are dropped.
+  #
+  # Also excluded, for the reasons in the header: cat, grep, ls, find, head,
+  # tail, pwd, whoami, id, hostname, uname, env, printenv, df, free, uptime,
+  # curl, wget, git (every subcommand reads repository contents).
+  #
+  # This file's bar is deliberately conservative and may not be yours — the
+  # sandbox container holds no credentials and has no LAN route, so several
+  # exclusions above are stricter than your threat model needs.
+  #
+  # Don't edit this file to loosen it, and don't copy it. Write a small
+  # instance-local policy that inherits from it:
+  #
+  #   extends: builtin:allow
+  #   rules:
+  #     - {id: ps, action: allow, command: ps, max_args: 0}
+  #   disable: [cal]
+  #
+  # then point extra.shell.policy.allow at that file. Base rules are
+  # inherited; a matching `id` replaces one, `disable:` drops one. See
+  # example.instance-allow.yaml in this directory for a worked version,
+  # including ps with its columns constrained.
