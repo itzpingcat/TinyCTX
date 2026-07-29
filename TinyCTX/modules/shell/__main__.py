@@ -25,15 +25,34 @@ the design). This replaced substring-glob blacklist.txt / whitelist.txt files,
 which could not tell a command from a quoted argument that happened to contain
 the same text.
 
-Permission tiers (see `_ShellPermissions` below, configured via
-extra.shell.permissions in config.yaml):
-  use_whitelist     — min caller level to invoke the tool at all. Below
-                       `neutral`, every command must be permitted by allow.yaml.
-  neutral           — min caller level for unrestricted commands (still
-                       subject to deny.yaml unless bypass_blacklist).
-  bypass_blacklist  — min caller level that skips policy checks entirely.
-  access_backend    — min caller level for backend_access=True.
-All four are resolved from the *actual caller* (agent.caller.permission_level),
+Which policies apply to whom is config, not code. Each policy carries the level
+at which a caller outgrows it:
+
+    min_permission: 30
+    policies:
+      - {policy: builtin:allow, applies_below: 45}
+      - {policy: builtin:deny,  applies_below: 90}
+
+Level 20 is subject to both, 50 to the deny-list only, 95 to nothing. Omit
+`applies_below` for a policy that binds everyone. `min_permission` is the level
+below which the tool isn't offered at all.
+
+Tier selection is therefore one comparison per policy, and this module has no
+opinion on how many tiers exist or which policy is an allow-list vs a
+deny-list — each file declares its own posture via `default_action`. Note what
+the shape rules out: a policy cannot bind a HIGHER-privileged caller while
+sparing a lower one. That would be incoherent, and a flat threshold list makes
+it unrepresentable.
+
+A relative `policy:` name resolves against the instance's config directory
+(`<instance>/config`, bound read-only at /app/config in the container), so the
+same config.yaml works on the host and in Docker where that directory has a
+different absolute path.
+
+`extra.shell.permissions.access_backend` remains a scalar: it gates *where* a
+command runs, not which policy applies to it.
+
+Levels are resolved from the *actual caller* (agent.caller.permission_level),
 captured once per cycle — never from a static config value.
 """
 from __future__ import annotations
@@ -46,7 +65,8 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable
 from pathlib import Path
-from typing import NamedTuple
+
+from TinyCTX.utils.instance import runtime_config_dir
 
 from . import policy as policy_mod
 from . import validate
@@ -58,11 +78,13 @@ logger = logging.getLogger(__name__)
 # Permission tiers
 # ---------------------------------------------------------------------------
 
-class _ShellPermissions(NamedTuple):
-    use_whitelist: int
-    neutral: int
-    bypass_blacklist: int
-    access_backend: int
+# Fallbacks when extra.shell is unset. Kept in sync with __init__.py's
+# EXTENSION_META default_config, which is what an operator actually sees.
+_DEFAULT_MIN_PERMISSION = 30
+_DEFAULT_POLICIES = [
+    {"policy": "builtin:allow", "applies_below": 45},
+    {"policy": "builtin:deny", "applies_below": 90},
+]
 
 
 # ---------------------------------------------------------------------------
@@ -173,35 +195,47 @@ def register_agent(agent) -> None:
     sandbox_url = _extra.get("sandbox_url", _default_sandbox_url) or None
 
     _perm_raw = _extra.get("permissions", {}) or {}
-    permissions = _ShellPermissions(
-        use_whitelist=int(_perm_raw.get("use_whitelist", 10)),
-        neutral=int(_perm_raw.get("neutral", 45)),
-        bypass_blacklist=int(_perm_raw.get("bypass_blacklist", 90)),
-        access_backend=int(_perm_raw.get("access_backend", 80)),
-    )
+    _removed = {"use_whitelist", "neutral", "bypass_blacklist"} & set(_perm_raw)
+    access_backend = int(_perm_raw.get("access_backend", 80))
 
     if sandbox_url:
         logger.info("shell: dispatching via sandbox at %s", sandbox_url)
     else:
         logger.info("shell: dispatching locally (no sandbox configured)")
 
-    # Policy files are read-only by design (mount them read-only when pointing
-    # at the instance directory) and are loaded once, cached by path.
-    _policy_raw = _extra.get("policy", {}) or {}
-    deny_path = _policy_raw.get("deny") or policy_mod.DENY_PATH
-    allow_path = _policy_raw.get("allow") or policy_mod.ALLOW_PATH
+    # Which policies apply at which permission level is config, not code.
+    # Relative policy names resolve against the instance's config directory,
+    # which is at a different absolute path inside the container than on the
+    # host — so `policy: shell-allow.yaml` works in both. Files are read-only
+    # by design (compose binds /app/config read-only) and cached by path.
+    #
+    # Fail closed. A policy that won't load blocks every command — it must
+    # never degrade into an unrestricted shell, which is what the old
+    # blacklist.txt did when its file was missing.
+    min_permission = int(_extra.get("min_permission", _DEFAULT_MIN_PERMISSION))
+    config_dir = runtime_config_dir(workspace)
 
-    # Fail closed. A policy that won't load blocks every command — it must never
-    # degrade into an unrestricted shell, which is what the old blacklist.txt
-    # did when the file was missing.
     policy_error: str | None = None
-    deny_policy = allow_policy = None
-    try:
-        deny_policy = policy_mod.load_policy(deny_path, workspace)
-        allow_policy = policy_mod.load_policy(allow_path, workspace)
-    except policy_mod.PolicyError as exc:
-        policy_error = str(exc)
-        logger.error("shell: policy failed to load — all commands blocked: %s", exc)
+    policies = None
+    if _removed:
+        # Silently ignoring these would be a security bug in the loosening
+        # direction: someone who set use_whitelist: 90 to lock the shell down
+        # would get the permissive default instead.
+        policy_error = (
+            f"extra.shell.permissions no longer accepts {sorted(_removed)} — "
+            "these were replaced by extra.shell.min_permission and the "
+            "extra.shell.policies list (see modules/shell/__init__.py). "
+            "Migrate the config to re-enable the shell."
+        )
+        logger.error("shell: %s", policy_error)
+    else:
+        try:
+            policies = policy_mod.load_policy_set(
+                _extra.get("policies") or _DEFAULT_POLICIES, workspace, config_dir,
+            )
+        except policy_mod.PolicyError as exc:
+            policy_error = str(exc)
+            logger.error("shell: policies failed to load — all commands blocked: %s", exc)
 
     # Caller's permission level for this cycle, resolved once. Mirrors
     # modules/sysops/__main__.py's caller_level snapshot: agent.caller is
@@ -210,28 +244,25 @@ def register_agent(agent) -> None:
     caller_level = agent.caller.permission_level
 
     def _dispatch(command: str, local: bool = False, call_timeout: int | None = None) -> str:
-        """Shared pipeline: policy check → dispatch."""
-        prefix = ""
-        if caller_level < permissions.bypass_blacklist:
-            if policy_error is not None:
-                return f"Blocked: shell policy could not be loaded — {policy_error}"
+        """Shared pipeline: apply every policy this caller is subject to, then
+        dispatch.
 
-            if caller_level < permissions.neutral:
-                verdict = validate.check(command, allow_policy, workspace)
-                if not verdict.allowed:
-                    logger.info("shell: allow-list rejected a command — %s", verdict.reason)
-                    return (
-                        f"Blocked: {verdict.reason}. Permission level {caller_level} may "
-                        f"only run commands permitted by the allow-list; full shell access "
-                        f"requires permission level {permissions.neutral}."
-                    )
+        Note what this doesn't know: which policy is an allow-list and which is
+        a deny-list, or how many tiers exist. Each file declares its own
+        posture and carries its own threshold, so tier selection is one
+        comparison per policy.
+        """
+        if policy_error is not None:
+            return f"Blocked: shell policy could not be loaded — {policy_error}"
 
-            verdict = validate.check(command, deny_policy, workspace)
+        warnings: list[str] = []
+        for policy in policies.for_level(caller_level):
+            verdict = validate.check(command, policy, workspace)
             if not verdict.allowed:
-                logger.warning("shell: blocked a command — %s", verdict.reason)
-                return f"Blocked: {verdict.reason}"
-            if verdict.warnings:
-                prefix = "\n".join(verdict.warnings) + "\n"
+                logger.warning("shell: blocked by %s — %s", policy.name, verdict.reason)
+                return f"Blocked: {verdict.reason}. Your permission level is {caller_level}."
+            warnings.extend(verdict.warnings)
+        prefix = "\n".join(dict.fromkeys(warnings)) + "\n" if warnings else ""
 
         effective_timeout = min(call_timeout, max_timeout) if call_timeout is not None else default_timeout
         if local or not sandbox_url:
@@ -242,10 +273,10 @@ def register_agent(agent) -> None:
 
     def shell(command: str, timeout: int | None = None, backend_access: bool = False) -> str:
         if backend_access:
-            if caller_level < permissions.access_backend:
+            if caller_level < access_backend:
                 return (
                     f"Blocked: backend_access=True requires permission level "
-                    f"{permissions.access_backend} (yours is {caller_level})."
+                    f"{access_backend} (yours is {caller_level})."
                 )
             return _dispatch(command, local=True, call_timeout=timeout)
         return _dispatch(command, call_timeout=timeout)
@@ -264,13 +295,13 @@ def register_agent(agent) -> None:
           - LAN services (192.168.x.x, 10.x.x.x)
           - Internal APIs (ComfyUI, local databases, self-hosted services)
           - Docker host or sibling containers by hostname
-        Requires permission level {permissions.access_backend}. Command policy still applies in both modes.
+        Requires permission level {access_backend}. Command policy still applies in both modes.
 
         The command is parsed as bash and each command in it is checked
         separately, so chaining with ; && || and pipes is fine and quoted
         arguments are treated as data. Blocked commands say which rule
-        objected. Callers below permission level {permissions.neutral} may only run
-        commands covered by the allow-list policy.
+        objected. Which policies apply depends on your permission level; at
+        lower levels only an explicitly allow-listed set of commands runs.
 
         Args:
             command: The shell command to run.
@@ -278,7 +309,7 @@ def register_agent(agent) -> None:
                      configured maximum (default {max_timeout}s).
             backend_access: If True, run in the main container with full
                             network access and access to its own backend
-                            files (requires permission level {permissions.access_backend}).
+                            files (requires permission level {access_backend}).
         """
 
-    agent.tool_handler.register_tool(shell, always_on=True, min_permission=permissions.use_whitelist)
+    agent.tool_handler.register_tool(shell, always_on=True, min_permission=min_permission)

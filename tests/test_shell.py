@@ -29,6 +29,8 @@ Run with:
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from TinyCTX.modules.shell import __main__ as shell_mod
@@ -92,12 +94,19 @@ def _policy_files(tmp_path, deny_rules="", allow_rules=""):
     return deny, allow
 
 
-def _register(tmp_path, caller_level, extra_shell=None, deny_rules="", allow_rules=""):
+def _register(tmp_path, caller_level, extra_shell=None, deny_rules="", allow_rules="", policies=None):
     deny, allow = _policy_files(tmp_path, deny_rules, allow_rules)
+    if policies is None:
+        # Mirrors the shipped defaults, against throwaway policy files.
+        policies = [
+            {"policy": str(allow), "applies_below": 45},
+            {"policy": str(deny), "applies_below": 90},
+        ]
     extra = {
         "shell": {
             "sandbox_url": None,
-            "policy": {"deny": str(deny), "allow": str(allow)},
+            "min_permission": 10,
+            "policies": policies,
             **(extra_shell or {}),
         }
     }
@@ -230,12 +239,72 @@ class TestTierRouting:
         assert result["success"] is False
         assert "PERMISSION DENIED" in result["error"]
 
-    def test_registered_min_permission_matches_use_whitelist_config(self, tmp_path):
+    def test_registered_min_permission_comes_from_config(self, tmp_path):
         agent = _register(
             tmp_path, caller_level=100,
-            extra_shell={"permissions": {"use_whitelist": 33}},
+            extra_shell={"min_permission": 33},
         )
         assert agent.tool_handler.tools["shell"]["min_permission"] == 33
+
+    @pytest.mark.asyncio
+    async def test_policy_without_applies_below_binds_everyone(self, tmp_path):
+        """No unrestricted tier at all — the threshold form expresses that by
+        simply omitting the number."""
+        agent = _register(
+            tmp_path, caller_level=100,
+            deny_rules=_BLOCK_MARKER,
+            policies=[{"policy": str(tmp_path / "deny.yaml")}],
+        )
+        result = await _call(agent, command="dd if=/dev/zero of=x")
+        assert "Blocked" in result["result"]
+
+    @pytest.mark.asyncio
+    async def test_arbitrary_number_of_tiers(self, tmp_path):
+        """The point of the shape: a fourth tier costs one config line, not an
+        edit to _dispatch()."""
+        # Distinct filenames: _register() rewrites deny.yaml/allow.yaml on
+        # every call, so these must not collide with the shared fixtures.
+        deny = tmp_path / "t-deny.yaml"
+        deny.write_text(
+            f"default_action: allow\n{_CONSTRUCTS}rules:\n"
+            "  - {id: no-dd, action: deny, command: dd, message: raw disk}\n"
+        )
+        allow = tmp_path / "t-allow.yaml"
+        allow.write_text(f"default_action: deny\n{_CONSTRUCTS}rules:\n{_ECHO_ALLOWED}")
+        mid = tmp_path / "t-mid.yaml"
+        mid.write_text(
+            f"extends: {allow}\n"
+            "rules:\n"
+            "  - {id: date, action: allow, command: date, max_args: 0}\n"
+        )
+        # echo-only below 40, echo+date below 70, deny-list below 95, then free.
+        policies = [
+            {"policy": str(allow), "applies_below": 40},
+            {"policy": str(mid), "applies_below": 70},
+            {"policy": str(deny), "applies_below": 95},
+        ]
+        for level, command, blocked in [
+            (10, "echo hi", False), (10, "date", True),
+            (40, "date", False), (40, "dd if=x", True),
+            (70, "dd if=x", True), (70, "cat /etc/hosts", False),
+            (95, "dd if=/dev/null of=/dev/null", False),
+        ]:
+            agent = _register(tmp_path, caller_level=level, policies=policies)
+            result = await _call(agent, command=command)
+            assert ("Blocked" in result["result"]) is blocked, (level, command, result["result"])
+
+    @pytest.mark.asyncio
+    async def test_removed_permission_keys_block_the_shell(self, tmp_path):
+        """Ignoring a stale use_whitelist would silently LOOSEN access for
+        anyone who had raised it to lock the shell down."""
+        agent = _register(
+            tmp_path, caller_level=50,
+            extra_shell={"permissions": {"use_whitelist": 90}},
+        )
+        result = await _call(agent, command="echo hi")
+        assert "Blocked" in result["result"]
+        assert "no longer accepts" in result["result"]
+        assert "policies" in result["result"]
 
 
 # ---------------------------------------------------------------------------
@@ -275,36 +344,112 @@ class TestDenyAndBypass:
 # ---------------------------------------------------------------------------
 
 class TestPolicyLoadFailure:
+    def _broken(self, tmp_path, caller_level, policies):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir(exist_ok=True)
+        extra = {"shell": {"sandbox_url": None, "min_permission": 10, "policies": policies}}
+        agent = _FakeAgent(_FakeCaller(caller_level), _FakeConfig(workspace, extra=extra))
+        shell_mod.register_agent(agent)
+        return agent
+
     @pytest.mark.asyncio
     async def test_missing_policy_blocks_everything(self, tmp_path):
         """The old blacklist.txt did the opposite — a missing file logged a
         warning and left the shell completely unrestricted."""
-        workspace = tmp_path / "workspace"
-        workspace.mkdir()
-        extra = {"shell": {
-            "sandbox_url": None,
-            "policy": {"deny": str(tmp_path / "nope.yaml"), "allow": str(tmp_path / "nope.yaml")},
-        }}
-        agent = _FakeAgent(_FakeCaller(50), _FakeConfig(workspace, extra=extra))
-        shell_mod.register_agent(agent)
-
+        agent = self._broken(tmp_path, 50, [{"policy": str(tmp_path / "nope.yaml")}])
         result = await _call(agent, command="echo hi")
         assert "Blocked" in result["result"]
         assert "could not be loaded" in result["result"]
 
     @pytest.mark.asyncio
-    async def test_bypass_tier_unaffected_by_broken_policy(self, tmp_path):
+    async def test_otherwise_unrestricted_caller_also_blocked(self, tmp_path):
+        """Stricter than before, deliberately: a policy that won't load is a
+        broken config, and we can't tell whether the entry that failed was the
+        one that would have bound this caller."""
+        agent = self._broken(
+            tmp_path, 95,
+            [{"policy": str(tmp_path / "nope.yaml"), "applies_below": 90}],
+        )
+        result = await _call(agent, command="echo nope")
+        assert "Blocked" in result["result"]
+
+    @pytest.mark.asyncio
+    async def test_malformed_threshold_blocks_everything(self, tmp_path):
+        agent = self._broken(
+            tmp_path, 50,
+            [{"policy": "builtin:deny", "applies_below": "not-a-number"}],
+        )
+        result = await _call(agent, command="echo hi")
+        assert "Blocked" in result["result"]
+        assert "applies_below" in result["result"]
+
+    @pytest.mark.asyncio
+    async def test_unknown_entry_key_is_rejected(self, tmp_path):
+        agent = self._broken(tmp_path, 50, [{"policy": "builtin:deny", "aplies_below": 90}])
+        result = await _call(agent, command="echo hi")
+        assert "Blocked" in result["result"]
+
+    @pytest.mark.asyncio
+    async def test_entry_without_policy_is_rejected(self, tmp_path):
+        agent = self._broken(tmp_path, 50, [{"applies_below": 90}])
+        result = await _call(agent, command="echo hi")
+        assert "Blocked" in result["result"]
+        assert "missing" in result["result"]
+
+
+# ---------------------------------------------------------------------------
+# Config-dir path resolution
+# ---------------------------------------------------------------------------
+
+class TestConfigDirResolution:
+    """A relative policy name must resolve against the instance's config
+    directory, which sits at a different absolute path on the host than inside
+    the container. Absolute paths in config.yaml would work in exactly one of
+    those two places."""
+
+    @pytest.mark.asyncio
+    async def test_relative_name_resolves_against_config_dir(self, tmp_path, monkeypatch):
+        config_dir = tmp_path / "config"
+        config_dir.mkdir()
+        (config_dir / "mine.yaml").write_text(
+            f"default_action: allow\n{_CONSTRUCTS}rules:\n{_BLOCK_MARKER}"
+        )
+        monkeypatch.setenv("TINYCTX_CONFIG_DIR_PATH", str(config_dir))
+
         workspace = tmp_path / "workspace"
-        workspace.mkdir()
+        workspace.mkdir(exist_ok=True)
         extra = {"shell": {
-            "sandbox_url": None,
-            "policy": {"deny": str(tmp_path / "nope.yaml"), "allow": str(tmp_path / "nope.yaml")},
+            "sandbox_url": None, "min_permission": 10,
+            "policies": [{"policy": "mine.yaml"}],
         }}
-        agent = _FakeAgent(_FakeCaller(95), _FakeConfig(workspace, extra=extra))
+        agent = _FakeAgent(_FakeCaller(50), _FakeConfig(workspace, extra=extra))
         shell_mod.register_agent(agent)
 
-        result = await _call(agent, command="echo bypass-ok")
-        assert "bypass-ok" in result["result"]
+        blocked = await _call(agent, command="dd if=/dev/zero of=x")
+        assert "no-dd" in blocked["result"]
+        ok = await _call(agent, command="echo fine")
+        assert "fine" in ok["result"]
+
+    def test_env_override_wins(self, tmp_path, monkeypatch):
+        from TinyCTX.utils.instance import runtime_config_dir
+
+        monkeypatch.setenv("TINYCTX_CONFIG_DIR_PATH", "/app/config")
+        monkeypatch.setenv("TINYCTX_CONFIG_FILE", str(tmp_path / "config.yaml"))
+        assert runtime_config_dir() == Path("/app/config")
+
+    def test_falls_back_to_config_file_sibling(self, tmp_path, monkeypatch):
+        from TinyCTX.utils.instance import runtime_config_dir
+
+        monkeypatch.delenv("TINYCTX_CONFIG_DIR_PATH", raising=False)
+        monkeypatch.setenv("TINYCTX_CONFIG_FILE", str(tmp_path / "config.yaml"))
+        assert runtime_config_dir() == tmp_path / "config"
+
+    def test_falls_back_to_workspace_sibling(self, tmp_path, monkeypatch):
+        from TinyCTX.utils.instance import runtime_config_dir
+
+        monkeypatch.delenv("TINYCTX_CONFIG_DIR_PATH", raising=False)
+        monkeypatch.delenv("TINYCTX_CONFIG_FILE", raising=False)
+        assert runtime_config_dir(tmp_path / "workspace") == tmp_path / "config"
 
 
 # ---------------------------------------------------------------------------

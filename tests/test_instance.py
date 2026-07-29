@@ -156,3 +156,68 @@ class TestLoadInstanceEnv:
         monkeypatch.setenv("TINYCTX_TEST_VAR", "pre_existing_value")
         load_instance_env(instance_dir)
         assert os.environ["TINYCTX_TEST_VAR"] == "from_dotenv"
+
+
+class TestConfigDir:
+    """The <instance>/config directory: extra config too big or too structured
+    to inline into config.yaml (currently the shell module's policy YAML),
+    bound read-only at /app/config by compose.yaml."""
+
+    def test_config_dir_is_a_child_of_the_instance(self, tmp_path):
+        from TinyCTX.utils.instance import config_dir_for
+
+        assert config_dir_for(tmp_path / "inst") == tmp_path / "inst" / "config"
+
+    def test_compose_env_exports_the_host_path(self, tmp_path):
+        from TinyCTX.utils.instance import compose_env, config_dir_for
+
+        instance_dir = tmp_path / "inst"
+        env = compose_env(instance_dir)
+        assert env["TINYCTX_CONFIG_DIR"] == str(config_dir_for(instance_dir))
+
+    def test_compose_yaml_binds_it_read_only_at_the_container_path(self):
+        """compose.yaml and utils/instance.py have to agree on both halves:
+        the host bind source comes from compose_env, the container path from
+        compose.yaml's own environment block."""
+        from pathlib import Path as _Path
+
+        import yaml as _yaml
+
+        from TinyCTX.utils.instance import CONTAINER_CONFIG_DIR
+
+        repo_root = _Path(__file__).resolve().parent.parent
+        compose = _yaml.safe_load((repo_root / "compose.yaml").read_text())
+        agent = compose["services"]["agent"]
+
+        mount = next(
+            v for v in agent["volumes"] if v["target"] == CONTAINER_CONFIG_DIR
+        )
+        assert mount["read_only"] is True
+        assert "TINYCTX_CONFIG_DIR" in mount["source"]
+        assert agent["environment"]["TINYCTX_CONFIG_DIR_PATH"] == CONTAINER_CONFIG_DIR
+
+    def test_runtime_dir_prefers_the_container_env_var(self, tmp_path, monkeypatch):
+        from pathlib import Path
+
+        from TinyCTX.utils.instance import runtime_config_dir
+
+        monkeypatch.setenv("TINYCTX_CONFIG_DIR_PATH", "/app/config")
+        monkeypatch.setenv("TINYCTX_CONFIG_FILE", str(tmp_path / "config.yaml"))
+        assert runtime_config_dir() == Path("/app/config")
+
+    def test_runtime_dir_falls_back_to_the_config_file_sibling(self, tmp_path, monkeypatch):
+        from TinyCTX.utils.instance import runtime_config_dir
+
+        monkeypatch.delenv("TINYCTX_CONFIG_DIR_PATH", raising=False)
+        monkeypatch.setenv("TINYCTX_CONFIG_FILE", str(tmp_path / "config.yaml"))
+        assert runtime_config_dir() == tmp_path / "config"
+
+    def test_start_creates_it_before_compose_runs(self):
+        """Docker auto-creates a missing bind source as root-owned, which the
+        user then can't write policy files into without sudo."""
+        import inspect
+
+        from TinyCTX.commands import start
+
+        src = inspect.getsource(start.run)
+        assert "config_dir_for" in src and "mkdir" in src

@@ -35,6 +35,7 @@ from pathlib import Path
 from TinyCTX.utils.instance import (
     resolve_instance_dir,
     config_path_for,
+    config_dir_for,
     project_name_for,
     compose_env,
     load_instance_env,
@@ -133,6 +134,11 @@ def run(args: argparse.Namespace) -> None:
     _require_docker()
 
     load_instance_env(instance_dir)
+
+    # compose.yaml binds this read-only at /app/config. Create it first —
+    # Docker auto-creates a missing bind source as a ROOT-OWNED directory,
+    # which the user then can't write policy files into without sudo.
+    config_dir_for(instance_dir).mkdir(parents=True, exist_ok=True)
 
     project_name = project_name_for(instance_dir)
     env = {**os.environ, **compose_env(instance_dir, port=cfg.gateway.port)}

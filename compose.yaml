@@ -36,6 +36,10 @@ services:
         target: /app/config.yaml
         read_only: true
       - type: bind
+        source: ${TINYCTX_CONFIG_DIR:-~/.tinyctx/config}
+        target: /app/config
+        read_only: true
+      - type: bind
         source: ./TinyCTX
         target: /app/TinyCTX
         read_only: true
@@ -44,6 +48,7 @@ services:
       TINYCTX_GATEWAY_HOST: "0.0.0.0"
       TINYCTX_WORKSPACE_PATH: /home/tinyctx
       TINYCTX_DATA_PATH: /etc/tinyctx
+      TINYCTX_CONFIG_DIR_PATH: /app/config
       TINYCTX_INSTANCE: ${TINYCTX_INSTANCE:-tinyctx}
       OPENROUTER_API_KEY:
       ANTHROPIC_API_KEY:

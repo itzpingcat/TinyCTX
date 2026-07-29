@@ -42,6 +42,27 @@ Inheritance:
   cannot change the inherited `default_action` — allow-posture and
   deny-posture rules use different schemas.
 
+Which policies apply to whom:
+  Config, not code. Each policy carries the level at which a caller outgrows
+  it — that single number is the whole mechanism:
+
+      min_permission: 30
+      policies:
+        - {policy: builtin:allow, applies_below: 45}
+        - {policy: builtin:deny,  applies_below: 90}
+
+  Level 20 is subject to both, 50 to the deny-list only, 95 to nothing.
+  Omitting `applies_below` makes a policy unconditional. `min_permission` is
+  the level below which the tool isn't offered at all.
+
+  Nothing here knows what a "whitelist" or a "blacklist" is. Each file
+  declares its own posture via `default_action`, so the dispatcher just
+  filters a list by one comparison. That replaced first a hardcoded if-chain
+  with the constants use_whitelist / neutral / bypass_blacklist (three fixed
+  tiers, unextendable), and then a table of bands with nested policy lists
+  (extendable, but able to express a policy binding a HIGHER-privileged caller
+  and not a lower one — incoherent, and now unrepresentable).
+
 Policies are loaded once and cached by (path, workspace). The files are
 read-only by design (mounted read-only into the container) and are not meant to
 be edited hot — changing one requires a restart.
@@ -130,6 +151,26 @@ class Policy:
     max_command_bytes: int
 
 
+@dataclass(frozen=True)
+class ScopedPolicy:
+    """A policy plus the level at which a caller stops being subject to it."""
+
+    policy: Policy
+    applies_below: int | None  # None = applies to everyone, no upper bound
+
+
+@dataclass(frozen=True)
+class PolicySet:
+    entries: tuple[ScopedPolicy, ...]
+
+    def for_level(self, level: int) -> tuple[Policy, ...]:
+        """Every policy this caller must satisfy. Empty tuple = unrestricted."""
+        return tuple(
+            e.policy for e in self.entries
+            if e.applies_below is None or level < e.applies_below
+        )
+
+
 # ---------------------------------------------------------------------------
 # Loading
 # ---------------------------------------------------------------------------
@@ -162,13 +203,69 @@ def clear_cache() -> None:
     _cache.clear()
 
 
-def _resolve_extends(value, child: Path) -> Path:
-    """Resolve an `extends:` target.
+def load_policy_set(raw, workspace: Path | str, config_dir: Path | str) -> PolicySet:
+    """Compile the `extra.shell.policies` list.
+
+    Each entry names a policy and the level at which a caller outgrows it:
+
+        policies:
+          - {policy: builtin:allow, applies_below: 45}
+          - {policy: builtin:deny,  applies_below: 90}
+
+    A caller is subject to every entry whose `applies_below` they are under, so
+    level 20 gets both, level 50 gets the deny-list only, and level 95 gets
+    nothing. Omit `applies_below` to make a policy unconditional.
+
+    Note what this cannot express: a policy that binds a HIGHER-privileged
+    caller but not a lower one. That's incoherent, and making it
+    unrepresentable is the reason this is a flat list of thresholds rather
+    than a table of tiers.
+
+    Raises PolicyError on a malformed list or an unloadable policy. Callers
+    must treat that as "block everything".
+    """
+    if not isinstance(raw, list):
+        raise PolicyError("shell.policies must be a list")
+
+    entries: list[ScopedPolicy] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            raise PolicyError(f"shell.policies: each entry must be a mapping, got {entry!r}")
+        unknown = set(entry) - {"policy", "applies_below"}
+        if unknown:
+            raise PolicyError(f"shell.policies: unknown key(s): {sorted(unknown)}")
+        ref = entry.get("policy")
+        if not ref:
+            raise PolicyError(f"shell.policies: entry is missing 'policy': {entry!r}")
+
+        applies_below = entry.get("applies_below")
+        if applies_below is not None:
+            try:
+                applies_below = int(applies_below)
+            except (TypeError, ValueError) as exc:
+                raise PolicyError(
+                    f"shell.policies: applies_below must be an integer, got {entry['applies_below']!r}"
+                ) from exc
+
+        policy = load_policy(_resolve_ref(ref, config_dir=Path(config_dir)), workspace)
+        entries.append(ScopedPolicy(policy=policy, applies_below=applies_below))
+
+    return PolicySet(entries=tuple(entries))
+
+
+def _resolve_ref(value, relative_to: Path | None = None, config_dir: Path | None = None) -> Path:
+    """Resolve a policy reference.
 
     "builtin:allow" / "builtin:deny" name the policies shipped in this module —
-    the common case, so an operator can add one rule without vendoring the
-    whole file. Anything else is a path, resolved relative to the file doing
-    the extending.
+    the common case, so an operator can layer on one rule without vendoring the
+    whole file.
+
+    Anything else is a path. A relative one resolves against `relative_to`'s
+    directory for an `extends:` (the file doing the extending), or against the
+    instance's config directory for a config entry. That anchor matters: the
+    config directory is at a different absolute path on the host than inside
+    the container, so `policy: shell-allow.yaml` is the form that works in
+    both. An absolute path is taken literally and is on you to keep mounted.
     """
     text = str(value)
     if text == "builtin:allow":
@@ -176,7 +273,13 @@ def _resolve_extends(value, child: Path) -> Path:
     if text == "builtin:deny":
         return DENY_PATH
     target = Path(text).expanduser()
-    return target if target.is_absolute() else (child.parent / target)
+    if target.is_absolute():
+        return target
+    if relative_to is not None:
+        return relative_to.parent / target
+    if config_dir is not None:
+        return config_dir / target
+    raise PolicyError(f"policy reference {text!r} has no directory to resolve against")
 
 
 def _compile(path: Path, workspace: str, chain: tuple[str, ...] = ()) -> Policy:
@@ -195,7 +298,7 @@ def _compile(path: Path, workspace: str, chain: tuple[str, ...] = ()) -> Policy:
 
     base: Policy | None = None
     if raw.get("extends") is not None:
-        base_path = _resolve_extends(raw["extends"], path)
+        base_path = _resolve_ref(raw["extends"], relative_to=path)
         if str(base_path) in chain:
             raise PolicyError(f"{path.name}: circular extends via {base_path}")
         base = _compile(base_path, workspace, (*chain, str(path)))

@@ -1,15 +1,21 @@
 # ============================================================
 # Example: extending the shipped allow-list without copying it.
 #
-# Copy this to your instance directory, edit, and point config.yaml at it:
+# Copy this to <instance>/config/ (created by `tinyctx onboard` / `tinyctx
+# start`, and bound READ-ONLY at /app/config in the container), then name it
+# in config.yaml:
 #
 #   extra:
 #     shell:
-#       policy:
-#         allow: /instance/shell-allow.yaml
+#       policies:
+#         - {policy: shell-allow.yaml, applies_below: 45}
+#         - {policy: builtin:deny,     applies_below: 90}
 #
-# Mount it READ-ONLY into the container. Policy files are loaded once at
-# startup and cached, so edits need a restart.
+# Use the bare filename, not an absolute path: it resolves against the config
+# directory, which lives at a different absolute path on the host than inside
+# the container. An absolute path would work in exactly one of those places.
+#
+# Policy files are loaded once at startup and cached, so edits need a restart.
 #
 # `extends: builtin:allow` pulls in modules/shell/allow.yaml — its
 # default_action, its constructs map, and all its rules. Everything below is

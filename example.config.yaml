@@ -150,14 +150,14 @@ router:
 shell:
   default_timeout: 120
   max_timeout: 1200
+  min_permission: 30
   permissions:
     access_backend: 80
-    bypass_blacklist: 90
-    neutral: 45
-    use_whitelist: 25
-  policy:
-    allow: null
-    deny: null
+  policies:
+  - applies_below: 45
+    policy: builtin:allow
+  - applies_below: 90
+    policy: builtin:deny
   sandbox_url: null
 skills:
   dropped_footer_priority: 50

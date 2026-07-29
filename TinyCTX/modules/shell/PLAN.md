@@ -6,7 +6,9 @@ resulting AST, one resolved command at a time. Rules move to two structured YAML
 files that can express subcommands, flags, and argument shapes — not just
 "does this string contain `rm -rf`".
 
-Status: **approved, in implementation.** All open questions resolved — see §11.
+Status: **built.** Open questions resolved in §11. Sections are append-only: §6
+was superseded by §12, and §12 by §13, each recording why the previous shape was
+wrong rather than deleting it.
 
 ---
 
@@ -72,10 +74,13 @@ built on).
    with per-command subcommand/flag/argument constraints.
 4. **Two YAML files, shipped in the module, overridable via config.** Defaults
    live at `modules/shell/deny.yaml` and `modules/shell/allow.yaml`. Operators
-   point `extra.shell.policy.deny` / `.allow` at their own files — expected
-   to live in the instance directory, mounted **read-only** into the container.
-   Loaded **once** and cached by resolved path; the files are read-only by
-   design and are not meant to be edited hot.
+   name their own in the `policies` list (§13) — living in `<instance>/config/`,
+   bound **read-only** at `/app/config`. Loaded **once** and cached by resolved
+   path; the files are read-only by design and are not meant to be edited hot.
+   *(The `extra.shell.policy.{deny,allow}` keys this originally specified were
+   superseded by §12's tier table and then by §13's threshold list. §13.1 also
+   records that the "instance directory" this section assumed was reachable
+   from the container was not, until the mount was added.)*
 5. **Obfuscation and interpreter escape are explicitly out of scope.** See §4.2.
 6. **A malformed or missing policy file blocks everything.** Fail closed.
 7. **Backgrounding (`&`) stays allowed** at `neutral` — running a long job in
@@ -103,9 +108,11 @@ test corpus in §8 trivial to write.
 
 The parser and the compiled policy are **module-level singletons** built once at
 import / first use, not per-`register_agent`. Today `_load_blacklist()` re-reads
-and re-compiles 319 lines of regex on **every AgentCycle**. Same for the policy:
-load once, cache by `(path, mtime)` so an operator editing the YAML doesn't need
-a restart.
+and re-compiles 319 lines of regex on **every AgentCycle**.
+
+*As built:* policies cache by `(path, workspace)`, not `(path, mtime)` — the
+files are mounted read-only by design, so hot reload buys nothing and an editor
+would need a restart anyway. One fewer moving part on a security path.
 
 ### Validation pipeline
 
@@ -157,7 +164,6 @@ Each YAML file carries a `constructs:` block. Proposed defaults:
 | `subshell`, `compound_statement` | allow | deny |
 | `if_statement`, `for_statement`, `while_statement`, `case_statement` | allow | deny |
 | `function_definition` | **deny** (see §4.4) | deny |
-| background `&` | **deny** (see §4.5) | deny |
 | `arithmetic_expansion`, `test_command`, `[[ ]]` | allow | deny |
 | background `&` | allow (§4.5) | **deny** |
 | *anything else* | **deny** | **deny** |
@@ -349,16 +355,15 @@ the agent nothing actionable, so it retries blind.
 
 ## 6. Tier behavior after the change
 
-| Caller level | Behavior |
-|---|---|
-| `< use_whitelist` (25) | Tool not visible. Unchanged. |
-| `use_whitelist` … `< neutral` (45) | `allow.yaml` constructs + rules must **permit**, then `deny.yaml` must not object. Deny-by-default. |
-| `neutral` … `< bypass_blacklist` (90) | `deny.yaml` constructs + rules must not object. Allow-by-default. |
-| `>= bypass_blacklist` (90) | No validation. Unchanged. |
-| `backend_access=True` | Requires `access_backend` (80); validated at the caller's own tier as above. Unchanged. |
+**Superseded — tiers are now a config table, not fixed bands. See §12.**
+
+The original design kept the existing four constants and hardcoded the
+level→policy mapping in `_dispatch()`. That shipped, then went: the rules were
+data but the tier *structure* was code, so a third tier was inexpressible
+without editing Python. §12 replaced it.
 
 Permission resolution keeps reading `agent.caller.permission_level` snapshotted
-once per cycle. That part is correct and is not being touched.
+once per cycle. That part is correct and was never touched.
 
 ---
 
@@ -513,3 +518,147 @@ State plainly, so nobody mistakes the scope:
 6. **Tests assert both directions** — every rule needs a must-deny case *and*
    the allow-list needs must-allow cases, so the corpus catches over-blocking as
    well as under-blocking. (§8)
+
+---
+
+## 12. Tiers as data (supersedes §6)
+
+**The flaw §6 shipped with:** rules were data, but the tier *structure* was
+code. `_dispatch()` contained
+
+```python
+if level < bypass_blacklist:
+    if level < neutral:  allow.yaml must permit
+    deny.yaml must not object
+```
+
+so the system could express any rule and exactly three tiers. Wanting a fourth
+("trusted contributor: read-only git, no writes") meant editing Python. The
+config names gave it away: `use_whitelist`, `neutral`, `bypass_blacklist` name
+the *branches of an if-chain*, not roles that exist in anyone's deployment.
+`bypass_blacklist` in particular was a hardcoded escape hatch — special-cased
+in code something that should fall out of the data.
+
+**The replacement** is a band table in config:
+
+```yaml
+extra:
+  shell:
+    tiers:
+      - {min_level: 30, apply: [builtin:allow, builtin:deny]}
+      - {min_level: 45, apply: [builtin:deny]}
+      - {min_level: 70, apply: [/instance/trusted-deny.yaml]}
+      - {min_level: 90, apply: []}
+```
+
+A caller gets the highest band whose `min_level` they meet; every policy in it
+must pass. The three constants collapse: `use_whitelist` is the lowest band
+(and the tool's `min_permission`), `bypass_blacklist` is `apply: []`, `neutral`
+stops existing as a concept.
+
+**What makes it collapse** is that each policy file already declares its own
+posture via `default_action`. So `_dispatch()` doesn't need to know which file
+is an allow-list and which is a deny-list — it runs a list in order and every
+entry must pass. Losing that distinction from the code is the whole trick;
+without it, "apply these N policies" wouldn't type-check as a concept.
+
+Details that matter:
+
+- **Removed keys are an error, not ignored.** A config still carrying
+  `use_whitelist: 90` blocks the shell with a migration message. Ignoring it
+  would silently *loosen* access for exactly the person who had raised it to
+  lock things down — a security bug in the worst direction.
+- **A broken table blocks every caller, including an `apply: []` band.** If the
+  table won't load we don't know which band a caller is in, so we can't know
+  they were meant to be unrestricted.
+- **Tier `apply` paths must be absolute** (or `builtin:*`). Unlike `extends:`,
+  a tier table has no file to resolve a relative path against, and falling back
+  to the process CWD would make policy selection depend on how the agent was
+  launched.
+- `access_backend` stays a scalar. It gates *where* a command runs, not which
+  policy applies to it — a genuinely different axis, and folding it into the
+  table would have been symmetry for its own sake.
+
+**Known limitation, not addressed.** The axis is still one-dimensional.
+`permission_level` answers *who*, but shell risk is *who × where*: the same
+user at level 50 gets identical access in a private DM and in a public channel
+with 400 people. `modules/memory` hit this and solved it with scopes
+(`global` / `guild:x` / `user:bob`) resolved from `SessionEnvironment`, which
+this module receives and ignores. Making band selection a function of
+`(caller_level, env)` rather than `caller_level` is the next step if that
+becomes the pain point; the table is the necessary foundation either way.
+
+---
+
+## 13. Thresholds, not bands (supersedes §12)
+
+§12's band table fixed the right problem the wrong way. Bands made tiers data,
+but kept a structure the domain doesn't have: a list of levels, each owning a
+nested list of policies. Two things fell out of that.
+
+**It could express nonsense.** Bands `30: [A]`, `45: [A, B]`, `70: [A]` say a
+caller at 45 is bound by B and a caller at 70 is not. Policy application should
+be monotonic in privilege — anything else is a misconfiguration nobody wants,
+and the table happily represented it.
+
+**It buried the actual datum.** What decides whether a policy applies to you is
+one number: the level at which you outgrow it. Bands scattered that across the
+table (a policy's threshold was implicit in which bands did and didn't list
+it), so adding a policy meant editing several entries.
+
+Put the number on the policy instead:
+
+```yaml
+min_permission: 30
+policies:
+  - {policy: builtin:allow, applies_below: 45}
+  - {policy: builtin:deny,  applies_below: 90}
+```
+
+A caller is subject to every entry whose `applies_below` they are under. Level
+20 gets both, 50 gets the deny-list, 95 gets nothing. Adding a policy is one
+line. Non-monotonic application is unrepresentable. `min_permission` becomes
+its own scalar rather than being inferred from "the lowest band", which it only
+ever coincidentally was.
+
+`PolicySet.for_level()` is now a filter over one comparison, and `Band` /
+`TierTable` are gone along with the None-vs-empty-tuple distinction they needed
+("below every band" versus "unrestricted") — `min_permission` handles the
+former in the tool handler, so `()` unambiguously means unrestricted.
+
+### 13.1 The mount bug this exposed
+
+Every instruction written up to §12 — "point it at a file in your instance
+directory, mounted read-only" — was **broken under Docker**. compose.yaml
+mounted exactly four things (`workspace/`, `data/`, `config.yaml`, `TinyCTX/`),
+so an instance-local policy file was not visible inside the container at all.
+The feature worked only for bare-metal launches.
+
+Fixed by giving the instance a dedicated extra-config directory:
+
+- `<instance>/config/` on the host, bound **read-only** at `/app/config`.
+  Deliberately not the instance directory itself, which holds `.env` and
+  `data/` — neither belongs in the container as config.
+- `compose_env()` exports the host path as `TINYCTX_CONFIG_DIR` (the bind
+  source); compose.yaml sets `TINYCTX_CONFIG_DIR_PATH=/app/config` for the code
+  side. Mirrors the existing `TINYCTX_WORKSPACE` / `TINYCTX_WORKSPACE_PATH`
+  pair rather than inventing a convention.
+- `tinyctx start` and `tinyctx onboard` create it first. Docker auto-creates a
+  missing bind source as **root-owned**, which the user then cannot write
+  policy files into without sudo.
+- `utils/instance.py::runtime_config_dir()` resolves it per environment:
+  container env var, else the `TINYCTX_CONFIG_FILE` sibling, else the workspace
+  sibling.
+
+That last piece is what makes a **relative** policy name the correct form:
+
+```yaml
+policies:
+  - {policy: shell-allow.yaml, applies_below: 45}
+```
+
+The same `config.yaml` now works on the host and in the container, where that
+directory has a different absolute path. §12's "tier paths must be absolute"
+rule is reversed — it was right that CWD is not an anchor, but wrong that no
+anchor existed. Absolute paths still work and are still on you to keep mounted.
+

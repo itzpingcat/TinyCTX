@@ -25,47 +25,58 @@ EXTENSION_META = {
         # bare-metal / dev (falls back to local). Linux only.
         "sandbox_url": None,
 
-        # Command policy files. null uses the defaults shipped in the module
-        # (modules/shell/deny.yaml and allow.yaml). Override to point at your
-        # own — typically in the instance directory, mounted READ-ONLY into
-        # the container:
-        #   extra:
-        #     shell:
-        #       policy:
-        #         deny:  /instance/shell-deny.yaml
-        #         allow: /instance/shell-allow.yaml
+        # Level below which the shell tool isn't offered at all. This is the
+        # tool's min_permission in the tool handler.
+        "min_permission": 30,
+
+        # Command policies, each with the level at which a caller outgrows it.
+        # A caller is subject to EVERY policy whose applies_below they are
+        # under. With the defaults here:
         #
-        # Files are loaded once and cached; editing one requires a restart.
-        # A missing or malformed policy file blocks EVERY command — the
+        #   level 30-44   allow.yaml AND deny.yaml   (allow-listed commands only)
+        #   level 45-89   deny.yaml                  (anything not denied)
+        #   level 90+     nothing                    (unrestricted)
+        #
+        # Omit applies_below for a policy that binds everyone, with no
+        # unrestricted tier at all.
+        #
+        # `policy:` accepts:
+        #   builtin:allow      modules/shell/allow.yaml (deny-by-default)
+        #   builtin:deny       modules/shell/deny.yaml  (allow-by-default)
+        #   name.yaml          relative to <instance>/config/, which compose
+        #                      binds read-only at /app/config — use this form,
+        #                      it resolves correctly both on the host and in
+        #                      the container
+        #   /abs/path.yaml     literal; you keep it mounted
+        #
+        # Add or remove entries freely — the module has no opinion on how many
+        # tiers exist, and doesn't care which file is an allow-list and which
+        # is a deny-list (each declares that itself via default_action).
+        #
+        # To layer onto a shipped policy rather than replace it, drop a small
+        # file with `extends: builtin:allow` into <instance>/config/ and name
+        # it here — see modules/shell/example.instance-allow.yaml.
+        #
+        # Policy files are loaded once and cached; editing one requires a
+        # restart. A missing or malformed policy blocks EVERY command — the
         # shell never degrades to unrestricted when its rules fail to load.
-        "policy": {
-            "deny": None,
-            "allow": None,
-        },
+        "policies": [
+            {"policy": "builtin:allow", "applies_below": 45},
+            {"policy": "builtin:deny", "applies_below": 90},
+        ],
 
-        # Permission levels (0-100) gating shell access. Resolved from the
-        # actual caller (agent.caller.permission_level) at call time, never
-        # from a static config value. Override per-instance via:
-        #   extra:
-        #     shell:
-        #       permissions:
-        #         use_whitelist: 10
-        #         neutral: 45
-        #         bypass_blacklist: 90
-        #         access_backend: 80
+        # Resolved from the actual caller (agent.caller.permission_level) at
+        # call time, never from a static config value.
+        #
+        # NOTE: use_whitelist / neutral / bypass_blacklist used to live here.
+        # They are gone — min_permission plus the policies list above express
+        # all three, and more. Leaving them in a config is an ERROR that
+        # blocks the shell rather than being ignored, since ignoring one would
+        # silently loosen access for anyone who had set it to lock things down.
         "permissions": {
-            # Min level to call the shell tool at all. Below "neutral",
-            # every command must be permitted by allow.yaml.
-            "use_whitelist": 30,
-
-            # Min level for unrestricted commands (still checked against
-            # deny.yaml unless bypass_blacklist).
-            "neutral": 45,
-
-            # Min level that skips policy checks entirely.
-            "bypass_blacklist": 90,
-
-            # Min level required for backend_access=True.
+            # Min level required for backend_access=True. Gates WHERE a
+            # command runs (main container vs sandbox), which is orthogonal
+            # to which policy applies to it — hence still a scalar.
             "access_backend": 80,
         },
     },
