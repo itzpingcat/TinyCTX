@@ -31,7 +31,7 @@ A context-efficient agentic assistant framework. Connect it to your LLM, configu
 > - **`prefix_required: true`** - in group channels, only respond when @mentioned or prefixed. This reduces noise but is not a security boundary on its own.
 > - **Gateway `api_key`** - always set a strong, random key if the gateway is enabled. Never expose the gateway port to the public internet without authentication.
 >
-> The filesystem module sandboxes `write_file`/`edit_file` to the workspace directory only. `view`/`grep`/`glob_search` can additionally see any directory listed in `filesystem.read_only_paths` in config.yaml (read-only, never writable - e.g. `/app` for the agent's own source code in the container). Nothing outside workspace + that whitelist is reachable at all. The module also maintains a shell command blacklist, but these are last-resort guardrails, not a substitute for access control.
+> The filesystem module sandboxes `write_file`/`edit_file` to the workspace directory only. `view`/`grep`/`glob_search` can additionally see any directory listed in `filesystem.read_only_paths` in config.yaml (read-only, never writable - e.g. `/app` for the agent's own source code in the container). Nothing outside workspace + that whitelist is reachable at all. The shell module parses commands with tree-sitter-bash and checks each one against a YAML policy, but these are last-resort guardrails, not a substitute for access control - the sandbox container is the real security boundary.
 >
 > **The right mental model: treat TinyCTX like an SSH session. Only give access to people you'd give a shell to.**
 

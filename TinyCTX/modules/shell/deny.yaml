@@ -1,0 +1,340 @@
+# ============================================================
+# Shell deny-list — callers at or above permissions.neutral
+#
+# Posture: run anything EXCEPT what a rule denies.
+#
+# Matching is on the PARSED command, not the command string. Each rule is
+# tested against every resolved command in the input separately, so
+# `echo "i"; echo "am"; echo "harmless"` is three commands and a rule about
+# `rm` cannot be tripped by the word "rm" inside someone else's quoted
+# argument. Commands nested in $(...), <(...), subshells and loop bodies are
+# reached too.
+#
+# Rule fields (all optional, ANDed together):
+#   command         executable basename; str or list
+#   subcommand      first non-flag operand (`git` **push**)
+#   any_flag        fires if the command has any of these flags
+#   all_flags       fires only if the command has all of these
+#   no_operands     fires only if the command has zero non-flag arguments
+#   path_under      fires if an operand resolves under one of these prefixes
+#   path_outside    fires if an operand resolves outside ALL of these
+#   redirect_under  fires if a redirect target (`> x`) is under one of these
+#
+# Flags match either spelling: `-rf`, `-r -f` and `-fr` all satisfy
+# `all_flags: [-r, -f]`, and single-dash long options like `-delete` work.
+# When an argument's value can't be known statically ($VAR, globs), any
+# path_* rule that got this far fires — unknown means blocked.
+#
+# action: deny  blocks the command
+# action: warn  runs it, prepending the message to the output
+#
+# Ported from the old blacklist.txt and simplified. Notes on what was dropped
+# and why are inline. The PowerShell half is gone entirely — the shell only
+# ever runs on Linux now.
+# ============================================================
+
+version: 1
+default_action: allow
+
+defaults:
+  max_command_bytes: 8192
+
+# Bash syntax permitted at this tier. Anything not listed here is denied,
+# including node types a future tree-sitter-bash release might add — so a
+# grammar upgrade fails closed (commands get rejected and we notice) rather
+# than open. Only named nodes are checked; punctuation and keywords are
+# governed by their named parent.
+constructs:
+  program: allow
+  command: allow
+  command_name: allow
+  word: allow
+  number: allow
+  comment: allow
+  concatenation: allow
+
+  string: allow
+  string_content: allow
+  raw_string: allow
+  ansi_c_string: allow
+  translated_string: allow
+
+  pipeline: allow
+  list: allow
+  subshell: allow
+  compound_statement: allow
+  negated_command: allow
+  background: allow          # `foo &` — see PLAN.md 4.5
+
+  redirected_statement: allow
+  file_redirect: allow
+  file_descriptor: allow
+  heredoc_redirect: allow
+  heredoc_start: allow
+  heredoc_body: allow
+  heredoc_end: allow
+
+  variable_assignment: allow
+  variable_name: allow
+  special_variable_name: allow
+  declaration_command: allow
+  unset_command: allow
+
+  simple_expansion: allow
+  expansion: allow
+  command_substitution: allow      # contents are validated as ordinary commands
+  process_substitution: allow
+  arithmetic_expansion: allow
+
+  test_command: allow
+  test_operator: allow
+  binary_expression: allow
+  unary_expression: allow
+  ternary_expression: allow
+  extglob_pattern: allow
+  regex: allow
+
+  if_statement: allow
+  elif_clause: allow
+  else_clause: allow
+  for_statement: allow
+  c_style_for_statement: allow
+  while_statement: allow
+  until_statement: allow
+  do_group: allow
+  case_statement: allow
+  case_item: allow
+
+  # function_definition is NOT allowed: defining `rm() { ... }` rebinds a name
+  # a later rule would check, and there's no legitimate use in a one-shot tool
+  # call. See PLAN.md 4.4.
+
+rules:
+
+  # ----------------------------------------------------------------
+  # Bulk destruction
+  # ----------------------------------------------------------------
+  # Old file had rm -rf / rm -fr / rm --recursive / rm --force as four glob
+  # lines. Flag normalization collapses them to two rules.
+  - id: rm-recursive-force
+    action: deny
+    command: rm
+    all_flags: ["-r", "-f"]
+    message: "recursive force-delete"
+
+  - id: rm-recursive-force-long
+    action: deny
+    command: rm
+    any_flag: ["--recursive", "--force", "--no-preserve-root"]
+    message: "recursive or forced delete"
+
+  # Not in the old file — the old one couldn't see paths at all. `rm -rf /`
+  # was caught only because the flags matched.
+  - id: delete-outside-workspace
+    action: deny
+    command: [rm, shred, truncate, mv]
+    path_outside: ["${workspace}", "/tmp", "/var/tmp"]
+    message: "deletes or moves files outside the workspace"
+
+  - id: overwrite-tools
+    action: deny
+    command: [dd, shred, wipe, mkfs]
+    message: "raw disk or secure-erase tool"
+
+  - id: find-executes
+    action: deny
+    command: find
+    any_flag: ["-delete", "-exec", "-execdir", "-ok", "-okdir"]
+    message: "find with -delete/-exec runs an action over every match"
+
+  # ----------------------------------------------------------------
+  # Pipe-to-shell and inline code
+  # ----------------------------------------------------------------
+  # `curl x.sh | bash` and `wget -qO- x | sh` both parse to a shell command
+  # with zero operands reading stdin. That one shape replaces all eight
+  # curl/wget * | bash/sh glob variants in the old file, and also catches
+  # `bash < script` and `... | sh -s`.
+  - id: shell-from-stdin
+    action: deny
+    command: [sh, bash, dash, zsh, ksh, fish]
+    no_operands: true
+    message: "piping into a shell executes whatever the upstream command emitted"
+
+  - id: shell-inline-command
+    action: deny
+    command: [sh, bash, dash, zsh, ksh]
+    any_flag: ["-c", "--command"]
+    message: "inline shell code bypasses command policy"
+
+  - id: eval
+    action: deny
+    command: [eval, source]
+    message: "runs a string as shell code"
+
+  # ----------------------------------------------------------------
+  # Privilege escalation
+  # ----------------------------------------------------------------
+  # The old chmod +s / chmod 4xxx / chown root rules are dropped: the sandbox
+  # runs non-root on a read-only rootfs, so setuid manipulation cannot succeed,
+  # and matching them needed operand-value regexes that reintroduce the
+  # false-positive problem this rewrite exists to remove.
+  - id: privilege-escalation
+    action: deny
+    command: [sudo, su, doas, pkexec, newgrp, setcap]
+    message: "privilege escalation"
+
+  # ----------------------------------------------------------------
+  # Process control
+  # ----------------------------------------------------------------
+  # By-name killers are bulk and imprecise — `pkill python` would take out the
+  # sandbox's own service. The old `kill -9` rule is dropped: backgrounding is
+  # allowed (PLAN.md 4.5), so the agent must be able to stop what it started,
+  # and blocking the signal while allowing the job is incoherent.
+  - id: bulk-kill
+    action: deny
+    command: [killall, killall5, pkill]
+    message: "kills processes by name — imprecise, may hit the sandbox itself"
+
+  # ----------------------------------------------------------------
+  # Persistence / init
+  # ----------------------------------------------------------------
+  - id: persistence
+    action: deny
+    command: [crontab, chkconfig, update-rc.d, at, batch]
+    message: "installs a persistent scheduled job"
+
+  - id: service-control
+    action: deny
+    command: systemctl
+    subcommand: [enable, disable, mask, unmask, start, stop, restart]
+    message: "changes system service state"
+
+  # ----------------------------------------------------------------
+  # Users / groups
+  # ----------------------------------------------------------------
+  - id: user-management
+    action: deny
+    command: [useradd, usermod, userdel, groupadd, groupmod, groupdel,
+              passwd, chpasswd, gpasswd, adduser, deluser]
+    message: "modifies users or groups"
+
+  # ----------------------------------------------------------------
+  # Network / firewall
+  # ----------------------------------------------------------------
+  # These would fail in the sandbox anyway (no CAP_NET_ADMIN), but
+  # backend_access=True runs in the main container where they would not.
+  - id: firewall
+    action: deny
+    command: [iptables, ip6tables, nft, ufw, firewall-cmd]
+    message: "modifies firewall rules"
+
+  - id: network-config
+    action: deny
+    command: [ip, ifconfig, route]
+    subcommand: [link, rule, route, addr, address]
+    message: "modifies network configuration"
+
+  # ----------------------------------------------------------------
+  # Filesystem / disk
+  # ----------------------------------------------------------------
+  - id: filesystem-admin
+    action: deny
+    command: [mount, umount, fsck, fdisk, parted, mkswap, swapon, swapoff, losetup]
+    message: "mounts or reconfigures a filesystem"
+
+  # Replaces ~20 `*> /etc/*`-style glob lines. Reading these paths stays
+  # allowed — only redirect targets are checked, so `cat /etc/hosts` is fine
+  # and `echo x > /etc/hosts` is not.
+  - id: write-to-system-path
+    action: deny
+    redirect_under: ["/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64",
+                     "/boot", "/proc", "/sys", "/var/spool/cron"]
+    message: "writes to a system path"
+
+  # ----------------------------------------------------------------
+  # Package managers
+  # ----------------------------------------------------------------
+  # System-wide installs only. pip/npm are deliberately absent — installing a
+  # library into the sandbox is normal work.
+  - id: system-package-manager
+    action: deny
+    command: [apt, apt-get, aptitude, dpkg, dnf, yum, pacman, rpm, apk, snap]
+    message: "system-wide package management"
+
+  # ----------------------------------------------------------------
+  # Power
+  # ----------------------------------------------------------------
+  - id: power
+    action: deny
+    command: [shutdown, reboot, halt, poweroff, init, telinit]
+    message: "halts or reboots the machine"
+
+  # ================================================================
+  # Warnings — these run, with the message prepended to the output.
+  # Ported from the _DESTRUCTIVE regex list in __main__.py. Several entries
+  # there are dropped rather than ported: the SQL ones (DROP TABLE,
+  # DELETE FROM) and `git checkout .` / `git stash drop` matched substrings
+  # of quoted arguments, which is exactly the false-positive class this
+  # rewrite removes, and expressing them correctly would need operand-value
+  # regexes to bring it back.
+  # ================================================================
+
+  - id: git-reset-hard
+    action: warn
+    command: git
+    subcommand: reset
+    any_flag: ["--hard"]
+    message: "may discard uncommitted changes"
+
+  - id: git-force-push
+    action: warn
+    command: git
+    subcommand: push
+    any_flag: ["-f", "--force", "--force-with-lease"]
+    message: "may overwrite remote history"
+
+  - id: git-clean-force
+    action: warn
+    command: git
+    subcommand: clean
+    any_flag: ["-f", "--force"]
+    message: "may permanently delete untracked files"
+
+  - id: git-branch-force-delete
+    action: warn
+    command: git
+    subcommand: branch
+    any_flag: ["-D"]
+    message: "may force-delete a branch"
+
+  - id: git-no-verify
+    action: warn
+    command: git
+    subcommand: [commit, push, merge]
+    any_flag: ["--no-verify"]
+    message: "skipping safety hooks"
+
+  - id: git-amend
+    action: warn
+    command: git
+    subcommand: commit
+    any_flag: ["--amend"]
+    message: "rewriting the last commit"
+
+  - id: rm-recursive
+    action: warn
+    command: rm
+    any_flag: ["-r", "-R"]
+    message: "recursively removing files"
+
+  - id: kubectl-delete
+    action: warn
+    command: kubectl
+    subcommand: delete
+    message: "deleting Kubernetes resources"
+
+  - id: terraform-destroy
+    action: warn
+    command: terraform
+    subcommand: destroy
+    message: "destroying Terraform infrastructure"

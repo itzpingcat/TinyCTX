@@ -155,6 +155,9 @@ shell:
     bypass_blacklist: 90
     neutral: 45
     use_whitelist: 25
+  policy:
+    allow: null
+    deny: null
   sandbox_url: null
 skills:
   dropped_footer_priority: 50

@@ -1,0 +1,136 @@
+# ============================================================
+# Shell allow-list — callers below permissions.neutral
+#
+# Posture: run NOTHING except what a rule permits. Every command in the input
+# must be covered by some rule here, and then deny.yaml still gets a say
+# (deny beats allow, same as the old whitelist behaviour).
+#
+# An allow rule must account for the command COMPLETELY:
+#   command         executable basename; str or list
+#   subcommand      permitted first operands (`git` **status**)
+#   allowed_flags   the only flags permitted; omit to permit none
+#   max_args        operand ceiling (after the subcommand); omit to permit none
+#   arg_matches     regex every operand must match
+#
+# Flags are matched canonically: `allowed_flags: [-l, -a]` covers `-l -a`,
+# `-la` and `-al` without listing every spelling.
+#
+# Anything with a $VAR, a glob, a redirect, or a construct not in the
+# `constructs` map below is rejected before rules are consulted.
+#
+# ---- On arguments ----
+# The old whitelist.txt needed an `{arg}` placeholder that expanded to a
+# hand-built character class, because it matched raw command text and had to
+# stop a caller from writing `"; rm -rf /`. That is gone. Arguments are now
+# parser leaves: in `echo "hello; rm -rf /"` the whole quoted span is ONE
+# operand, and the `;` is text. There is nothing to escape, so callers get
+# their apostrophes, quotes and semicolons back.
+#
+# WARNING (carried over from whitelist.txt): allow-listing a command
+# guarantees it can't damage the system or leak data through execution. It
+# does NOT vet what a caller chooses to say through it — `echo` happily
+# echoes anything. Moderating that output is a separate concern from this
+# file.
+# ============================================================
+
+version: 1
+default_action: deny
+
+defaults:
+  max_command_bytes: 4096
+
+# Only simple commands and pipelines of them. No substitution, no expansion,
+# no redirection, no control flow, no backgrounding. This is what makes
+# injection structurally impossible rather than filtered: with these
+# constructs absent, every argument is a literal leaf.
+constructs:
+  program: allow
+  command: allow
+  command_name: allow
+  word: allow
+  number: allow
+  comment: allow
+  string: allow
+  string_content: allow
+  raw_string: allow
+  ansi_c_string: allow
+  pipeline: allow
+  list: allow
+
+rules:
+
+  - id: echo
+    action: allow
+    command: echo
+    max_args: 8
+    message: "echo literal text"
+
+  - id: date
+    action: allow
+    command: date
+    max_args: 0
+    message: "current date and time"
+
+  # ps / ps -eo pid,comm only.
+  #
+  # The sandbox is ONE container shared for the whole instance's lifetime,
+  # across every caller and every conversation branch — not per-request
+  # isolated. Backgrounding is permitted at the neutral tier, and
+  # subprocess.run only waits for the immediate bash child, so a backgrounded
+  # process outlives its request and stays visible to ps. Its full argv can
+  # carry secrets, e.g. `API_TOKEN=sk-... some-server &`.
+  #   - Safe: plain `ps` and `ps -eo pid,comm`. Linux's short CMD/COMM column
+  #     is the executable name only, never argv (verified: a process invoked
+  #     as `sleep --my-secret-token=X` shows up as just "sleep").
+  #   - NEVER allow `ps aux` / `ps -ef` / `-o args=` / `-o cmd=` / `-o
+  #     command=` / any "e" flag — those print the full command line and, with
+  #     -e, the environment. That is exactly the leak above.
+  # Requires the procps package — verify `which ps` in your actual sandbox
+  # container before relying on this (sandbox/Dockerfile doesn't list procps
+  # explicitly; it may or may not be pulled in transitively).
+  - id: ps-bare
+    action: allow
+    command: ps
+    max_args: 0
+    message: "process list"
+
+  - id: ps-pid-comm
+    action: allow
+    command: ps
+    allowed_flags: ["-e", "-o"]
+    max_args: 1
+    arg_matches: '^pid,comm$'
+    message: "process list, pid and executable name only"
+
+  # --- Other examples (uncomment to enable) ---
+  #
+  # Note what the rule schema buys you over the old one-line-per-command
+  # whitelist: `git status`, `git log --oneline`, `git log --oneline -n 5`
+  # and `git diff --stat` are all covered by the single entry below, and
+  # `git push` is not.
+  #
+  # - id: git-read-only
+  #   action: allow
+  #   command: git
+  #   subcommand: [status, log, diff, show, branch]
+  #   allowed_flags: ["--oneline", "--stat", "--graph", "--no-color", "-n"]
+  #   max_args: 3
+  #   arg_matches: '^[A-Za-z0-9._/-]+$'
+  #   message: "read-only git"
+  #
+  # - id: pwd
+  #   action: allow
+  #   command: [pwd, whoami]
+  #   max_args: 0
+  #   message: "current directory / user"
+  #
+  # - id: ls
+  #   action: allow
+  #   command: ls
+  #   allowed_flags: ["-l", "-a", "-h", "-t", "-r"]
+  #   max_args: 1
+  #   arg_matches: '^[A-Za-z0-9._/-]+$'
+  #   message: "directory listing"
+  #
+  # cal is NOT installed by default in sandbox/Dockerfile (needs
+  # bsdmainutils/ncal) — verify before enabling.
