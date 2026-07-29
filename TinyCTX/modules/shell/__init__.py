@@ -56,7 +56,7 @@ EXTENSION_META = {
         "permissions": {
             # Min level to call the shell tool at all. Below "neutral",
             # every command must be permitted by allow.yaml.
-            "use_whitelist": 25,
+            "use_whitelist": 30,
 
             # Min level for unrestricted commands (still checked against
             # deny.yaml unless bypass_blacklist).
