@@ -6,7 +6,7 @@ FLAGGER_TYPE = "too_many_edges"
 
 
 def scan(graph_db, cfg) -> list[dict]:
-    limit = int(cfg.get("max_edges_between", 4))
+    limit = int(cfg.get("flaggers", {}).get("max_edges_between", 4))
     # count directed edges per ordered pair, then fold to unordered
     r = graph_db.safe_execute(
         "MATCH (a:Entity)-[rel:Relation]->(b:Entity) RETURN a.uuid, b.uuid, a.scope, b.scope"

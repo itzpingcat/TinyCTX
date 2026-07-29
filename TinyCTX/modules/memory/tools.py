@@ -202,9 +202,10 @@ async def search_memory(query: str, top_k: int = 5) -> str:
     from TinyCTX.utils.bm25 import BM25
 
     visible = current_scopes()
-    min_p = float(_cfg.get("search_min_p", 0.0))
-    rrf_k = int(_cfg.get("rrf_k", 60))
-    bm25_w = float(_cfg.get("bm25_weight", 0.4))
+    passive_cfg = _cfg.get("passive_rag", {})
+    min_p = float(passive_cfg.get("search_min_p", 0.0))
+    rrf_k = int(passive_cfg.get("rrf_k", 60))
+    bm25_w = float(passive_cfg.get("bm25_weight", 0.4))
 
     # -- exact match short-circuit --
     exact = _resolve(query, visible)

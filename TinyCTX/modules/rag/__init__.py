@@ -3,9 +3,13 @@ EXTENSION_META = {
     "version": "3.0",
     "description": (
         "Databank retrieval system. Indexes named databank folders under workspace/rag/. "
+        "Markdown files may carry a YAML frontmatter header declaring keyword-triggered "
+        "lore entries (native format, see lorefile.py); legacy SillyTavern lorebook JSON "
+        "is auto-converted into this format on discovery and the original renamed to .bak. "
         "Provides rag_search(query, targets, max_results) and "
         "set_auto_rag_databanks(targets) tools. Auto-rag databanks are injected "
-        "into the system prompt every turn via hybrid BM25+vector search."
+        "into the system prompt every turn via both deterministic keyword-triggered "
+        "lore matching and hybrid BM25+vector search over the databank's index."
     ),
     "default_config": {
         # --- Databank root ---
@@ -41,5 +45,19 @@ EXTENSION_META = {
         # --- Auto-inject ---
         # System prompt priority for the auto-rag injected block.
         "auto_inject_priority": 25,
+        # Databank names auto-searched/injected every turn on branches that have
+        # never called set_auto_rag_databanks. Once that tool is called on a
+        # branch (even with []), its stored value wins over this default.
+        "default_auto_targets": [],
+        # Whether auto-inject's passive half also runs the hybrid BM25+vector
+        # search (in addition to deterministic keyword/regex/constant firing).
+        # This costs a real embed() network call on every qualifying turn,
+        # sharing ai.py's process-wide priority queue with the main LLM call
+        # and everything else — on a low `parallel:` deployment this can add
+        # meaningful per-turn latency under concurrent load. Set to false to
+        # fall back to keyword/regex-only auto-inject (no embed() call at all);
+        # rag_search (the explicit tool) always does the full hybrid search
+        # regardless of this setting.
+        "auto_inject_semantic": True,
     },
 }

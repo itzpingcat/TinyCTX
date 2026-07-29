@@ -203,6 +203,57 @@ class UserStore:
         user = self._create_user(platform, user_id, username, display_name)
         return user
 
+    def create_user(
+        self,
+        username: str,
+        *,
+        platform: Platform = Platform.CLI,
+        permission_level: int = 25,
+    ) -> User:
+        """
+        Create a user with the exact requested username — no slugify/random
+        fallback (unlike resolve_user's internal _create_user, which picks a
+        username for a platform identity that may already be taken).
+
+        Used by the CLI launch flow when a typed-in username doesn't exist
+        yet. Raises UsernameConflictError if the username is already taken.
+        """
+        if self._username_taken(username):
+            raise UsernameConflictError(f"Username already taken: {username!r}")
+
+        identity = PlatformIdentity(
+            platform=platform,
+            user_id=username,
+            username=username,
+            display_name=username,
+        )
+        user = User(
+            username=username,
+            permission_level=permission_level,
+            identities=[identity],
+            meta={},
+            created_at=time.time(),
+        )
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO users (username, permission_level, identities, meta, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    user.username,
+                    user.permission_level,
+                    json.dumps([_identity_to_dict(identity)]),
+                    json.dumps(user.meta),
+                    user.created_at,
+                ),
+            )
+            self._conn.execute(
+                "INSERT INTO user_platform_index (platform, user_id, username) VALUES (?, ?, ?)",
+                (platform.value, username, username),
+            )
+        self._populate_cache(user)
+        logger.info("UserStore: created user %r via %s (exact)", username, platform.value)
+        return user
+
     def get_user(self, username: str) -> User | None:
         if username in self._cache_by_username:
             return self._cache_by_username[username]

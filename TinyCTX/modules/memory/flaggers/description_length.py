@@ -7,8 +7,9 @@ FLAGGER_TYPE = "description_length"
 
 
 def scan(graph_db, cfg) -> list[dict]:
-    max_chars = int(cfg.get("desc_max_chars", 1200))
-    min_chars = int(cfg.get("desc_min_chars", 15))
+    flaggers_cfg = cfg.get("flaggers", {})
+    max_chars = int(flaggers_cfg.get("desc_max_chars", 1200))
+    min_chars = int(flaggers_cfg.get("desc_min_chars", 15))
     issues = []
     for e in all_entities(graph_db):
         desc = e.get("description") or ""

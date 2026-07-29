@@ -33,6 +33,19 @@ def register_runtime(runtime) -> None:
 # register_agent — static prompt providers
 # ---------------------------------------------------------------------------
 
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Recursively merge override into a copy of base. Nested dicts merge
+    key-by-key (so e.g. overriding config.soul.priority doesn't drop
+    config.soul.file); any other value type is replaced outright."""
+    out = dict(base)
+    for k, v in override.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
 def register_agent(cycle) -> None:
     try:
         from TinyCTX.modules.system_prompt import EXTENSION_META
@@ -42,9 +55,9 @@ def register_agent(cycle) -> None:
 
     overrides: dict = {}
     if hasattr(cycle.config, "extra") and isinstance(cycle.config.extra, dict):
-        overrides = cycle.config.extra.get("memory_search", {})
+        overrides = cycle.config.extra.get("system_prompt", {})
 
-    cfg = {**defaults, **overrides}
+    cfg = _deep_merge(defaults, overrides)
 
     workspace = Path(cycle.config.workspace.path).expanduser().resolve()
     workspace.mkdir(parents=True, exist_ok=True)
@@ -56,17 +69,14 @@ def register_agent(cycle) -> None:
     from TinyCTX.modules.system_prompt.inject import MacroResolver, make_provider
     resolver = MacroResolver()
 
-    for key, cfg_key, priority_key in (
-        ("soul",   "soul_file",   "soul_priority"),
-        ("agents", "agents_file", "agents_priority"),
-        # ("memory", "memory_file", "memory_priority"),
-        ("tools",  "tools_file",  "tools_priority"),
-    ):
-        path = _resolve(cfg[cfg_key])
+    for key in ("soul", "agents", "tools"):
+        # ("memory", ...) intentionally omitted — see commented-out entry below.
+        section = cfg.get(key, {})
+        path = _resolve(section["file"])
         cycle.context.register_prompt(
             key,
             make_provider(path, workspace, extra_macros=resolver),
             role="system",
-            priority=int(cfg[priority_key]),
+            priority=int(section["priority"]),
         )
         logger.debug("[system_prompt] registered prompt '%s' from %s", key, path)

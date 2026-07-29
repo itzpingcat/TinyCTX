@@ -64,6 +64,7 @@ from TinyCTX.contracts import (
     AgentThinkingChunk, AgentTextChunk, AgentTextFinal,
     AgentToolCall, AgentToolResult, AgentError, AgentOutboundFiles,
 )
+from TinyCTX.users import UsernameConflictError
 
 logger = logging.getLogger(__name__)
 
@@ -595,6 +596,41 @@ async def handle_user_get(request: web.Request) -> web.Response:
     )
 
 
+async def handle_user_create(request: web.Request) -> web.Response:
+    """
+    Create a user with an exact username (no slugify/random fallback).
+    Used by `tinyctx launch cli` when a typed-in username doesn't exist yet.
+
+    Body: { "permission_level": 25 }   (optional; defaults to 25)
+    Response (200): { "username": "...", "permission_level": 25 }
+    Response (409): { "error": "username already taken" }
+    """
+    runtime  = request.app["runtime"]
+    username = request.match_info["username"]
+
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    permission_level = max(0, min(100, int(body.get("permission_level", 25))))
+
+    try:
+        user = runtime.users.create_user(username, permission_level=permission_level)
+    except UsernameConflictError:
+        raise web.HTTPConflict(
+            content_type="application/json",
+            body=json.dumps({"error": f"username {username!r} already taken"}),
+        )
+
+    logger.info("gateway: created user %r (permission_level %d)", username, permission_level)
+    return web.Response(
+        content_type="application/json",
+        body=json.dumps({"username": user.username,
+                         "permission_level": user.permission_level}),
+    )
+
+
 async def handle_user_elevate(request: web.Request) -> web.Response:
     """
     Set a user's permission_level to the requested level (clamped 0-100).
@@ -754,6 +790,7 @@ def _make_app(runtime, cfg: GatewayConfig, shutdown_event: asyncio.Event) -> web
 
     # User management
     app.router.add_get(   "/v1/user/{username}",          handle_user_get)
+    app.router.add_post(  "/v1/user/{username}",          handle_user_create)
     app.router.add_post(  "/v1/user/{username}/elevate",  handle_user_elevate)
 
     # Shutdown

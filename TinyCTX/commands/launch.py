@@ -13,10 +13,11 @@ Flags
 -----
   --dir PATH       Path to a .tinyctx instance directory.
   --config PATH    Path to config.yaml directly (overrides --dir/autodetect).
-  --user USERNAME  TinyCTX username to log in as. If the user's
-                   permission_level is below 100, you will be prompted
-                   to elevate it (CLI is a trusted admin console — no
-                   higher-level caller is required).
+  --user USERNAME  TinyCTX username to log in as. If it doesn't exist yet,
+                   you will be prompted to create it (permission_level 25).
+                   If the user's permission_level is below 100, you will
+                   also be prompted to elevate it (CLI is a trusted admin
+                   console — no higher-level caller is required).
 
 Docker
 ------
@@ -43,6 +44,15 @@ import urllib.request
 from pathlib import Path
 
 from TinyCTX.utils.instance import resolve_instance_dir, config_path_for
+
+
+def _prompt_create(username: str) -> bool:
+    """Ask the user if they want to create a new TinyCTX user. Returns True if yes."""
+    try:
+        answer = input(f"  User '{username}' not found. Create it? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return answer in ("y", "yes")
 
 
 def _prompt_elevate(username: str, current_level: int) -> bool:
@@ -124,11 +134,26 @@ def run(args: argparse.Namespace) -> None:
             user_data = json.loads(r.read().decode())
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
-            print(f"error: user '{username}' not found in users.db.", file=sys.stderr)
-            print("  Check the username with: python -m TinyCTX.onboard.fix_permissions --user <name> --list", file=sys.stderr)
+            if not _prompt_create(username):
+                print(f"error: user '{username}' not found in users.db.", file=sys.stderr)
+                print("  Check the username with: python -m TinyCTX.onboard.fix_permissions --user <name> --list", file=sys.stderr)
+                sys.exit(1)
+            try:
+                req = urllib.request.Request(
+                    f"{gateway_url}/v1/user/{username}",
+                    data=b"{}",
+                    headers={**auth_headers, "Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    user_data = json.loads(r.read().decode())
+                print(f"  ✓ created user '{username}'.\n")
+            except Exception as create_exc:
+                print(f"error: could not create user '{username}': {create_exc}", file=sys.stderr)
+                sys.exit(1)
         else:
             print(f"error: gateway returned {exc.code} looking up user.", file=sys.stderr)
-        sys.exit(1)
+            sys.exit(1)
     except Exception as exc:
         print(f"error: could not reach gateway to look up user: {exc}", file=sys.stderr)
         sys.exit(1)

@@ -127,6 +127,11 @@ def load_existing_config() -> dict | None:
 
 def write_config(data: dict) -> None:
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    # Extra-config directory, bound read-only at /app/config by compose.yaml.
+    # Create it here so a fresh instance has it owned by the user — Docker
+    # auto-creates a missing bind source as root, which the user then can't
+    # drop files into without sudo.
+    (INSTANCE_DIR / "config").mkdir(parents=True, exist_ok=True)
     with open(CONFIG_PATH, "w") as f:
         yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
 

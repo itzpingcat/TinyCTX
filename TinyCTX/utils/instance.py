@@ -23,6 +23,7 @@ point the user at `tinyctx onboard` if it doesn't exist yet.
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 
 
@@ -68,6 +69,49 @@ def config_path_for(instance_dir: Path) -> Path:
     return instance_dir / "config.yaml"
 
 
+# Where the extra-config directory is mounted inside the agent container.
+# compose.yaml binds <instance>/config here read-only and exports it as
+# TINYCTX_CONFIG_DIR_PATH, mirroring the TINYCTX_WORKSPACE / _PATH pattern.
+CONTAINER_CONFIG_DIR = "/app/config"
+
+
+def config_dir_for(instance_dir: Path) -> Path:
+    """Host path of the instance's extra-config directory.
+
+    Read-only supporting files that are too big or too structured to inline
+    into config.yaml — currently the shell module's policy YAML. Deliberately
+    NOT the instance directory itself: that holds .env (secrets) and data/,
+    neither of which should be visible to the container as config.
+    """
+    return instance_dir / "config"
+
+
+def runtime_config_dir(workspace_path: Path | str | None = None) -> Path:
+    """Where the extra-config directory lives *for the running process*.
+
+    Three environments, three answers:
+      - In the container, compose.yaml sets TINYCTX_CONFIG_DIR_PATH.
+      - Launched directly, TINYCTX_CONFIG_FILE points at the instance's
+        config.yaml, so the sibling config/ is the answer.
+      - Failing both, fall back to the workspace's sibling, since workspace/
+        also lives inside the instance directory.
+
+    This indirection is the reason a policy can be referenced as a plain
+    relative name: the same `config.yaml` then resolves correctly whether the
+    agent is running on the host or inside Docker, where the same directory
+    has a different absolute path.
+    """
+    override = os.environ.get("TINYCTX_CONFIG_DIR_PATH", "").strip()
+    if override:
+        return Path(override)
+    config_file = os.environ.get("TINYCTX_CONFIG_FILE", "").strip()
+    if config_file:
+        return Path(config_file).parent / "config"
+    if workspace_path is not None:
+        return Path(workspace_path).parent / "config"
+    return resolve_instance_dir() / "config"
+
+
 def project_name_for(instance_dir: Path) -> str:
     """
     Stable, short `docker compose -p` project name derived from the
@@ -107,6 +151,7 @@ def compose_env(instance_dir: Path, port: int | None = None) -> dict[str, str]:
     """
     env: dict[str, str] = {
         "TINYCTX_CONFIG_FILE": str(instance_dir / "config.yaml"),
+        "TINYCTX_CONFIG_DIR":  str(config_dir_for(instance_dir)),
         "TINYCTX_WORKSPACE":   str(instance_dir / "workspace"),
         "TINYCTX_DATA":        str(instance_dir / "data"),
         "TINYCTX_INSTANCE":    project_name_for(instance_dir),

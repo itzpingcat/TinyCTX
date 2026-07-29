@@ -7,8 +7,8 @@ Security model:
   - No auth token. The sandbox port (8700) is only reachable from the agent
     container via the agent_sandbox Docker network (internal: true). Nothing
     else has a route to it. If you can POST /exec, you are the agent.
-  - No blacklist here. The shell module enforces the blacklist before
-    dispatching. The sandbox just runs what it receives.
+  - No command policy here. The shell module parses and checks the command
+    before dispatching. The sandbox just runs what it receives.
   - Runs as non-root. Root filesystem is read-only. /workspace is the only
     writable surface (shared bind mount with the agent).
   - No LAN / Tailscale access. entrypoint.sh runs as root, installs

@@ -263,7 +263,7 @@ def _install_fake(monkeypatch, entities, embedder=None):
     fake = FakeGraphDB(entities)
     monkeypatch.setattr(tools, "_graph_db", fake)
     monkeypatch.setattr(tools, "_embedder", embedder)
-    monkeypatch.setattr(tools, "_cfg", {"bm25_weight": 0.4, "rrf_k": 60, "search_min_p": 0.0,
+    monkeypatch.setattr(tools, "_cfg", {"passive_rag": {"bm25_weight": 0.4, "rrf_k": 60, "search_min_p": 0.0},
                                         "embed_query_template": "{text}"})
     tools._load_relations()
     return fake

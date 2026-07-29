@@ -30,6 +30,8 @@ dependencies = [
     "jinja2",
     "croniter",
     "python-dotenv",
+    "tree-sitter>=0.25,<0.27",
+    "tree-sitter-bash>=0.23,<0.26",
     "discord.py",
     "matrix-nio",
     "ladybug"

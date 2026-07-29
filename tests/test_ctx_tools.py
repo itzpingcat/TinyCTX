@@ -83,15 +83,12 @@ class TestExtensionMeta:
 
     def test_default_config_keys(self):
         cfg = ctx_tools.EXTENSION_META["default_config"]
-        for key in (
-            "same_call_dedup_after",
-            "cot_keep_recent_turns",
-            "tool_trim_after",
-            "tool_output_truncate_after",
-            "max_tool_output_chars",
-            "tokenade_threshold",
-        ):
+        for key in ("same_call_dedup_after", "cot_keep_recent_turns", "tokenade_threshold"):
             assert key in cfg
+        for key in ("trim_after", "truncate_after", "max_chars"):
+            assert key in cfg["tool_output"]
+        for key in ("enabled", "roles"):
+            assert key in cfg["token_sanitize"]
 
 
 # ---------------------------------------------------------------------------
@@ -208,9 +205,7 @@ class TestCotStrip:
 class TestTrim:
     def test_old_tool_output_replaced_with_placeholder(self, ctx):
         ctx_tools_main._register_trim(ctx, {
-            "tool_trim_after": 1,
-            "tool_output_truncate_after": 100,
-            "max_tool_output_chars": 2000,
+            "tool_output": {"trim_after": 1, "truncate_after": 100, "max_chars": 2000},
         })
 
         tc = ToolCall.make("foo", {})
@@ -229,9 +224,7 @@ class TestTrim:
 
     def test_long_recent_tool_output_truncated_not_dropped(self, ctx):
         ctx_tools_main._register_trim(ctx, {
-            "tool_trim_after": 100,
-            "tool_output_truncate_after": 0,
-            "max_tool_output_chars": 40,
+            "tool_output": {"trim_after": 100, "truncate_after": 0, "max_chars": 40},
         })
 
         tc = ToolCall.make("foo", {})
@@ -247,9 +240,7 @@ class TestTrim:
 
     def test_short_recent_tool_output_untouched(self, ctx):
         ctx_tools_main._register_trim(ctx, {
-            "tool_trim_after": 100,
-            "tool_output_truncate_after": 100,
-            "max_tool_output_chars": 2000,
+            "tool_output": {"trim_after": 100, "truncate_after": 100, "max_chars": 2000},
         })
         tc = ToolCall.make("foo", {})
         _assistant(ctx, "", tool_calls=[tc])
@@ -355,7 +346,7 @@ class TestTokenSanitize:
         assert any("<|im_start|>" in c for c in assistant_msgs)
 
     def test_disabled_via_config(self, ctx):
-        ctx_tools_main._register_token_sanitize(ctx, {"token_sanitize_enabled": False})
+        ctx_tools_main._register_token_sanitize(ctx, {"token_sanitize": {"enabled": False}})
         _user(ctx, "keep <|im_start|> as-is")
         messages, _ = ctx.assemble()
         user_msgs = _msg_contents(messages, "user")

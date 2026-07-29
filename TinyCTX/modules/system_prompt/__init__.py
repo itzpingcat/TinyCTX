@@ -13,11 +13,8 @@ EXTENSION_META = {
         "as system prompt providers."
     ),
     "default_config": {
-        "soul_file":    "SOUL.md",
-        "agents_file":  "AGENTS.md",
-        "tools_file":   "TOOLS.md",
-        "soul_priority":   0,
-        "agents_priority": 10,
-        "tools_priority":  15,
+        "soul":   {"file": "SOUL.md",   "priority": 0},
+        "agents": {"file": "AGENTS.md", "priority": 10},
+        "tools":  {"file": "TOOLS.md",  "priority": 15},
     },
 }

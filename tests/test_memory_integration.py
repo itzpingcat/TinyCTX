@@ -54,7 +54,7 @@ def _make_graph(tmp_path, embedder=None, cfg=None):
     write_conn = gdbase.new_async_write_conn()
     write_lock = asyncio.Lock()
     graph_db = GraphDB(gdbase)
-    base_cfg = {"bm25_weight": 0.4, "rrf_k": 60, "search_min_p": 0.0, "passive_min_p": 0.0,
+    base_cfg = {"passive_rag": {"bm25_weight": 0.4, "rrf_k": 60, "search_min_p": 0.0, "min_p": 0.0},
                 "embed_query_template": "{text}", "embed_document_template": "{text}"}
     if cfg:
         base_cfg.update(cfg)
@@ -225,7 +225,7 @@ async def test_update_description_stale_base_rejected(graph):
 async def test_vector_search_and_embedding_pass(tmp_path):
     from TinyCTX.modules.memory import deduper
     gdbase, graph_db = _make_graph(tmp_path, embedder=FakeEmbedder(),
-                                   cfg={"similarity_threshold": 0.9})
+                                   cfg={"dedup": {"similarity_threshold": 0.9}})
     try:
         with tools.scope_context({"global"}):
             await tools.memory_add_entity("Atlas", "Project", "the atlas roadmap")
@@ -263,7 +263,7 @@ async def test_dedup_progress_in_stats(tmp_path):
             yield TextDelta(text=payload)
 
     gdbase, graph_db = _make_graph(tmp_path, embedder=DupEmbedder(),
-                                   cfg={"similarity_threshold": 0.9})
+                                   cfg={"dedup": {"similarity_threshold": 0.9}})
     try:
         with tools.scope_context({"global"}):
             await tools.memory_add_entity("Atlas One", "Project", "atlas alpha")

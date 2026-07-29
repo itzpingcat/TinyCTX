@@ -11,6 +11,7 @@ import heapq
 import itertools
 import json
 import logging
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Any
 import aiohttp
@@ -444,6 +445,25 @@ class LLM:
 # Embedding client
 # ---------------------------------------------------------------------------
 
+# Process-wide LRU cache of embedding vectors, keyed by (model, kind, text).
+# Shared across all Embedder instances so repeated calls for the same text
+# (e.g. the same user query embedded by multiple modules) skip the API call.
+# Bounded by _embed_cache_max — oldest entry is evicted once the cache is
+# full. configure_embed_cache() is the only external touchpoint.
+_embed_cache: "OrderedDict[tuple[str, str, str], list[float]]" = OrderedDict()
+_embed_cache_max = 512          # overwritten by configure_embed_cache()
+
+
+def configure_embed_cache(n: int) -> None:
+    """
+    Set the max number of embedding vectors kept in the in-memory cache.
+    Called once at startup after Config is loaded (config.yaml's
+    `embed_cache_size:` key). Safe to call before the first embed() call.
+    """
+    global _embed_cache_max
+    _embed_cache_max = max(1, n)
+
+
 class Embedder:
     """
     Async OpenAI-compatible embedding client.
@@ -515,6 +535,12 @@ class Embedder:
         in its slot instead of raising — callers that need an all-or-nothing
         guarantee (e.g. not recording a file as indexed) must check for
         `None` in the result themselves.
+
+        Results are cached in memory keyed by (model, kind, text), shared
+        process-wide across all Embedder instances, bounded to the last
+        `configure_embed_cache()`-set number of entries (LRU eviction). A
+        cache hit skips the API call entirely; failed items (`None`) are
+        not cached, so they're retried on the next call.
         """
         if not texts:
             return []
@@ -525,7 +551,20 @@ class Embedder:
             tmpl = self.document_template
         else:
             tmpl = "{text}"
-        texts = [tmpl.format(text=t) for t in texts]
+
+        # Check the cache on raw text before templating — a cache hit means
+        # skipping the API call for that text entirely.
+        cache_keys = [(self.model, kind, t) for t in texts]
+        results: list[list[float] | None] = []
+        for k in cache_keys:
+            if k in _embed_cache:
+                _embed_cache.move_to_end(k)  # mark as recently used
+            results.append(_embed_cache.get(k))
+        miss_idx = [i for i, r in enumerate(results) if r is None]
+        if not miss_idx:
+            return results
+
+        miss_texts = [tmpl.format(text=texts[i]) for i in miss_idx]
 
         async def _embed_one_item(item: str) -> "list[float] | None":
             try:
@@ -535,11 +574,11 @@ class Embedder:
                 return None
 
         async def _run():
-            results: list[list[float] | None] = []
-            for i in range(0, len(texts), self.batch_size):
-                batch = texts[i : i + self.batch_size]
+            batch_results: list[list[float] | None] = []
+            for i in range(0, len(miss_texts), self.batch_size):
+                batch = miss_texts[i : i + self.batch_size]
                 try:
-                    results.extend(await self._call(batch))
+                    batch_results.extend(await self._call(batch))
                 except Exception as exc:
                     logger.warning(
                         "Embedding batch of %d failed (%s); retrying items individually",
@@ -549,10 +588,18 @@ class Embedder:
                     # calls, and a worker holds its slot until _run() returns, so
                     # retrying batch_size items one at a time here would tie up the
                     # slot for up to batch_size extra sequential round trips.
-                    results.extend(await asyncio.gather(*(_embed_one_item(t) for t in batch)))
-            return results
+                    batch_results.extend(await asyncio.gather(*(_embed_one_item(t) for t in batch)))
+            return batch_results
 
-        return await _enqueue(priority, _run)
+        computed = await _enqueue(priority, _run)
+        for i, vec in zip(miss_idx, computed):
+            results[i] = vec
+            if vec is not None:
+                _embed_cache[cache_keys[i]] = vec
+                _embed_cache.move_to_end(cache_keys[i])
+                while len(_embed_cache) > _embed_cache_max:
+                    _embed_cache.popitem(last=False)  # evict least recently used
+        return results
 
     async def _call(self, texts: list[str]) -> list[list[float]]:
         payload = {"model": self.model, "input": texts}

@@ -1,0 +1,98 @@
+# ============================================================
+# Example: extending the shipped allow-list without copying it.
+#
+# Copy this to <instance>/config/ (created by `tinyctx onboard` / `tinyctx
+# start`, and bound READ-ONLY at /app/config in the container), then name it
+# in config.yaml:
+#
+#   extra:
+#     shell:
+#       policies:
+#         - {policy: shell-allow.yaml, applies_below: 45}
+#         - {policy: builtin:deny,     applies_below: 90}
+#
+# Use the bare filename, not an absolute path: it resolves against the config
+# directory, which lives at a different absolute path on the host than inside
+# the container. An absolute path would work in exactly one of those places.
+#
+# Policy files are loaded once at startup and cached, so edits need a restart.
+#
+# `extends: builtin:allow` pulls in modules/shell/allow.yaml — its
+# default_action, its constructs map, and all its rules. Everything below is
+# layered on top:
+#   - a rule with a NEW id is appended
+#   - a rule with the SAME id as a base rule replaces it
+#   - `disable: [id, ...]` drops base rules outright
+# ============================================================
+
+version: 1
+extends: builtin:allow
+
+rules:
+
+  # ----------------------------------------------------------------
+  # ps, for watching resource usage in the sandbox container.
+  # ----------------------------------------------------------------
+  # The shipped allow.yaml excludes ps because its bar is "a stranger on
+  # Discord could run this", and a process list discloses container state.
+  # That bar is deliberately conservative and may not be yours: the sandbox
+  # runs minimal code, holds no credentials, and has no LAN or Tailscale
+  # route, so what ps discloses about it is close to meaningless.
+  #
+  # -o is constrained to a fixed set of columns rather than left open. The
+  # column list is where the risk actually lives: `-o args=` / `-o cmd=` /
+  # `-o command=` print full argv, and a backgrounded process started by a
+  # higher-tier caller can carry a token in its argv (`API_TOKEN=sk-... srv &`)
+  # — the sandbox having no secrets of its own doesn't stop one being passed
+  # in. comm, pid, %cpu, %mem and etime carry no argv.
+  - id: ps
+    action: allow
+    command: ps
+    allowed_flags: ["-e", "-o"]
+    max_args: 1
+    arg_matches: '^(pid|comm|%cpu|%mem|etime|stat)(,(pid|comm|%cpu|%mem|etime|stat))*$'
+    message: "process list, resource columns only"
+
+  # Bare `ps` (current session only, no operands).
+  - id: ps-bare
+    action: allow
+    command: ps
+    max_args: 0
+    message: "process list"
+
+  # ----------------------------------------------------------------
+  # Other things you might want. Uncomment as needed.
+  # ----------------------------------------------------------------
+  #
+  # Resource summaries. free/df/uptime disclose host-ish state, which is why
+  # they are not in the shipped file.
+  # - id: resource-summary
+  #   action: allow
+  #   command: [free, uptime]
+  #   allowed_flags: ["-h", "-m"]
+  #   max_args: 0
+  #   message: "memory and load summary"
+  #
+  # Read-only git. Note what the schema buys over a flat command list: this
+  # single rule covers `git status`, `git log --oneline`, `git log --oneline
+  # -n 5` and `git diff --stat`, and does not cover `git push`.
+  # - id: git-read-only
+  #   action: allow
+  #   command: git
+  #   subcommand: [status, log, diff, show]
+  #   allowed_flags: ["--oneline", "--stat", "--graph", "--no-color", "-n"]
+  #   max_args: 3
+  #   arg_matches: '^[A-Za-z0-9._/-]+$'
+  #   message: "read-only git"
+  #
+  # Widen an existing base rule by reusing its id — this REPLACES the shipped
+  # `echo` rule rather than adding a second one.
+  # - id: echo
+  #   action: allow
+  #   command: echo
+  #   allowed_flags: ["-n", "-e"]
+  #   max_args: 32
+  #   message: "echo literal text (longer)"
+
+# Drop base rules you don't want at all.
+# disable: [checksum, cal]

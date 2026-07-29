@@ -46,6 +46,19 @@ _cfg: dict = {}
 _memory_block_cache: dict = {"value": None}
 
 
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Recursively merge override into a copy of base. Nested dicts merge
+    key-by-key (so e.g. overriding config.reviewer.enabled doesn't drop the
+    rest of the reviewer defaults); any other value type is replaced outright."""
+    out = dict(base)
+    for k, v in override.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
 # ---------------------------------------------------------------------------
 # LibrarianRunner
 # ---------------------------------------------------------------------------
@@ -125,8 +138,9 @@ class LibrarianRunner:
                 logger.error("[memory/librarian] task raised: %s", t.exception())
         self._active_tasks -= done
 
-        max_concurrent = int(self._cfg.get("max_concurrent", 4))
-        batch_size = int(self._cfg.get("batch_size", 20))
+        librarian_cfg = self._cfg.get("librarian", {})
+        max_concurrent = int(librarian_cfg.get("max_concurrent", 4))
+        batch_size = int(librarian_cfg.get("batch_size", 20))
 
         # -- queue messages (targeted / branch / trigger / review) --
         while not self.queue.empty():
@@ -144,7 +158,7 @@ class LibrarianRunner:
         now = time.time()
 
         # -- scheduled node walk (extractor) --
-        interval = float(self._cfg.get("trigger_interval_hours", 6)) * 3600
+        interval = float(librarian_cfg.get("trigger_interval_hours", 6)) * 3600
         if not self._user_cycles_active() and (now - self._state["last_poll_ts"]) >= interval:
             self._state["last_poll_ts"] = now
             async with self._write_lock:
@@ -156,9 +170,10 @@ class LibrarianRunner:
                                             nodes_to_text, batch_size, max_concurrent)
 
         # -- reviewer cycle --
-        if (bool(self._cfg.get("reviewer_enabled", True))
+        reviewer_cfg = self._cfg.get("reviewer", {})
+        if (bool(reviewer_cfg.get("enabled", True))
                 and not self._user_cycles_active()
-                and (now - self._state["last_review_ts"]) >= float(self._cfg.get("reviewer_interval_hours", 6)) * 3600
+                and (now - self._state["last_review_ts"]) >= float(reviewer_cfg.get("interval_hours", 6)) * 3600
                 and len(self._active_tasks) < max_concurrent):
             self._state["last_review_ts"] = now
             t = asyncio.create_task(run_reviewer_cycle(
@@ -168,11 +183,12 @@ class LibrarianRunner:
             self._active_tasks.add(t)
 
         # -- deduper cycle --
-        if (bool(self._cfg.get("dedup_enabled", True))
+        dedup_cfg = self._cfg.get("dedup", {})
+        if (bool(dedup_cfg.get("enabled", True))
                 and self._embedder is not None
                 and not self._user_cycles_active()
                 and not self._state["dedup_running"]
-                and (now - self._state["last_dedup_ts"]) >= float(self._cfg.get("dedup_interval_hours", 6)) * 3600
+                and (now - self._state["last_dedup_ts"]) >= float(dedup_cfg.get("interval_hours", 6)) * 3600
                 and len(self._active_tasks) < max_concurrent):
             self._state["dedup_running"] = True
             self._state["last_dedup_ts"] = now
@@ -275,7 +291,7 @@ def register_runtime(runtime) -> None:
     overrides = {}
     if hasattr(runtime.config, "extra") and isinstance(runtime.config.extra, dict):
         overrides = runtime.config.extra.get("memory", {})
-    cfg = {**defaults, **overrides}
+    cfg = _deep_merge(defaults, overrides)
     _cfg = cfg
 
     def _resolve(rel: str) -> Path:
@@ -285,7 +301,7 @@ def register_runtime(runtime) -> None:
     graph_path = _resolve(cfg["graph_path"])
     log_path = _resolve(cfg.get("librarian_log", "memory/librarian.log"))
     agent_db = data_path / "agent.db"
-    max_concurrent = int(cfg.get("max_concurrent", 4))
+    max_concurrent = int(cfg.get("librarian", {}).get("max_concurrent", 4))
 
     # One-shot migration from v1 if present.
     try:
@@ -312,7 +328,7 @@ def register_runtime(runtime) -> None:
             logger.warning("[memory] embedding_model '%s' unusable (%s)", emb_model, exc)
 
     primary = runtime.config.llm.primary
-    lib_key = cfg.get("librarian_model", "").strip() or primary
+    lib_key = cfg.get("librarian", {}).get("model", "").strip() or primary
     mc = runtime.config.models.get(lib_key)
     try:
         api_key = mc.api_key if mc else ""
@@ -413,7 +429,7 @@ def _last_user_text(dialogue) -> str:
 
 
 def _resolve_cycle_scopes(cycle) -> set:
-    scan = int(_cfg.get("pinned_user_scan", 3))
+    scan = int(_cfg.get("pins", {}).get("user_scan", 3))
     return _scopes.resolve_scopes(_cycle_env(cycle), _active_users(cycle.context.dialogue, scan))
 
 
@@ -421,8 +437,9 @@ async def _build_memory_block(visible: set, last_user_text: str) -> str | None:
     """Assemble the <memory> block: pinned first, then RAG hits, deduped by uuid,
     min-p before RRF, capped at memory_block_tokens."""
     gdb = _graph_db
-    budget = int(_cfg.get("memory_block_tokens", 2048))
-    rag_enabled = bool(_cfg.get("passive_rag_enabled", True))
+    passive_cfg = _cfg.get("passive_rag", {})
+    budget = int(passive_cfg.get("memory_block_tokens", 2048))
+    rag_enabled = bool(passive_cfg.get("enabled", True))
 
     def _tok(s: str) -> int:
         return len(s) // 4
@@ -449,7 +466,7 @@ async def _build_memory_block(visible: set, last_user_text: str) -> str | None:
     used = _tok("<memory>\n\n</memory>")
     pinned_dropped = 0
     n_pinned = len(pinned)
-    bump = float(_cfg.get("passive_mention_bump", 0.1))
+    bump = float(passive_cfg.get("mention_bump", 0.1))
     bump_uids: list[str] = []
     for idx, (uid, e) in enumerate(ordered):
         block = _render_entity(e)
@@ -472,9 +489,10 @@ async def _build_memory_block(visible: set, last_user_text: str) -> str | None:
 
 async def _passive_rag_uuids(visible: set, query: str) -> list[str]:
     from TinyCTX.utils.bm25 import BM25
-    min_p = float(_cfg.get("passive_min_p", 0.30))
-    bm25_w = float(_cfg.get("bm25_weight", 0.4))
-    rrf_k = int(_cfg.get("rrf_k", 60))
+    passive_cfg = _cfg.get("passive_rag", {})
+    min_p = float(passive_cfg.get("min_p", 0.30))
+    bm25_w = float(passive_cfg.get("bm25_weight", 0.4))
+    rrf_k = int(passive_cfg.get("rrf_k", 60))
     top_k = int(_cfg.get("passive_top_k", 5))
 
     bm25_ranks = {}
@@ -541,8 +559,9 @@ def register_agent(cycle) -> None:
     cycle.tool_handler.register_tool(call_librarian, always_on=True, min_permission=35)
 
     # pressure ingest
-    pressure_ratio = float(_cfg.get("ingest_pressure_ratio", 0.5))
-    pressure_min = int(_cfg.get("ingest_pressure_min_tokens", 500))
+    librarian_cfg = _cfg.get("librarian", {})
+    pressure_ratio = float(librarian_cfg.get("ingest_pressure_ratio", 0.5))
+    pressure_min = int(librarian_cfg.get("ingest_pressure_min_tokens", 500))
     trigger_threshold = int(pressure_ratio * cycle.context.token_limit)
     pre_len = len(cycle.context.dialogue)
 
@@ -566,7 +585,7 @@ def register_agent(cycle) -> None:
     async def _refresh_block(dialogue_snapshot):
         try:
             visible = _scopes.resolve_scopes(_cycle_env(cycle),
-                                             _active_users(dialogue_snapshot, int(_cfg.get("pinned_user_scan", 3))))
+                                             _active_users(dialogue_snapshot, int(_cfg.get("pins", {}).get("user_scan", 3))))
             _memory_block_cache["value"] = await _build_memory_block(visible, _last_user_text(dialogue_snapshot))
         except Exception:
             logger.exception("[memory] refresh block failed")
@@ -578,4 +597,4 @@ def register_agent(cycle) -> None:
 
     cycle.post_turn_hooks.append(_block_refresh_hook)
     cycle.context.register_prompt("memory_block", lambda _ctx: _memory_block_cache["value"],
-                                  role="system", priority=int(_cfg.get("pinned_priority", 5)))
+                                  role="system", priority=int(_cfg.get("pins", {}).get("priority", 5)))
