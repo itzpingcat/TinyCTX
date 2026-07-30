@@ -65,6 +65,7 @@ EXTENSION_META = {
             "desc_max_chars":              1200,
             "desc_min_chars":              15,
             "fuzzy_name_threshold":        95,
+            "false_alias_max_cosine":      0.5,
             "decay_min_effective_mention": 0.5,
             "decay_max_edges":             1,
             "decay_stale_days":            90,
