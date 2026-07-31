@@ -8,12 +8,21 @@ levels, so the two call sites can't drift out of sync.
 Detail levels
 -------------
 low (default):
-    [Type] name description
-    REL_A: target1, target2 REL_B: target3 < source1: REL_C source2: REL_D
-  Edges grouped by relation type (outgoing: "REL: t1, t2"); incoming edges
-  prefixed with "<" as "source: REL" pairs. Relations listed in
-  prompts/noisy_relationships.txt are dropped entirely. Description
-  truncated at desc_truncate_chars (relationships are never truncated).
+    [Type] name
+    description
+    >
+    REL_A: target1, target2
+    REL_B: target3
+    <
+    source1: REL_C
+    source2: REL_D
+  Header and description are each their own line, immediately followed (no
+  blank line) by a ">" marker line and one line per outgoing relation group
+  ("REL: t1, t2"), then (only if incoming edges exist) a "<" marker line and
+  one line per incoming edge ("source: REL"). The ">" section is omitted if
+  there are no outgoing edges; likewise "<" if there are no incoming edges.
+  Relations listed in prompts/noisy_relationships.txt are dropped entirely.
+  Description truncated at desc_truncate_chars (relationships never are).
   A relation that exists in both directions between the same pair (A -[REL]->
   B and B -[REL]-> A) is one fact, not two: it's shown once, on the outgoing
   side, tagged "(mutual)", and dropped from the incoming list.
@@ -109,7 +118,9 @@ def format_entity(e: dict, *, detail: str = "low", desc_truncate_chars: int = 25
             tags.append(f"UUID: {uid}")
         if tags:
             header += f" ({', '.join(tags)})"
-    lines = [f"{header} {desc}".rstrip() if desc else header]
+    lines = [header]
+    if desc:
+        lines.append(desc)
 
     edges_out = list(e.get("edges_out", []))
     edges_in = list(e.get("edges_in", []))
@@ -128,23 +139,24 @@ def format_entity(e: dict, *, detail: str = "low", desc_truncate_chars: int = 25
             base += f"(w={edge.get('weight')})"
         return base
 
-    out_parts = []
+    out_lines = []
     for rel, group in _group_by_relation(edges_out, "target_name"):
         targets = ", ".join(_fmt_target(x, "target_name") for x in group)
-        out_parts.append(f"{rel}: {targets}")
+        out_lines.append(f"{rel}: {targets}")
 
-    in_parts = []
+    in_lines = []
     for edge in edges_in:
         src = edge.get("source_name", "?")
         if detail == "high":
             src += f"(w={edge.get('weight')})"
-        in_parts.append(f"{src}: {edge.get('relation', '?')}")
+        in_lines.append(f"{src}: {edge.get('relation', '?')}")
 
-    rel_line = " ".join(out_parts)
-    if in_parts:
-        rel_line = (rel_line + " " if rel_line else "") + "< " + " ".join(in_parts)
-    if rel_line:
-        lines.append(rel_line)
+    if out_lines:
+        lines.append(">")
+        lines.extend(out_lines)
+    if in_lines:
+        lines.append("<")
+        lines.extend(in_lines)
 
     if detail == "high":
         created = e.get("e.created_at")
