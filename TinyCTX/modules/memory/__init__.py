@@ -21,6 +21,12 @@ EXTENSION_META = {
         # --- read-time weighting shared across flaggers ---
         "mention_half_life_days": 30,
 
+        # --- entity text formatting ---
+        "formatting": {
+            "injection_detail":     "low",   # detail level for the <memory> block
+            "desc_truncate_chars":  2500,    # low-detail description cutoff (0 = no truncation)
+        },
+
         # --- passive RAG + memory block ---
         "passive_rag": {
             "enabled":             True,

@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from TinyCTX.modules.memory import scopes as _scopes
+from TinyCTX.modules.memory.format import format_entities
 from TinyCTX.modules.memory.graph import (
     embed_content_for,
     new_uuid,
@@ -189,7 +190,7 @@ def _resolve(name_or_uuid: str, visible: set) -> dict | None:
 # Tools — read
 # ---------------------------------------------------------------------------
 
-async def search_memory(query: str, top_k: int = 5) -> str:
+async def search_memory(query: str, top_k: int = 5, detail: str = "low") -> str:
     """
     Search memory for entities relevant to a query, within the current scope.
     Exact name/UUID matches return immediately. Otherwise hybrid BM25 + vector
@@ -198,9 +199,14 @@ async def search_memory(query: str, top_k: int = 5) -> str:
     Args:
         query: Natural-language query or exact entity name / UUID.
         top_k: Max entities to return (default 5).
+        detail: "low" (default, token-efficient), "medium" (+ pinned/scope,
+            noisy relations), or "high" (+ uuid, timestamps, edge weights).
     """
     from TinyCTX.utils.bm25 import BM25
 
+    if detail not in ("low", "medium", "high"):
+        detail = "low"
+    desc_trunc = int(_cfg.get("formatting", {}).get("desc_truncate_chars", 2500))
     visible = current_scopes()
     passive_cfg = _cfg.get("passive_rag", {})
     min_p = float(passive_cfg.get("search_min_p", 0.0))
@@ -212,7 +218,8 @@ async def search_memory(query: str, top_k: int = 5) -> str:
     if exact:
         _bump_mention([exact["uuid"]], 1.0)
         full = _graph_db.get_entity(exact["uuid"], visible)
-        return _format_entities([full], exact_uuid=exact["uuid"]) if full else "No matching entities found."
+        return (format_entities([full], detail=detail, desc_truncate_chars=desc_trunc, exact_uuid=exact["uuid"])
+                if full else "No matching entities found.")
 
     # -- BM25 --
     bm25_ranks: dict[str, int] = {}
@@ -242,7 +249,7 @@ async def search_memory(query: str, top_k: int = 5) -> str:
 
     _bump_mention(uids, 1.0)
     ents = [_graph_db.get_entity(u, visible) for u in uids]
-    return _format_entities([e for e in ents if e])
+    return format_entities([e for e in ents if e], detail=detail, desc_truncate_chars=desc_trunc)
 
 
 async def memory_stats() -> str:
@@ -328,7 +335,7 @@ async def memory_add_entity(name: str, entity_type: str, description: str) -> st
         if existing_uid:
             full = _graph_db.get_entity(existing_uid, visible)
             return "Error: '{}' already exists in scope '{}'.\n{}".format(
-                name, scope, _format_entities([full]) if full else f"UUID: {existing_uid}"
+                name, scope, format_entities([full]) if full else f"UUID: {existing_uid}"
             ) + "\nUse memory_update_entity_description or memory_merge_into instead."
 
         uid = new_uuid()
@@ -699,32 +706,8 @@ def throttle_delay(queue_len: int, *, base: float, min_delay: float, target: int
 
 
 # ---------------------------------------------------------------------------
-# Formatting + small DB reads
+# Small DB reads and writes
 # ---------------------------------------------------------------------------
-
-def _format_entities(entities: list[dict], exact_uuid: str | None = None) -> str:
-    lines = []
-    for e in entities:
-        if not e:
-            continue
-        name = e.get("e.name", "?")
-        et = e.get("e.entity_type", "?")
-        uid = e.get("e.uuid", "?")
-        desc = e.get("e.description", "")
-        scope = e.get("e.scope", "")
-        pin = e.get("e.pinned", "")
-        tags = f" scope={scope}" + (f" pinned={pin}" if pin else "")
-        exact = "  [exact]" if uid == exact_uuid else ""
-        lines.append(f"[{et}] {name} (UUID: {uid}){tags}{exact}")
-        if desc:
-            lines.append(f"  {desc}")
-        for edge in e.get("edges_out", []):
-            lines.append(f"  ->[{edge['relation']}]-> {edge['target_name']} (UUID: {edge['target_uuid']}) (w={edge.get('weight')})")
-        for edge in e.get("edges_in", []):
-            lines.append(f"  <-[{edge['relation']}]<- {edge['source_name']} (UUID: {edge['source_uuid']}) (w={edge.get('weight')})")
-        lines.append("")
-    return "\n".join(lines).strip() or "No matching entities found."
-
 
 def _current_mention(uid: str) -> float:
     try:

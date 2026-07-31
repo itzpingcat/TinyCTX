@@ -79,6 +79,9 @@ memory:
     desc_min_chars: 15
     fuzzy_name_threshold: 95
     max_edges_between: 4
+  formatting:
+    desc_truncate_chars: 2500
+    injection_detail: low
   graph_path: memory/memory.lbug
   librarian:
     batch_size: 20

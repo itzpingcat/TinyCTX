@@ -31,6 +31,7 @@ import time
 from pathlib import Path
 
 from TinyCTX.modules.memory import scopes as _scopes
+from TinyCTX.modules.memory.format import format_entity
 
 logger = logging.getLogger(__name__)
 
@@ -440,6 +441,11 @@ async def _build_memory_block(visible: set, last_user_text: str) -> str | None:
     passive_cfg = _cfg.get("passive_rag", {})
     budget = int(passive_cfg.get("memory_block_tokens", 2048))
     rag_enabled = bool(passive_cfg.get("enabled", True))
+    fmt_cfg = _cfg.get("formatting", {})
+    detail = fmt_cfg.get("injection_detail", "low")
+    if detail not in ("low", "medium", "high"):
+        detail = "low"
+    desc_trunc = int(fmt_cfg.get("desc_truncate_chars", 2500))
 
     def _tok(s: str) -> int:
         return len(s) // 4
@@ -469,7 +475,7 @@ async def _build_memory_block(visible: set, last_user_text: str) -> str | None:
     bump = float(passive_cfg.get("mention_bump", 0.1))
     bump_uids: list[str] = []
     for idx, (uid, e) in enumerate(ordered):
-        block = _render_entity(e)
+        block = format_entity(e, detail=detail, desc_truncate_chars=desc_trunc)
         cost = _tok(block) + 1
         if used + cost > budget:
             if idx < n_pinned:
@@ -515,20 +521,6 @@ async def _passive_rag_uuids(visible: set, query: str) -> list[str]:
 
     fused = _tools._rrf_fuse(bm25_ranks, vec_ranks, bm25_w=bm25_w, rrf_k=rrf_k)
     return [u for u, _ in fused[:top_k]]
-
-
-def _render_entity(e: dict) -> str:
-    name = e.get("e.name", "?")
-    et = e.get("e.entity_type", "?")
-    desc = e.get("e.description", "")
-    pin = e.get("e.pinned", "")
-    tag = "  [pinned]" if pin else ""
-    lines = [f"[{et}] {name}{tag} — {desc}"]
-    for edge in e.get("edges_out", []):
-        lines.append(f"  ->[{edge['relation']}]-> {edge['target_name']} (w={edge.get('weight')})")
-    for edge in e.get("edges_in", []):
-        lines.append(f"  <-[{edge['relation']}]<- {edge['source_name']} (w={edge.get('weight')})")
-    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
