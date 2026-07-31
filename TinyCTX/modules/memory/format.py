@@ -14,6 +14,9 @@ low (default):
   prefixed with "<" as "source: REL" pairs. Relations listed in
   prompts/noisy_relationships.txt are dropped entirely. Description
   truncated at desc_truncate_chars (relationships are never truncated).
+  A relation that exists in both directions between the same pair (A -[REL]->
+  B and B -[REL]-> A) is one fact, not two: it's shown once, on the outgoing
+  side, tagged "(mutual)", and dropped from the incoming list.
 
 medium:
   low, plus pinned/scope shown in the header, and noisy relations included.
@@ -64,6 +67,22 @@ def _group_by_relation(edges: list[dict], name_key: str) -> list[tuple[str, list
     return [(rel, groups[rel]) for rel in order]
 
 
+def _split_mutual(edges_out: list[dict], edges_in: list[dict]) -> tuple[set, list[dict]]:
+    """Same relation, same pair, both directions (A -[REL]-> B and B -[REL]-> A) is
+    one fact, not two — flag it and drop the incoming half so it isn't printed
+    twice as if it were two independent relationships."""
+    out_keys = {(e.get("relation"), e.get("target_uuid")) for e in edges_out}
+    mutual: set = set()
+    remaining_in = []
+    for e in edges_in:
+        key = (e.get("relation"), e.get("source_uuid"))
+        if key in out_keys:
+            mutual.add(key)
+        else:
+            remaining_in.append(e)
+    return mutual, remaining_in
+
+
 def format_entity(e: dict, *, detail: str = "low", desc_truncate_chars: int = 2500) -> str:
     """Render one entity dict (as returned by GraphDB.get_entity) as text."""
     if detail not in ("low", "medium", "high"):
@@ -99,8 +118,12 @@ def format_entity(e: dict, *, detail: str = "low", desc_truncate_chars: int = 25
         edges_out = [x for x in edges_out if x.get("relation") not in noisy]
         edges_in = [x for x in edges_in if x.get("relation") not in noisy]
 
+    mutual, edges_in = _split_mutual(edges_out, edges_in)
+
     def _fmt_target(edge: dict, key: str) -> str:
         base = edge.get(key, "?")
+        if (edge.get("relation"), edge.get("target_uuid")) in mutual:
+            base += " (mutual)"
         if detail == "high":
             base += f"(w={edge.get('weight')})"
         return base
