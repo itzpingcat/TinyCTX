@@ -68,6 +68,8 @@ EXTENSION_META = {
         # --- reviewer flaggers ---
         "flaggers": {
             "max_edges_between":           4,
+            "edge_bloat_min_edges":        10,
+            "edge_bloat_chars_per_edge":   10,
             "desc_max_chars":              1200,
             "desc_min_chars":              15,
             "fuzzy_name_threshold":        95,
