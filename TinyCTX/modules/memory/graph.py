@@ -455,7 +455,7 @@ class GraphDB:
 
     def get_entity_slim(self, uid: str, visible: set[str] | None = None) -> dict | None:
         r = self.safe_execute(
-            "MATCH (e:Entity {uuid: $uid}) RETURN e.uuid, e.name, e.entity_type, e.description, e.scope",
+            "MATCH (e:Entity {uuid: $uid}) RETURN e.uuid, e.name, e.entity_type, e.description, e.scope, e.pinned",
             {"uid": uid},
         )
         if not (r and r.has_next()):
@@ -463,16 +463,16 @@ class GraphDB:
         row = r.get_next()
         if not self._scope_ok(row[4], visible):
             return None
-        return {"uuid": row[0], "name": row[1], "entity_type": row[2], "description": row[3], "scope": row[4]}
+        return {"uuid": row[0], "name": row[1], "entity_type": row[2], "description": row[3], "scope": row[4], "pinned": row[5]}
 
     def find_by_name(self, name: str, visible: set[str] | None = None) -> list[dict]:
         """Substring name match, scope-filtered. Used for exact-match resolution."""
         r = self.safe_execute(
             "MATCH (e:Entity) WHERE e.name =~ $rx "
-            "RETURN e.uuid, e.name, e.entity_type, e.description, e.scope LIMIT 25",
+            "RETURN e.uuid, e.name, e.entity_type, e.description, e.scope, e.pinned LIMIT 25",
             {"rx": f"(?i).*{_regex_escape(name)}.*"},
         )
-        out = self._rows_to_dicts(r, ["uuid", "name", "entity_type", "description", "scope"])
+        out = self._rows_to_dicts(r, ["uuid", "name", "entity_type", "description", "scope", "pinned"])
         return [e for e in out if self._scope_ok(e["scope"], visible)]
 
     def name_exists_in_scope(self, name: str, scope: str) -> str | None:

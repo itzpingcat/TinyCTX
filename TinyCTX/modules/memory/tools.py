@@ -166,6 +166,44 @@ async def _edge_exists(src_uid: str, tgt_uid: str, relation: str) -> bool:
     return bool(r and r.has_next())
 
 
+async def _edge_get(src_uid: str, tgt_uid: str, relation: str) -> dict | None:
+    """Existing edge's weight/created_at for the ordered (src, tgt, relation)
+    triple, or None. Used to merge onto an existing edge instead of silently
+    dropping the incoming one."""
+    r = await _conn.execute(
+        "MATCH (a:Entity {uuid:$s})-[r:Relation]->(b:Entity {uuid:$t}) "
+        "WHERE r.relation = $rel RETURN r.weight, r.created_at LIMIT 1",
+        parameters={"s": src_uid, "t": tgt_uid, "rel": relation},
+    )
+    if r and r.has_next():
+        w, created_at = r.get_next()
+        return {"weight": w, "created_at": created_at}
+    return None
+
+
+async def _edge_merge_onto(src_uid: str, tgt_uid: str, relation: str, existing: dict, new_weight: float, new_created_at) -> None:
+    """Update an existing edge to absorb an incoming duplicate edge: keep the
+    stronger weight and the earlier created_at, so a collapsed merge doesn't
+    quietly lose the duplicate's edge strength/age."""
+    weight = max(float(existing.get("weight") or 0.0), float(new_weight or 0.0))
+    created_at = min(existing.get("created_at") or new_created_at, new_created_at or existing.get("created_at"))
+    await _conn.execute(
+        "MATCH (a:Entity {uuid:$s})-[r:Relation]->(b:Entity {uuid:$t}) "
+        "WHERE r.relation = $rel SET r.weight = $w, r.created_at = $ca, r.updated_at = $now",
+        parameters={"s": src_uid, "t": tgt_uid, "rel": relation, "w": weight, "ca": created_at, "now": now_ts()},
+    )
+
+
+def _tentative_alias_note(canonical_name: str, canonical_uid: str) -> str:
+    """Appended to an aliased-away node's description. Unlike the old stub,
+    this never replaces the node's own data — it just flags where writes
+    should tentatively go until a human/reviewer confirms the alias."""
+    return (
+        f"[Tentatively aliased to '{canonical_name}' (UUID {canonical_uid}) — not confirmed. "
+        f"Unless stated otherwise, '{canonical_name}' is the main node to write updates to.]"
+    )
+
+
 def _mark_embed_stale(uid: str) -> None:
     """Drop the node from the live vector index; the embed pass re-adds it once
     re-embedded. Combined with embed_hash='' this is the dirty-set signal."""
@@ -582,7 +620,12 @@ async def _merge_internal(c: dict, d: dict, merged_description: str, verdict: st
         await _aset(c_uid, "embed_hash", "")
         await _touch(c_uid)
         _mark_embed_stale(c_uid)
-        await _aset(d_uid, "description", f"Aliased to {c['name']} (UUID {c_uid}).")
+        note = _tentative_alias_note(c["name"], c_uid)
+        if note not in (d.get("description") or ""):
+            await _aset(d_uid, "description", f"{d.get('description') or ''}\n\n{note}".strip())
+            await _aset(d_uid, "embed_content", embed_content_for(d["name"], d["entity_type"], f"{d.get('description') or ''}\n\n{note}".strip()))
+            await _aset(d_uid, "embed_hash", "")
+            _mark_embed_stale(d_uid)
         await _touch(d_uid)
         await _conn.execute(
             "MATCH (a:Entity {uuid:$d}), (c:Entity {uuid:$c}) "
@@ -600,27 +643,41 @@ async def _merge_internal(c: dict, d: dict, merged_description: str, verdict: st
         x = e["target_uuid"]
         if x == c_uid:
             continue
-        if not await _edge_exists(c_uid, x, e["relation"]):
+        existing = await _edge_get(c_uid, x, e["relation"])
+        if existing is None:
             await _conn.execute(
                 "MATCH (c:Entity {uuid:$c}), (x:Entity {uuid:$x}) "
                 "CREATE (c)-[:Relation {relation:$rel, weight:$w, created_at:$now, updated_at:$now}]->(x)",
                 parameters={"c": c_uid, "x": x, "rel": e["relation"], "w": e.get("weight", 0.5), "now": now},
             )
+        else:
+            # canonical already has this (relation, target) — merge onto it
+            # instead of silently dropping the duplicate's edge weight/age.
+            await _edge_merge_onto(c_uid, x, e["relation"], existing, e.get("weight", 0.5), e.get("created_at"))
     in_edges = _graph_db._edges_to(d_uid, None)
     for e in in_edges:
         x = e["source_uuid"]
         if x == c_uid:
             continue
-        if not await _edge_exists(x, c_uid, e["relation"]):
+        existing = await _edge_get(x, c_uid, e["relation"])
+        if existing is None:
             await _conn.execute(
                 "MATCH (x:Entity {uuid:$x}), (c:Entity {uuid:$c}) "
                 "CREATE (x)-[:Relation {relation:$rel, weight:$w, created_at:$now, updated_at:$now}]->(c)",
                 parameters={"x": x, "c": c_uid, "rel": e["relation"], "w": e.get("weight", 0.5), "now": now},
             )
+        else:
+            await _edge_merge_onto(x, c_uid, e["relation"], existing, e.get("weight", 0.5), e.get("created_at"))
     await _aset(c_uid, "description", merged_description)
     await _aset(c_uid, "embed_content", embed_content_for(c["name"], c["entity_type"], merged_description))
     await _aset(c_uid, "embed_hash", "")
     await _aset(c_uid, "mention", _current_mention(c_uid) + _current_mention(d_uid))
+    merged_scope = _scopes.narrower(c["scope"], d["scope"], _scopes.GLOBAL)
+    if merged_scope != c["scope"]:
+        await _aset(c_uid, "scope", merged_scope)
+    merged_pinned = _scopes.narrower(c.get("pinned") or "", d.get("pinned") or "", "")
+    if merged_pinned != (c.get("pinned") or ""):
+        await _aset(c_uid, "pinned", merged_pinned)
     await _touch(c_uid)
     _mark_embed_stale(c_uid)
     await _conn.execute("MATCH (e:Entity) WHERE e.uuid = $uid DETACH DELETE e", parameters={"uid": d_uid})
