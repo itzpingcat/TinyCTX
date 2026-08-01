@@ -550,25 +550,40 @@ class GraphDB:
                 pinned_by_scope[pin] = pinned_by_scope.get(pin, 0) + 1
             if emb:
                 embedded += 1
-        edge_count = self._count_visible_edges(vis_uuids)
+        edge_count, alias_count, noisy_count = self._relation_breakdown(vis_uuids)
         return {
             "entity_count": entity_count,
             "edge_count": edge_count,
+            "alias_count": alias_count,
+            "noisy_count": noisy_count,
+            "regular_count": edge_count - alias_count - noisy_count,
             "pinned_by_scope": pinned_by_scope,
             "embedded_count": embedded,
             "by_type": by_type,
         }
 
-    def _count_visible_edges(self, vis_uuids: set[str]) -> int:
+    def _relation_breakdown(self, vis_uuids: set[str]) -> tuple[int, int, int]:
+        """Total visible edge count, split into aliases (ALIASED_TO) and
+        "noisy" (relation types listed in prompts/noisy_relationships.txt —
+        the same list format.py uses to drop chatter like MENTIONED/SAID/
+        KNOWS from detail=low output). Everything else is "regular"."""
         if not vis_uuids:
-            return 0
-        r = self.safe_execute("MATCH (a:Entity)-[:Relation]->(b:Entity) RETURN a.uuid, b.uuid")
-        n = 0
+            return 0, 0, 0
+        from TinyCTX.modules.memory.format import _load_noisy_relations
+        noisy_relations = _load_noisy_relations()
+
+        r = self.safe_execute("MATCH (a:Entity)-[r:Relation]->(b:Entity) RETURN a.uuid, b.uuid, r.relation")
+        total = alias = noisy = 0
         while r and r.has_next():
-            a, b = r.get_next()
-            if a in vis_uuids and b in vis_uuids:
-                n += 1
-        return n
+            a, b, rel = r.get_next()
+            if a not in vis_uuids or b not in vis_uuids:
+                continue
+            total += 1
+            if rel == "ALIASED_TO":
+                alias += 1
+            elif rel in noisy_relations:
+                noisy += 1
+        return total, alias, noisy
 
     # -- edge reads (both endpoints must be visible) ------------------------
 

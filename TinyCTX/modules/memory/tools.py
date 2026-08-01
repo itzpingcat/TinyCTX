@@ -292,15 +292,17 @@ async def search_memory(query: str, top_k: int = 5, detail: str = "low") -> str:
 
 async def memory_stats() -> str:
     """
-    Diagnostics for the current scope: entity counts by type, relationship count,
-    pinned counts by scope, embedding coverage, and the reviewer backlog by
-    issue type.
+    Diagnostics for the current scope: entity counts by type, relationship
+    count (broken down into regular / noisy / alias edges), pinned counts by
+    scope, embedding coverage, and the reviewer backlog by issue type.
     """
     visible = current_scopes()
     s = _graph_db.get_stats(visible)
     lines = [
         f"Entities: {s['entity_count']}  |  Relationships: {s['edge_count']}  |  "
         f"Embedded: {s['embedded_count']}/{s['entity_count']}",
+        f"  Relationships breakdown: {s['regular_count']} regular, "
+        f"{s['noisy_count']} noisy, {s['alias_count']} aliases",
         "By type:",
     ]
     for et, n in sorted(s["by_type"].items(), key=lambda x: -x[1]):
