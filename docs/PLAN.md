@@ -79,11 +79,12 @@ same lobotomy on a delay.
 @dataclass
 class Run:
     id:            str
-    session_key:   str                  # bridge cursor key
+    session_key:   str                  # scope; see §10
     intent:        str                  # triggering user message, truncated
     root_node_id:  str
     status:        str                  # running | done | failed | aborted
     started_at:    float
+    hidden:        bool                 # excluded from the roster; see §10.2
     inbox:         asyncio.Queue        # Exogenous events, see 3.3
     cycle:         AgentCycle | None    # for live head reads
 ```
@@ -244,8 +245,10 @@ start and finish transitions are serialized.
 
 - `_runs: dict[str, Run]`, `_settled: dict[str, str]` (session_key → node_id),
   `_session_locks: dict[str, asyncio.Lock]`.
-- `start_run(session_key, …) -> Run` — under the session lock: resolve
-  `settled_tail`, create the `Run`, register it.
+- `start_run(session_key, …, parent: Run | None, hidden: bool) -> Run` — under
+  the session lock: resolve `settled_tail`, create the `Run`, register it. When
+  `parent` is given (`spawn_fork`), inherit its `session_key` rather than
+  minting a new one — see §10.2.
 - `finish_run(run, final_text)` — under the session lock: advance
   `settled_tail`, fan out digests (R2).
 - `runs_in_session(session_key)` — for the roster provider and fan-out.
@@ -265,22 +268,30 @@ start and finish transitions are serialized.
   `for … in range(…)` so the pre-finalize drain can loop once more.
 - Call `runtime.finish_run(...)` on completion.
 
-### `modules/forks/` (new module — requirement 1 in full)
+### `modules/concurrency/` (new module — requirement 1 in full)
 
-- `register_runtime(runtime)` — the pattern `modules/subagents` already uses.
-- `register_agent(agent)` registers a prompt provider:
+Absorbs everything `modules/subagents` did, in roughly a third of the code.
+
+- `register_runtime(runtime)` — the module-global pattern `modules/subagents`
+  used before deletion.
+- `register_agent(agent)` registers the roster prompt provider:
 
   ```python
   agent.context.register_prompt("running_forks", provider,
                                 role=ROLE_USER, priority=…)
   ```
 
-  The provider reads `_runtime.runs_in_session(...)`, filters out self and
-  anything not running, and renders one line per run. `register_prompt` already
-  re-invokes the provider on every `assemble()`, so freshness is automatic.
-  `role=ROLE_USER` places it in the deferred-footer position outside the cached
-  prefix — same reason `equipment_manifest_footer` exists, and correct here
-  because the roster changes every turn.
+  The provider reads `_runtime.runs_in_session(agent.run.session_key)` and
+  filters out self, anything not running, and anything `hidden` (§10), then
+  renders one line per run. `register_prompt` already re-invokes the provider on
+  every `assemble()`, so freshness is automatic. `role=ROLE_USER` places it in
+  the deferred-footer position outside the cached prefix — same reason
+  `equipment_manifest_footer` exists, and correct here because the roster
+  changes every turn.
+
+- Two tools: `spawn_fork(prompt)` (§9.1) and `nudge_fork(run_id, message)`
+  (§11). Both resolve peers through `agent.run.session_key`; neither can reach
+  outside the session.
 
 **No changes to `context.py` or `db.py`.** Requirement 1 lands entirely on
 existing extension points.
@@ -297,9 +308,9 @@ existing extension points.
 
 ### `modules/subagents/`
 
-Subsumed. `spawn_agent` becomes "start a run that does not take `settled_tail`",
-`wait_agent` becomes a lookup in `_runs`. The `SubagentTask` registry,
-`max_concurrent`, and the TTL pruning all go.
+**Deleted outright** — not ported. `SubagentTask`, the per-agent registry, the
+`_AGENTS` weakset, `max_concurrent`, the TTL pruning, `spawn_agent`, and
+`wait_agent` all go. Its replacement is one tool in `modules/concurrency/`; see §9.
 
 ---
 
@@ -333,7 +344,100 @@ user can kill it — but it is a real behaviour change, not a free win.
 
 ---
 
-## 9. Inter-Fork Messaging (Nudges)
+## 9. Coordination Without a Coordinator
+
+A pseudo-coordinator is not a problem to be prevented — it is a useful pattern
+that should be available. What this design removes is the *requirement* that
+one exist, and the blocking wait that makes it expensive.
+
+### 9.1 `spawn_fork` — the one surviving tool
+
+```python
+spawn_fork(prompt: str)  →  run_id
+```
+
+Starts a run on a fresh branch off the caller's current head, with `intent` set
+from `prompt`. It does not take `settled_tail` on completion unless it is the
+last finisher (R2 applies unchanged — spawned forks are not a special case).
+
+That is the entire subagent feature. **There is no `wait_agent`, and nothing
+replaces it.** Fan-out (R2) already delivers the spawned fork's digest to the
+spawner if the spawner is still running, and inheritance via `settled_tail`
+delivers it if the spawner is not. Blocking on a child is redundant work in both
+cases.
+
+### 9.2 Why This Is Better Than the Old Subagent Model
+
+1. **A coordinator that spawns and then waits is wasteful.** It burns a cycle
+   sitting idle, holding context, doing nothing. Here the spawner keeps working
+   and receives digests as they land.
+
+2. **Forks are provisioned automatically, and manual spawning still works.**
+   Ordinary concurrent user messages fork by themselves under R1 — no tool call,
+   no decision, no coordinator. `spawn_fork` remains for the cases where the
+   agent genuinely wants to split work deliberately. Both produce the same kind
+   of `Run`; there is one code path.
+
+3. **Near-zero impact on non-concurrent use.** With one run in flight,
+   `settled_tail` advances linearly, the roster renders empty, no digests are
+   fanned out, and nothing is drained. The concurrent machinery is inert.
+
+### 9.3 The Coordinator Can Be a Fork
+
+Nothing distinguishes a "coordinator" from any other run. A fork can
+`spawn_fork` its own children, receive their digests, and nudge them (§11) —
+and it is itself just a run, which may have been spawned by another run, and
+whose own digest goes to *its* peers. The hierarchy is emergent and
+per-situation rather than structural.
+
+This is the payoff of building it peer-to-peer first: coordination becomes a
+*behaviour the agent can choose*, not a topology the framework imposes.
+
+---
+
+## 10. Roster Scope
+
+A cycle must see running peers **in its own environment only** — the Discord
+channel it is in, not every cycle in the process. A fork answering a question in
+`#dev` has no business seeing forks in a stranger's DM.
+
+### 10.1 Scope By `session_key`, Not `SessionEnvironment`
+
+The obvious candidate is `SessionEnvironment` (platform / server_name /
+channel_name), since it is already carried on every `InboundMessage` and
+snapshotted into `state_delta`, so a prompt provider could read it from
+`ctx.state["session"]`. **It is the wrong key.** The Discord bridge constructs
+DM environments as `SessionEnvironment(platform=DISCORD, agent_name=…)` with no
+`server_name` and no `channel_name` — every DM in the process is environmentally
+identical, so every DM would see every other DM's forks.
+
+Scope by `Run.session_key` instead. It is the bridge's cursor key
+(`dm:<uid>` / `group:<cid>` / `thread:<tid>`), which is exactly the granularity
+wanted, and it never has to enter the DB or be reconstructed from context: the
+cycle holds its own `Run` (§7), so the roster provider reads `agent.run.session_key`
+directly and filters `_runs` on equality. O(1), no tree walk, no env heuristics.
+
+**Rule:** the roster, fan-out (R2), and nudges (§11) are all scoped to
+`session_key`. Nothing is ever process-global. Widening any of them to "all
+running cycles" is a bug, not a convenience.
+
+### 10.2 Two Things This Requires
+
+**Inheritance.** A run started by `spawn_fork` must inherit the spawner's
+`session_key`, not mint a new one. Otherwise spawned forks are invisible to
+their siblings and to the fork that spawned them — they would each be their own
+session of one. `start_run` takes the parent `Run` when there is one and copies
+the key.
+
+**`hidden` runs.** Some cycles share a session but are internal noise:
+`modules/heartbeat` pushes with `Platform.CRON`, and the memory librarian runs
+its own cycles. These should not appear in the roster or receive digests. One
+boolean on `Run`, set at `start_run`, filtered by the provider. Not speculative
+— heartbeat exists today and will otherwise show up in every roster render.
+
+---
+
+## 11. Inter-Fork Messaging (Nudges)
 
 A fork can send an advisory message to a peer — "the user changed their mind,
 stop generating and revert the file you wrote." There is deliberately **no hard
@@ -348,10 +452,10 @@ nudge_fork(run_id: str, message: str)          # agent-facing tool
   → target.inbox.put(Exogenous("nudge", role=…, content=…))
 ```
 
-The roster (§7, `modules/forks/`) already exposes run ids and intents, so
+The roster (§7, `modules/concurrency/`) already exposes run ids and intents, so
 addressing needs no new scheme. The target drains it at the normal R3 points.
 
-### 9.1 Rules
+### 11.1 Rules
 
 **Advisory by construction.** A nudge arrives as text in the target's context.
 The target reads it and decides. There is no kill path, so there is nothing to
@@ -375,7 +479,7 @@ buys nothing the model cannot express.
 No lock needed — the benign failure is a `put` into an inbox nobody drains
 again.
 
-### 9.2 Rendering Carries Authority
+### 11.2 Rendering Carries Authority
 
 This is what actually enforces "no murdering each other." If a peer's nudge
 renders like a user message, the target obeys it like one. The rendered node
@@ -388,7 +492,7 @@ User changed their mind on the image. Stop generating, don't post it.
 (Advisory, from a peer fork. Not from the user. You decide whether to comply.)
 ```
 
-### 9.3 Revert Is Mostly Already Free
+### 11.3 Revert Is Mostly Already Free
 
 The target is on its own branch, so its own tool calls are already in its own
 context. It can read what it did and undo it with no new machinery. The only
@@ -398,7 +502,7 @@ Do **not** add a per-run effect log for this. That would be a second digest
 system running alongside the completion digest, projecting the same data
 differently. Live with the trimming gap until it demonstrably bites.
 
-### 9.4 Latency
+### 11.4 Latency
 
 Drain point 1 (R3) fires between tool batches, so a nudge lands before the
 target's next LLM call. Worst case the target wastes one batch of tool calls.
@@ -408,7 +512,7 @@ added **once, for all kinds**, never specifically for nudges. Drain points are a
 property of the cycle, not of the event kind. A drain point per feature is the
 same failure mode as a queue per feature (§3.3).
 
-### 9.5 Interaction With §5
+### 11.5 Interaction With §5
 
 None. Nudges only flow between overlapping runs and never need to reach the
 trunk: whether the target complied is visible either way in its completion
@@ -416,7 +520,7 @@ digest. The completeness invariant is unaffected.
 
 ---
 
-## 10. Open Decisions
+## 12. Open Decisions
 
 1. **Role of an injected digest node.** Assistant-role is literally true (same
    agent) and the existing adjacent-merge in `context.py` handles
