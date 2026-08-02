@@ -142,6 +142,7 @@ class LibrarianRunner:
         librarian_cfg = self._cfg.get("librarian", {})
         max_concurrent = int(librarian_cfg.get("max_concurrent", 4))
         batch_size = int(librarian_cfg.get("batch_size", 20))
+        overlap_nodes = int(librarian_cfg.get("overlap_nodes", 5))
 
         # -- queue messages (targeted / branch / trigger / review) --
         while not self.queue.empty():
@@ -150,7 +151,8 @@ class LibrarianRunner:
             if mtype == "branch":
                 await self._dispatch_branch(msg.get("tail_node_id", "").strip(),
                                             run_extractor, resolve_extractor_scopes,
-                                            nodes_to_text, batch_size, max_concurrent)
+                                            nodes_to_text, batch_size, max_concurrent,
+                                            overlap_nodes)
             elif mtype == "review_front":
                 issue = msg.get("issue")
                 if issue:
@@ -168,7 +170,8 @@ class LibrarianRunner:
                 if len(self._active_tasks) >= max_concurrent:
                     break
                 await self._dispatch_branch(tail.id, run_extractor, resolve_extractor_scopes,
-                                            nodes_to_text, batch_size, max_concurrent)
+                                            nodes_to_text, batch_size, max_concurrent,
+                                            overlap_nodes)
 
         # -- reviewer cycle --
         reviewer_cfg = self._cfg.get("reviewer", {})
@@ -201,7 +204,7 @@ class LibrarianRunner:
             self._active_tasks.add(t)
 
     async def _dispatch_branch(self, tail_id, run_extractor, resolve_scopes_fn,
-                               nodes_to_text, batch_size, max_concurrent):
+                               nodes_to_text, batch_size, max_concurrent, overlap_nodes=0):
         if not tail_id or len(self._active_tasks) >= max_concurrent:
             return
         async with self._write_lock:
@@ -209,7 +212,8 @@ class LibrarianRunner:
         if not flagged:
             return
         ordered = list(reversed(flagged))
-        batch_text, agent_name = nodes_to_text(self._conv_db, ordered, batch_size)
+        overlap_ids = self._overlap_context(ordered[0], overlap_nodes) if overlap_nodes > 0 else []
+        batch_text, agent_name = nodes_to_text(self._conv_db, ordered, batch_size, overlap_ids)
         if not batch_text.strip():
             return
         authors = self._branch_authors(ordered[:batch_size])
@@ -222,6 +226,18 @@ class LibrarianRunner:
         self._active_tasks.add(t)
         logger.info("[memory/librarian] extractor dispatched for %d node(s), scopes=%s",
                     len(flagged), sorted(scope_set))
+
+    def _overlap_context(self, first_new_node_id: str, overlap_nodes: int) -> list[str]:
+        """
+        Return up to `overlap_nodes` already-visited ancestor node ids immediately
+        preceding first_new_node_id, oldest-first. Gives the extractor trailing
+        context for small/fragmented new batches without re-extracting them.
+        """
+        node = self._conv_db.get_node(first_new_node_id)
+        if node is None or node.parent_id is None:
+            return []
+        ancestors = self._conv_db.get_ancestors(node.parent_id)
+        return [n.id for n in ancestors[-overlap_nodes:]]
 
     def _branch_authors(self, node_ids) -> set:
         authors = set()

@@ -50,6 +50,7 @@ EXTENSION_META = {
         "librarian": {
             "trigger_interval_hours":     6,
             "batch_size":                 20,
+            "overlap_nodes":              5,
             "max_concurrent":             4,
             "model":                      "",
             "ingest_pressure_ratio":      0.5,
