@@ -34,6 +34,10 @@ Tools registered
 ----------------
   use_skill(name)                    — always_on (configurable)
       Loads a skill's SKILL.md body, OR expands a category listing.
+      If the skill's frontmatter has a `tools:` field (comma-separated tool
+      names), those tools are enabled (via tool_handler.enable) as a side
+      effect of loading the skill — lets a skill bring its own deferred
+      tools online without the caller needing tools_search first.
   collapse_skill_categories(paths)   — deferred
       Removes one or more category paths from the expanded set (no-op when ephemeral).
 
@@ -89,13 +93,14 @@ def _skill_body(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 class SkillEntry:
-    __slots__ = ("name", "description", "skill_md", "category_path")
+    __slots__ = ("name", "description", "skill_md", "category_path", "tools")
 
-    def __init__(self, name: str, description: str, skill_md: Path, category_path: str) -> None:
+    def __init__(self, name: str, description: str, skill_md: Path, category_path: str, tools: list[str] | None = None) -> None:
         self.name          = name
         self.description   = description
         self.skill_md      = skill_md
         self.category_path = category_path   # "" for top-level skills
+        self.tools         = tools or []     # tool names to enable when this skill is loaded
 
 
 class CategoryNode:
@@ -163,11 +168,15 @@ def _scan_tree(
                 )
                 continue
 
+            tools_raw = (fm.get("tools", "") or "").strip()
+            tools = [t.strip() for t in tools_raw.split(",") if t.strip()] if tools_raw else []
+
             skill = SkillEntry(
                 name=name,
                 description=(fm.get("description", "") or "").strip(),
                 skill_md=skill_md,
                 category_path=parent_path,
+                tools=tools,
             )
             skills[name] = skill
             children.append(skill)
@@ -555,9 +564,23 @@ def register_agent(cycle) -> None:
             try:
                 text = skill.skill_md.read_text(encoding="utf-8")
                 body = _skill_body(text)
-                return f"# Skill: {name}\n\n{body}" if body else f"Skill '{name}' has no instructions body"
+                result = f"# Skill: {name}\n\n{body}" if body else f"Skill '{name}' has no instructions body"
             except Exception as exc:
                 return f"Error reading skill '{name}': {exc}"
+
+            if skill.tools:
+                enabled, unknown = [], []
+                for tool_name in skill.tools:
+                    (enabled if agent.tool_handler.enable(tool_name) else unknown).append(tool_name)
+                note_parts = []
+                if enabled:
+                    note_parts.append(f"Enabled tool(s): {', '.join(enabled)}")
+                if unknown:
+                    note_parts.append(f"Unknown tool(s) (not registered, skipped): {', '.join(unknown)}")
+                if note_parts:
+                    result = f"{result}\n\n[{'; '.join(note_parts)}]"
+
+            return result
 
         # --- case-insensitive fallback ---
         name_lower  = name.lower()

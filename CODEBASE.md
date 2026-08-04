@@ -54,7 +54,7 @@ TinyCTX/
 │   └── workspace_setup.py
 │
 ├── custom_modules/     User-defined plugins, gitignored (same interface as modules/)
-│   └── anima/          generate_image_anima — always-on tool for Anima.json ComfyUI workflow
+│   └── anima/          generate_image_anima — deferred tool for Anima.json ComfyUI workflow (enable via tools_search or a skill's `tools:` field)
 └── modules/            Auto-discovered plugins (see Module System below)
     ├── cron/           Cron scheduler
     ├── ctx_tools/      Context manipulation tools (edit, delete turns)
@@ -66,7 +66,7 @@ TinyCTX/
     ├── present/        present() tool — delivers files to users via bridges
     ├── rag/            Semantic search over workspace/memory/ (BM25 or embeddings)
     ├── shell/          shell tool
-    ├── skills/         use_skill tool (loads SKILL.md files)
+    ├── skills/         use_skill tool (loads SKILL.md files; a skill's `tools:` frontmatter enables named deferred tools on load)
     ├── subagents/      spawn_agent / wait_agent tools
     ├── sysops/         User/permission management + /model command + set_active_model tool (per-branch LLM override, see below)
     ├── system_prompt/  Injects SOUL.md, AGENTS.md into system prompt
@@ -396,7 +396,7 @@ Superseded modules `decay.py` / `dedup_agents.py` / `librarian_agents.py` are in
 
 ### `subagents` — `spawn_agent(prompt)` and `wait_agent(task_id)` for parallel side tasks on child branches.
 
-### `skills` — `use_skill(name)` tool. Loads `SKILL.md` from `workspace/skills/<name>/`. Follows agentskills.io convention.
+### `skills` — `use_skill(name)` tool. Loads `SKILL.md` from `workspace/skills/<name>/`. Follows agentskills.io convention. A skill's frontmatter may declare `tools: tool_a, tool_b` (comma-separated); loading that skill calls `tool_handler.enable()` on each name, letting a skill bring its own deferred tools online without a separate `tools_search` call. Unknown names are reported back, not silently dropped.
 
 ### `todo` — `todo_read` / `todo_write`. Session-scoped task checklist.
 
