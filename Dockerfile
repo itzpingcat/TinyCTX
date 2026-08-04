@@ -2,9 +2,8 @@
 FROM python:3.14-rc-slim
 
 # --- env -------------------------------------------------------------------
-# Force Playwright to install browsers in a shared path
-ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
-    HOME=/home/tinyctx
+# Camoufox installs its browser under $HOME/.cache/camoufox
+ENV HOME=/home/tinyctx
 
 # --- system deps -----------------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -21,9 +20,9 @@ RUN groupadd -r tinyctx && useradd -r -g tinyctx -d /home/tinyctx -m -s /sbin/no
 
 WORKDIR /app
 
-# --- playwright (pinned first so it never re-runs when other deps change) --
+# --- camoufox (pinned first so it never re-runs when other deps change) ----
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install playwright && playwright install chromium
+    pip install "camoufox[geoip]" && camoufox fetch
 
 # --- app source ------------------------------------------------------------
 COPY TinyCTX/ ./TinyCTX/
@@ -35,7 +34,7 @@ RUN pip install --no-cache-dir -e .
 RUN mkdir -p /etc/tinyctx && chown tinyctx:tinyctx /etc/tinyctx
 
 # --- permissions -----------------------------------------------------------
-RUN chown -R tinyctx:tinyctx /home/tinyctx /ms-playwright
+RUN chown -R tinyctx:tinyctx /home/tinyctx
 
 USER tinyctx
 

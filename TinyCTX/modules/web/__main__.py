@@ -13,7 +13,7 @@ Registers web tools into the agent loop's tool_handler:
   - wait_for       — wait for element state
   - manage_browser — adjust settings or close the browser
 
-One Playwright browser instance lives on the AgentLoop for the session lifetime.
+One Camoufox browser instance lives on the AgentLoop for the session lifetime.
 It is created lazily on first use and closed on reset() via a registered hook.
 
 Convention: register_agent(agent) — no imports from contracts or gateway.
@@ -440,7 +440,7 @@ _STATE_KEY = "_web_module"
 def _state(agent) -> dict:
     if not hasattr(agent, _STATE_KEY):
         setattr(agent, _STATE_KEY, {
-            "playwright": None,
+            "camoufox":   None,
             "browser":    None,
             "page":       None,
             "settings": {
@@ -456,16 +456,16 @@ def _state(agent) -> dict:
 
 
 async def _ensure_page(agent):
-    """Lazily create a Playwright browser page for this session."""
-    from playwright.async_api import async_playwright
+    """Lazily create a Camoufox browser page for this session."""
+    from camoufox.async_api import AsyncCamoufox
 
     st = _state(agent)
     if st["page"] is not None:
         return st["page"]
 
     headless = st.get("_headless", True)
-    pw = await async_playwright().start()
-    browser = await pw.chromium.launch(headless=headless)
+    camoufox = AsyncCamoufox(headless=headless)
+    browser = await camoufox.__aenter__()
     page = await browser.new_page()
 
     # Block requests (including redirects) to private/internal addresses.
@@ -478,23 +478,22 @@ async def _ensure_page(agent):
 
     await page.route("**/*", _ssrf_route_handler)
 
-    st["playwright"] = pw
-    st["browser"]    = browser
-    st["page"]       = page
+    st["camoufox"] = camoufox
+    st["browser"]  = browser
+    st["page"]     = page
     return page
 
 
 async def _close_browser(agent) -> str:
     st = _state(agent)
     try:
-        if st["browser"]:
-            await st["browser"].close()
+        if st["camoufox"]:
+            await st["camoufox"].__aexit__(None, None, None)
     finally:
-        if st["playwright"]:
-            await st["playwright"].stop()
-    st["playwright"] = None
-    st["browser"]    = None
-    st["page"]       = None
+        pass
+    st["camoufox"] = None
+    st["browser"]  = None
+    st["page"]     = None
     return "Browser closed."
 
 
@@ -902,7 +901,7 @@ def register_agent(agent) -> None:
 
     async def manage_browser(action: str, key: str | None = None, value: str | None = None) -> str:
         """
-        Manage the Playwright browser session and settings.
+        Manage the Camoufox browser session and settings.
 
         Args:
             action: One of: close, view_settings, set_setting, add_ignore_tag, remove_ignore_tag, list.

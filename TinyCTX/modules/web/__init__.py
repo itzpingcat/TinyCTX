@@ -3,7 +3,7 @@ EXTENSION_META = {
     "version": "1.2",
     "description": (
         "Web tools: DuckDuckGo search, open_url (fetch or browser-render a page returning "
-        "elements/text/html), async HTTP requests, and Playwright browser automation "
+        "elements/text/html), async HTTP requests, and Camoufox browser automation "
         "(click, type, extract, screenshot). "
         "Screenshots are saved to workspace/downloads/. "
         "One browser instance per agent session."
