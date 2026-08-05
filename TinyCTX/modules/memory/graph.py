@@ -455,7 +455,7 @@ class GraphDB:
 
     def get_entity_slim(self, uid: str, visible: set[str] | None = None) -> dict | None:
         r = self.safe_execute(
-            "MATCH (e:Entity {uuid: $uid}) RETURN e.uuid, e.name, e.entity_type, e.description, e.scope",
+            "MATCH (e:Entity {uuid: $uid}) RETURN e.uuid, e.name, e.entity_type, e.description, e.scope, e.pinned",
             {"uid": uid},
         )
         if not (r and r.has_next()):
@@ -463,16 +463,16 @@ class GraphDB:
         row = r.get_next()
         if not self._scope_ok(row[4], visible):
             return None
-        return {"uuid": row[0], "name": row[1], "entity_type": row[2], "description": row[3], "scope": row[4]}
+        return {"uuid": row[0], "name": row[1], "entity_type": row[2], "description": row[3], "scope": row[4], "pinned": row[5]}
 
     def find_by_name(self, name: str, visible: set[str] | None = None) -> list[dict]:
         """Substring name match, scope-filtered. Used for exact-match resolution."""
         r = self.safe_execute(
             "MATCH (e:Entity) WHERE e.name =~ $rx "
-            "RETURN e.uuid, e.name, e.entity_type, e.description, e.scope LIMIT 25",
+            "RETURN e.uuid, e.name, e.entity_type, e.description, e.scope, e.pinned LIMIT 25",
             {"rx": f"(?i).*{_regex_escape(name)}.*"},
         )
-        out = self._rows_to_dicts(r, ["uuid", "name", "entity_type", "description", "scope"])
+        out = self._rows_to_dicts(r, ["uuid", "name", "entity_type", "description", "scope", "pinned"])
         return [e for e in out if self._scope_ok(e["scope"], visible)]
 
     def name_exists_in_scope(self, name: str, scope: str) -> str | None:
@@ -550,25 +550,40 @@ class GraphDB:
                 pinned_by_scope[pin] = pinned_by_scope.get(pin, 0) + 1
             if emb:
                 embedded += 1
-        edge_count = self._count_visible_edges(vis_uuids)
+        edge_count, alias_count, noisy_count = self._relation_breakdown(vis_uuids)
         return {
             "entity_count": entity_count,
             "edge_count": edge_count,
+            "alias_count": alias_count,
+            "noisy_count": noisy_count,
+            "regular_count": edge_count - alias_count - noisy_count,
             "pinned_by_scope": pinned_by_scope,
             "embedded_count": embedded,
             "by_type": by_type,
         }
 
-    def _count_visible_edges(self, vis_uuids: set[str]) -> int:
+    def _relation_breakdown(self, vis_uuids: set[str]) -> tuple[int, int, int]:
+        """Total visible edge count, split into aliases (ALIASED_TO) and
+        "noisy" (relation types listed in prompts/noisy_relationships.txt —
+        the same list format.py uses to drop chatter like MENTIONED/SAID/
+        KNOWS from detail=low output). Everything else is "regular"."""
         if not vis_uuids:
-            return 0
-        r = self.safe_execute("MATCH (a:Entity)-[:Relation]->(b:Entity) RETURN a.uuid, b.uuid")
-        n = 0
+            return 0, 0, 0
+        from TinyCTX.modules.memory.format import _load_noisy_relations
+        noisy_relations = _load_noisy_relations()
+
+        r = self.safe_execute("MATCH (a:Entity)-[r:Relation]->(b:Entity) RETURN a.uuid, b.uuid, r.relation")
+        total = alias = noisy = 0
         while r and r.has_next():
-            a, b = r.get_next()
-            if a in vis_uuids and b in vis_uuids:
-                n += 1
-        return n
+            a, b, rel = r.get_next()
+            if a not in vis_uuids or b not in vis_uuids:
+                continue
+            total += 1
+            if rel == "ALIASED_TO":
+                alias += 1
+            elif rel in noisy_relations:
+                noisy += 1
+        return total, alias, noisy
 
     # -- edge reads (both endpoints must be visible) ------------------------
 

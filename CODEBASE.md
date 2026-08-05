@@ -54,7 +54,7 @@ TinyCTX/
 │   └── workspace_setup.py
 │
 ├── custom_modules/     User-defined plugins, gitignored (same interface as modules/)
-│   └── anima/          generate_image_anima — always-on tool for Anima.json ComfyUI workflow
+│   └── anima/          generate_image_anima — deferred tool for Anima.json ComfyUI workflow (enable via tools_search or a skill's `tools:` field)
 └── modules/            Auto-discovered plugins (see Module System below)
     ├── cron/           Cron scheduler
     ├── ctx_tools/      Context manipulation tools (edit, delete turns)
@@ -66,7 +66,7 @@ TinyCTX/
     ├── present/        present() tool — delivers files to users via bridges
     ├── rag/            Semantic search over workspace/memory/ (BM25 or embeddings)
     ├── shell/          shell tool
-    ├── skills/         use_skill tool (loads SKILL.md files)
+    ├── skills/         use_skill tool (loads SKILL.md files; a skill's `tools:` frontmatter enables named deferred tools on load)
     ├── subagents/      spawn_agent / wait_agent tools
     ├── sysops/         User/permission management + /model command + set_active_model tool (per-branch LLM override, see below)
     ├── system_prompt/  Injects SOUL.md, AGENTS.md into system prompt
@@ -127,6 +127,8 @@ All cross-layer communication uses these frozen dataclasses/enums. No business l
 **Fixed bug (`/model` couldn't resolve caller identity):** `modules/sysops/__main__.py`'s `_resolve_model_caller()` read session state's `"author_id"` and passed it to `UserStore.get_by_platform(platform, author_id)`. But `"author_id"` in session state is the TinyCTX **username** (`runtime.py`'s `_compute_state_delta()` sets `mapping["author_id"] = msg.author.username`), while `get_by_platform` expects a platform-native user_id (Discord snowflake, etc.) as its second argument — a different key entirely, so the lookup essentially never matched and `/model` always reported "Cannot resolve your identity for this conversation." Fixed by looking the caller up via `runtime.users.get_user(author_id)` (username lookup) instead.
 
 **Fixed bug (agent.db path mismatch):** `AgentCycle.run()` and `gateway.handle_lane_branch()` previously opened their own `ConversationDB` at `workspace/agent.db`, while `Runtime` (which writes every inbound user node) uses `data/agent.db`. Since `workspace/` and `data/` are different directories, this meant every cycle read/wrote an effectively empty, wrong-path SQLite file — any `add_node(parent_id=...)` referencing a node `Runtime.push()` had actually written failed `FOREIGN KEY constraint failed` (the parent row only existed in the other file). Fixed: `agent.py` now opens `data/agent.db` (same as `runtime.py` and `modules/memory/__main__.py`, which were already correct); `gateway/__main__.py`'s `handle_lane_branch` now reuses `request.app["runtime"].db` instead of opening a second connection at all.
+
+**Memory entity formatting unified (`modules/memory/format.py`, new file):** `tools.py`'s `_format_entities` (used by `search_memory`) and `__main__.py`'s `_render_entity` (used by the `<memory>` injection block) were two separate, drifting formatters. Replaced both with `format.py`'s `format_entity()`/`format_entities()`, which support three detail levels — `low` (default; token-efficient, edges grouped by relation type, e.g. `USES: a, b`, incoming edges prefixed `< source: REL`, relations listed in `prompts/noisy_relationships.txt` dropped, description truncated at `memory.formatting.desc_truncate_chars`), `medium` (+ pinned/scope shown, noisy relations included, no truncation), `high` (+ uuid, created_at/updated_at, per-edge weights). `search_memory` now takes a `detail` param (default `"low"`); the `<memory>` block's detail is set by `memory.formatting.injection_detail` (default `"low"`). New config section `memory.formatting: {injection_detail, desc_truncate_chars}` in `EXTENSION_META["default_config"]` and `example.config.yaml`.
 
 ## Database (`db.py`)
 
@@ -361,6 +363,8 @@ Cursors (`dm:<uid>`, `group:<cid>`, `thread:<tid>`) are persisted in
 
 **Decay** is no longer an auto-deleter: the `decay_candidate` flagger surfaces stale/quiet/isolated nodes for the Reviewer to *assess* (absolute thresholds, never population-relative), so quiet-but-important data is never mechanically destroyed.
 
+**New flagger `edge_bloat` (`modules/memory/flaggers/edge_bloat.py`):** fires when an entity's edge count is disproportionate to its description length — `edges > flaggers.edge_bloat_min_edges` (default 10) AND `edges > desc_len / flaggers.edge_bloat_chars_per_edge` (default 10 chars/edge). Deliberately does NOT tell the reviewer to "clean up" or "reduce" relationships (that phrasing is how a reviewer ends up wiping everything indiscriminately) — instead the prompt names two specific failure modes to check each edge against: relations to a near-duplicate entity the embed/dedup pass missed (fix via `memory_merge_into`), and relations to transient/one-off data with no lasting relevance (fix via `memory_delete_relationship` on just that edge). Edges that don't match either pattern must be left alone.
+
 **Migration** (`migrate.py`): one-shot, runs when `graph.lbug` exists and `memory.lbug` doesn't; maps v1→v2 (everything → `global` scope, `pinned_target`→`pinned`, `mention_count`→`mention`, drops `priority`/`graph_*`, skips superseded edges, preserves embeddings only when the hash matches else lazy re-embed), verifies counts, then **renames** the old file to `.migrated.bak` (never deletes; `--purge` removes the backup, `--dry-run` writes nothing).
 
 Superseded modules `decay.py` / `dedup_agents.py` / `librarian_agents.py` are inert deprecation stubs (file deletion was unavailable in the authoring environment). Tests: `tests/test_memory.py` (16 pure-logic + fake-backed scope-isolation tests; live-DB paths need a ladybug + py3.14 environment).
@@ -392,7 +396,7 @@ Superseded modules `decay.py` / `dedup_agents.py` / `librarian_agents.py` are in
 
 ### `subagents` — `spawn_agent(prompt)` and `wait_agent(task_id)` for parallel side tasks on child branches.
 
-### `skills` — `use_skill(name)` tool. Loads `SKILL.md` from `workspace/skills/<name>/`. Follows agentskills.io convention.
+### `skills` — `use_skill(name)` tool. Loads `SKILL.md` from `workspace/skills/<name>/`. Follows agentskills.io convention. A skill's frontmatter may declare `tools: tool_a, tool_b` (comma-separated); loading that skill calls `tool_handler.enable()` on each name, letting a skill bring its own deferred tools online without a separate `tools_search` call. Unknown names are reported back, not silently dropped.
 
 ### `todo` — `todo_read` / `todo_write`. Session-scoped task checklist.
 

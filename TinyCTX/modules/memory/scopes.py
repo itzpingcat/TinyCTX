@@ -98,6 +98,29 @@ def resolve_scopes(env: dict, active_users: set[str]) -> set[str]:
     return visible
 
 
+def narrower(a: str, b: str, broad: str) -> str:
+    """
+    Pick the narrower of two scope-grammar values (used for both `scope` and
+    `pinned`, which share the grammar). `broad` is the value that means "no
+    restriction" for the field in question — GLOBAL for `scope`, `""` for
+    `pinned` (unpinned).
+
+    - equal -> either
+    - one is `broad` -> the other (a specific scope is always narrower than
+      no restriction at all)
+    - both specific and different -> genuinely incomparable (e.g. `user:alice`
+      vs `guild:foo`); arbitrarily keeps `a` since there's no ordering between
+      them, but this is a real ambiguity worth flagging at the call site.
+    """
+    if a == b:
+        return a
+    if a == broad:
+        return b
+    if b == broad:
+        return a
+    return a
+
+
 def writable_scopes(visible: set[str]) -> set[str]:
     """
     The scopes a librarian running in this cycle may WRITE to. Identical to the

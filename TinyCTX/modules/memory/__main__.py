@@ -31,6 +31,7 @@ import time
 from pathlib import Path
 
 from TinyCTX.modules.memory import scopes as _scopes
+from TinyCTX.modules.memory.format import format_entity
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +142,7 @@ class LibrarianRunner:
         librarian_cfg = self._cfg.get("librarian", {})
         max_concurrent = int(librarian_cfg.get("max_concurrent", 4))
         batch_size = int(librarian_cfg.get("batch_size", 20))
+        overlap_nodes = int(librarian_cfg.get("overlap_nodes", 5))
 
         # -- queue messages (targeted / branch / trigger / review) --
         while not self.queue.empty():
@@ -149,7 +151,8 @@ class LibrarianRunner:
             if mtype == "branch":
                 await self._dispatch_branch(msg.get("tail_node_id", "").strip(),
                                             run_extractor, resolve_extractor_scopes,
-                                            nodes_to_text, batch_size, max_concurrent)
+                                            nodes_to_text, batch_size, max_concurrent,
+                                            overlap_nodes)
             elif mtype == "review_front":
                 issue = msg.get("issue")
                 if issue:
@@ -167,7 +170,8 @@ class LibrarianRunner:
                 if len(self._active_tasks) >= max_concurrent:
                     break
                 await self._dispatch_branch(tail.id, run_extractor, resolve_extractor_scopes,
-                                            nodes_to_text, batch_size, max_concurrent)
+                                            nodes_to_text, batch_size, max_concurrent,
+                                            overlap_nodes)
 
         # -- reviewer cycle --
         reviewer_cfg = self._cfg.get("reviewer", {})
@@ -200,7 +204,7 @@ class LibrarianRunner:
             self._active_tasks.add(t)
 
     async def _dispatch_branch(self, tail_id, run_extractor, resolve_scopes_fn,
-                               nodes_to_text, batch_size, max_concurrent):
+                               nodes_to_text, batch_size, max_concurrent, overlap_nodes=0):
         if not tail_id or len(self._active_tasks) >= max_concurrent:
             return
         async with self._write_lock:
@@ -208,7 +212,8 @@ class LibrarianRunner:
         if not flagged:
             return
         ordered = list(reversed(flagged))
-        batch_text, agent_name = nodes_to_text(self._conv_db, ordered, batch_size)
+        overlap_ids = self._overlap_context(ordered[0], overlap_nodes) if overlap_nodes > 0 else []
+        batch_text, agent_name = nodes_to_text(self._conv_db, ordered, batch_size, overlap_ids)
         if not batch_text.strip():
             return
         authors = self._branch_authors(ordered[:batch_size])
@@ -221,6 +226,18 @@ class LibrarianRunner:
         self._active_tasks.add(t)
         logger.info("[memory/librarian] extractor dispatched for %d node(s), scopes=%s",
                     len(flagged), sorted(scope_set))
+
+    def _overlap_context(self, first_new_node_id: str, overlap_nodes: int) -> list[str]:
+        """
+        Return up to `overlap_nodes` already-visited ancestor node ids immediately
+        preceding first_new_node_id, oldest-first. Gives the extractor trailing
+        context for small/fragmented new batches without re-extracting them.
+        """
+        node = self._conv_db.get_node(first_new_node_id)
+        if node is None or node.parent_id is None:
+            return []
+        ancestors = self._conv_db.get_ancestors(node.parent_id)
+        return [n.id for n in ancestors[-overlap_nodes:]]
 
     def _branch_authors(self, node_ids) -> set:
         authors = set()
@@ -440,6 +457,11 @@ async def _build_memory_block(visible: set, last_user_text: str) -> str | None:
     passive_cfg = _cfg.get("passive_rag", {})
     budget = int(passive_cfg.get("memory_block_tokens", 2048))
     rag_enabled = bool(passive_cfg.get("enabled", True))
+    fmt_cfg = _cfg.get("formatting", {})
+    detail = fmt_cfg.get("injection_detail", "low")
+    if detail not in ("low", "medium", "high"):
+        detail = "low"
+    desc_trunc = int(fmt_cfg.get("desc_truncate_chars", 2500))
 
     def _tok(s: str) -> int:
         return len(s) // 4
@@ -469,7 +491,7 @@ async def _build_memory_block(visible: set, last_user_text: str) -> str | None:
     bump = float(passive_cfg.get("mention_bump", 0.1))
     bump_uids: list[str] = []
     for idx, (uid, e) in enumerate(ordered):
-        block = _render_entity(e)
+        block = format_entity(e, detail=detail, desc_truncate_chars=desc_trunc)
         cost = _tok(block) + 1
         if used + cost > budget:
             if idx < n_pinned:
@@ -515,20 +537,6 @@ async def _passive_rag_uuids(visible: set, query: str) -> list[str]:
 
     fused = _tools._rrf_fuse(bm25_ranks, vec_ranks, bm25_w=bm25_w, rrf_k=rrf_k)
     return [u for u, _ in fused[:top_k]]
-
-
-def _render_entity(e: dict) -> str:
-    name = e.get("e.name", "?")
-    et = e.get("e.entity_type", "?")
-    desc = e.get("e.description", "")
-    pin = e.get("e.pinned", "")
-    tag = "  [pinned]" if pin else ""
-    lines = [f"[{et}] {name}{tag} — {desc}"]
-    for edge in e.get("edges_out", []):
-        lines.append(f"  ->[{edge['relation']}]-> {edge['target_name']} (w={edge.get('weight')})")
-    for edge in e.get("edges_in", []):
-        lines.append(f"  <-[{edge['relation']}]<- {edge['source_name']} (w={edge.get('weight')})")
-    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------

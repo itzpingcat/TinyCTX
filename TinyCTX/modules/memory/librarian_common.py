@@ -35,38 +35,69 @@ def make_tool_handler():
     return handler
 
 
-def nodes_to_text(conv_db, node_ids: list[str], batch_size: int) -> tuple[str, str]:
+def _render_node(conv_db, node_id: str, sanitize_brackets):
+    """Return (author, content) for a node, or None if not renderable."""
+    node = conv_db.get_node(node_id)
+    if node is None or node.role not in ("user", "assistant"):
+        return None
+    author = node.author_id or node.role
+    content = node.content or ""
+    if content.startswith("["):
+        try:
+            blocks = json.loads(content)
+            content = " ".join(
+                b.get("text", "") for b in blocks
+                if isinstance(b, dict) and b.get("type") == "text"
+            )
+        except Exception:
+            pass
+    content = sanitize_brackets(content.strip())
+    if not content:
+        return None
+    return author, content, (node.role == "assistant" and node.author_id)
+
+
+def nodes_to_text(conv_db, node_ids: list[str], batch_size: int,
+                  overlap_node_ids: list[str] | None = None) -> tuple[str, str]:
     """
-    Render up to batch_size conversation nodes as '【author】: content' lines
-    (fullwidth brackets, matching context.py). Content is passed through
-    sanitize_brackets() so it cannot forge the delimiter (injection defense).
-    Returns (text, agent_name).
+    Render up to batch_size unread conversation nodes as '【author】: content'
+    lines (fullwidth brackets, matching context.py), optionally preceded by
+    overlap_node_ids — already-visited nodes rendered the same way but wrapped
+    in an <already_extracted> block so the extractor has trailing context for
+    small/fragmented new batches without re-extracting content from them.
+    Content is passed through sanitize_brackets() so it cannot forge the
+    delimiter (injection defense). Returns (text, agent_name).
     """
     from TinyCTX.utils.sanitize import sanitize_brackets
 
-    lines: list[str] = []
     agent_name = "assistant"
-    for node_id in node_ids[:batch_size]:
-        node = conv_db.get_node(node_id)
-        if node is None or node.role not in ("user", "assistant"):
-            continue
-        author = node.author_id or node.role
-        if node.role == "assistant" and node.author_id:
-            agent_name = node.author_id
-        content = node.content or ""
-        if content.startswith("["):
-            try:
-                blocks = json.loads(content)
-                content = " ".join(
-                    b.get("text", "") for b in blocks
-                    if isinstance(b, dict) and b.get("type") == "text"
-                )
-            except Exception:
-                pass
-        content = sanitize_brackets(content.strip())
-        if content:
+
+    def render(ids):
+        nonlocal agent_name
+        lines: list[str] = []
+        for node_id in ids:
+            rendered = _render_node(conv_db, node_id, sanitize_brackets)
+            if rendered is None:
+                continue
+            author, content, is_named_assistant = rendered
+            if is_named_assistant:
+                agent_name = author
             lines.append(f"【{author}】: {content}")
-    return "\n".join(lines), agent_name
+        return lines
+
+    overlap_lines = render(overlap_node_ids) if overlap_node_ids else []
+    new_lines = render(node_ids[:batch_size])
+
+    parts: list[str] = []
+    if overlap_lines:
+        parts.append(
+            "<already_extracted>\n"
+            "The following is prior context, already ingested into memory. "
+            "Do not extract from it again — use it only to correctly interpret "
+            "what follows.\n" + "\n".join(overlap_lines) + "\n</already_extracted>"
+        )
+    parts.append("\n".join(new_lines))
+    return "\n".join(p for p in parts if p.strip()), agent_name
 
 
 async def agent_loop(llm, system_prompt: str, user_prompt: str, handler, agent_logger,

@@ -20,7 +20,7 @@ dependencies = [
     "structlog",
     "tenacity",
     "ddgs",
-    "playwright",
+    "camoufox[geoip]",
     "pdfplumber",
     "python-docx",
     "Pillow",

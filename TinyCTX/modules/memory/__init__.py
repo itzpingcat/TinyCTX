@@ -21,6 +21,12 @@ EXTENSION_META = {
         # --- read-time weighting shared across flaggers ---
         "mention_half_life_days": 30,
 
+        # --- entity text formatting ---
+        "formatting": {
+            "injection_detail":     "low",   # detail level for the <memory> block
+            "desc_truncate_chars":  2500,    # low-detail description cutoff (0 = no truncation)
+        },
+
         # --- passive RAG + memory block ---
         "passive_rag": {
             "enabled":             True,
@@ -44,6 +50,7 @@ EXTENSION_META = {
         "librarian": {
             "trigger_interval_hours":     6,
             "batch_size":                 20,
+            "overlap_nodes":              5,
             "max_concurrent":             4,
             "model":                      "",
             "ingest_pressure_ratio":      0.5,
@@ -62,9 +69,12 @@ EXTENSION_META = {
         # --- reviewer flaggers ---
         "flaggers": {
             "max_edges_between":           4,
+            "edge_bloat_min_edges":        10,
+            "edge_bloat_chars_per_edge":   10,
             "desc_max_chars":              1200,
             "desc_min_chars":              15,
             "fuzzy_name_threshold":        95,
+            "false_alias_max_cosine":      0.5,
             "decay_min_effective_mention": 0.5,
             "decay_max_edges":             1,
             "decay_stale_days":            90,

@@ -1,0 +1,8 @@
+# Relation types considered "noisy" — omitted from entity output at detail=low.
+# One relation per line. Not consulted at detail=medium/high.
+MENTIONED
+SAID
+KNOWS
+WANTS_TO_KNOW
+WANTS_TO_TEACH
+RELATED_TO
