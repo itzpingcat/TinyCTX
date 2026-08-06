@@ -174,8 +174,10 @@ async def test_delete_relationship_directional(graph, detail):
         # KNOWS is in noisy_relationships.txt -> dropped entirely at low
         assert "KNOWS" not in a
     else:
-        # A->B deleted, B->A survives (shows as incoming on A)
-        assert "KNOWS: B" not in a and "B: KNOWS" in a
+        # A->B deleted, B->A survives (shows as incoming on A). At detail=high
+        # the incoming source name gets a "(w=...)" suffix before the colon.
+        assert "KNOWS: B" not in a
+        assert ("B: KNOWS" in a) or ("B(w=0.5): KNOWS" in a)
 
 
 # ---------------------------------------------------------------------------
