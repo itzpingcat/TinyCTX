@@ -141,44 +141,63 @@ async def test_relation_conflict_group_deletion(graph):
     assert "SUPERSEDES" in a and "DEPENDS_ON" not in a
 
 
-async def test_relation_weight_update_not_duplicated(graph):
+@pytest.mark.parametrize("detail", ["low", "medium", "high"])
+async def test_relation_weight_update_not_duplicated(graph, detail):
     with tools.scope_context({"global"}):
         await tools.memory_add_entity("A", "Concept", "a")
         await tools.memory_add_entity("B", "Concept", "b")
         await tools.memory_set_relationship("A", "B", "RELATED_TO", 0.3)
         out = await tools.memory_set_relationship("A", "B", "RELATED_TO", 0.8)
-        a = await tools.search_memory("A", top_k=1)
+        a = await tools.search_memory("A", top_k=1, detail=detail)
     assert "Updated" in out
-    assert a.count("RELATED_TO") == 1 and "w=0.8" in a
+    if detail == "low":
+        # RELATED_TO is in noisy_relationships.txt -> dropped entirely at low
+        assert "RELATED_TO" not in a
+    else:
+        assert a.count("RELATED_TO") == 1
+        if detail == "high":
+            assert "w=0.8" in a
+        else:
+            assert "w=" not in a
 
 
-async def test_delete_relationship_directional(graph):
+@pytest.mark.parametrize("detail", ["low", "medium", "high"])
+async def test_delete_relationship_directional(graph, detail):
     with tools.scope_context({"global"}):
         await tools.memory_add_entity("A", "Concept", "a")
         await tools.memory_add_entity("B", "Concept", "b")
         await tools.memory_set_relationship("A", "B", "KNOWS", 0.5)
         await tools.memory_set_relationship("B", "A", "KNOWS", 0.5)
         await tools.memory_delete_relationship("A", "B", "KNOWS")
-        a = await tools.search_memory("A", top_k=1)
-    # A->B deleted, B->A survives (shows as incoming on A)
-    assert "->[KNOWS]->" not in a and "<-[KNOWS]<-" in a
+        a = await tools.search_memory("A", top_k=1, detail=detail)
+    if detail == "low":
+        # KNOWS is in noisy_relationships.txt -> dropped entirely at low
+        assert "KNOWS" not in a
+    else:
+        # A->B deleted, B->A survives (shows as incoming on A)
+        assert "KNOWS: B" not in a and "B: KNOWS" in a
 
 
 # ---------------------------------------------------------------------------
 # Merge
 # ---------------------------------------------------------------------------
 
-async def test_merge_duplicate_reparents_and_deletes(graph):
+@pytest.mark.parametrize("detail", ["low", "medium", "high"])
+async def test_merge_duplicate_reparents_and_deletes(graph, detail):
     with tools.scope_context({"global"}):
         await tools.memory_add_entity("Canon", "Person", "canonical")
         await tools.memory_add_entity("Dup", "Person", "duplicate")
         await tools.memory_add_entity("Friend", "Person", "friend")
         await tools.memory_set_relationship("Dup", "Friend", "KNOWS", 0.7)
         out = await tools.memory_merge_into("Canon", "Dup", "merged", "duplicate")
-        canon = await tools.search_memory("Canon", top_k=1)
-        gone = await tools.search_memory("Dup", top_k=3)
+        canon = await tools.search_memory("Canon", top_k=1, detail=detail)
+        gone = await tools.search_memory("Dup", top_k=3, detail=detail)
     assert "Merged" in out
-    assert "->[KNOWS]-> Friend" in canon      # edge reparented
+    if detail == "low":
+        # KNOWS is in noisy_relationships.txt -> dropped entirely at low
+        assert "KNOWS" not in canon
+    else:
+        assert "KNOWS: Friend" in canon      # edge reparented
     assert "Dup" not in gone                    # duplicate deleted
 
 
