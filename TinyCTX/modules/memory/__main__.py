@@ -44,7 +44,6 @@ _graph_db = None
 _tools = None
 _cfg: dict = {}
 
-_memory_block_cache: dict = {"value": None}
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -590,11 +589,13 @@ def register_agent(cycle) -> None:
     cycle.post_turn_hooks.append(_pressure_hook)
 
     # passive memory block
+    cycle._memory_block = None
+
     async def _refresh_block(dialogue_snapshot):
         try:
             visible = _scopes.resolve_scopes(_cycle_env(cycle),
                                              _active_users(dialogue_snapshot, int(_cfg.get("pins", {}).get("user_scan", 3))))
-            _memory_block_cache["value"] = await _build_memory_block(visible, _last_user_text(dialogue_snapshot))
+            cycle._memory_block = await _build_memory_block(visible, _last_user_text(dialogue_snapshot))
         except Exception:
             logger.exception("[memory] refresh block failed")
 
@@ -604,5 +605,5 @@ def register_agent(cycle) -> None:
         await _refresh_block(list(cycle.context.dialogue))
 
     cycle.post_turn_hooks.append(_block_refresh_hook)
-    cycle.context.register_prompt("memory_block", lambda _ctx: _memory_block_cache["value"],
+    cycle.context.register_prompt("memory_block", lambda _ctx: cycle._memory_block,
                                   role="system", priority=int(_cfg.get("pins", {}).get("priority", 5)))
