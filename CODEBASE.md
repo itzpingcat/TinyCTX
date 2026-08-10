@@ -4,7 +4,7 @@
 
 ## What TinyCTX Is
 
-A context-efficient agentic assistant framework. You configure a language model, pick a bridge (CLI, Discord, or HTTP gateway), and get a persistent, tool-using AI agent with memory consolidation, scheduled heartbeats, subagent support, and web browsing.
+A context-efficient agentic assistant framework. You configure a language model, pick a bridge (CLI, Discord, or HTTP gateway), and get a persistent, tool-using AI agent with memory consolidation, scheduled heartbeats, concurrent forks, and web browsing.
 
 ---
 
@@ -57,6 +57,7 @@ TinyCTX/
 │   └── anima/          generate_image_anima — deferred tool for Anima.json ComfyUI workflow (enable via tools_search or a skill's `tools:` field)
 └── modules/            Auto-discovered plugins (see Module System below)
     ├── cron/           Cron scheduler
+    ├── concurrency/    Concurrent Forks — running-peer roster + spawn_fork / nudge_fork
     ├── ctx_tools/      Context manipulation tools (edit, delete turns)
     ├── equipment_manifest/  Agent's self-description of available tools
     ├── filesystem/     view / write_file / edit_file / grep / glob_search tools
@@ -67,7 +68,6 @@ TinyCTX/
     ├── rag/            Semantic search over workspace/memory/ (BM25 or embeddings)
     ├── shell/          shell tool
     ├── skills/         use_skill tool (loads SKILL.md files; a skill's `tools:` frontmatter enables named deferred tools on load)
-    ├── subagents/      spawn_agent / wait_agent tools
     ├── sysops/         User/permission management + /model command + set_active_model tool (per-branch LLM override, see below)
     ├── system_prompt/  Injects SOUL.md, AGENTS.md into system prompt
     ├── todo/           todo_read / todo_write tools (per-session task list)
@@ -322,6 +322,13 @@ new DB branch from the channel turn that spawned it. Both evolve independently.
 Cursors (`dm:<uid>`, `group:<cid>`, `thread:<tid>`) are persisted in
 `<instance>/data/cursors/discord.json` so sessions survive restarts.
 
+Concurrency: the bridge no longer buffers or serialises turns. Every trigger message
+gets its own `push()`; if a turn is already running for that cursor key, the new
+message forks off `settled_tail` instead of queueing behind it (see `concurrency`
+below). The cursor key doubles as the `session_key` that scopes fork rosters, and
+`CursorStore`'s cursor map is now a restart-persisted *mirror* of `Runtime._settled`
+rather than the authority — Runtime owns the attach point while the process lives.
+
 ### Gateway (`gateway/__main__.py`)
 - aiohttp HTTP server exposing `/v1/chat` (OpenAI-compat SSE)
 - `api_key` authentication
@@ -394,7 +401,26 @@ Superseded modules `decay.py` / `dedup_agents.py` / `librarian_agents.py` are in
 
 ### `web` — `web_search` (DuckDuckGo via `ddgs`) and `open_url` (Playwright, headless by default; `headless=False` for captchas).
 
-### `subagents` — `spawn_agent(prompt)` and `wait_agent(task_id)` for parallel side tasks on child branches.
+### `concurrency` — Concurrent Forks. Replaces the deleted `subagents` module; see `docs/PLAN.md` for the design of record.
+
+Many live `AgentCycle`s per conversation, peer-to-peer, no coordinator. Registers a `running_forks` roster prompt provider (role=user, so it re-renders outside the cached prefix on every `assemble()`) plus two tools:
+
+- `spawn_fork(prompt)` → `run_id`. Starts a run on a fresh branch off the caller's head. **There is no `wait_fork`** — blocking on a child is redundant, since the child's completion digest reaches the spawner either through its inbox (if still running) or through `settled_tail` (if not).
+- `nudge_fork(run_id, message)` — advisory, one-way, same-session-only message to a peer. No acks and no kill path, deliberately: request/response between forks is how a coordinator sneaks back in.
+
+The lifecycle lives in `runtime.py`, not here:
+
+- `Run` — in-memory handle per live cycle (`id`, `session_key`, `intent`, `root_node_id`, `status`, `inbox`). Never persisted; `run.id` is deliberately *not* a node id, which is what makes two concurrent cycles on one conversation representable.
+- `_settled: session_key → node_id` — the single node new inbound messages attach to. One attach rule covers both behaviours with no mode detection: nothing running means attaching is linear continuation; a run in flight means attaching is a fork. `push()` therefore advances `settled_tail` **only for passive messages** — a triggering message leaves it put so the next concurrent message is a sibling, not a child.
+- `finish_run()` advances `settled_tail` to the last finisher and fans a digest (intent + final text, no tools, no thinking, capped at 2000 chars) into every still-running peer in the same session. This makes "the last run to finish always has everything" true by construction, so no merge or reconciliation pass exists.
+- One `asyncio.Lock` per session serialises the *start* and *finish* transitions only — never cycle execution. Without it a run starting as another finishes could miss it permanently.
+- `Exogenous(kind, role, content)` is the single inbox entry type. Adding an event source is a new `kind`, not a new queue. `AgentCycle._drain_inbox()` runs at exactly two points: top of the outer loop before `assemble()`, and once before finalizing (which loops one more time if anything was written).
+
+Scoping is by `Run.session_key` (the bridge's cursor key: `dm:<uid>` / `group:<cid>` / `thread:<tid>`), **not** `SessionEnvironment` — the Discord bridge builds every DM's environment identically, so environment-scoped rosters would leak across DMs. Callers that pass no `session_key` (heartbeat, cron, the memory librarian) default to `msg.tail_node_id`, landing each push in its own degenerate session: linear attach, empty roster, no fan-out, invisible to real sessions.
+
+Capacity: `Runtime._semaphore` (`max_workers`, default 8) caps concurrent *execution*. There is no admission check — over-capacity runs queue on the semaphore rather than being dropped.
+
+Tests: `tests/test_concurrency.py` covers the attach rule, fan-out, the completeness invariant, the start/finish race, digest rendering, roster scoping, nudges, and the drain.
 
 ### `skills` — `use_skill(name)` tool. Loads `SKILL.md` from `workspace/skills/<name>/`. Follows agentskills.io convention. A skill's frontmatter may declare `tools: tool_a, tool_b` (comma-separated); loading that skill calls `tool_handler.enable()` on each name, letting a skill bring its own deferred tools online without a separate `tools_search` call. Unknown names are reported back, not silently dropped.
 

@@ -50,15 +50,26 @@ class AgentCycle:
         # immediately after the AgentToolResult for that tool call.
         self.outbound_events: list = []
 
+        # Concurrent Forks (docs/PLAN.md) — set in run(). The live Run handle
+        # this cycle is executing under; modules/concurrency reads
+        # agent.run.session_key to scope the roster/fan-out/nudges (§10).
+        self.run = None
+        self._runtime = None
+
     async def run(
         self,
-        node_id: str,
+        run,
         caller,
         abort_event: asyncio.Event | None = None,
+        runtime=None,
     ) -> AsyncIterator[AgentEvent]:
         if abort_event is None:
             abort_event = asyncio.Event()
 
+        node_id = run.root_node_id
+        self.run = run
+        run.cycle = self
+        self._runtime = runtime
         self.caller = caller
 
         # --- 1. Resource Setup (Lazy Loading) ---
@@ -125,13 +136,19 @@ class AgentCycle:
         no_reply = False
         agent_name: str | None = state.get("agent_name")
 
-        for cycle_num in range(max_cycles):
+        cycle_num = 0
+        while cycle_num < max_cycles:
             logger.debug("[agent] cycle %d, node %s", cycle_num + 1, node_id)
             if abort_event.is_set():
                 self._record_error_introspection("[aborted]")
                 meta["tail_node_id"] = self.context.tail_node_id
                 yield AgentError(message="[aborted]", **meta)
                 return
+
+            # R3 drain point 1 — top of the outer loop, before assemble(), so
+            # the next LLM call sees anything a peer fork or nudge delivered.
+            if self._drain_inbox():
+                meta["tail_node_id"] = self.context.tail_node_id
 
             # Context Assembly
             logger.debug("[agent] running async hooks")
@@ -180,6 +197,17 @@ class AgentCycle:
                     final_text = ""
                 else:
                     final_text = response_text
+
+                # R3 drain point 2 — once before finalizing. A peer may have
+                # finished while this run was streaming its final message; if
+                # the drain wrote anything, loop once more so the model can
+                # rewrite or confirm what it was about to say.
+                if self._drain_inbox():
+                    meta["tail_node_id"] = self.context.tail_node_id
+                    cycle_num += 1
+                    logger.debug("[agent] inbox drained pre-finalize, looping once more")
+                    continue
+
                 logger.debug("[agent] no tool calls, breaking loop")
                 break
 
@@ -213,6 +241,8 @@ class AgentCycle:
                     yield extra
                 self.outbound_events.clear()
 
+            cycle_num += 1
+
         logger.debug("[agent] yielding AgentTextFinal, streaming_active=%s", streaming_active)
         # meta["tail_node_id"] is the real assistant tail — yield it as-is so
         # bridges can advance their cursor to the correct node.
@@ -232,7 +262,31 @@ class AgentCycle:
             except Exception:
                 logger.exception("[agent] post-turn hook '%s' raised", getattr(hook, '__name__', hook))
 
+        # Concurrent Forks (docs/PLAN.md R2) — advance settled_tail to this
+        # run's head and fan the completion digest out to any peers still
+        # running in the same session.
+        if self._runtime is not None:
+            try:
+                await self._runtime.finish_run(self.run, final_text, final_tail)
+            except Exception:
+                logger.exception("[agent] finish_run raised for run %s", self.run.id)
+
     # --- Internal Helpers ---
+
+    def _drain_inbox(self) -> bool:
+        """
+        Drain self.run.inbox, writing each Exogenous entry as a node off the
+        current head. Returns True if anything was written (R3, docs/PLAN.md).
+        """
+        wrote = False
+        while True:
+            try:
+                exo = self.run.inbox.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            self.context.add(HistoryEntry(role=exo.role, content=exo.content))
+            wrote = True
+        return wrote
 
     def _record_error_introspection(self, message: str) -> None:
         """

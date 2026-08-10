@@ -11,6 +11,19 @@ bridge-internal bookkeeping, not agent-authored content):
                             Records which DB node a channel trigger message
                             produced, so thread forks can branch accurately.
                             Capped at MAX_MSG_NODES entries (LRU-style trim).
+
+Concurrent Forks (docs/PLAN.md §3.2, §7): during a live process, Runtime owns
+the *authoritative* settled_tail (Runtime._settled) — that's what push()
+attaches new messages to and what finish_run() advances, under its own
+session lock, scoped to session_key. This store's cursor map is kept as a
+restart-persisted mirror of it: the bridge seeds Runtime._settled from here
+on the first push() for a session_key (see DiscordBridge._get_or_create_cursor
+/ _get_or_create_thread_cursor), and keeps writing the latest known tail back
+here after each turn, so a bot restart doesn't lose conversation continuity.
+Slash commands (commands.py) that need "the current cursor" outside of a live
+AgentCycle (e.g. /model) also read/write this map directly, since they have
+no Run to go through. It is not consulted for fork/attach decisions once
+Runtime has a session_key's settled_tail loaded into memory.
 """
 from __future__ import annotations
 
@@ -41,7 +54,8 @@ class CursorStore:
         self._msg_nodes: dict[str, str] = self._load(self._msg_node_file)
 
     # ------------------------------------------------------------------
-    # Cursor map (cursor_key -> node_id)
+    # Cursor map (cursor_key -> node_id) — restart-persisted mirror of
+    # Runtime._settled; see module docstring.
     # ------------------------------------------------------------------
 
     def get(self, cursor_key: str) -> str | None:
@@ -59,9 +73,9 @@ class CursorStore:
         return dict(self._cursors)
 
     # ------------------------------------------------------------------
-    # Reconciliation — drop cursors pointing at nodes that no longer
-    # exist in the DB (e.g. agent.db was deleted/replaced out from under
-    # the bot, so old node_ids are now dangling).
+    # Reconciliation — drop cursor / msg-node entries pointing at nodes
+    # that no longer exist in the DB (e.g. agent.db was deleted/replaced
+    # out from under the bot, so old node_ids are now dangling).
     # ------------------------------------------------------------------
 
     def reconcile(self, db) -> None:

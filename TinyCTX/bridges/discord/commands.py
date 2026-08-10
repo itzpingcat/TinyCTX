@@ -225,9 +225,12 @@ async def handle_reset_interaction(
 
     if cursor_key:
         bridge._reset_epoch[cursor_key] = bridge._reset_epoch.get(cursor_key, 0) + 1
-        bridge._pending.pop(cursor_key, None)
         new_node_id = make_session_node(bridge._runtime.db, cursor_key)
         bridge._store.set(cursor_key, new_node_id)
+        # Runtime owns the live settled_tail during this process (docs/PLAN.md
+        # §3.2) — reseed it too, or the next push() would still attach past
+        # the old branch instead of the fresh one just created.
+        bridge._runtime.seed_session(cursor_key, new_node_id)
         logger.info(
             "Discord: session reset by %s — new branch %s for %s",
             interaction.user.id, new_node_id, cursor_key,

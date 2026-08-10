@@ -1,6 +1,6 @@
 # PLAN: Concurrent Forks
 
-**Status:** design of record. Supersedes the root-level `PLAN.md`
+**Status:** implemented. Design of record. Supersedes the root-level `PLAN.md`
 ("Interleaved Interruptions v4"), which is deleted — see
 [What This Replaces](#what-this-replaces).
 
@@ -84,7 +84,6 @@ class Run:
     root_node_id:  str
     status:        str                  # running | done | failed | aborted
     started_at:    float
-    hidden:        bool                 # excluded from the roster; see §10.2
     inbox:         asyncio.Queue        # Exogenous events, see 3.3
     cycle:         AgentCycle | None    # for live head reads
 ```
@@ -206,6 +205,14 @@ t=3  C finishes → settled_tail = C.head; no peers
 C.head chain = C-full + digest(A) + digest(B)
 ```
 
+**Known limitation: failed runs.** A run that aborts or errors does not advance
+`settled_tail` and does not fan out a digest — nothing meaningful happened, so
+there is nothing to inherit. The consequence is that "the last run to finish has
+everything" is a statement about the last run to finish *successfully*. If the
+final run crashes, the tail stays at the previous successful head and that run's
+branch is unreferenced history. Accepted as-is; revisit only if crashed final
+runs turn out to lose work worth recovering.
+
 Nothing is lost. A and B's full transcripts stay addressable on their own
 branches; a future turn that needs more than the digest can HEAD-jump to them.
 Nothing is ever force-merged, and nothing is canonical by default.
@@ -245,17 +252,28 @@ start and finish transitions are serialized.
 
 - `_runs: dict[str, Run]`, `_settled: dict[str, str]` (session_key → node_id),
   `_session_locks: dict[str, asyncio.Lock]`.
-- `start_run(session_key, …, parent: Run | None, hidden: bool) -> Run` — under
-  the session lock: resolve `settled_tail`, create the `Run`, register it. When
-  `parent` is given (`spawn_fork`), inherit its `session_key` rather than
-  minting a new one — see §10.2.
-- `finish_run(run, final_text)` — under the session lock: advance
+- `start_run(session_key, prompt, branch_from, caller, *, parent: Run | None) -> Run`
+  — under the session lock: write the run's root node as a branch off
+  `branch_from`, create the `Run`, register it. The node write is inside the lock
+  so every start transition serialises against `finish_run`'s fan-out, exactly as
+  `push()`'s does. When `parent` is given (`spawn_fork`), inherit its
+  `session_key` rather than minting a new one — see §10.2.
+- `finish_run(run, final_text, head_node_id)` — under the session lock: advance
   `settled_tail`, fan out digests (R2).
 - `runs_in_session(session_key)` — for the roster provider and fan-out.
 - `push()` attaches to `settled_tail` and spawns a run rather than taking a
-  node id from the bridge.
-- Fix the capacity check at the top of `push()`: it reads the private
-  `self._semaphore._value` and is evaluated before acquiring, so it is racy.
+  node id from the bridge. It advances `settled_tail` **only for passive
+  (non-trigger) messages**, which are plain linear continuation; a triggering
+  message leaves it put, because §3.2 defines a fork as attaching while
+  `settled_tail` has not advanced past the running run's root. Advancing to the
+  new user node would make the next concurrent message that run's *child*
+  rather than its sibling. `finish_run` is the only thing that moves the tail
+  past a run.
+- Delete the capacity check at the top of `push()`: it read the private
+  `self._semaphore._value`, was evaluated before acquiring, and rejected work the
+  semaphore would have queued anyway. `_process` already gates on the semaphore,
+  so over-capacity runs wait for a slot instead of being dropped. `max_workers`
+  caps concurrent *execution*, not how much work may be accepted.
 
 ### `AgentCycle` (`agent.py`)
 
@@ -282,8 +300,7 @@ Absorbs everything `modules/subagents` did, in roughly a third of the code.
   ```
 
   The provider reads `_runtime.runs_in_session(agent.run.session_key)` and
-  filters out self, anything not running, and anything `hidden` (§10), then
-  renders one line per run. `register_prompt` already re-invokes the provider on
+  filters out self and anything not running (§10), then renders one line per run. `register_prompt` already re-invokes the provider on
   every `assemble()`, so freshness is automatic. `role=ROLE_USER` places it in
   the deferred-footer position outside the cached prefix — same reason
   `equipment_manifest_footer` exists, and correct here because the roster
@@ -429,11 +446,21 @@ their siblings and to the fork that spawned them — they would each be their ow
 session of one. `start_run` takes the parent `Run` when there is one and copies
 the key.
 
-**`hidden` runs.** Some cycles share a session but are internal noise:
-`modules/heartbeat` pushes with `Platform.CRON`, and the memory librarian runs
-its own cycles. These should not appear in the roster or receive digests. One
-boolean on `Run`, set at `start_run`, filtered by the provider. Not speculative
-— heartbeat exists today and will otherwise show up in every roster render.
+**Internal cycles stay out of rosters.** Some cycles are internal noise:
+`modules/heartbeat` pushes with `Platform.CRON`, `modules/cron` pushes scheduled
+turns, and the memory librarian runs its own. These should not appear in the
+roster or receive digests.
+
+This was originally specced as a `hidden` boolean on `Run`, set at `start_run`
+and filtered by the provider. **Implemented without it.** Those callers pass no
+`session_key`, which defaults to `msg.tail_node_id` — a caller-computed value
+that differs on essentially every call. Each such push therefore lands in its own
+degenerate session of one: linear attach, empty roster, no fan-out, invisible to
+every real session. The flag would have been a second mechanism enforcing what
+not minting a shared key already enforces.
+
+The rule this leaves behind: **a caller that wants to participate in a session's
+roster must pass that session's key.** Anything internal simply doesn't.
 
 ---
 
@@ -522,23 +549,23 @@ digest. The completeness invariant is unaffected.
 
 ## 12. Open Decisions
 
-1. **Role of an injected digest node.** Assistant-role is literally true (same
-   agent) and the existing adjacent-merge in `context.py` handles
-   assistant-after-assistant; it reads naturally on the trunk for future turns.
-   User-role with an explicit `[fork 3 finished] …` wrapper is safer with
-   OpenAI-compat backends and makes it unambiguous to a *peer* that this
-   happened elsewhere rather than something it said. Likely different answers
-   for the trunk versus the peer inject. Decide by reading real transcripts.
+1. ~~**Role of an injected digest node.**~~ **Settled: user-role with an explicit
+   `[fork abc12345 finished — intent: …]` wrapper**, for both digests and nudges.
+   Safer with OpenAI-compat backends, and unambiguous to a peer that this
+   happened elsewhere rather than being something it said. The plan anticipated
+   possibly wanting different answers for the trunk versus the peer inject; one
+   role is used for both until real transcripts show a reason to split them.
 
-2. **Module state assuming one live cycle.** `agent._subagent_tasks`,
-   `modules/todo`'s per-session list, and module-global `_runtime` references
-   all predate concurrency. Audit before enabling N runs — `todo` especially,
-   since "session" there probably means something scalar.
+2. **Module state assuming one live cycle.** *Still open — not audited.*
+   `modules/todo`'s per-session list and module-global `_runtime` references
+   predate concurrency. `todo` especially, since "session" there probably means
+   something scalar. (`agent._subagent_tasks` is gone with `modules/subagents`.)
 
-3. **Digest length policy.** Currently "final output, no tools, no thinking."
-   Unbounded if a fork's final message is long. May need truncation, and if so
-   it should share one `render(run, level)` function with any future
-   full-transcript recall so the two do not diverge.
+3. ~~**Digest length policy.**~~ **Partly settled:** final output, no tools, no
+   thinking, truncated at `_DIGEST_MAX_CHARS` (2000) in
+   `Runtime._render_digest`. Still open: if full-transcript recall is ever
+   added, it must share one `render(run, level)` function with this so the two
+   projections do not diverge.
 
 4. **Multiple concurrent streams into one Discord channel.** Sending is
    milliseconds and each stream is its own message, so this is cosmetic rather
