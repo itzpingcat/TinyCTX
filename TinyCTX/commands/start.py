@@ -145,19 +145,7 @@ def run(args: argparse.Namespace) -> None:
 
     try:
         subprocess.run(
-            # --build makes `up` check the Docker layer cache on every start
-            # and only actually rebuild what changed (e.g. after editing
-            # Dockerfile) — cheap no-op when nothing changed. --progress=quiet
-            # suppresses the build log itself, since --progress=tty's compact
-            # bar isn't reliable here: Compose falls back to plain, per-layer
-            # output whenever stdout isn't a real interactive TTY (true for a
-            # subprocess call), and on some Compose/Desktop versions --progress
-            # tty has been reported to error outright on Windows for the same
-            # reason. quiet is a documented, TTY-independent flag: silent on
-            # success (including a real rebuild), while `check=True` still
-            # surfaces Docker's own error output if the build fails.
-            ["docker", "compose", "-f", str(_COMPOSE_FILE), "-p", project_name,
-             "--progress", "quiet", "up", "-d", "--build"],
+            ["docker", "compose", "-f", str(_COMPOSE_FILE), "-p", project_name, "up", "-d"],
             cwd=_REPO_ROOT,
             env=env,
             check=True,
