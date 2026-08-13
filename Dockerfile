@@ -2,8 +2,15 @@
 FROM python:3.14-rc-slim
 
 # --- env -------------------------------------------------------------------
-# Camoufox installs its browser under $HOME/.cache/camoufox
 ENV HOME=/home/tinyctx
+
+# Camoufox resolves its cache dir via platformdirs.user_cache_dir("camoufox"),
+# which honors XDG_CACHE_HOME before falling back to $HOME/.cache. Since
+# /home/tinyctx is a bind-mount target at runtime (compose.yaml mounts the
+# host workspace over it), anything camoufox fetches under $HOME/.cache during
+# the build would be shadowed once the container starts. Point XDG_CACHE_HOME
+# at a path outside any mounted volume so the fetched browser survives.
+ENV XDG_CACHE_HOME=/opt/camoufox-cache
 
 # --- system deps -----------------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -21,6 +28,7 @@ RUN groupadd -r tinyctx && useradd -r -g tinyctx -d /home/tinyctx -m -s /sbin/no
 WORKDIR /app
 
 # --- camoufox (pinned first so it never re-runs when other deps change) ----
+RUN mkdir -p /opt/camoufox-cache
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install "camoufox[geoip]" && camoufox fetch
 
@@ -34,7 +42,7 @@ RUN pip install --no-cache-dir -e .
 RUN mkdir -p /etc/tinyctx && chown tinyctx:tinyctx /etc/tinyctx
 
 # --- permissions -----------------------------------------------------------
-RUN chown -R tinyctx:tinyctx /home/tinyctx
+RUN chown -R tinyctx:tinyctx /home/tinyctx /opt/camoufox-cache
 
 USER tinyctx
 
