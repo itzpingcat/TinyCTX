@@ -4,6 +4,8 @@ attachments:
   uploads_dir: uploads
 bridges: {}
 command_introspection: false
+concurrency:
+  roster_priority: 13
 cron:
   store_file: CRON.json
 ctx_tools:
@@ -79,6 +81,7 @@ memory:
     desc_min_chars: 15
     edge_bloat_chars_per_edge: 10
     edge_bloat_min_edges: 10
+    false_alias_max_cosine: 0.5
     fuzzy_name_threshold: 95
     max_edges_between: 4
   formatting:
@@ -90,7 +93,9 @@ memory:
     ingest_pressure_min_tokens: 500
     ingest_pressure_ratio: 0.5
     max_concurrent: 4
+    max_cycles: 40
     model: ''
+    overlap_nodes: 5
     trigger_interval_hours: 6
   librarian_log: memory/librarian.log
   mention_half_life_days: 30
@@ -172,10 +177,6 @@ skills:
   skill_dirs:
   - skills
   tools: {}
-subagents:
-  completed_ttl_seconds: 900.0
-  max_concurrent: 4
-  prompt_priority: 13
 sysops:
   model_min_permission: 75
 system_prompt:
@@ -188,8 +189,6 @@ system_prompt:
   tools:
     file: TOOLS.md
     priority: 15
-todo:
-  prompt_priority: 8
 token_fuzz: 1.1
 tool_overrides: {}
 web:

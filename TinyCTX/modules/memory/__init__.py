@@ -55,6 +55,7 @@ EXTENSION_META = {
             "model":                      "",
             "ingest_pressure_ratio":      0.5,
             "ingest_pressure_min_tokens": 500,
+            "max_cycles":                 40,   # tool-call loop cap for librarian subagents (extractor/reviewer/deduper)
         },
 
         # --- reviewer ---

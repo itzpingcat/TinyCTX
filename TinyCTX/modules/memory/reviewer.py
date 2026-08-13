@@ -159,6 +159,7 @@ async def run_reviewer_cycle(cfg, graph_db, conn, write_lock, llm, queue: Review
     base = float(reviewer_cfg.get("base_delay", 30))
     min_delay = float(reviewer_cfg.get("min_delay", 2))
     target = int(reviewer_cfg.get("target_len", 10))
+    max_cycles = int(cfg.get("librarian", {}).get("max_cycles", 40))
     vocab = await _tools.relation_vocab()
 
     while True:
@@ -173,7 +174,8 @@ async def run_reviewer_cycle(cfg, graph_db, conn, write_lock, llm, queue: Review
             system = _read("reviewer_system.txt").format(relation_vocab=vocab)
             scope_set = {issue.get("scope", "global"), "global"}
             with _tools.scope_context(scope_set):
-                await agent_loop(llm, system, instruction, make_tool_handler(), agent_logger)
+                await agent_loop(llm, system, instruction, make_tool_handler(), agent_logger,
+                                 max_cycles=max_cycles)
         except Exception as exc:
             logger.warning("[memory/reviewer] processing issue failed: %s", exc)
         await asyncio.sleep(_tools.throttle_delay(len(queue), base=base, min_delay=min_delay, target=target))

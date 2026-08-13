@@ -101,7 +101,7 @@ def nodes_to_text(conv_db, node_ids: list[str], batch_size: int,
 
 
 async def agent_loop(llm, system_prompt: str, user_prompt: str, handler, agent_logger,
-                     max_cycles: int = 20) -> None:
+                     max_cycles: int = 40) -> None:
     """Manual tool-calling loop. Caller is responsible for having bound the
     scope contextvar (tools.scope_context) before invoking this."""
     from TinyCTX.ai import TextDelta, ToolCallAssembled, LLMError
