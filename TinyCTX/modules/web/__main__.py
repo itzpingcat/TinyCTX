@@ -464,7 +464,13 @@ async def _ensure_page(agent):
         return st["page"]
 
     headless = st.get("_headless", True)
-    camoufox = AsyncCamoufox(headless=headless)
+    # The container runs with cap_drop: ALL and no-new-privileges:true (see
+    # compose.yaml), so Firefox's own content-process sandbox can't create a
+    # user namespace (clone(CLONE_NEWUSER) -> EPERM) and the browser fails to
+    # start. Docker's network/filesystem isolation plus our cap_drop already
+    # provide the containment that Firefox's sandbox would add, so it's safe
+    # to disable it here with --no-sandbox.
+    camoufox = AsyncCamoufox(headless=headless, args=["--no-sandbox"])
     browser = await camoufox.__aenter__()
     page = await browser.new_page()
 
