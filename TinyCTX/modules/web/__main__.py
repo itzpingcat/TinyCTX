@@ -542,7 +542,15 @@ def _screenshot_path(st: dict, filename: Optional[str]) -> Path | str:
         safe_name = f"screenshot_{int(time.time())}.png"
     if not safe_name.lower().endswith(".png"):
         safe_name += ".png"
-    out_dir = st["output_dir"].resolve()
+    out_dir = st["output_dir"]
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return (
+            f"Error: could not create the screenshot directory {out_dir}: {exc}. "
+            "Check that the workspace is writable by the container user."
+        )
+    out_dir = out_dir.resolve()
     path = (out_dir / safe_name).resolve()
     if not str(path).startswith(str(out_dir)):
         return "Error: filename escapes the output directory"
@@ -777,8 +785,12 @@ def register_agent(agent) -> None:
     cfg = {**cfg, **{k: v for k, v in runtime_web_cfg.items() if k != "tools"}}
 
     workspace  = Path(agent.config.workspace.path).expanduser().resolve()
+    # NOT created here. The workspace is a bind mount owned by the host UID, so
+    # creating a new top-level dir can raise PermissionError for the container
+    # user — and register_agent exceptions are swallowed by module_registry,
+    # which would silently drop every tool in this module. Created on demand at
+    # screenshot time instead (same as custom_modules/anima).
     output_dir = workspace / cfg.get("output_dir", "outputs/browser")
-    output_dir.mkdir(parents=True, exist_ok=True)
 
     st = _state(agent)
     st["output_dir"] = output_dir
