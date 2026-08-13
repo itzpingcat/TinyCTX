@@ -52,8 +52,14 @@ class AgentCycle:
 
         # Concurrent Forks (docs/PLAN.md) — set in run(). The live Run handle
         # this cycle is executing under; modules/concurrency reads
-        # agent.run.session_key to scope the roster/fan-out/nudges (§10).
-        self.run = None
+        # agent.active_run.session_key to scope the roster/fan-out/nudges (§10).
+        #
+        # NOTE: this must NOT be named `self.run`. Functions are non-data
+        # descriptors, so an instance attribute of that name shadows the
+        # run() async generator below — `agent.run(...)` then resolves to the
+        # Run dataclass (or None) and raises TypeError before a single cycle
+        # executes. See tests/test_agent_run_not_shadowed.py.
+        self.active_run = None
         self._runtime = None
 
     async def run(
@@ -67,7 +73,7 @@ class AgentCycle:
             abort_event = asyncio.Event()
 
         node_id = run.root_node_id
-        self.run = run
+        self.active_run = run
         run.cycle = self
         self._runtime = runtime
         self.caller = caller
@@ -267,21 +273,21 @@ class AgentCycle:
         # running in the same session.
         if self._runtime is not None:
             try:
-                await self._runtime.finish_run(self.run, final_text, final_tail)
+                await self._runtime.finish_run(self.active_run, final_text, final_tail)
             except Exception:
-                logger.exception("[agent] finish_run raised for run %s", self.run.id)
+                logger.exception("[agent] finish_run raised for run %s", self.active_run.id)
 
     # --- Internal Helpers ---
 
     def _drain_inbox(self) -> bool:
         """
-        Drain self.run.inbox, writing each Exogenous entry as a node off the
+        Drain self.active_run.inbox, writing each Exogenous entry as a node off the
         current head. Returns True if anything was written (R3, docs/PLAN.md).
         """
         wrote = False
         while True:
             try:
-                exo = self.run.inbox.get_nowait()
+                exo = self.active_run.inbox.get_nowait()
             except asyncio.QueueEmpty:
                 break
             self.context.add(HistoryEntry(role=exo.role, content=exo.content))

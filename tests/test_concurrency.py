@@ -491,7 +491,7 @@ class TestDrain:
 
         cycle = AgentCycle(config, module_registry=None)
         cycle.context = _RecordingContext()
-        cycle.run = Run(id="r1", session_key="dm:1", intent="i", root_node_id="n1")
+        cycle.active_run = Run(id="r1", session_key="dm:1", intent="i", root_node_id="n1")
         return cycle
 
     def test_drain_on_empty_inbox_reports_nothing_written(self, config):
@@ -501,8 +501,8 @@ class TestDrain:
 
     def test_drain_writes_each_entry_as_a_node(self, config):
         cycle = self._cycle(config)
-        cycle.run.inbox.put_nowait(Exogenous("fork_finished", "user", "fork 1 done"))
-        cycle.run.inbox.put_nowait(Exogenous("nudge", "user", "please stop"))
+        cycle.active_run.inbox.put_nowait(Exogenous("fork_finished", "user", "fork 1 done"))
+        cycle.active_run.inbox.put_nowait(Exogenous("nudge", "user", "please stop"))
 
         assert cycle._drain_inbox() is True
         assert [e.content for e in cycle.context.entries] == ["fork 1 done", "please stop"]
@@ -510,13 +510,13 @@ class TestDrain:
 
     def test_drain_empties_the_inbox(self, config):
         cycle = self._cycle(config)
-        cycle.run.inbox.put_nowait(Exogenous("nudge", "user", "x"))
+        cycle.active_run.inbox.put_nowait(Exogenous("nudge", "user", "x"))
         cycle._drain_inbox()
-        assert cycle.run.inbox.empty()
+        assert cycle.active_run.inbox.empty()
         assert cycle._drain_inbox() is False
 
     def test_drain_advances_the_context_tail(self, config):
         cycle = self._cycle(config)
-        cycle.run.inbox.put_nowait(Exogenous("nudge", "user", "x"))
+        cycle.active_run.inbox.put_nowait(Exogenous("nudge", "user", "x"))
         cycle._drain_inbox()
         assert cycle.context.tail_node_id == "tail-1"

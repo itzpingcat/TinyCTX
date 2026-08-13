@@ -9,7 +9,7 @@ register_agent(cycle) — per AgentCycle:
      equipment_manifest_footer exists).
   2. Register spawn_fork and nudge_fork tools.
 
-Both tools resolve peers through agent.run.session_key — neither can reach
+Both tools resolve peers through agent.active_run.session_key — neither can reach
 outside the session (§10.1). This module absorbs everything modules/subagents
 did; spawn_fork replaces spawn_agent/wait_agent — there is no wait_agent
 equivalent, and nothing replaces it (§9.1).
@@ -41,11 +41,11 @@ def _format_run_line(run) -> str:
 
 def _running_forks_provider(cycle):
     def provider(_ctx):
-        if _runtime is None or cycle.run is None:
+        if _runtime is None or cycle.active_run is None:
             return None
         peers = [
-            r for r in _runtime.runs_in_session(cycle.run.session_key)
-            if r.id != cycle.run.id and r.status == "running"
+            r for r in _runtime.runs_in_session(cycle.active_run.session_key)
+            if r.id != cycle.active_run.id and r.status == "running"
         ]
         if not peers:
             return None
@@ -62,7 +62,7 @@ def register_agent(agent) -> None:
     if _runtime is None:
         logger.error("[concurrency] register_agent before register_runtime — skipping")
         return
-    if agent.run is None:
+    if agent.active_run is None:
         # Defensive: every AgentCycle.run() call passes a Run handle now, but
         # skip cleanly rather than crashing if something odd wires this in
         # without one.
@@ -100,11 +100,11 @@ def register_agent(agent) -> None:
 
         # start_run writes the branch node itself, under the session lock (§6).
         run = await _runtime.start_run(
-            agent.run.session_key,
+            agent.active_run.session_key,
             prompt,
             agent.context.tail_node_id,
             agent.caller,
-            parent=agent.run,
+            parent=agent.active_run,
         )
         return json.dumps({"status": "ok", "run_id": run.id})
 
@@ -121,7 +121,7 @@ def register_agent(agent) -> None:
         message = (message or "").strip()
         if not message:
             return json.dumps({"status": "error", "error": "nudge_fork requires a non-empty message."})
-        ok = _runtime.nudge(run_id, agent.run, message)
+        ok = _runtime.nudge(run_id, agent.active_run, message)
         if not ok:
             return json.dumps({"status": "error", "error": "That fork already completed (or is unknown)."})
         return json.dumps({"status": "ok"})

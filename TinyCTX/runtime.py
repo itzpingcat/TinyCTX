@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from TinyCTX.config import Config
-from TinyCTX.contracts import InboundMessage, SessionEnvironment
+from TinyCTX.contracts import AgentError, InboundMessage, SessionEnvironment
 from TinyCTX.users import UserStore
 from TinyCTX.utils.attachments import build_content_blocks as _build_content_blocks
 from TinyCTX.db import ConversationDB
@@ -414,6 +414,19 @@ class Runtime:
                 peer.inbox.put_nowait(Exogenous(kind="fork_finished", role="user", content=notice))
             self._runs.pop(run.id, None)
 
+    async def _abandon_run(self, run: Run) -> None:
+        """
+        Failure/abort counterpart to finish_run: advance settled_tail past a
+        run that died without producing a digest, so the session keeps moving
+        instead of stranding every later message on the dead run's parent.
+        No fan-out — nothing meaningful happened to tell peers about.
+        """
+        cycle = run.cycle
+        head = getattr(getattr(cycle, "context", None), "tail_node_id", None) or run.root_node_id
+        lock = self._session_lock(run.session_key)
+        async with lock:
+            self._settled[run.session_key] = head
+
     def nudge(self, target_id: str, from_run: Run, message: str) -> bool:
         """
         Advisory, one-way, same-session-only message from one running fork to
@@ -466,9 +479,19 @@ class Runtime:
                         await reply_queue.put(event)
 
                 logger.debug("[runtime] cycle complete for run %s", run.id)
-            except Exception:
+            except Exception as exc:
                 logger.exception("Cycle failed for run %s", run.id)
                 run.status = "failed"
+                # Surface it. Without this the bridge drains an empty queue,
+                # hits the sentinel, and sends nothing — a crashed cycle is
+                # indistinguishable from the agent choosing not to reply.
+                if reply_queue is not None:
+                    await reply_queue.put(AgentError(
+                        message=f"Cycle failed: {type(exc).__name__}: {exc}",
+                        trace_id=run.id,
+                        reply_to_message_id="synthetic",
+                        tail_node_id=run.root_node_id,
+                    ))
             finally:
                 self._active -= 1
                 self._abort_events.pop(run.root_node_id, None)
@@ -479,6 +502,13 @@ class Runtime:
                 # linger in _runs forever either way.
                 if run.status == "running":
                     run.status = "aborted" if abort_event.is_set() else "failed"
+                if run.status != "done":
+                    # finish_run (R2) never ran, so settled_tail is still
+                    # parked at this run's parent. Leaving it there makes
+                    # every subsequent message fork off the same stale node
+                    # forever — the session stops advancing. Release it to
+                    # the furthest node this run actually wrote.
+                    await self._abandon_run(run)
                 self._runs.pop(run.id, None)
                 if reply_queue is not None:
                     await reply_queue.put(None)  # sentinel: turn complete
