@@ -387,10 +387,17 @@ class AgentCycle:
         # higher-level run() loop inject a follow-up user turn with the image.
         if not is_error and raw_output.startswith(IMAGE_BLOCK_PREFIX):
             try:
-                payload = raw_output[len(IMAGE_BLOCK_PREFIX):]  # Format: "mime;base64data"
+                payload = raw_output[len(IMAGE_BLOCK_PREFIX):]  # Format: "mime;base64data[\ncaption]"
                 sep = payload.index(";")
                 mime = payload[:sep]
                 b64data = payload[sep + 1:]
+
+                # Optional caption after a newline. base64 never contains one,
+                # so this is unambiguous and older callers that omit it still work.
+                caption = ""
+                if "\n" in b64data:
+                    b64data, caption = b64data.split("\n", 1)
+                    caption = caption.strip()
 
                 _conversion_failed = False
 
@@ -428,7 +435,10 @@ class AgentCycle:
                         return ToolResult(
                             call_id=call.call_id,
                             tool_name=call.tool_name,
-                            output=f"[{mime} — see attached image below]",
+                            output=(
+                                f"[{mime} — see attached image below]"
+                                + (f"\n{caption}" if caption else "")
+                            ),
                             is_error=False,
                             is_image=True,
                             image_mime=mime,

@@ -195,8 +195,8 @@ web:
   browse_max_bytes: 2000000
   browse_max_chars: 20000
   browse_user_agent: TinyCTX/1.1
-  downloads_dir: downloads
-  headless: false
+  output_dir: outputs/browser   # screenshots land here; also returned inline
+  headless: virtual   # true | false | virtual (Xvfb-backed headful; needed for bot-checked sites)
   ignore_tags:
   - script
   - style
@@ -204,6 +204,8 @@ web:
   prompt_priority: 12
   search_results: 5
   shift_enter_for_newline: true
+  screenshot_max_bytes: 1500000   # larger screenshots are saved but not shown inline
+  settle_timeout_ms: 15000   # extra wait for JS interstitials (Reddit, Cloudflare)
   timeout_ms: 30000
   tools: {}
   wait_until: domcontentloaded

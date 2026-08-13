@@ -71,7 +71,7 @@ TinyCTX/
     ├── sysops/         User/permission management + /model command + set_active_model tool (per-branch LLM override, see below)
     ├── system_prompt/  Injects SOUL.md, AGENTS.md into system prompt
     ├── todo/           todo_read / todo_write tools (per-session task list)
-    └── web/            web_search / open_url tools (DuckDuckGo + Playwright)
+    └── web/            web_search / open_url tools (DuckDuckGo + Camoufox)
 ```
 
 ---
@@ -399,7 +399,20 @@ Superseded modules `decay.py` / `dedup_agents.py` / `librarian_agents.py` are in
 - A policy that won't load blocks **every** caller, including one who'd otherwise be unrestricted — a broken config can't tell us whether the failed entry was the one that would have bound them.
 - Tests: `tests/test_shell_policy.py` is a must-deny/must-allow corpus run against the **real shipped YAML**, including a check that every shipped rule has a test case proving it fires. `tests/test_shell.py` covers tier routing and fail-closed behaviour against throwaway fixture policies.
 
-### `web` — `web_search` (DuckDuckGo via `ddgs`) and `open_url` (Playwright, headless by default; `headless=False` for captchas).
+### `web` — `web_search` (DuckDuckGo via `ddgs`, falling back to scraping `html.duckduckgo.com`) and `open_url` (Camoufox).
+
+`open_url(url, type=...)` renders in Camoufox (anti-detect Firefox) and returns `text` | `html` | `elements` | `screenshot`. One browser instance per agent session, shared: `click` / `type_text` / `extract_text` / `extract_html` / `screenshot_browser` / `wait_for` all act on whatever `open_url` loaded last.
+
+- **Launch mode** is `config.web.headless`: `true` | `false` | `"virtual"` (default). `"virtual"` is headful Firefox under Xvfb — plain headless Firefox is detectable and gets challenged by Reddit/Cloudflare. Requires `xvfb` + `pyvirtualdisplay` (both in the Dockerfile). `false` needs a real display and will not work in the container.
+- **Interstitial settling**: `wait_until="domcontentloaded"` returns on JS challenge pages (Reddit `js_challenge=1`, Cloudflare) with a healthy 200. After every `goto`, `_settle_navigation()` resolves the page using the strongest signal available, in order:
+  1. `open_url(wait_for="<css>")` — an explicit selector only the real page has. Preferred for known bot-checked sites: a challenge cannot fake it, so there is no ambiguity about when it cleared.
+  2. Challenge machinery disappearing — `_CHALLENGE_SELECTORS` (`#challenge-form`, `#cf-chl-widget`, `script[src*='/cdn-cgi/challenge-platform']`, the Turnstile iframe, …) plus `_CHALLENGE_URL_MARKERS`. Detection is **structural, not textual** — matching phrases like "just a moment" is English-only and breaks on any vendor rewording. Hand-off is awaited via `expect_navigation`, falling back to polling for in-place rewrites.
+  3. `_wait_for_dom_stable()` — DOM size unchanged across consecutive polls. Generic completion signal covering challenge hand-off, client-side rendering and late hydration alike.
+
+  Budget is `config.web.settle_timeout_ms` (default 15s); on timeout the result carries a `[warning: ...interstitial...]` line. Results report `page.url`, not the requested URL, so post-challenge redirects are visible.
+- Firefox's content sandbox is left **on**; it launches fine under `cap_drop: ALL`. (Firefox has no `--no-sandbox` — that is a Chromium flag and was previously being passed as a no-op.)
+- **Screenshots** go to `workspace/outputs/browser/` (config `web.output_dir`), matching the `outputs/<module>/` convention `anima` uses. By default they are *also* returned inline as `IMAGE_BLOCK:image/png;<b64>` (see `contracts.IMAGE_BLOCK_PREFIX`, same sentinel `filesystem.view()` uses), which `agent._execute_tool` unwraps into a real image block for vision models. The sentinel now takes an optional `\n<caption>` suffix (added to `contracts.py` / `agent.py`; base64 has no newline so the split is unambiguous and `filesystem.view()` is unaffected), which web uses to append `(also saved to <path>)`. Screenshots over `config.web.screenshot_max_bytes` (default 1.5 MB) are saved but not inlined — a full-page PNG of a long page costs a lot of context. `inline=False` returns the path as text.
+- `http_request` was removed.
 
 ### `concurrency` — Concurrent Forks. Replaces the deleted `subagents` module; see `docs/PLAN.md` for the design of record.
 

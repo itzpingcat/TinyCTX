@@ -13,7 +13,10 @@ ENV HOME=/home/tinyctx
 ENV XDG_CACHE_HOME=/opt/camoufox-cache
 
 # --- system deps -----------------------------------------------------------
+# xvfb backs Camoufox's headless="virtual" mode: a real headful Firefox on a
+# virtual display, which bot checks accept where true-headless is detected.
 RUN apt-get update && apt-get install -y --no-install-recommends \
+        xvfb \
         libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
         libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
         libgbm1 libasound2 libpango-1.0-0 libpangocairo-1.0-0 \
@@ -31,7 +34,7 @@ WORKDIR /app
 # --- camoufox (pinned first so it never re-runs when other deps change) ----
 RUN mkdir -p /opt/camoufox-cache
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install "camoufox[geoip]" && camoufox fetch
+    pip install "camoufox[geoip]" pyvirtualdisplay && camoufox fetch
 
 # --- app source ------------------------------------------------------------
 COPY TinyCTX/ ./TinyCTX/
