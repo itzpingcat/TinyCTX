@@ -112,9 +112,10 @@ class CronJob:
     schedule:         CronSchedule
     message:          str
     state:            CronState  = field(default_factory=CronState)
-    cursor_node_id:   str | None = None    # DB node_id for this job's branch cursor
+    cursor_node_id:   str | None = None    # DB node_id for this job's branch cursor (isolated mode only)
     delete_after_run: bool       = False
-    reset_after_run:  bool       = False   # wipe session context after each run
+    reset_after_run:  bool       = False   # wipe session context after each run (isolated mode only)
+    run_in:           str        = "main"  # "main" (fork off the live channel tail) or "isolated" (private branch)
     created_at_ms:    int        = 0
     updated_at_ms:    int        = 0
 
@@ -184,6 +185,7 @@ CREATE TABLE IF NOT EXISTS cron_jobs (
     delete_after_run  INTEGER NOT NULL DEFAULT 0,
     reset_after_run   INTEGER NOT NULL DEFAULT 0,
     cursor_node_id    TEXT,
+    run_in            TEXT NOT NULL DEFAULT 'main',
     next_run_at_ms    INTEGER,
     last_run_at_ms    INTEGER,
     last_status       TEXT,
@@ -218,6 +220,7 @@ def _row_to_job(row: sqlite3.Row) -> CronJob:
         cursor_node_id=row["cursor_node_id"],
         delete_after_run=bool(row["delete_after_run"]),
         reset_after_run=bool(row["reset_after_run"]),
+        run_in=row["run_in"] if "run_in" in row.keys() else "main",
         created_at_ms=row["created_at_ms"],
         updated_at_ms=row["updated_at_ms"],
     )
@@ -249,14 +252,14 @@ class CronStore:
                 """INSERT INTO cron_jobs (
                     id, creator_username, platform, cursor_key, enabled,
                     schedule_expr, schedule_tz, schedule_one_shot,
-                    message, delete_after_run, reset_after_run, cursor_node_id,
+                    message, delete_after_run, reset_after_run, cursor_node_id, run_in,
                     next_run_at_ms, last_run_at_ms, last_status, last_error,
                     created_at_ms, updated_at_ms
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     job.id, job.creator_username, job.platform, job.cursor_key, int(job.enabled),
                     job.schedule.expr, job.schedule.tz, int(job.schedule.one_shot),
-                    job.message, int(job.delete_after_run), int(job.reset_after_run), job.cursor_node_id,
+                    job.message, int(job.delete_after_run), int(job.reset_after_run), job.cursor_node_id, job.run_in,
                     job.state.next_run_at_ms, job.state.last_run_at_ms,
                     job.state.last_status, job.state.last_error,
                     job.created_at_ms, job.updated_at_ms,
@@ -317,6 +320,8 @@ def _format_job_line(j: CronJob) -> list[str]:
         sched_str += f" ({s.tz})"
     if s.one_shot:
         sched_str += " [one-shot]"
+    if j.run_in == "isolated":
+        sched_str += " [isolated]"
 
     status_icon = "✓" if j.enabled else "–"
     disabled_str = " [disabled]" if not j.enabled else ""
@@ -471,42 +476,99 @@ class _CronRunner:
             logger.info("[cron] job '%s' skipped — creator permission too low", job.id)
             return
 
-        logger.info("[cron] running job '%s' (creator=%s, reset=%s)",
-                     job.id, job.creator_username, job.reset_after_run)
+        logger.info("[cron] running job '%s' (creator=%s, run_in=%s, reset=%s)",
+                     job.id, job.creator_username, job.run_in, job.reset_after_run)
 
-        # 2. Determine the starting cursor, same staleness guard as v1.
-        if job.reset_after_run or not job.cursor_node_id or not self.runtime.db.get_node(job.cursor_node_id):
-            if job.cursor_node_id and not job.reset_after_run:
-                logger.warning(
-                    "[cron] job '%s' cursor %s no longer exists — resetting to root",
-                    job.id, job.cursor_node_id,
-                )
-            parent_id = self.runtime.db.get_root().id
+        # 2. Determine the starting cursor.
+        #
+        # "main" (default): the job forks off the channel's own live tail at
+        # fire time, exactly like a real message arriving in that channel —
+        # done below by passing session_key=job.cursor_key to push(), which
+        # attaches to Runtime._settled[cursor_key] (§3.2 concurrent forks).
+        # tail_node_id here is only a *seed*, used the one time this
+        # cursor_key has never been pushed to before; any other time it's
+        # ignored in favor of the real settled tail. This is what makes the
+        # agent's own past cron firings (and everyone else's live messages)
+        # visible in this job's context, and vice versa — it's genuinely the
+        # same conversation, not a side channel.
+        #
+        # "isolated": the job keeps its own private branch (job.cursor_node_id),
+        # seeded from root and never touching the channel's live history —
+        # same staleness guard as v1. reset_after_run only means anything here.
+        if job.run_in == "isolated":
+            if job.reset_after_run or not job.cursor_node_id or not self.runtime.db.get_node(job.cursor_node_id):
+                if job.cursor_node_id and not job.reset_after_run:
+                    logger.warning(
+                        "[cron] job '%s' cursor %s no longer exists — resetting to root",
+                        job.id, job.cursor_node_id,
+                    )
+                parent_id = self.runtime.db.get_root().id
+            else:
+                parent_id = job.cursor_node_id
         else:
-            parent_id = job.cursor_node_id
+            # main mode — seed only matters the first time cursor_key is seen.
+            parent_id = self.runtime.db.get_root().id
 
         # 3. Prepare the turn — runs as the real creator, so permission-gated
         # tools see this job's actual current permission_level, not a fixed
         # system identity's.
+        #
+        # job.message is wrapped, not sent verbatim, and suppress_attribution
+        # is set so this ONE node gets no 【label】: prefix — not the whole
+        # cycle. A cron job's turn is still attached to whatever channel
+        # history came before it (real people's messages, if reset_after_run
+        # is False), and those must keep their own attribution; only the
+        # single node this call writes should read as unattributed. See
+        # InboundMessage.suppress_attribution / context.py's
+        # NO_ATTRIBUTION_SENTINEL for how Runtime.push() and Context.assemble()
+        # implement this per-node, not per-Context — author=creator below is
+        # completely unaffected by suppress_attribution and still drives
+        # caller.permission_level normally.
+        #
+        # Two complementary fixes for one root cause: without
+        # suppress_attribution, the LLM would see what looks exactly like the
+        # creator typing live (e.g. "【kamie】: Remind Alex to send the Q3
+        # report") and naturally reply *to* them instead of carrying out the
+        # instruction. Suppressing the prefix removes that misleading visual
+        # cue; the wrapper text below makes the situation explicit in words
+        # too, and tells the agent where its reply actually goes.
+        wrapped_message = (
+            "[Scheduled trigger — not a message from a person waiting in this "
+            f"conversation. This fired automatically on the schedule you set up. "
+            f"Your instruction to yourself was:]\n{job.message}\n\n"
+            "[Carry it out now. Whatever you write in reply is what gets sent "
+            "to this channel — there is no one here to reply \"to\".]"
+        )
         msg = InboundMessage(
             tail_node_id=parent_id,
             author=creator,
             env=SessionEnvironment(platform=Platform.CRON),
             content_type=ContentType.TEXT,
-            text=job.message,
+            text=wrapped_message,
             message_id=str(start_ms),
             timestamp=start_ms / 1000,
             trigger=True,
+            suppress_attribution=True,
         )
 
         reply_queue: asyncio.Queue = asyncio.Queue()
 
         try:
             # 4. Push — returns the user node id; events stream into reply_queue.
-            # No session_key passed: a cron run is its own one-off internal
-            # session (see push()'s docstring), invisible to the concurrent-
-            # forks roster — matches v1's behavior exactly.
-            await self.runtime.push(msg, reply_queue=reply_queue)
+            #
+            # main mode passes session_key=job.cursor_key so this run forks
+            # off the channel's live settled tail (see the cursor-selection
+            # comment above) and finish_run() advances that same tail
+            # afterwards, exactly like a real bridge turn — no extra
+            # bookkeeping needed here.
+            #
+            # isolated mode passes no session_key: a one-off internal
+            # session (see push()'s docstring), invisible to the
+            # concurrent-forks roster — matches v1's behavior exactly.
+            if job.run_in == "main":
+                await self.runtime.push(msg, reply_queue=reply_queue, session_key=job.cursor_key)
+            else:
+                await self.runtime.push(msg, reply_queue=reply_queue)
 
             # 5. Drain the queue, delivering each event to the job's origin
             # channel via the platform's registered renderer (see
@@ -530,7 +592,9 @@ class _CronRunner:
                 elif isinstance(event, AgentError):
                     raise RuntimeError(event.message)
 
-            if final_tail:
+            if final_tail and job.run_in == "isolated":
+                # main mode has no private cursor to persist — Runtime's own
+                # _settled[cursor_key] already tracks the channel's tail.
                 job.cursor_node_id = final_tail
 
             job.state.last_status = "ok"
@@ -626,7 +690,7 @@ def register_agent(agent) -> None:
         return platform, cursor_key
 
     def add_cron(cron_expr: str, message: str, one_shot: bool = False,
-                 tz: str = "", reset_after_run: bool = False) -> str:
+                 tz: str = "", reset_after_run: bool = False, run_in: str = "main") -> str:
         """
         Schedule something to happen later, in this channel — a reminder,
         a recurring check-in, a daily/weekly report, anything you'd
@@ -662,12 +726,26 @@ def register_agent(agent) -> None:
         14:10 UTC + 20 minutes -> "30 14 * * *", and set one_shot=True
         so it fires exactly once and then stops.
 
+        By default the job fires right into this same conversation — when it
+        goes off, it'll see everything that's happened here since (including
+        its own past firings), and whatever you reply is just the next
+        message in this channel. That's what you want for almost everything:
+        reminders, check-ins, follow-ups.
+
+        Set run_in="isolated" only if you specifically want the job to run
+        in a private scratch conversation that nobody in this channel sees
+        and that never mixes with this channel's history — useful for a
+        background task whose reasoning shouldn't clutter this conversation
+        (you'd still need another way to report results back). If you're not
+        sure, leave it as "main".
+
         Args:
             cron_expr: 5-field cron expression — see examples above.
             message: The self-contained instruction you'll receive when this fires. Be detailed — you'll have no memory of this conversation.
             one_shot: True for a single reminder/follow-up that fires once and never again. False (default) for something recurring.
             tz: IANA timezone (e.g. "America/New_York") if the person means local time rather than UTC. Leave empty for UTC.
-            reset_after_run: True to wipe this job's own conversation history after each run, so it never accumulates context across firings. Usually leave False.
+            reset_after_run: Only meaningful with run_in="isolated" — wipes that private scratch conversation after each run. No effect in the default "main" mode.
+            run_in: "main" (default) to fire into this conversation, or "isolated" for a private one-off scratch conversation. Leave as "main" unless you have a specific reason not to.
         """
         caller = agent.caller
         if caller is None:
@@ -694,6 +772,10 @@ def register_agent(agent) -> None:
         if err:
             return json.dumps({"status": "error", "error": err})
 
+        run_in = (run_in or "main").strip().lower()
+        if run_in not in ("main", "isolated"):
+            return json.dumps({"status": "error", "error": f"run_in must be 'main' or 'isolated', got {run_in!r}."})
+
         now = _now_ms()
         job = CronJob(
             id=str(uuid.uuid4())[:8],
@@ -705,6 +787,7 @@ def register_agent(agent) -> None:
             message=message,
             delete_after_run=bool(one_shot),
             reset_after_run=bool(reset_after_run),
+            run_in=run_in,
             created_at_ms=now,
             updated_at_ms=now,
         )

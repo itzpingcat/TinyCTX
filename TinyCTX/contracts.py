@@ -127,6 +127,19 @@ class InboundMessage:
     author        — who sent the message (platform + user_id + display name)
     env           — session environment (platform, agent name, server, channel)
     group_policy  — present for group/channel messages; None for DMs
+    suppress_attribution — when True, Runtime.push() writes this message's DB
+                    node with context.py's NO_ATTRIBUTION_SENTINEL as author_id
+                    instead of author.username, so Context.assemble() skips the
+                    "【label】:" prefix for this one node only — everything else
+                    in the same conversation (other real people's messages)
+                    keeps its normal attribution. `author` itself is untouched
+                    either way: it's still used for permission_level checks
+                    (AgentCycle.caller) regardless of this flag. Used by
+                    non-interactive trigger sources (e.g. modules/cron) whose
+                    message is attributed to a real user for permission
+                    purposes but shouldn't visually read as that user having
+                    just said it live. Default False — every other caller is
+                    unaffected.
     """
     tail_node_id: str
     author:       Any             # TinyCTX.users.User; typed as Any to avoid circular import
@@ -140,6 +153,7 @@ class InboundMessage:
     reply_to_author: str | None = None
     attachments:  tuple["Attachment", ...] = field(default_factory=tuple)
     trace_id:     str           = field(default_factory=lambda: str(uuid.uuid4()))
+    suppress_attribution: bool  = False
 
 
 # ---------------------------------------------------------------------------

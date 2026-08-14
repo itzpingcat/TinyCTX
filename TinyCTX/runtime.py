@@ -319,17 +319,26 @@ class Runtime:
         content_str = json.dumps(content, ensure_ascii=False) if isinstance(content, list) else str(content)
 
         # 2. Write User Node to DB
-        author_id = msg.author.username
-        if not author_id:
-            # author_id being empty/None means the prefix will be silently skipped
-            # in context assembly, making multi-user attribution invisible to the LLM.
-            logger.error(
-                "[push] author_id is empty for inbound message (tail=%s, platform=%s, user_id=%s). "
-                "User node will be written without author_id — prefix will be missing in LLM context.",
-                msg.tail_node_id,
-                msg.env.platform,
-                getattr(msg.author, 'user_id', '<unknown>'),
-            )
+        if msg.suppress_attribution:
+            # Deliberate — see InboundMessage.suppress_attribution and
+            # context.py's NO_ATTRIBUTION_SENTINEL. msg.author is still the
+            # real caller (used below via _spawn_task for permission checks);
+            # only the DB node's author_id — and therefore the 【label】:
+            # prefix Context.assemble() would otherwise add — is affected.
+            from TinyCTX.context import NO_ATTRIBUTION_SENTINEL
+            author_id = NO_ATTRIBUTION_SENTINEL
+        else:
+            author_id = msg.author.username
+            if not author_id:
+                # author_id being empty/None means the prefix will be silently skipped
+                # in context assembly, making multi-user attribution invisible to the LLM.
+                logger.error(
+                    "[push] author_id is empty for inbound message (tail=%s, platform=%s, user_id=%s). "
+                    "User node will be written without author_id — prefix will be missing in LLM context.",
+                    msg.tail_node_id,
+                    msg.env.platform,
+                    getattr(msg.author, 'user_id', '<unknown>'),
+                )
         effective_session_key = parent.session_key if parent is not None else (session_key or msg.tail_node_id)
 
         # session_key IS the bridge's cursor_key for real (non-internal) turns
