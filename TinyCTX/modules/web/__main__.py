@@ -990,13 +990,28 @@ def register_agent(agent) -> None:
                     "Use open_url with type='text' or type='html' for full page content."
                 )
 
-            html = await page.content()
             if mode == "html":
+                html = await page.content()
                 content = html
+                title = await page.title() or _extract_html_title(html) or ""
             else:
-                content = _html_to_text(html, st["settings"]["ignore_tags"])
+                # Playwright''s inner_text() reflects computed visibility (display:none,
+                # hidden, visually-hidden dialogs, etc.) and pierces shadow DOM natively,
+                # unlike _html_to_text(page.content()) which walks raw markup with no
+                # concept of what a browser would actually render. This cuts out ad
+                # blocks, off-screen login modals, and other DOM-but-not-visible noise
+                # that used to leak into "text" mode.
+                try:
+                    content = await page.locator("body").inner_text(
+                        timeout=st["settings"]["timeout_ms"]
+                    )
+                except Exception:
+                    # Fall back to the old path if inner_text() fails for any reason
+                    # (e.g. no <body>, detached frame) rather than losing the page.
+                    html = await page.content()
+                    content = _html_to_text(html, st["settings"]["ignore_tags"])
+                title = await page.title() or ""
             content, truncated = _truncate_content(content, st["settings"]["browse_max_chars"])
-            title = await page.title() or _extract_html_title(html) or ""
 
             suffix     = "\n[truncated]" if truncated else ""
             title_line = f"# {title}\n" if title else ""
