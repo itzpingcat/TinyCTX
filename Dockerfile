@@ -40,7 +40,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 COPY TinyCTX/ ./TinyCTX/
 COPY pyproject.toml ./
 
-RUN pip install --no-cache-dir -e .
+RUN pip install --no-cache-dir -e ".[agent]"
 
 # --- config dir (users.db lives here, outside the workspace mount) --------
 RUN mkdir -p /etc/tinyctx && chown tinyctx:tinyctx /etc/tinyctx
