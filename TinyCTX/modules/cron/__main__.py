@@ -18,7 +18,10 @@ synthetic runner identity) had:
      time the job executes with that user's *current* permission_level
      (re-resolved via UserStore.get_user, not cached) — a promotion or
      demotion since the job was created takes effect on the job's very
-     next run.
+     next run. The agent-facing tools never mention this: the agent isn't
+     "running the job as itself" in any permission sense — see add_cron's
+     docstring, which is written entirely from the agent's point of view
+     (schedule things, reminders/recurring checks, message goes to itself).
 
   3. Indirect prompt injection via file write: v1 stored jobs as plain JSON
      in workspace/, which the agent's own filesystem tools (edit_file,
@@ -30,10 +33,18 @@ synthetic runner identity) had:
      way to create/inspect/remove a job is through the add_cron / list_cron
      / remove_cron tools below — there is no file for the agent to edit.
 
-Schedule kinds (unchanged from v1):
-  every  — fixed interval (every_ms)
-  at     — one-shot UTC timestamp (at_ms); auto-disables after firing
-  cron   — cron expression (expr + optional tz); requires `croniter`
+Schedule surface (v2 simplification — v1 had three schedule kinds: "every"
+fixed-interval, "at" one-shot timestamp, and "cron" expression, each with
+its own set of args). A cron expression alone covers everything calendar-
+shaped ("every day at 9am", "every 30 minutes" via */30, "every Monday") —
+the only thing it can't express is a relative one-shot delay ("in 20
+minutes") without computing an absolute future timestamp first. So v2 keeps
+a single schedule param, `cron_expr`, plus `one_shot: bool` (replaces v1's
+separate "at" kind — the job auto-disables after firing once, same as v1's
+`at` behavior, but expressed as a flag on a cron expression rather than a
+different schedule shape). For "in 20 minutes"-style asks, add_cron's
+docstring tells the agent to compute a one-shot expression from the current
+time it already has in context, and set one_shot=True.
 
 Channel isolation: every job stores the cursor_key of the channel it was
 created in (the same stable "group:<id>" / "tg:<id>" address bridges use
@@ -78,11 +89,9 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class CronSchedule:
-    kind:     str        # "every" | "at" | "cron"
-    every_ms: int | None = None
-    at_ms:    int | None = None
-    expr:     str | None = None
-    tz:       str | None = None
+    expr:     str               # cron expression, e.g. "0 9 * * *" or "*/30 * * * *"
+    tz:       str | None = None # IANA timezone; None = UTC
+    one_shot: bool = False      # if True, job auto-disables after firing once
 
 
 @dataclass
@@ -125,62 +134,35 @@ def _fmt_ts(ms: int | None) -> str:
 
 
 def _compute_next_run(schedule: CronSchedule, now_ms: int) -> int | None:
-    if schedule.kind == "at":
-        return schedule.at_ms if schedule.at_ms and schedule.at_ms > now_ms else None
-
-    if schedule.kind == "every":
-        if not schedule.every_ms or schedule.every_ms <= 0:
-            return None
-        return now_ms + schedule.every_ms
-
-    if schedule.kind == "cron" and schedule.expr:
-        try:
-            # Aliased import — see v1 note: `croniter` as both module and
-            # class name confuses static analysers if not aliased.
-            from croniter import croniter as CronIter
-            from zoneinfo import ZoneInfo
-            tz   = ZoneInfo(schedule.tz) if schedule.tz else timezone.utc
-            base = datetime.fromtimestamp(now_ms / 1000, tz=tz)
-            nxt  = CronIter(schedule.expr, base).get_next(datetime)
-            return int(nxt.timestamp() * 1000)
-        except Exception:
-            return None
-
-    return None
+    try:
+        # Aliased import — `croniter` as both module and class name confuses
+        # static analysers if not aliased.
+        from croniter import croniter as CronIter
+        from zoneinfo import ZoneInfo
+        tz   = ZoneInfo(schedule.tz) if schedule.tz else timezone.utc
+        base = datetime.fromtimestamp(now_ms / 1000, tz=tz)
+        nxt  = CronIter(schedule.expr, base).get_next(datetime)
+        return int(nxt.timestamp() * 1000)
+    except Exception:
+        return None
 
 
-def _validate_schedule(kind: str, every_ms: int | None, at_ms: int | None,
-                        expr: str | None, tz: str | None, now_ms: int) -> str | None:
+def _validate_schedule(expr: str, tz: str | None) -> str | None:
     """Return an error string if the requested schedule is invalid, else None."""
-    if kind not in ("every", "at", "cron"):
-        return f"unknown schedule kind {kind!r} — must be 'every', 'at', or 'cron'"
-
-    if kind == "every":
-        if not every_ms or every_ms <= 0:
-            return "every_ms must be > 0 for kind='every'"
-
-    elif kind == "at":
-        if at_ms is None:
-            return "at_ms is required for kind='at'"
-        if at_ms <= now_ms:
-            return "at_ms is in the past — job would never fire"
-
-    elif kind == "cron":
-        if not expr:
-            return "expr is required for kind='cron'"
+    if not expr or not expr.strip():
+        return "cron_expr is required."
+    try:
+        from croniter import croniter as CronIter
+        if not CronIter.is_valid(expr):
+            return f"invalid cron expression {expr!r}"
+    except ImportError:
+        return "croniter not installed — cron jobs are unavailable on this instance."
+    if tz:
         try:
-            from croniter import croniter as CronIter
-            if not CronIter.is_valid(expr):
-                return f"invalid cron expression {expr!r}"
-        except ImportError:
-            return "croniter not installed — cron-kind schedules are unavailable"
-        if tz:
-            try:
-                from zoneinfo import ZoneInfo
-                ZoneInfo(tz)
-            except Exception:
-                return f"unknown timezone {tz!r}"
-
+            from zoneinfo import ZoneInfo
+            ZoneInfo(tz)
+        except Exception:
+            return f"unknown timezone {tz!r}"
     return None
 
 
@@ -195,11 +177,9 @@ CREATE TABLE IF NOT EXISTS cron_jobs (
     platform          TEXT NOT NULL,
     cursor_key        TEXT NOT NULL,
     enabled           INTEGER NOT NULL DEFAULT 1,
-    schedule_kind     TEXT NOT NULL,
-    schedule_every_ms INTEGER,
-    schedule_at_ms    INTEGER,
-    schedule_expr     TEXT,
+    schedule_expr     TEXT NOT NULL,
     schedule_tz       TEXT,
+    schedule_one_shot INTEGER NOT NULL DEFAULT 0,
     message           TEXT NOT NULL,
     delete_after_run  INTEGER NOT NULL DEFAULT 0,
     reset_after_run   INTEGER NOT NULL DEFAULT 0,
@@ -224,11 +204,9 @@ def _row_to_job(row: sqlite3.Row) -> CronJob:
         cursor_key=row["cursor_key"],
         enabled=bool(row["enabled"]),
         schedule=CronSchedule(
-            kind=row["schedule_kind"],
-            every_ms=row["schedule_every_ms"],
-            at_ms=row["schedule_at_ms"],
             expr=row["schedule_expr"],
             tz=row["schedule_tz"],
+            one_shot=bool(row["schedule_one_shot"]),
         ),
         message=row["message"],
         state=CronState(
@@ -270,15 +248,14 @@ class CronStore:
             self._conn.execute(
                 """INSERT INTO cron_jobs (
                     id, creator_username, platform, cursor_key, enabled,
-                    schedule_kind, schedule_every_ms, schedule_at_ms, schedule_expr, schedule_tz,
+                    schedule_expr, schedule_tz, schedule_one_shot,
                     message, delete_after_run, reset_after_run, cursor_node_id,
                     next_run_at_ms, last_run_at_ms, last_status, last_error,
                     created_at_ms, updated_at_ms
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     job.id, job.creator_username, job.platform, job.cursor_key, int(job.enabled),
-                    job.schedule.kind, job.schedule.every_ms, job.schedule.at_ms,
-                    job.schedule.expr, job.schedule.tz,
+                    job.schedule.expr, job.schedule.tz, int(job.schedule.one_shot),
                     job.message, int(job.delete_after_run), int(job.reset_after_run), job.cursor_node_id,
                     job.state.next_run_at_ms, job.state.last_run_at_ms,
                     job.state.last_status, job.state.last_error,
@@ -335,23 +312,11 @@ class CronStore:
 
 def _format_job_line(j: CronJob) -> list[str]:
     s = j.schedule
-    if s.kind == "every" and s.every_ms:
-        mins = s.every_ms // 60000
-        hrs  = mins // 60
-        if hrs and not mins % 60:
-            sched_str = f"every {hrs}h"
-        elif hrs:
-            sched_str = f"every {hrs}h {mins % 60}m"
-        else:
-            sched_str = f"every {mins}m"
-    elif s.kind == "at":
-        sched_str = f"at {_fmt_ts(s.at_ms)}"
-    elif s.kind == "cron":
-        sched_str = f'cron "{s.expr}"'
-        if s.tz:
-            sched_str += f" ({s.tz})"
-    else:
-        sched_str = f"unknown kind '{s.kind}'"
+    sched_str = f'"{s.expr}"'
+    if s.tz:
+        sched_str += f" ({s.tz})"
+    if s.one_shot:
+        sched_str += " [one-shot]"
 
     status_icon = "✓" if j.enabled else "–"
     disabled_str = " [disabled]" if not j.enabled else ""
@@ -464,7 +429,7 @@ class _CronRunner:
                         job.state.last_status = "error"
                         job.state.last_error = "internal error — see server logs"
                         job.state.last_run_at_ms = now
-                        if job.schedule.kind == "at":
+                        if job.schedule.one_shot:
                             job.enabled = False
                         else:
                             job.state.next_run_at_ms = _compute_next_run(job.schedule, _now_ms())
@@ -578,12 +543,16 @@ class _CronRunner:
 
         # 6. Housekeeping.
         job.state.last_run_at_ms = start_ms
-        if job.schedule.kind == "at":
+        if job.schedule.one_shot:
             job.enabled = False
         else:
             job.state.next_run_at_ms = _compute_next_run(job.schedule, _now_ms())
 
-        if job.delete_after_run and job.schedule.kind != "every":
+        # delete_after_run removes the row outright rather than leaving it
+        # disabled — meaningful on both one-shot jobs (skip the disabled
+        # husk lingering in list_cron) and recurring jobs the agent wants
+        # to fire exactly once more then forget.
+        if job.delete_after_run:
             await asyncio.to_thread(self._store.delete, job.id)
         else:
             await asyncio.to_thread(self._store.save_state, job)
@@ -656,23 +625,49 @@ def register_agent(agent) -> None:
             return None
         return platform, cursor_key
 
-    def add_cron(schedule_kind: str, message: str, every_ms: int = 0,
-                 at_ms: int = 0, expr: str = "", tz: str = "",
-                 delete_after_run: bool = False, reset_after_run: bool = False) -> str:
+    def add_cron(cron_expr: str, message: str, one_shot: bool = False,
+                 tz: str = "", reset_after_run: bool = False) -> str:
         """
-        Create a new scheduled job in this channel. The job later runs as
-        you (this call's caller) — with whatever permission_level you hold
-        at run time, re-checked on every fire, not frozen at creation.
+        Schedule something to happen later, in this channel — a reminder,
+        a recurring check-in, a daily/weekly report, anything you'd
+        otherwise have to remember to do yourself.
+
+        Use this whenever someone asks you to remind them of something
+        later, or asks you to do something on a recurring basis (check
+        in every morning, post a daily summary, follow up in a week,
+        etc). You don't need to stay running for it to fire — it happens
+        on its own, even if this conversation is long over.
+
+        `message` is what YOU will receive when the schedule fires — not
+        what gets shown to the person. Write it as an instruction to
+        your future self: be specific and self-contained, since you
+        won't have this conversation's context anymore. E.g. instead of
+        "remind them", write "Remind Alex to send the Q3 report — she
+        asked for a nudge at 3pm today." Whatever you say in response to
+        that instruction is what the person in this channel actually sees.
+
+        Scheduling is expressed as a standard 5-field cron expression
+        (minute hour day-of-month month day-of-week), always in UTC
+        unless you set tz. Examples:
+          "0 9 * * *"     — every day at 9:00 UTC
+          "*/30 * * * *"  — every 30 minutes
+          "0 9 * * 1"     — every Monday at 9:00 UTC
+          "0 17 * * 1-5"  — weekdays at 17:00 UTC
+
+        For a one-time reminder ("remind me in 20 minutes", "follow up
+        with them tomorrow at noon") rather than a recurring schedule:
+        compute the single future UTC minute/hour/day/month you want
+        (you have the current time in your context) and pass it as the
+        cron expression with day-of-week as "*", e.g. current time
+        14:10 UTC + 20 minutes -> "30 14 * * *", and set one_shot=True
+        so it fires exactly once and then stops.
 
         Args:
-            schedule_kind: "every" (fixed interval), "at" (one-shot timestamp), or "cron" (cron expression).
-            message: The instruction the agent receives when this job fires.
-            every_ms: Interval in milliseconds — required for schedule_kind="every".
-            at_ms: UTC epoch milliseconds — required for schedule_kind="at".
-            expr: Cron expression e.g. "0 9 * * *" — required for schedule_kind="cron".
-            tz: IANA timezone e.g. "America/New_York" — optional, only used for schedule_kind="cron".
-            delete_after_run: If true, delete this job after it fires once (ignored for "every").
-            reset_after_run: If true, wipe this job's own session context after each run.
+            cron_expr: 5-field cron expression — see examples above.
+            message: The self-contained instruction you'll receive when this fires. Be detailed — you'll have no memory of this conversation.
+            one_shot: True for a single reminder/follow-up that fires once and never again. False (default) for something recurring.
+            tz: IANA timezone (e.g. "America/New_York") if the person means local time rather than UTC. Leave empty for UTC.
+            reset_after_run: True to wipe this job's own conversation history after each run, so it never accumulates context across firings. Usually leave False.
         """
         caller = agent.caller
         if caller is None:
@@ -695,28 +690,20 @@ def register_agent(agent) -> None:
         if not message:
             return json.dumps({"status": "error", "error": "message must not be empty."})
 
-        now = _now_ms()
-        err = _validate_schedule(
-            schedule_kind, every_ms or None, at_ms or None, expr or None, tz or None, now,
-        )
+        err = _validate_schedule(cron_expr, tz or None)
         if err:
             return json.dumps({"status": "error", "error": err})
 
+        now = _now_ms()
         job = CronJob(
             id=str(uuid.uuid4())[:8],
             creator_username=caller.username,
             platform=platform,
             cursor_key=cursor_key,
             enabled=True,
-            schedule=CronSchedule(
-                kind=schedule_kind,
-                every_ms=every_ms or None,
-                at_ms=at_ms or None,
-                expr=expr or None,
-                tz=tz or None,
-            ),
+            schedule=CronSchedule(expr=cron_expr, tz=tz or None, one_shot=bool(one_shot)),
             message=message,
-            delete_after_run=bool(delete_after_run),
+            delete_after_run=bool(one_shot),
             reset_after_run=bool(reset_after_run),
             created_at_ms=now,
             updated_at_ms=now,
@@ -728,8 +715,14 @@ def register_agent(agent) -> None:
 
     def list_cron() -> str:
         """
-        List scheduled cron jobs in this channel only — jobs created in a
-        different channel are never shown here, even to an admin.
+        Show everything currently scheduled in this channel — reminders,
+        recurring check-ins, anything created with add_cron. Use this
+        before scheduling something new if you're not sure whether a
+        similar job already exists, or when someone asks what's still
+        pending / what you've got scheduled.
+
+        Only shows jobs scheduled in this channel — nothing from other
+        conversations, even ones you're also active in.
         """
         channel = _current_channel()
         if channel is None:
@@ -739,10 +732,14 @@ def register_agent(agent) -> None:
 
     def remove_cron(job_id: str) -> str:
         """
-        Remove a scheduled job by id (see list_cron). You must either be
-        the job's creator, or hold a high enough permission_level to
-        override in your own channel — either way, only within this
-        channel; you cannot remove a job from a different channel.
+        Cancel a scheduled job — use when someone asks you to cancel a
+        reminder or stop a recurring check-in. Call list_cron first to
+        find the job's id if you don't already have it from when it was
+        created.
+
+        Only works on jobs in this channel, and only if you (the person
+        who asked) created the job, or have permission to manage jobs
+        others created here.
 
         Args:
             job_id: The job id shown by list_cron.
