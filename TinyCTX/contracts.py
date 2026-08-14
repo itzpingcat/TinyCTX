@@ -231,8 +231,12 @@ AgentEvent = Union[
 # Sentinel values
 # ---------------------------------------------------------------------------
 
-# Returned by the filesystem view() tool when an image file is read.
-# Format: IMAGE_BLOCK_PREFIX + "<mime>;<base64data>"
+# Returned by tools that hand an image to the model — filesystem view(), and
+# the web module's screenshots.
+# Format: IMAGE_BLOCK_PREFIX + "<mime>;<base64data>[\n<caption>]"
+# The caption is optional; base64 contains no newline, so the split is
+# unambiguous and callers that emit no caption are unaffected. It surfaces as
+# extra text on the ToolResult (web uses it to report the saved file path).
 # agent._execute_tool detects this and builds a vision content block.
 IMAGE_BLOCK_PREFIX = "IMAGE_BLOCK:"
 

@@ -15,7 +15,7 @@ Decomposed sub-modules:
   mentions.py  — humanize_mentions / dehumanize_mentions
   compat.py    — CompatRules (proxy-bot delay rules)
   cursors.py   — CursorStore, make_session_node
-  turn.py      — handle_turn, run_turn_loop, typing_keepalive
+  turn.py      — handle_turn, typing_keepalive
   commands.py  — sync_app_commands, slash-command interaction handlers
 """
 from __future__ import annotations
@@ -133,13 +133,12 @@ class DiscordBridge:
         self._active_channels:  dict[str, discord.abc.Messageable] = {}
         self._node_to_cursor:   dict[str, str]                    = {}
         self._reset_epoch:      dict[str, int]                    = {}
-        self._lane_locks:       dict[str, asyncio.Lock]           = {}
 
-        # Buffering: while a turn is generating for a cursor, further
-        # trigger messages for that same cursor are buffered instead of
-        # starting a new (overlapping) turn.
-        self._generating:       dict[str, bool]                   = {}
-        self._pending:          dict[str, list[InboundMessage]]   = {}
+        # Concurrent Forks (docs/PLAN.md): overlapping messages for the same
+        # cursor_key no longer buffer waiting for the in-flight turn — each
+        # triggers its own push(), and Runtime forks off settled_tail (R1).
+        # The one-fork-per-conversation cap this used to enforce is gone;
+        # Runtime._semaphore (max_workers) is the real concurrency cap now.
 
         # Persisted cursor store — internal bridge bookkeeping (cursor_key ->
         # node_id, message_id -> node_id), not agent-authored content, so it
@@ -259,36 +258,27 @@ class DiscordBridge:
         cursor_key: str,
     ) -> None:
         """
-        Start an agent turn for msg, unless a turn is already generating for
-        cursor_key — in that case, buffer msg and let run_turn_loop() pick it
-        up once the in-flight turn finishes.
+        Start an agent turn for msg. Concurrent Forks (docs/PLAN.md R1): every
+        trigger message gets its own push() — if a turn is already running for
+        cursor_key, the new message forks off settled_tail rather than being
+        buffered. Runtime._semaphore (max_workers) is the actual concurrency cap.
         """
-        if self._generating.get(cursor_key):
-            self._pending.setdefault(cursor_key, []).append(msg)
-            logger.debug(
-                "Discord: agent busy for %s — buffering message %s",
-                cursor_key, msg.message_id,
-            )
-            return
-
-        self._generating[cursor_key] = True
         task = asyncio.create_task(
-            _turn_module.run_turn_loop(self, msg, channel, cursor_key)
+            _turn_module.handle_turn(self, msg, channel, cursor_key)
         )
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
     async def _push_passive(self, msg: InboundMessage, cursor_key: str) -> None:
         """Record a non-triggering message in the conversation history."""
-        lock = self._lane_locks.setdefault(cursor_key, asyncio.Lock())
-        async with lock:
-            node_id = self._get_or_create_cursor(cursor_key)
-            new_node_id = await self._runtime.push(
-                dataclasses.replace(msg, tail_node_id=node_id, trigger=False)
-            )
-            self._advance_cursor(cursor_key, new_node_id)
-            if msg.message_id:
-                self._store.set_msg_node(msg.message_id, new_node_id)
+        node_id = self._get_or_create_cursor(cursor_key)
+        new_node_id = await self._runtime.push(
+            dataclasses.replace(msg, tail_node_id=node_id, trigger=False),
+            session_key=cursor_key,
+        )
+        self._advance_cursor(cursor_key, new_node_id)
+        if msg.message_id:
+            self._store.set_msg_node(msg.message_id, new_node_id)
 
     # ------------------------------------------------------------------
     # Permission helpers
@@ -551,6 +541,12 @@ class DiscordBridge:
             )
 
         self._store.set(cursor_key, fork_node)
+        # Seed Runtime's live settled_tail (docs/PLAN.md §3.2) so the
+        # thread's first push() attaches at the resolved fork point instead
+        # of falling back to msg.tail_node_id (which _get_or_create_cursor
+        # would also compute correctly here, but this avoids any window
+        # where the two disagree).
+        self._runtime.seed_session(cursor_key, fork_node)
 
     async def _on_message(self, message: discord.Message) -> None:
         if message.author.bot and (

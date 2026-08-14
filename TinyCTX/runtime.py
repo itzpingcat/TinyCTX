@@ -3,10 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
+import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from TinyCTX.config import Config
-from TinyCTX.contracts import InboundMessage, SessionEnvironment
+from TinyCTX.contracts import AgentError, InboundMessage, SessionEnvironment
 from TinyCTX.users import UserStore
 from TinyCTX.utils.attachments import build_content_blocks as _build_content_blocks
 from TinyCTX.db import ConversationDB
@@ -14,6 +17,35 @@ from TinyCTX.utils.commands import CommandRegistry
 from TinyCTX.module_registry import ModuleRegistry
 
 logger = logging.getLogger(__name__)
+
+# Digests (see Runtime._render_digest) are capped so a long fork output
+# doesn't blow the context budget of every peer it fans out to.
+_DIGEST_MAX_CHARS = 2000
+
+
+@dataclass
+class Exogenous:
+    """One typed event carried in a Run's inbox — drained into a node by
+    AgentCycle at the two R3 drain points. See docs/PLAN.md §3.3."""
+    kind:    str    # "fork_finished" | "nudge"
+    role:    str    # role to write the node as
+    content: str    # pre-rendered
+
+
+@dataclass
+class Run:
+    """In-memory handle for one live AgentCycle. Not persisted — see
+    docs/PLAN.md §3.1. run.id is independent of any DB node id, which is
+    what makes two concurrent runs on one conversation representable."""
+    id:            str
+    session_key:   str
+    intent:        str
+    root_node_id:  str
+    status:        str = "running"          # running | done | failed | aborted
+    started_at:    float = field(default_factory=time.time)
+    inbox:         asyncio.Queue = field(default_factory=asyncio.Queue)
+    cycle:         object = None            # AgentCycle | None — for live head reads
+
 
 class Runtime:
     def __init__(self, config: Config) -> None:
@@ -41,6 +73,15 @@ class Runtime:
         self._active: int = 0
         self._tasks: set[asyncio.Task] = set()
         self._abort_events: dict[str, asyncio.Event] = {}
+
+        # Concurrent Forks — see docs/PLAN.md. In-memory, per-process; dies
+        # with a restart (correct — abandoned branches are just unreferenced
+        # history). _settled is session_key -> node_id, the single node new
+        # inbound messages attach to (§3.2). One lock per session serialises
+        # the start/finish transitions only — runs execute freely (§6).
+        self._runs: dict[str, Run] = {}
+        self._settled: dict[str, str] = {}
+        self._session_locks: dict[str, asyncio.Lock] = {}
 
     async def start(self) -> None:
         self._register_user_commands()
@@ -164,12 +205,43 @@ class Runtime:
     # Entry Point: push()
     # ------------------------------------------------------------------
 
-    async def push(self, msg: InboundMessage, reply_queue: asyncio.Queue | None = None) -> str:
+    async def push(
+        self,
+        msg: InboundMessage,
+        reply_queue: asyncio.Queue | None = None,
+        *,
+        session_key: str | None = None,
+        parent: Run | None = None,
+    ) -> str:
         """
         Accepts InboundMessage, persists to DB, and triggers AgentCycle if needed.
         Always returns the new user node id.
         If reply_queue is provided and msg.trigger is True, events are written into
         it as they arrive. A None sentinel is put when the turn is complete.
+
+        Concurrent Forks (docs/PLAN.md §3.2, R1): the new node always attaches to
+        session_key's settled_tail, not to msg.tail_node_id directly. msg.tail_node_id
+        is only used to seed settled_tail the first time this session_key is seen.
+
+        settled_tail advances here only for passive (non-trigger) messages, which are
+        plain linear continuation. A *triggering* message deliberately leaves it where
+        it was: §3.2 defines a fork as "attach to settled_tail while settled_tail has
+        not advanced past the running run's root", so advancing to the new user node
+        would make the next concurrent message a child of this run's root rather than
+        its sibling. finish_run() is the only thing that advances settled_tail past a
+        run (R2).
+
+        session_key scopes the roster/fan-out/nudges (§10). Callers that don't pass
+        one get session_key defaulted to msg.tail_node_id — a value that is
+        caller-computed and differs on essentially every call, so each such push() is
+        its own one-off "session": linear attach, empty roster, no fan-out, invisible
+        to real sessions. This is how internal cycles (modules/heartbeat with
+        Platform.CRON, modules/cron, the memory librarian) stay out of user-facing
+        rosters — §10.2's concern, handled by not minting a shared key rather than by
+        a per-run flag.
+
+        parent, when given (spawn_fork — §9.1), makes the new run inherit the
+        parent run's session_key rather than minting one from session_key/msg (§10.2).
         """
         # 1. Build message content — inline attachments or append reference notes.
         workspace = Path(self.config.workspace.path).expanduser().resolve()
@@ -204,61 +276,240 @@ class Runtime:
                 getattr(msg.author, 'user_id', '<unknown>'),
             )
         state_delta = self._compute_state_delta(msg)
-        user_node = self.db.add_node(
-            parent_id=msg.tail_node_id,
-            role="user",
-            content=content_str,
-            author_id=author_id or None,
-            state_delta=json.dumps(state_delta) if state_delta else None,
-        )
-        
-        new_tail_id = user_node.id
 
-        # 4. Trigger Cycle if requested
-        if not msg.trigger:
-            return new_tail_id
+        effective_session_key = parent.session_key if parent is not None else (session_key or msg.tail_node_id)
 
-        # Capacity Check
-        if self._active >= (self._semaphore._value + self._active):
-            logger.warning("Capacity reached. Node %s persisted but not triggered.", new_tail_id)
-            if reply_queue is not None:
-                await reply_queue.put(None)
-            return new_tail_id
+        # --- R1 attach + §6 race fix: resolve settled_tail, write the node,
+        # and (if triggering) register the Run, all under one session lock. ---
+        lock = self._session_lock(effective_session_key)
+        async with lock:
+            attach_to = self._settled.setdefault(effective_session_key, msg.tail_node_id)
+            user_node = self.db.add_node(
+                parent_id=attach_to,
+                role="user",
+                content=content_str,
+                author_id=author_id or None,
+                state_delta=json.dumps(state_delta) if state_delta else None,
+            )
+            new_tail_id = user_node.id
 
-        # Spawn Task
-        abort_ev = self._get_abort_event(new_tail_id)
+            if not msg.trigger:
+                # Passive message: linear continuation, so the attach point moves.
+                self._settled[effective_session_key] = new_tail_id
+                return new_tail_id
+
+            # Triggering message: settled_tail stays put until finish_run (R2),
+            # so a concurrent message forks off the same parent. See docstring.
+            run = Run(
+                id=str(uuid.uuid4()),
+                session_key=effective_session_key,
+                intent=(msg.text or "")[:200],
+                root_node_id=new_tail_id,
+            )
+            self._runs[run.id] = run
+
+        await self._spawn_task(run, msg.author, reply_queue)
+        return new_tail_id
+
+    async def _spawn_task(self, run: Run, caller, reply_queue: asyncio.Queue | None = None) -> None:
+        """
+        Launch the asyncio task that drives run through AgentCycle.
+
+        There is deliberately no admission check here. _process() acquires
+        self._semaphore, which already queues: over-capacity runs wait for a slot
+        rather than being dropped. max_workers caps *concurrent execution*, not
+        how much work may be accepted.
+        """
+        abort_ev = self._get_abort_event(run.root_node_id)
         task = asyncio.create_task(
-            self._process(new_tail_id, msg.author, abort_ev, reply_queue),
-            name=f"cycle:{new_tail_id}"
+            self._process(run, caller, abort_ev, reply_queue),
+            name=f"cycle:{run.id}"
         )
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
-        return new_tail_id
+    # ------------------------------------------------------------------
+    # Concurrent Forks — Run lifecycle (docs/PLAN.md §3, §6, §7)
+    # ------------------------------------------------------------------
+
+    def _session_lock(self, session_key: str) -> asyncio.Lock:
+        lock = self._session_locks.get(session_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._session_locks[session_key] = lock
+        return lock
+
+    def seed_session(self, session_key: str, node_id: str) -> None:
+        """
+        Force session_key's settled_tail to node_id — used by bridge-side
+        session bootstrapping/reset flows (e.g. /reset, thread-fork-point
+        resolution) that need to establish or correct the attach point
+        Runtime uses for this process's lifetime.
+        """
+        self._settled[session_key] = node_id
+
+    def runs_in_session(self, session_key: str) -> list[Run]:
+        """Runs scoped to session_key — for the roster provider and fan-out.
+        Never process-global (§10.1)."""
+        return [r for r in self._runs.values() if r.session_key == session_key]
+
+    async def start_run(
+        self,
+        session_key: str,
+        prompt: str,
+        branch_from: str,
+        caller,
+        *,
+        parent: Run | None = None,
+    ) -> Run:
+        """
+        Write the run's root node as a fresh branch off branch_from, register
+        the Run, and launch it — all under session_key's lock (§6). Used by
+        spawn_fork (§9.1), which doesn't go through push()'s inbound-message path.
+
+        The node write happens inside the lock rather than at the call site so
+        that every start transition is serialised against finish_run's fan-out,
+        exactly as push()'s is.
+
+        When parent is given, the run inherits parent's session_key so spawned
+        forks are visible to their siblings and spawner (§10.2).
+        """
+        if parent is not None:
+            session_key = parent.session_key
+        lock = self._session_lock(session_key)
+        async with lock:
+            branch_node = self.db.add_node(
+                parent_id=branch_from,
+                role="user",
+                content=prompt,
+                author_id=getattr(caller, "username", None) or None,
+            )
+            run = Run(
+                id=str(uuid.uuid4()),
+                session_key=session_key,
+                intent=(prompt or "")[:200],
+                root_node_id=branch_node.id,
+            )
+            self._runs[run.id] = run
+        await self._spawn_task(run, caller)
+        return run
+
+    async def finish_run(self, run: Run, final_text: str, head_node_id: str) -> None:
+        """
+        Advance settled_tail to the last finisher and fan the digest out to
+        every peer still running (R2). Under the session lock (§6): a peer
+        starting concurrently either observes the advanced tail or is visible
+        to this fan-out — never neither.
+        """
+        lock = self._session_lock(run.session_key)
+        async with lock:
+            run.status = "done"
+            self._settled[run.session_key] = head_node_id
+            notice = self._render_digest(run, final_text)
+            for peer in self._runs.values():
+                if peer.id == run.id or peer.session_key != run.session_key:
+                    continue
+                if peer.status != "running":
+                    continue
+                peer.inbox.put_nowait(Exogenous(kind="fork_finished", role="user", content=notice))
+            self._runs.pop(run.id, None)
+
+    async def _abandon_run(self, run: Run) -> None:
+        """
+        Failure/abort counterpart to finish_run: advance settled_tail past a
+        run that died without producing a digest, so the session keeps moving
+        instead of stranding every later message on the dead run's parent.
+        No fan-out — nothing meaningful happened to tell peers about.
+        """
+        cycle = run.cycle
+        head = getattr(getattr(cycle, "context", None), "tail_node_id", None) or run.root_node_id
+        lock = self._session_lock(run.session_key)
+        async with lock:
+            self._settled[run.session_key] = head
+
+    def nudge(self, target_id: str, from_run: Run, message: str) -> bool:
+        """
+        Advisory, one-way, same-session-only message from one running fork to
+        another (§11). Returns False if the target isn't a running peer in the
+        same session — nudging a finished/unknown/foreign run is a benign no-op.
+        """
+        target = self._runs.get(target_id)
+        if target is None or target.status != "running":
+            return False
+        if target.session_key != from_run.session_key:
+            return False
+        content = (
+            f"[nudge from fork {from_run.id[:8]} — {from_run.intent!r}]\n"
+            f"{message}\n\n"
+            "(Advisory, from a peer fork. Not from the user. You decide whether to comply.)"
+        )
+        target.inbox.put_nowait(Exogenous(kind="nudge", role="user", content=content))
+        return True
+
+    @staticmethod
+    def _render_digest(run: Run, final_text: str) -> str:
+        """
+        Render a finished run's completion digest — intent + final text only,
+        no tools, no thinking (§1). Truncated so one long fork can't blow the
+        context budget of every peer it fans out to (open decision §12.3).
+        Delivered into a peer's inbox as user-role with an explicit wrapper —
+        unambiguous to the peer that this happened elsewhere (§12.1).
+        """
+        text = (final_text or "").strip()
+        if len(text) > _DIGEST_MAX_CHARS:
+            text = text[:_DIGEST_MAX_CHARS] + "...[truncated]"
+        return f"[fork {run.id[:8]} finished — intent: {run.intent!r}]\n{text}"
 
     # ------------------------------------------------------------------
     # Processing Logic
     # ------------------------------------------------------------------
 
-    async def _process(self, node_id: str, caller, abort_event: asyncio.Event, reply_queue: asyncio.Queue | None = None) -> None:
+    async def _process(self, run: Run, caller, abort_event: asyncio.Event, reply_queue: asyncio.Queue | None = None) -> None:
         from TinyCTX.agent import AgentCycle
-        
+
         async with self._semaphore:
             self._active += 1
             try:
                 agent = AgentCycle(self.config, self.module_registry)
-                logger.debug("[runtime] cycle starting for node %s", node_id)
-                
-                async for event in agent.run(node_id, caller, abort_event):
+                run.cycle = agent
+                logger.debug("[runtime] cycle starting for run %s (node %s)", run.id, run.root_node_id)
+
+                async for event in agent.run(run, caller, abort_event, runtime=self):
                     if reply_queue is not None:
                         await reply_queue.put(event)
-                
-                logger.debug("[runtime] cycle complete for node %s", node_id)
-            except Exception:
-                logger.exception("Cycle failed for node %s", node_id)
+
+                logger.debug("[runtime] cycle complete for run %s", run.id)
+            except Exception as exc:
+                logger.exception("Cycle failed for run %s", run.id)
+                run.status = "failed"
+                # Surface it. Without this the bridge drains an empty queue,
+                # hits the sentinel, and sends nothing — a crashed cycle is
+                # indistinguishable from the agent choosing not to reply.
+                if reply_queue is not None:
+                    await reply_queue.put(AgentError(
+                        message=f"Cycle failed: {type(exc).__name__}: {exc}",
+                        trace_id=run.id,
+                        reply_to_message_id="synthetic",
+                        tail_node_id=run.root_node_id,
+                    ))
             finally:
                 self._active -= 1
-                self._abort_events.pop(node_id, None)
+                self._abort_events.pop(run.root_node_id, None)
+                # Belt-and-suspenders cleanup: AgentCycle.run() normally calls
+                # finish_run() itself on the success path, which pops the run.
+                # Abort / LLM-error paths return early without a digest to fan
+                # out (nothing meaningful happened) — make sure the run doesn't
+                # linger in _runs forever either way.
+                if run.status == "running":
+                    run.status = "aborted" if abort_event.is_set() else "failed"
+                if run.status != "done":
+                    # finish_run (R2) never ran, so settled_tail is still
+                    # parked at this run's parent. Leaving it there makes
+                    # every subsequent message fork off the same stale node
+                    # forever — the session stops advancing. Release it to
+                    # the furthest node this run actually wrote.
+                    await self._abandon_run(run)
+                self._runs.pop(run.id, None)
                 if reply_queue is not None:
                     await reply_queue.put(None)  # sentinel: turn complete
 

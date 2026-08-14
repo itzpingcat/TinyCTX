@@ -135,10 +135,16 @@ def run(args: argparse.Namespace) -> None:
 
     load_instance_env(instance_dir)
 
-    # compose.yaml binds this read-only at /app/config. Create it first —
+    # compose.yaml binds these into the container. Create them first —
     # Docker auto-creates a missing bind source as a ROOT-OWNED directory,
-    # which the user then can't write policy files into without sudo.
+    # which the non-root `tinyctx` user inside the container then can't
+    # write to (PermissionError on the memory log, readonly-database errors
+    # from the users store, etc). config/ was already handled; data/ and
+    # workspace/ need the same treatment since they're just as often the
+    # first-run case (a fresh instance dir, or one created by hand).
     config_dir_for(instance_dir).mkdir(parents=True, exist_ok=True)
+    (instance_dir / "data").mkdir(parents=True, exist_ok=True)
+    (instance_dir / "workspace").mkdir(parents=True, exist_ok=True)
 
     project_name = project_name_for(instance_dir)
     env = {**os.environ, **compose_env(instance_dir, port=cfg.gateway.port)}

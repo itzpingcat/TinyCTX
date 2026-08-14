@@ -2,26 +2,32 @@
 modules/web/__main__.py
 
 Registers web tools into the agent loop's tool_handler:
-  - web_search     — DuckDuckGo text search
-  - open_url       — fetch or browser-render a URL; returns elements, text, or HTML
-  - http_request   — generic async HTTP (GET/POST/etc.)
-  - click          — click an element on the current browser page
-  - type_text      — type into a field
-  - extract_text   — get visible text from element or whole page
-  - extract_html   — get HTML from element or whole page
-  - screenshot     — save screenshot to workspace/downloads/
-  - wait_for       — wait for element state
-  - manage_browser — adjust settings or close the browser
+  - web_search          — DuckDuckGo text search
+  - open_url            — browser-render a URL; returns elements, text, HTML, or a screenshot
+  - click               — click an element on the current browser page
+  - type_text           — type into a field
+  - extract_text        — get visible text from element or whole page
+  - extract_html        — get HTML from element or whole page
+  - screenshot_browser  — save screenshot to workspace/downloads/
+  - wait_for            — wait for element state
+  - manage_browser      — adjust settings or close the browser
 
-One Camoufox browser instance lives on the AgentLoop for the session lifetime.
-It is created lazily on first use and closed on reset() via a registered hook.
+One Camoufox (anti-detect Firefox) browser instance lives on the AgentLoop for
+the session lifetime. It is created lazily on first use and closed on reset()
+via a registered hook. All browser tools share that single page: click,
+type_text, extract_* and screenshot_browser act on whatever open_url loaded last.
+
+Navigation settles past JS interstitials (Reddit's js_challenge, Cloudflare's
+"Just a moment", etc.) before content is read — see _settle_navigation.
 
 Convention: register_agent(agent) — no imports from contracts or gateway.
 """
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+import logging
 import re
 import time
 from html import unescape
@@ -32,12 +38,16 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import aiohttp
 
+from TinyCTX.contracts import IMAGE_BLOCK_PREFIX
+
 
 # ---------------------------------------------------------------------------
 # SSRF guard — block requests to private/loopback IPs and non-http(s) schemes
 # ---------------------------------------------------------------------------
 import ipaddress
 import socket
+
+logger = logging.getLogger(__name__)
 
 _PRIVATE_NETWORKS = [
     # IPv4
@@ -119,6 +129,16 @@ _BLOCK_TAGS = {
     "section", "table", "tbody", "td", "tfoot", "th", "thead", "tr", "ul",
 }
 _HEADING_PREFIX = {"h1": "# ", "h2": "## ", "h3": "### ", "h4": "#### ", "h5": "##### ", "h6": "###### "}
+# HTML5 void elements: never receive a closing tag, so HTMLParser will never
+# fire handle_endtag() for them. If one of these is also listed in
+# _IGNORED_TEXT_TAGS, incrementing _ignored_depth on its start tag without a
+# matching decrement permanently poisons the parse (every char of the
+# document after the first stray void tag gets silently dropped). meta/link
+# in <head> are the common real-world trigger.
+_VOID_ELEMENTS = {
+    "area", "base", "br", "col", "embed", "hr", "img", "input",
+    "link", "meta", "param", "source", "track", "wbr",
+}
 _IGNORED_TEXT_TAGS = {
     "canvas", "head", "meta", "link", "noscript", "script", "style", "svg", "title",
 }
@@ -177,7 +197,11 @@ class _HTMLTextExtractor(HTMLParser):
     def handle_starttag(self, tag: str, attrs) -> None:  # noqa: ANN001
         tag = tag.lower()
         if tag in self._ignored_tags:
-            self._ignored_depth += 1
+            # Void elements (meta, link, ...) never get a closing tag, so
+            # never fire handle_endtag() - do not increment depth for them
+            # or it can never be decremented back down.
+            if tag not in _VOID_ELEMENTS:
+                self._ignored_depth += 1
             return
         if self._ignored_depth:
             return
@@ -241,7 +265,7 @@ class _HTMLTextExtractor(HTMLParser):
     def handle_endtag(self, tag: str) -> None:
         tag = tag.lower()
         if tag in self._ignored_tags:
-            if self._ignored_depth:
+            if tag not in _VOID_ELEMENTS and self._ignored_depth:
                 self._ignored_depth -= 1
             return
         if self._ignored_depth:
@@ -404,6 +428,185 @@ def _validate_browse_url(url: str) -> Optional[str]:
         return "Error: URLs with embedded credentials are not supported."
     return None
 
+# ---------------------------------------------------------------------------
+# JS interstitial handling
+# ---------------------------------------------------------------------------
+# Sites like Reddit and Cloudflare-fronted hosts answer the first request with a
+# tiny JS challenge page that redirects (or rewrites itself) a moment later. Its
+# DOM parses instantly, so wait_until="domcontentloaded" returns the *challenge*
+# rather than the page, and the status is a perfectly healthy 200.
+
+# Detection is structural, not textual. Matching on phrases like "just a moment"
+# only works in English and breaks whenever a vendor reworders their page; the
+# challenge *machinery* (the form, the widget iframe, the challenge-platform
+# script) is what actually has to be present for a challenge to run.
+_CHALLENGE_URL_MARKERS = (
+    "js_challenge=",
+    "__cf_chl",
+    "/cdn-cgi/challenge",
+    "/_incapsula_resource",
+)
+_CHALLENGE_SELECTORS = (
+    "#challenge-form",
+    "#challenge-running",
+    "#cf-chl-widget",
+    "script[src*='/cdn-cgi/challenge-platform']",
+    "iframe[src*='challenges.cloudflare.com']",
+    "iframe[title*='challenge' i]",
+    "#px-captcha",
+    "#sec-cpt-if",
+)
+
+
+async def _looks_like_challenge(page) -> bool:
+    """Is the current page an interstitial rather than real content?"""
+    if any(marker in (page.url or "").lower() for marker in _CHALLENGE_URL_MARKERS):
+        return True
+    try:
+        return bool(await page.evaluate(
+            "sels => sels.some(s => document.querySelector(s) !== null)",
+            list(_CHALLENGE_SELECTORS),
+        ))
+    except Exception:
+        return False
+
+
+async def _wait_for_dom_stable(page, deadline: float, *, polls: int = 3, interval: float = 0.4) -> None:
+    """
+    Wait until the DOM stops changing size across consecutive polls.
+
+    This is the generic completion signal: rather than guessing when a specific
+    vendor's challenge is done, wait for the document to stop being rewritten.
+    It covers challenge hand-off, client-side rendering and late hydration alike.
+    """
+    stable  = 0
+    last    = -1
+    while time.monotonic() < deadline and stable < polls:
+        try:
+            size = await page.evaluate("document.documentElement.innerHTML.length")
+        except Exception:
+            return  # navigating / context torn down — caller re-checks
+        stable = stable + 1 if size == last else 0
+        last   = size
+        await asyncio.sleep(interval)
+
+
+async def _settle_navigation(page, settings, *, wait_for: Optional[str] = None) -> bool:
+    """
+    Wait for the page to finish becoming itself after goto().
+
+    Order of preference, strongest signal first:
+      1. `wait_for` — an explicit selector from the caller. If you know what the
+         real page contains, that beats every heuristic here; a challenge cannot
+         fake it, and there is no ambiguity about when it has cleared.
+      2. Challenge machinery disappearing (structural, see _CHALLENGE_SELECTORS),
+         re-checked after each navigation the challenge triggers.
+      3. DOM size going quiet (_wait_for_dom_stable).
+
+    Returns True if the page still looks like an interstitial when the settle
+    budget runs out. Never raises — a settle failure should degrade to whatever
+    content is on the page, not blow up the tool call.
+    """
+    timeout   = settings["timeout_ms"]
+    settle_ms = settings.get("settle_timeout_ms", 15000)
+    deadline  = time.monotonic() + settle_ms / 1000.0
+
+    try:
+        await page.wait_for_load_state("load", timeout=min(timeout, settle_ms))
+    except Exception:
+        pass
+
+    if wait_for:
+        try:
+            remaining = max(0.0, deadline - time.monotonic()) * 1000
+            await page.wait_for_selector(wait_for, timeout=remaining or 1)
+            return False
+        except Exception:
+            return await _looks_like_challenge(page)
+
+    while await _looks_like_challenge(page):
+        if time.monotonic() >= deadline:
+            return True
+        # The challenge usually hands off by navigating; wait for that rather
+        # than blind-polling, but fall back to a poll for in-place rewrites.
+        try:
+            async with page.expect_navigation(
+                timeout=max(0.0, deadline - time.monotonic()) * 1000 or 1
+            ):
+                pass
+        except Exception:
+            await asyncio.sleep(0.5)
+        try:
+            await page.wait_for_load_state("load", timeout=min(timeout, settle_ms))
+        except Exception:
+            pass
+
+    await _wait_for_dom_stable(page, deadline)
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Screenshot output
+# ---------------------------------------------------------------------------
+
+def _screenshot_path(st: dict, filename: Optional[str]) -> Path | str:
+    """Resolve a screenshot path under output_dir, or return an error string."""
+    safe_name = Path(filename).name if filename else ""
+    if not safe_name:
+        safe_name = f"screenshot_{int(time.time())}.png"
+    if not safe_name.lower().endswith(".png"):
+        safe_name += ".png"
+    out_dir = st["output_dir"]
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return (
+            f"Error: could not create the screenshot directory {out_dir}: {exc}. "
+            "Check that the workspace is writable by the container user."
+        )
+    out_dir = out_dir.resolve()
+    path = (out_dir / safe_name).resolve()
+    if not str(path).startswith(str(out_dir)):
+        return "Error: filename escapes the output directory"
+    return path
+
+
+def _image_result(path: Path, inline: bool, max_bytes: int) -> str:
+    """
+    Return a screenshot to the model.
+
+    The file is always written to output_dir. inline=True additionally emits the
+    IMAGE_BLOCK sentinel (see contracts.IMAGE_BLOCK_PREFIX) that
+    agent._execute_tool unwraps into a real image block, with the saved path as
+    the trailing caption so the model knows where the file landed.
+
+    Oversized images are never inlined — a full-page PNG of a long page can run
+    to tens of megabytes, which is a large amount of context to spend on one
+    tool call. Past max_bytes the path is returned instead.
+    """
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        return f"Error: screenshot saved to {path} but could not be read back: {exc}"
+
+    if not inline:
+        return f"Screenshot saved to {path}"
+
+    if size > max_bytes:
+        logger.info("web: screenshot %s is %d bytes, over the inline limit", path, size)
+        return (
+            f"Screenshot saved to {path} ({size // 1024} KB) — too large to show inline "
+            f"(limit {max_bytes // 1024} KB). View it with view(), or capture a single "
+            "element with screenshot_browser(target=...) for a smaller image."
+        )
+
+    try:
+        b64 = base64.b64encode(path.read_bytes()).decode()
+    except OSError as exc:
+        return f"Error: screenshot saved to {path} but could not be read back: {exc}"
+    return f"{IMAGE_BLOCK_PREFIX}image/png;{b64}\n(also saved to {path})"
+
+
 async def _search_with_duckduckgo_html(
     query: str,
     *,
@@ -450,7 +653,7 @@ def _state(agent) -> dict:
                 "ignore_tags":            ["script", "style"],
                 "max_discovery_elements": 40,
             },
-            "downloads_dir": None,
+            "output_dir": None,
         })
     return getattr(agent, _STATE_KEY)
 
@@ -463,7 +666,14 @@ async def _ensure_page(agent):
     if st["page"] is not None:
         return st["page"]
 
-    headless = st.get("_headless", True)
+    # headless may be True, False, or "virtual". "virtual" runs a real headful
+    # Firefox inside Xvfb: Camoufox recommends it because true-headless Firefox
+    # leaks detectable signals that trip bot checks (Reddit, Cloudflare).
+    headless = st.get("_headless", "virtual")
+    # Firefox's own content-process sandbox is left ON — it launches fine under
+    # the container's cap_drop: ALL / no-new-privileges (see compose.yaml).
+    # Note there is no --no-sandbox flag to pass here even if we wanted one:
+    # that is a Chromium flag, and Firefox ignores it.
     camoufox = AsyncCamoufox(headless=headless)
     browser = await camoufox.__aenter__()
     page = await browser.new_page()
@@ -588,12 +798,16 @@ def register_agent(agent) -> None:
         runtime_web_cfg = agent.config.extra.get("web", {})
     cfg = {**cfg, **{k: v for k, v in runtime_web_cfg.items() if k != "tools"}}
 
-    workspace     = Path(agent.config.workspace.path).expanduser().resolve()
-    downloads_dir = workspace / cfg.get("downloads_dir", "downloads")
-    downloads_dir.mkdir(parents=True, exist_ok=True)
+    workspace  = Path(agent.config.workspace.path).expanduser().resolve()
+    # NOT created here. The workspace is a bind mount owned by the host UID, so
+    # creating a new top-level dir can raise PermissionError for the container
+    # user — and register_agent exceptions are swallowed by module_registry,
+    # which would silently drop every tool in this module. Created on demand at
+    # screenshot time instead (same as custom_modules/anima).
+    output_dir = workspace / cfg.get("output_dir", "outputs/browser")
 
     st = _state(agent)
-    st["downloads_dir"] = downloads_dir
+    st["output_dir"] = output_dir
     st["settings"].update({
         "timeout_ms":             cfg.get("timeout_ms", 30000),
         "wait_until":             cfg.get("wait_until", "domcontentloaded"),
@@ -603,7 +817,24 @@ def register_agent(agent) -> None:
         "browse_max_bytes":       int(cfg.get("browse_max_bytes", 2000000)),
         "browse_max_chars":       int(cfg.get("browse_max_chars", 20000)),
         "browse_user_agent":      str(cfg.get("browse_user_agent", "TinyCTX/1.1")),
+        "settle_timeout_ms":      int(cfg.get("settle_timeout_ms", 15000)),
+        "screenshot_max_bytes":   int(cfg.get("screenshot_max_bytes", 1500000)),
     })
+
+    # Launch mode: True | False | "virtual" (Xvfb-backed headful — the default,
+    # and the only mode that survives most bot checks). config `headless` was
+    # previously parsed but never applied; it is honoured here.
+    _cfg_headless = cfg.get("headless", "virtual")
+    if isinstance(_cfg_headless, str):
+        _cfg_headless = _cfg_headless.strip().lower()
+        if _cfg_headless in ("true", "yes", "1"):
+            _cfg_headless = True
+        elif _cfg_headless in ("false", "no", "0"):
+            _cfg_headless = False
+        elif _cfg_headless != "virtual":
+            _cfg_headless = "virtual"
+    st["_headless"] = _cfg_headless
+    st["_default_headless"] = _cfg_headless
 
     original_reset = getattr(agent, 'reset', None)
 
@@ -625,6 +856,11 @@ def register_agent(agent) -> None:
         """
         Search the web using DuckDuckGo and return the top results.
         Use this when the user asks about current information or if no URL is provided.
+
+        Backed by the `ddgs` library, falling back to scraping html.duckduckgo.com
+        if it is unavailable. DuckDuckGo rate-limits aggressively, so an empty
+        result set often means throttling rather than "nothing exists" — retry or
+        rephrase before concluding a topic has no coverage.
 
         Args:
             query: The search query string.
@@ -661,8 +897,8 @@ def register_agent(agent) -> None:
                     f"{i}. {r.get('title','')}\n   {r.get('href','')}\n   {r.get('body','')}"
                 )
             lines.append(
-                "If you need the contents of a specific result URL, prefer browse_url() "
-                "or navigate() instead of shell-based curl/Invoke-WebRequest."
+                "If you need the contents of a specific result URL, prefer open_url() "
+                "instead of shell-based curl/Invoke-WebRequest."
             )
             return "\n".join(lines)
         except Exception as e:
@@ -673,19 +909,34 @@ def register_agent(agent) -> None:
     async def open_url(
         url: str,
         type: str = "text",
-        headless: bool = True,
+        headless: bool | None = None,
+        filename: str | None = None,
+        inline: bool = True,
+        wait_for: str | None = None,
     ) -> str:
         """
         Open a URL in the browser and return its content.
-        Runs headless by default. Set headless=False to show the browser window
-        (useful for solving captchas or login walls manually).
+
+        Uses Camoufox (anti-detect Firefox) driving one shared page per session —
+        the page stays loaded, so click/type_text/extract_text/screenshot_browser
+        operate on it afterwards. Waits past JS interstitials (Reddit, Cloudflare)
+        before reading content.
 
         Args:
             url: The full URL to open (include https://).
             type: What to return — "text" (visible page text, default),
-                  "html" (raw HTML markup), or "elements" (interactive element map).
-            headless: Whether to run the browser headlessly (default True).
-                      Set False to show the browser window for manual interaction.
+                  "html" (raw HTML markup), "elements" (interactive element map),
+                  or "screenshot" (full-page PNG saved to workspace/outputs/browser/).
+            headless: Leave unset to use the configured launch mode. Set False to
+                      show a real browser window — only works where a display is
+                      available, not in the default container.
+            filename: Output filename, for type="screenshot" only
+                      (default: screenshot_<timestamp>.png).
+            inline: For type="screenshot": return the image itself so you can see it
+                    (default). Set False to get the saved file path as text instead.
+            wait_for: CSS selector that only the real page has. Strongly preferred on
+                      sites behind a bot check — waiting for known content is more
+                      reliable than guessing when the interstitial finished.
         """
         st  = _state(agent)
         err = _validate_browse_url(url)
@@ -697,14 +948,16 @@ def register_agent(agent) -> None:
             return ssrf_err
 
         mode = type.lower().strip()
-        if mode not in ("elements", "text", "html"):
-            return "Error: type must be 'elements', 'text', or 'html'."
+        if mode not in ("elements", "text", "html", "screenshot"):
+            return "Error: type must be 'elements', 'text', 'html', or 'screenshot'."
+
+        want_headless = st.get("_default_headless", "virtual") if headless is None else headless
 
         try:
             # If a browser is already open with a mismatched headless mode, close it.
-            if st["browser"] is not None and st.get("_headless") != headless:
+            if st["browser"] is not None and st.get("_headless") != want_headless:
                 await _close_browser(agent)
-            st["_headless"] = headless
+            st["_headless"] = want_headless
 
             page     = await _ensure_page(agent)
             response = await page.goto(
@@ -713,33 +966,63 @@ def register_agent(agent) -> None:
                 timeout=st["settings"]["timeout_ms"],
             )
             status = response.status if response else 200
+            stuck  = await _settle_navigation(page, st["settings"], wait_for=wait_for)
+            stuck_note = (
+                "\n[warning: page still looks like a bot-check interstitial after "
+                "waiting; content below may be incomplete]"
+                if stuck else ""
+            )
+
+            if mode == "screenshot":
+                path = _screenshot_path(st, filename)
+                if isinstance(path, str):
+                    return path
+                await page.screenshot(path=str(path), full_page=True)
+                if stuck:
+                    logger.warning("web: screenshot of %s taken on a likely interstitial", page.url)
+                return _image_result(path, inline, st["settings"]["screenshot_max_bytes"])
 
             if mode == "elements":
                 elements = await _dynamic_discovery(agent)
                 return (
-                    f"Opened {url} (status {status}).\n"
+                    f"Opened {page.url} (status {status}).{stuck_note}\n"
                     f"Elements: {json.dumps(elements, indent=2)}\n"
                     "Use open_url with type='text' or type='html' for full page content."
                 )
 
-            html = await page.content()
             if mode == "html":
+                html = await page.content()
                 content = html
+                title = await page.title() or _extract_html_title(html) or ""
             else:
-                content = _html_to_text(html, st["settings"]["ignore_tags"])
+                # Playwright''s inner_text() reflects computed visibility (display:none,
+                # hidden, visually-hidden dialogs, etc.) and pierces shadow DOM natively,
+                # unlike _html_to_text(page.content()) which walks raw markup with no
+                # concept of what a browser would actually render. This cuts out ad
+                # blocks, off-screen login modals, and other DOM-but-not-visible noise
+                # that used to leak into "text" mode.
+                try:
+                    content = await page.locator("body").inner_text(
+                        timeout=st["settings"]["timeout_ms"]
+                    )
+                except Exception:
+                    # Fall back to the old path if inner_text() fails for any reason
+                    # (e.g. no <body>, detached frame) rather than losing the page.
+                    html = await page.content()
+                    content = _html_to_text(html, st["settings"]["ignore_tags"])
+                title = await page.title() or ""
             content, truncated = _truncate_content(content, st["settings"]["browse_max_chars"])
-            title = await page.title() or _extract_html_title(html) or ""
 
             suffix     = "\n[truncated]" if truncated else ""
             title_line = f"# {title}\n" if title else ""
-            return f"{title_line}{url} (status {status})\n\n{content}{suffix}"
+            return f"{title_line}{page.url} (status {status}){stuck_note}\n\n{content}{suffix}"
 
         except Exception as e:
             return f"Error: {e}"
 
     async def click(target: str, nth: int = 0, exact: bool | None = None) -> str:
         """
-        Click an element on the current page.
+        Click an element on the current Camoufox page (whatever open_url loaded last).
 
         Args:
             target: CSS selector, role=..., text=..., or plain text label.
@@ -763,7 +1046,8 @@ def register_agent(agent) -> None:
         clear: bool = True,
     ) -> str:
         """
-        Type text into a field. Append \\n to submit/press Enter.
+        Type text into a field on the current Camoufox page (whatever open_url
+        loaded last). Append \\n to submit/press Enter.
 
         Args:
             target: The input field (CSS selector, role=..., or label text).
@@ -803,6 +1087,10 @@ def register_agent(agent) -> None:
         """
         Get the visible text content from an element or the whole page.
 
+        Reads the live Camoufox page (whatever open_url loaded last), so it
+        reflects any clicks or typing done since. To read a fresh URL, use
+        open_url instead.
+
         Args:
             target: Element selector or label. Leave empty for the full page.
             nth: Which matching element to read (0 = first).
@@ -825,6 +1113,9 @@ def register_agent(agent) -> None:
         """
         Get the HTML markup from an element or the whole page.
 
+        Reads the live Camoufox page (whatever open_url loaded last), so it
+        reflects any clicks or typing done since.
+
         Args:
             target: Element selector or label. Leave empty for the full page.
             nth: Which matching element to read (0 = first).
@@ -841,38 +1132,44 @@ def register_agent(agent) -> None:
         except Exception as e:
             return f"Error: {e}"
 
-    async def screenshot_browser(target: str | None = None, filename: str | None = None, nth: int = 0, exact: bool | None = None) -> str:
+    async def screenshot_browser(
+        target: str | None = None,
+        filename: str | None = None,
+        nth: int = 0,
+        exact: bool | None = None,
+        inline: bool = True,
+    ) -> str:
         """
-        Take a screenshot of a browser page or a specific element.
-        Saved to workspace/downloads/<filename>.
+        Take a screenshot of the current Camoufox page or a specific element on it.
+        Saved to workspace/outputs/browser/<filename>, and returned inline so you
+        can see it.
+
+        Use this to capture an element, or the page state after click/type_text.
+        To screenshot a URL you have not opened yet, use open_url(type="screenshot").
 
         Args:
             target: Element to screenshot. Leave empty for the full page.
             filename: Output filename (default: screenshot_<timestamp>.png).
             nth: Which matching element to capture (0 = first).
             exact: Whether text matching must be exact.
+            inline: Return the image itself so you can see it (default). Set False
+                    to get the saved file path as text instead. Either way the file
+                    is written to workspace/outputs/browser/.
         """
         st   = _state(agent)
         page = await _ensure_page(agent)
 
-        if not filename:
-            filename = f"screenshot_{int(time.time())}.png"
-        # Strip any directory components — prevent path traversal outside downloads_dir.
-        safe_name = Path(filename).name
-        if not safe_name:
-            safe_name = f"screenshot_{int(time.time())}.png"
-        path = (st["downloads_dir"] / safe_name).resolve()
-        if not str(path).startswith(str(st["downloads_dir"].resolve())):
-            return "Error: filename escapes downloads directory"
+        path = _screenshot_path(st, filename)
+        if isinstance(path, str):
+            return path
 
         try:
             if target:
                 loc = await _locate(agent, target, nth=nth, exact=exact)
                 await loc.screenshot(path=str(path))
-                return f"Element screenshot saved to {path}"
             else:
                 await page.screenshot(path=str(path), full_page=True)
-                return f"Page screenshot saved to {path}"
+            return _image_result(path, inline, st["settings"]["screenshot_max_bytes"])
         except Exception as e:
             return f"Error: {e}"
 
@@ -883,7 +1180,7 @@ def register_agent(agent) -> None:
         exact: bool | None = None,
     ) -> str:
         """
-        Wait for an element to reach a given state before continuing.
+        Wait for an element on the current Camoufox page to reach a given state.
 
         Args:
             target: The element to wait for.

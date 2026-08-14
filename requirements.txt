@@ -1,12 +1,9 @@
-# Install the package and all its dependencies from pyproject.toml.
-# To install dev/optional extras add them here, e.g.:
-#   .[dev]
+# Install the package and its CLI-only dependencies from pyproject.toml.
+# The full agent runtime (gateway, bridges, ai.py, etc.) normally runs inside
+# Docker via the provided Dockerfile/compose.yaml. To run it on the host
+# instead, install the `agent` extra:
+#   .[agent]
 -e .
-
-# Heavy optional bridges — uncomment as needed:
-# discord.py
-# matrix-nio
-# matrix-nio[e2e]   # requires cmake + libolm
 
 # Dev / test tools:
 pytest

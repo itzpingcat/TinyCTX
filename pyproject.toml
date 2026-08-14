@@ -6,14 +6,22 @@ build-backend = "setuptools.build_meta"
 name = "tinyctx"
 version = "0.1.0"
 requires-python = ">=3.14"
+# CLI-only deps: everything needed to run `tinyctx onboard/start/stop/restart/status/launch`
+# on the host. The full agent runtime (gateway, bridges, ai.py, etc.) runs inside Docker
+# and its dependencies live under the `agent` extra below — install with `.[agent]` if you
+# need to run that code outside a container.
 dependencies = [
     "platformdirs",
     "PyYAML",
-    "aiohttp",
     "pyfiglet",
     "rich",
     "questionary",
     "requests",
+]
+
+[project.optional-dependencies]
+agent = [
+    "aiohttp",
     "mcp",
     "numpy",
     "tiktoken",
@@ -34,7 +42,7 @@ dependencies = [
     "tree-sitter-bash>=0.23,<0.26",
     "discord.py",
     "matrix-nio",
-    "ladybug"
+    "ladybug",
 ]
 
 [project.scripts]

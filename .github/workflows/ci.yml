@@ -43,7 +43,8 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+        pip install -e ".[agent]"
+        pip install pytest pytest-asyncio
     - name: Test with pytest
       run: |
         pytest -q

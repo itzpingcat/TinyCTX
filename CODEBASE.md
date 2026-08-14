@@ -4,7 +4,7 @@
 
 ## What TinyCTX Is
 
-A context-efficient agentic assistant framework. You configure a language model, pick a bridge (CLI, Discord, or HTTP gateway), and get a persistent, tool-using AI agent with memory consolidation, scheduled heartbeats, subagent support, and web browsing.
+A context-efficient agentic assistant framework. You configure a language model, pick a bridge (CLI, Discord, or HTTP gateway), and get a persistent, tool-using AI agent with memory consolidation, scheduled heartbeats, concurrent forks, and web browsing.
 
 ---
 
@@ -57,6 +57,7 @@ TinyCTX/
 │   └── anima/          generate_image_anima — deferred tool for Anima.json ComfyUI workflow (enable via tools_search or a skill's `tools:` field)
 └── modules/            Auto-discovered plugins (see Module System below)
     ├── cron/           Cron scheduler
+    ├── concurrency/    Concurrent Forks — running-peer roster + spawn_fork / nudge_fork
     ├── ctx_tools/      Context manipulation tools (edit, delete turns)
     ├── equipment_manifest/  Agent's self-description of available tools
     ├── filesystem/     view / write_file / edit_file / grep / glob_search tools
@@ -67,11 +68,10 @@ TinyCTX/
     ├── rag/            Semantic search over workspace/memory/ (BM25 or embeddings)
     ├── shell/          shell tool
     ├── skills/         use_skill tool (loads SKILL.md files; a skill's `tools:` frontmatter enables named deferred tools on load)
-    ├── subagents/      spawn_agent / wait_agent tools
     ├── sysops/         User/permission management + /model command + set_active_model tool (per-branch LLM override, see below)
     ├── system_prompt/  Injects SOUL.md, AGENTS.md into system prompt
     ├── todo/           todo_read / todo_write tools (per-session task list)
-    └── web/            web_search / open_url tools (DuckDuckGo + Playwright)
+    └── web/            web_search / open_url tools (DuckDuckGo + Camoufox)
 ```
 
 ---
@@ -322,6 +322,13 @@ new DB branch from the channel turn that spawned it. Both evolve independently.
 Cursors (`dm:<uid>`, `group:<cid>`, `thread:<tid>`) are persisted in
 `<instance>/data/cursors/discord.json` so sessions survive restarts.
 
+Concurrency: the bridge no longer buffers or serialises turns. Every trigger message
+gets its own `push()`; if a turn is already running for that cursor key, the new
+message forks off `settled_tail` instead of queueing behind it (see `concurrency`
+below). The cursor key doubles as the `session_key` that scopes fork rosters, and
+`CursorStore`'s cursor map is now a restart-persisted *mirror* of `Runtime._settled`
+rather than the authority — Runtime owns the attach point while the process lives.
+
 ### Gateway (`gateway/__main__.py`)
 - aiohttp HTTP server exposing `/v1/chat` (OpenAI-compat SSE)
 - `api_key` authentication
@@ -392,9 +399,41 @@ Superseded modules `decay.py` / `dedup_agents.py` / `librarian_agents.py` are in
 - A policy that won't load blocks **every** caller, including one who'd otherwise be unrestricted — a broken config can't tell us whether the failed entry was the one that would have bound them.
 - Tests: `tests/test_shell_policy.py` is a must-deny/must-allow corpus run against the **real shipped YAML**, including a check that every shipped rule has a test case proving it fires. `tests/test_shell.py` covers tier routing and fail-closed behaviour against throwaway fixture policies.
 
-### `web` — `web_search` (DuckDuckGo via `ddgs`) and `open_url` (Playwright, headless by default; `headless=False` for captchas).
+### `web` — `web_search` (DuckDuckGo via `ddgs`, falling back to scraping `html.duckduckgo.com`) and `open_url` (Camoufox).
 
-### `subagents` — `spawn_agent(prompt)` and `wait_agent(task_id)` for parallel side tasks on child branches.
+`open_url(url, type=...)` renders in Camoufox (anti-detect Firefox) and returns `text` | `html` | `elements` | `screenshot`. One browser instance per agent session, shared: `click` / `type_text` / `extract_text` / `extract_html` / `screenshot_browser` / `wait_for` all act on whatever `open_url` loaded last.
+
+- **Launch mode** is `config.web.headless`: `true` | `false` | `"virtual"` (default). `"virtual"` is headful Firefox under Xvfb — plain headless Firefox is detectable and gets challenged by Reddit/Cloudflare. Requires `xvfb` + `pyvirtualdisplay` (both in the Dockerfile). `false` needs a real display and will not work in the container.
+- **Interstitial settling**: `wait_until="domcontentloaded"` returns on JS challenge pages (Reddit `js_challenge=1`, Cloudflare) with a healthy 200. After every `goto`, `_settle_navigation()` resolves the page using the strongest signal available, in order:
+  1. `open_url(wait_for="<css>")` — an explicit selector only the real page has. Preferred for known bot-checked sites: a challenge cannot fake it, so there is no ambiguity about when it cleared.
+  2. Challenge machinery disappearing — `_CHALLENGE_SELECTORS` (`#challenge-form`, `#cf-chl-widget`, `script[src*='/cdn-cgi/challenge-platform']`, the Turnstile iframe, …) plus `_CHALLENGE_URL_MARKERS`. Detection is **structural, not textual** — matching phrases like "just a moment" is English-only and breaks on any vendor rewording. Hand-off is awaited via `expect_navigation`, falling back to polling for in-place rewrites.
+  3. `_wait_for_dom_stable()` — DOM size unchanged across consecutive polls. Generic completion signal covering challenge hand-off, client-side rendering and late hydration alike.
+
+  Budget is `config.web.settle_timeout_ms` (default 15s); on timeout the result carries a `[warning: ...interstitial...]` line. Results report `page.url`, not the requested URL, so post-challenge redirects are visible.
+- Firefox's content sandbox is left **on**; it launches fine under `cap_drop: ALL`. (Firefox has no `--no-sandbox` — that is a Chromium flag and was previously being passed as a no-op.)
+- **Screenshots** go to `workspace/outputs/browser/` (config `web.output_dir`), matching the `outputs/<module>/` convention `anima` uses. By default they are *also* returned inline as `IMAGE_BLOCK:image/png;<b64>` (see `contracts.IMAGE_BLOCK_PREFIX`, same sentinel `filesystem.view()` uses), which `agent._execute_tool` unwraps into a real image block for vision models. The sentinel now takes an optional `\n<caption>` suffix (added to `contracts.py` / `agent.py`; base64 has no newline so the split is unambiguous and `filesystem.view()` is unaffected), which web uses to append `(also saved to <path>)`. Screenshots over `config.web.screenshot_max_bytes` (default 1.5 MB) are saved but not inlined — a full-page PNG of a long page costs a lot of context. `inline=False` returns the path as text.
+- `http_request` was removed.
+
+### `concurrency` — Concurrent Forks. Replaces the deleted `subagents` module; see `docs/PLAN.md` for the design of record.
+
+Many live `AgentCycle`s per conversation, peer-to-peer, no coordinator. Registers a `running_forks` roster prompt provider (role=user, so it re-renders outside the cached prefix on every `assemble()`) plus two tools:
+
+- `spawn_fork(prompt)` → `run_id`. Starts a run on a fresh branch off the caller's head. **There is no `wait_fork`** — blocking on a child is redundant, since the child's completion digest reaches the spawner either through its inbox (if still running) or through `settled_tail` (if not).
+- `nudge_fork(run_id, message)` — advisory, one-way, same-session-only message to a peer. No acks and no kill path, deliberately: request/response between forks is how a coordinator sneaks back in.
+
+The lifecycle lives in `runtime.py`, not here:
+
+- `Run` — in-memory handle per live cycle (`id`, `session_key`, `intent`, `root_node_id`, `status`, `inbox`). Never persisted; `run.id` is deliberately *not* a node id, which is what makes two concurrent cycles on one conversation representable.
+- `_settled: session_key → node_id` — the single node new inbound messages attach to. One attach rule covers both behaviours with no mode detection: nothing running means attaching is linear continuation; a run in flight means attaching is a fork. `push()` therefore advances `settled_tail` **only for passive messages** — a triggering message leaves it put so the next concurrent message is a sibling, not a child.
+- `finish_run()` advances `settled_tail` to the last finisher and fans a digest (intent + final text, no tools, no thinking, capped at 2000 chars) into every still-running peer in the same session. This makes "the last run to finish always has everything" true by construction, so no merge or reconciliation pass exists.
+- One `asyncio.Lock` per session serialises the *start* and *finish* transitions only — never cycle execution. Without it a run starting as another finishes could miss it permanently.
+- `Exogenous(kind, role, content)` is the single inbox entry type. Adding an event source is a new `kind`, not a new queue. `AgentCycle._drain_inbox()` runs at exactly two points: top of the outer loop before `assemble()`, and once before finalizing (which loops one more time if anything was written).
+
+Scoping is by `Run.session_key` (the bridge's cursor key: `dm:<uid>` / `group:<cid>` / `thread:<tid>`), **not** `SessionEnvironment` — the Discord bridge builds every DM's environment identically, so environment-scoped rosters would leak across DMs. Callers that pass no `session_key` (heartbeat, cron, the memory librarian) default to `msg.tail_node_id`, landing each push in its own degenerate session: linear attach, empty roster, no fan-out, invisible to real sessions.
+
+Capacity: `Runtime._semaphore` (`max_workers`, default 8) caps concurrent *execution*. There is no admission check — over-capacity runs queue on the semaphore rather than being dropped.
+
+Tests: `tests/test_concurrency.py` covers the attach rule, fan-out, the completeness invariant, the start/finish race, digest rendering, roster scoping, nudges, and the drain.
 
 ### `skills` — `use_skill(name)` tool. Loads `SKILL.md` from `workspace/skills/<name>/`. Follows agentskills.io convention. A skill's frontmatter may declare `tools: tool_a, tool_b` (comma-separated); loading that skill calls `tool_handler.enable()` on each name, letting a skill bring its own deferred tools online without a separate `tools_search` call. Unknown names are reported back, not silently dropped.
 
