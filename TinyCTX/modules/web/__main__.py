@@ -129,6 +129,16 @@ _BLOCK_TAGS = {
     "section", "table", "tbody", "td", "tfoot", "th", "thead", "tr", "ul",
 }
 _HEADING_PREFIX = {"h1": "# ", "h2": "## ", "h3": "### ", "h4": "#### ", "h5": "##### ", "h6": "###### "}
+# HTML5 void elements: never receive a closing tag, so HTMLParser will never
+# fire handle_endtag() for them. If one of these is also listed in
+# _IGNORED_TEXT_TAGS, incrementing _ignored_depth on its start tag without a
+# matching decrement permanently poisons the parse (every char of the
+# document after the first stray void tag gets silently dropped). meta/link
+# in <head> are the common real-world trigger.
+_VOID_ELEMENTS = {
+    "area", "base", "br", "col", "embed", "hr", "img", "input",
+    "link", "meta", "param", "source", "track", "wbr",
+}
 _IGNORED_TEXT_TAGS = {
     "canvas", "head", "meta", "link", "noscript", "script", "style", "svg", "title",
 }
@@ -187,7 +197,11 @@ class _HTMLTextExtractor(HTMLParser):
     def handle_starttag(self, tag: str, attrs) -> None:  # noqa: ANN001
         tag = tag.lower()
         if tag in self._ignored_tags:
-            self._ignored_depth += 1
+            # Void elements (meta, link, ...) never get a closing tag, so
+            # never fire handle_endtag() - do not increment depth for them
+            # or it can never be decremented back down.
+            if tag not in _VOID_ELEMENTS:
+                self._ignored_depth += 1
             return
         if self._ignored_depth:
             return
@@ -251,7 +265,7 @@ class _HTMLTextExtractor(HTMLParser):
     def handle_endtag(self, tag: str) -> None:
         tag = tag.lower()
         if tag in self._ignored_tags:
-            if self._ignored_depth:
+            if tag not in _VOID_ELEMENTS and self._ignored_depth:
                 self._ignored_depth -= 1
             return
         if self._ignored_depth:
