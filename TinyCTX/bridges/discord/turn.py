@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Awaitable, Callable
 
 import discord
 
@@ -29,6 +29,110 @@ if TYPE_CHECKING:
     from TinyCTX.bridges.discord.bridge import DiscordBridge
 
 logger = logging.getLogger(__name__)
+
+
+class ChannelRenderer:
+    """
+    Renders one AgentEvent stream to a Discord channel — buffering text
+    until AgentTextFinal/completion, uploading files, and formatting
+    errors. This is the same rendering logic handle_turn() used to run
+    inline; it's extracted here so any caller with an event stream and a
+    destination channel (a live turn, or a background source like cron via
+    Runtime.deliver) gets identical rendering: same chunking, same file
+    handling, same error formatting — not a second, drifting reimplementation.
+
+    Usage: feed events one at a time via feed(event), then call flush()
+    once the stream is exhausted (None sentinel / turn done) to send any
+    buffered text. dehumanize is optional — handle_turn's live path passes
+    bridge._dehumanize_mentions; callers without a live bridge (cron) can
+    omit it and get raw text.
+    """
+
+    def __init__(
+        self,
+        channel: discord.abc.Messageable,
+        max_len: int,
+        dehumanize: "Callable[[str], str] | None" = None,
+    ) -> None:
+        self._channel = channel
+        self._max_len = max_len
+        self._dehumanize = dehumanize or (lambda t: t)
+        self._buf: list[str] = []
+        self._suppressed = False
+
+    async def feed(self, event) -> None:
+        if isinstance(event, AgentTextChunk):
+            self._buf.append(event.text)
+        elif isinstance(event, AgentThinkingChunk):
+            pass
+        elif isinstance(event, AgentTextFinal):
+            if event.suppressed:
+                self._suppressed = True
+                self._buf.clear()
+            elif event.text:
+                self._buf.append(event.text)
+        elif isinstance(event, AgentToolCall):
+            logger.debug("Discord: tool call %s", event.tool_name)
+        elif isinstance(event, AgentToolResult):
+            logger.debug(
+                "Discord: tool result %s (%s)",
+                event.tool_name, "error" if event.is_error else "ok",
+            )
+        elif isinstance(event, AgentOutboundFiles):
+            for path in event.paths:
+                try:
+                    await self._channel.send(file=discord.File(path))
+                except Exception as exc:
+                    logger.warning("Discord: failed to upload file %s: %s", path, exc)
+        elif isinstance(event, AgentError):
+            await self._channel.send(f"⚠️ {event.message}")
+            self._suppressed = True
+            self._buf.clear()
+
+    async def flush(self) -> None:
+        text = "" if self._suppressed else self._dehumanize("".join(self._buf).strip())
+        self._buf.clear()
+        if text:
+            for i in range(0, len(text), self._max_len):
+                await self._channel.send(text[i : i + self._max_len])
+
+
+def make_platform_handler(bridge: "DiscordBridge") -> "Callable[[str, object], Awaitable[None]]":
+    """
+    Build the Runtime.register_platform_handler(...) callable for the
+    Discord platform: (cursor_key, event) -> None. Cron (or any future
+    non-live trigger) delivers one event at a time via this; a
+    ChannelRenderer is created lazily per cursor_key and flushed when a
+    completion event (AgentTextFinal, AgentError, or the sentinel-shaped
+    signal handled by Runtime.deliver's caller) is fed. Since Runtime.deliver
+    is called once per event, not once per turn, this handler keeps a
+    per-cursor_key buffer alive across calls and flushes on AgentTextFinal
+    or AgentError — the two events that end a turn's output.
+    """
+    renderers: dict[str, ChannelRenderer] = {}
+
+    async def handler(cursor_key: str, event) -> None:
+        channel = bridge._active_channels.get(cursor_key)
+        if channel is None:
+            channel = await bridge._cursor_to_channel(cursor_key)
+        if channel is None:
+            logger.warning(
+                "Discord: platform handler has no channel for cursor_key %r — dropping event", cursor_key
+            )
+            return
+
+        renderer = renderers.get(cursor_key)
+        if renderer is None:
+            renderer = ChannelRenderer(channel, bridge._max_len, bridge._dehumanize_mentions)
+            renderers[cursor_key] = renderer
+
+        await renderer.feed(event)
+
+        if isinstance(event, (AgentTextFinal, AgentError)):
+            await renderer.flush()
+            renderers.pop(cursor_key, None)
+
+    return handler
 
 
 async def typing_keepalive(
@@ -101,8 +205,7 @@ async def handle_turn(
         turn_timeout: float | None = (
             float(bridge._opts.get("turn_timeout_s", 0)) or None
         )
-        buf: list[str] = []
-        suppressed = False
+        renderer = ChannelRenderer(channel, bridge._max_len, bridge._dehumanize_mentions)
 
         while True:
             try:
@@ -117,52 +220,26 @@ async def handle_turn(
             if event is None:  # sentinel: turn complete
                 break
 
-            if isinstance(event, AgentTextChunk):
-                if bridge._typing_on_reply:
-                    typing_ev.set()
-                buf.append(event.text)
-            elif isinstance(event, AgentThinkingChunk):
-                if bridge._typing_on_thinking:
-                    typing_ev.set()
+            # Typing-indicator triggers are turn-local UX, not rendering —
+            # kept here rather than in ChannelRenderer, which has no notion
+            # of a live typing indicator (cron has no channel.typing()).
+            if isinstance(event, AgentTextChunk) and bridge._typing_on_reply:
+                typing_ev.set()
+            elif isinstance(event, AgentThinkingChunk) and bridge._typing_on_thinking:
+                typing_ev.set()
             elif isinstance(event, AgentTextFinal):
-                if event.suppressed:
-                    suppressed = True
-                    buf.clear()
-                elif event.text:
-                    buf.append(event.text)
                 current_epoch = bridge._reset_epoch.get(cursor_key, 0)
                 if current_epoch == epoch_at_start and event.tail_node_id:
                     bridge._advance_cursor(cursor_key, event.tail_node_id)
-            elif isinstance(event, AgentToolCall):
-                if bridge._typing_on_tools:
-                    typing_ev.set()
-                logger.debug(
-                    "Discord: tool call %s for %s", event.tool_name, cursor_key
-                )
-            elif isinstance(event, AgentToolResult):
-                logger.debug(
-                    "Discord: tool result %s (%s) for %s",
-                    event.tool_name,
-                    "error" if event.is_error else "ok",
-                    cursor_key,
-                )
-            elif isinstance(event, AgentOutboundFiles):
-                for path in event.paths:
-                    try:
-                        await channel.send(file=discord.File(path))
-                    except Exception as exc:
-                        logger.warning(
-                            "Discord: failed to upload file %s: %s", path, exc
-                        )
-            elif isinstance(event, AgentError):
-                await channel.send(f"⚠️ {event.message}")
+            elif isinstance(event, AgentToolCall) and bridge._typing_on_tools:
+                typing_ev.set()
+
+            await renderer.feed(event)
+
+            if isinstance(event, AgentError):
                 break
 
-        # Send accumulated text (unless the agent replied NO_REPLY).
-        text = "" if suppressed else bridge._dehumanize_mentions("".join(buf).strip())
-        if text:
-            for i in range(0, len(text), bridge._max_len):
-                await channel.send(text[i : i + bridge._max_len])
+        await renderer.flush()
 
     except Exception:
         logger.exception("Discord: error handling turn for %s", cursor_key)

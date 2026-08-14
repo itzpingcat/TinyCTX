@@ -43,6 +43,7 @@ import os
 import re
 import time
 from pathlib import Path
+from typing import Awaitable, Callable
 
 from TinyCTX.bridges.telegram.api import DEFAULT_API_BASE, TelegramAPI
 from TinyCTX.contracts import (
@@ -51,6 +52,81 @@ from TinyCTX.contracts import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class ChatRenderer:
+    """
+    Renders one AgentEvent stream to a Telegram chat — buffering text until
+    AgentTextFinal/completion, then sending chunked messages. Mirrors
+    Discord's turn.ChannelRenderer: extracted so a live turn and a
+    background caller (cron via Runtime.deliver) get identical rendering.
+
+    Matches the pre-existing live-loop behavior exactly, including that an
+    AgentError is only logged, never sent to the chat — Telegram's bridge
+    has never surfaced tool/LLM errors to end users, unlike Discord; this
+    preserves that rather than introducing new user-facing behavior.
+    """
+
+    def __init__(self, api: TelegramAPI, chat_id, max_len: int) -> None:
+        self._api = api
+        self._chat_id = chat_id
+        self._max_len = max_len
+        self._buf: list[str] = []
+        self._suppressed = False
+
+    async def feed(self, event) -> None:
+        if isinstance(event, AgentTextChunk):
+            self._buf.append(event.text)
+        elif isinstance(event, AgentTextFinal):
+            if event.suppressed:
+                self._suppressed = True
+            elif event.text:
+                self._buf = [event.text]
+        elif isinstance(event, AgentError):
+            logger.error("[telegram] agent error: %s", event.message)
+
+    async def flush(self) -> None:
+        text = "" if self._suppressed else "".join(self._buf)
+        self._buf = []
+        for chunk in _chunks(text, self._max_len):
+            try:
+                await self._api.send_message(self._chat_id, chunk)
+            except Exception:
+                logger.exception("[telegram] send_message failed")
+                break
+
+
+def make_platform_handler(bridge: "TelegramBridge") -> "Callable[[str, object], Awaitable[None]]":
+    """
+    Build the Runtime.register_platform_handler(...) callable for the
+    Telegram platform: (chat_key, event) -> None, where chat_key is the same
+    "tg:<chat_id>" key used for cursors (see _cursor_for). Renderers are
+    kept per chat_key across calls (Runtime.deliver is invoked once per
+    event) and flushed on AgentTextFinal or AgentError.
+    """
+    renderers: dict[str, ChatRenderer] = {}
+
+    async def handler(chat_key: str, event) -> None:
+        if bridge.api is None:
+            logger.warning("[telegram] platform handler called before bridge is connected — dropping event")
+            return
+        _, _, raw_id = chat_key.partition(":")
+        if not raw_id:
+            logger.warning("[telegram] platform handler got malformed chat_key %r", chat_key)
+            return
+
+        renderer = renderers.get(chat_key)
+        if renderer is None:
+            renderer = ChatRenderer(bridge.api, raw_id, bridge.max_reply_length)
+            renderers[chat_key] = renderer
+
+        await renderer.feed(event)
+
+        if isinstance(event, (AgentTextFinal, AgentError)):
+            await renderer.flush()
+            renderers.pop(chat_key, None)
+
+    return handler
 
 
 class TelegramBridge:
@@ -133,6 +209,13 @@ class TelegramBridge:
             "[telegram] connected as @%s (answers to: %s)",
             self.bot_username,
             ", ".join(sorted({f"@{self.bot_username}", *self.mention_aliases})),
+        )
+
+        # Let non-live callers (cron; any future background trigger) deliver
+        # AgentEvents to a Telegram chat_key through the same rendering path
+        # a live turn uses (ChatRenderer) instead of being dropped.
+        self.runtime.register_platform_handler(
+            Platform.TELEGRAM.value, make_platform_handler(self)
         )
 
         offset = 0
@@ -262,34 +345,19 @@ class TelegramBridge:
             await self.api.send_chat_action(chat["id"])
             new_tail = await self.runtime.push(msg, reply_queue=reply_queue)
 
-            final_text = ""
-            streamed: list[str] = []
-            suppressed = False
+            renderer = ChatRenderer(self.api, chat["id"], self.max_reply_length)
             while True:
                 event = await reply_queue.get()
                 if event is None:
                     break
-                if isinstance(event, AgentTextChunk):
-                    streamed.append(event.text)
-                elif isinstance(event, AgentTextFinal):
+                if isinstance(event, AgentTextFinal) and event.tail_node_id:
                     new_tail = event.tail_node_id
-                    if event.suppressed:
-                        suppressed = True
-                    elif event.text:
-                        final_text = event.text
-                elif isinstance(event, AgentError):
-                    logger.error("[telegram] agent error: %s", event.message)
-            final_text = "" if suppressed else (final_text or "".join(streamed))
+                await renderer.feed(event)
 
             self._cursors[chat_key] = new_tail
             self._save_cursors()
 
-            for chunk in _chunks(final_text, self.max_reply_length):
-                try:
-                    await self.api.send_message(chat["id"], chunk)
-                except Exception:
-                    logger.exception("[telegram] send_message failed")
-                    break
+            await renderer.flush()
 
 
 def _chunks(text: str, limit: int) -> list[str]:

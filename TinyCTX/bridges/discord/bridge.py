@@ -247,6 +247,34 @@ class DiscordBridge:
         self._store.set(cursor_key, new_tail)
         logger.info("Discord: cursor %s advanced to %s", cursor_key, new_tail)
 
+    async def _cursor_to_channel(self, cursor_key: str) -> discord.abc.Messageable | None:
+        """
+        Resolve a cursor_key (see cursors.py: "dm:<uid>", "group:<cid>",
+        "thread:<tid>") to a live Discord channel/thread object, for
+        delivering output outside a live turn (e.g. a cron job's platform
+        handler — see Runtime.register_platform_handler). Unlike
+        _active_channels (only populated transiently during a live turn's
+        handle_turn call), this always does a fresh client-side resolution,
+        so it works for a cursor_key with no turn currently in flight.
+        """
+        try:
+            kind, _, raw_id = cursor_key.partition(":")
+            if not raw_id:
+                return None
+            if kind == "dm":
+                user = self._client.get_user(int(raw_id)) or await self._client.fetch_user(int(raw_id))
+                return await user.create_dm() if user else None
+            if kind in ("group", "thread"):
+                channel = self._client.get_channel(int(raw_id))
+                if channel is None:
+                    channel = await self._client.fetch_channel(int(raw_id))
+                return channel
+            logger.warning("Discord: _cursor_to_channel got unknown cursor kind %r", cursor_key)
+            return None
+        except Exception:
+            logger.exception("Discord: failed to resolve channel for cursor_key %r", cursor_key)
+            return None
+
     # ------------------------------------------------------------------
     # Turn dispatch / buffering
     # ------------------------------------------------------------------
@@ -475,6 +503,13 @@ class DiscordBridge:
                 "in any server."
             )
         await _cmd_module.sync_app_commands(self)
+
+        # Let non-live callers (cron; any future background trigger) deliver
+        # AgentEvents to a Discord cursor_key through the same rendering path
+        # a live turn uses (turn.ChannelRenderer) instead of being dropped.
+        self._runtime.register_platform_handler(
+            Platform.DISCORD.value, _turn_module.make_platform_handler(self)
+        )
 
     async def _on_thread_create(self, thread: discord.Thread) -> None:
         """
