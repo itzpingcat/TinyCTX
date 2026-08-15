@@ -100,16 +100,17 @@ class ToolOverrideConfig:
     """
     Per-tool override of registration-time defaults (always_on / min_permission).
 
-    Configured via the top-level 'tool_overrides:' key in config.yaml:
+    Configured via 'tools.overrides:' in config.yaml:
 
-        tool_overrides:
-          shell:
-            min_permission: 80
-          present:
-            always_on: true
-          memory_search:
-            always_on: false
-            min_permission: 10
+        tools:
+          overrides:
+            shell:
+              min_permission: 80
+            present:
+              always_on: true
+            memory_search:
+              always_on: false
+              min_permission: 10
 
     Fields left unset (null/omitted) leave that aspect of the tool untouched —
     only the fields you specify are overridden. Unknown tool names are ignored
@@ -117,6 +118,122 @@ class ToolOverrideConfig:
     """
     always_on:      bool | None = None
     min_permission: int | None  = None
+
+
+@dataclass
+class ToolPassiveConfig:
+    """
+    Automatic, un-requested tool enabling — run once per user turn, before the
+    model sees its tool list, over the same tools_vector_cache.db corpus that
+    the explicit tools_search tool (see ToolSearchConfig) reads from.
+
+    Up to `auto_limit` tools scoring above `auto_min_score` are enabled for
+    that turn only; the enable is not persisted to session state, so the next
+    turn re-runs the search fresh against its own query.
+
+    Configured via 'tools.passive:' in config.yaml:
+
+        tools:
+          passive:
+            auto_bm25_enabled: true
+            auto_vector_enabled: false
+            embedding_model: ""
+            auto_limit: 2
+            auto_min_score: 0.0
+            rrf_k: 60
+
+    auto_bm25_enabled: true  (default)
+        Every turn, BM25-rank the full tool corpus against the user's message
+        and auto-enable the top `auto_limit` hits. No network call, no
+        embedding_model dependency — this is today's tools_search fuzzy-match
+        logic, just run automatically instead of waiting for the model to
+        call it.
+
+    auto_vector_enabled: false  (default)
+        Also embed the user's message and RRF-fuse vector similarity with the
+        BM25 ranks (same fusion as modules/memory's search_memory). Requires
+        embedding_model to name a 'kind: embedding' entry under models: — if
+        unset, or the embed call fails, this silently falls back to
+        auto_bm25_enabled's behavior. Off by default: unlike BM25 this costs
+        a real embed() call every turn.
+
+    embedding_model
+        Model name to embed with when auto_vector_enabled is true. Resolved
+        via Config.get_embedding_model() at use time, not at config load —
+        intentionally independent from tools.search.embedding_model so
+        passive (every turn) and explicit search (model-initiated, rarer)
+        can point at different models.
+    """
+    auto_bm25_enabled:   bool  = True
+    auto_vector_enabled: bool  = False
+    embedding_model:     str   = ""
+    auto_limit:          int   = 2
+    auto_min_score:       float = 0.0
+    rrf_k:                int   = 60
+
+
+@dataclass
+class ToolSearchConfig:
+    """
+    Config for the explicit, model-invoked tools_search tool — distinct from
+    ToolPassiveConfig's automatic per-turn pass. The model deliberately calls
+    this, so it can afford to be more thorough; it still only lists
+    candidates, it does not auto-enable them (the model must call it again
+    with an exact tool name to enable one).
+
+    Configured via 'tools.search:' in config.yaml:
+
+        tools:
+          search:
+            vector_enabled: false
+            embedding_model: ""
+            top_k: 5
+            rrf_k: 60
+            min_score: 0.0
+
+    vector_enabled: false  (default)
+        Whether tools_search's fuzzy (non-exact-name) path also uses vector
+        similarity, RRF-fused with BM25, instead of BM25 alone. Requires
+        embedding_model. Reads the same tools_vector_cache.db corpus as
+        ToolPassiveConfig — tool descriptions are embedded once and shared
+        between the two entry points, never twice.
+
+    embedding_model
+        Independent from tools.passive.embedding_model — see that field's
+        docstring for why they're kept separate.
+
+    top_k
+        Max candidates listed per fuzzy search call.
+
+    min_score
+        Floor below which a candidate isn't listed at all, so a query that
+        barely matches anything doesn't dump the whole registry back at the
+        model.
+    """
+    vector_enabled:   bool  = False
+    embedding_model:  str   = ""
+    top_k:            int   = 5
+    rrf_k:             int   = 60
+    min_score:         float = 0.0
+
+
+@dataclass
+class ToolsConfig:
+    """
+    Top-level 'tools:' key in config.yaml — groups per-tool overrides and the
+    two tool-discovery config blocks:
+
+        tools:
+          overrides: {}
+          passive: {}
+          search: {}
+
+    See ToolOverrideConfig, ToolPassiveConfig, ToolSearchConfig for each
+    sub-key's fields and defaults.
+    """
+    overrides: dict[str, ToolOverrideConfig] = field(default_factory=dict)
+    passive:   ToolPassiveConfig             = field(default_factory=ToolPassiveConfig)
+    search:    ToolSearchConfig              = field(default_factory=ToolSearchConfig)
 
 
 @dataclass
@@ -286,7 +403,7 @@ class Config:
     token_fuzz:      float                   = 1.1   # multiplier applied to counted tokens to account for tokenizer inaccuracy
     attachments:     AttachmentConfig        = field(default_factory=AttachmentConfig)
     permissions:     PermissionsConfig       = field(default_factory=PermissionsConfig)
-    tool_overrides:  dict[str, ToolOverrideConfig] = field(default_factory=dict)
+    tools:           ToolsConfig             = field(default_factory=ToolsConfig)
     # When True, AgentError events (LLM error, abort) are written into the
     # conversation as a node so the LLM can see, on its next turn, that its
     # previous turn errored out — instead of the error vanishing silently
@@ -355,7 +472,7 @@ def _parse_tool_overrides(raw: dict) -> dict[str, ToolOverrideConfig]:
     overrides: dict[str, ToolOverrideConfig] = {}
     for tool_name, o in (raw or {}).items():
         if not isinstance(o, dict):
-            raise ValueError(f"tool_overrides.{tool_name} must be a mapping")
+            raise ValueError(f"tools.overrides.{tool_name} must be a mapping")
         always_on = o.get("always_on")
         min_permission = o.get("min_permission")
         if always_on is not None:
@@ -367,6 +484,36 @@ def _parse_tool_overrides(raw: dict) -> dict[str, ToolOverrideConfig]:
             min_permission=min_permission,
         )
     return overrides
+
+
+def _parse_tool_passive(raw: dict) -> ToolPassiveConfig:
+    return ToolPassiveConfig(
+        auto_bm25_enabled=bool(raw.get("auto_bm25_enabled", True)),
+        auto_vector_enabled=bool(raw.get("auto_vector_enabled", False)),
+        embedding_model=str(raw.get("embedding_model", "")),
+        auto_limit=int(raw.get("auto_limit", 2)),
+        auto_min_score=float(raw.get("auto_min_score", 0.0)),
+        rrf_k=int(raw.get("rrf_k", 60)),
+    )
+
+
+def _parse_tool_search(raw: dict) -> ToolSearchConfig:
+    return ToolSearchConfig(
+        vector_enabled=bool(raw.get("vector_enabled", False)),
+        embedding_model=str(raw.get("embedding_model", "")),
+        top_k=int(raw.get("top_k", 5)),
+        rrf_k=int(raw.get("rrf_k", 60)),
+        min_score=float(raw.get("min_score", 0.0)),
+    )
+
+
+def _parse_tools(raw: dict) -> ToolsConfig:
+    raw = raw or {}
+    return ToolsConfig(
+        overrides=_parse_tool_overrides(raw.get("overrides", {})),
+        passive=_parse_tool_passive(raw.get("passive", {})),
+        search=_parse_tool_search(raw.get("search", {})),
+    )
 
 
 def _parse_model(raw: dict, default_context: int = 16384) -> ModelConfig:
@@ -424,7 +571,7 @@ def _parse_model(raw: dict, default_context: int = 16384) -> ModelConfig:
 _KNOWN_KEYS = {
     "models", "llm", "router", "bridges", "gateway", "workspace", "data",
     "logging", "max_tool_cycles", "parallel", "token_fuzz", "attachments", "permissions",
-    "tool_overrides", "context",  # "context" is the deprecated legacy top-level key
+    "tools", "context",  # "context" is the deprecated legacy top-level key
     "error_introspection", "command_introspection",
 }
 
@@ -551,8 +698,8 @@ def load(path="config.yaml") -> Config:
     if parallel < 1:
         raise ValueError(f"parallel must be >= 1, got {parallel}")
 
-    # ------------------------------------------------------------------ tool_overrides
-    tool_overrides = _parse_tool_overrides(raw.get("tool_overrides", {}))
+    # ------------------------------------------------------------------ tools
+    tools = _parse_tools(raw.get("tools", {}))
 
     # ------------------------------------------------------------------ extra
     extra = {k: v for k, v in raw.items() if k not in _KNOWN_KEYS}
@@ -574,7 +721,7 @@ def load(path="config.yaml") -> Config:
         token_fuzz=float(raw.get("token_fuzz", 1.1)),
         attachments=attachments,
         permissions=permissions,
-        tool_overrides=tool_overrides,
+        tools=tools,
         error_introspection=bool(raw.get("error_introspection", False)),
         command_introspection=bool(raw.get("command_introspection", False)),
         extra=extra,

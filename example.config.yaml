@@ -190,7 +190,21 @@ system_prompt:
     file: TOOLS.md
     priority: 15
 token_fuzz: 1.1
-tool_overrides: {}
+tools:
+  overrides: {}   # per-tool always_on / min_permission overrides, e.g. shell: {min_permission: 80}
+  passive:        # automatic per-turn tool enabling (no model action required)
+    auto_bm25_enabled: true    # BM25-rank the tool corpus against the user's message each turn
+    auto_vector_enabled: false # also embed + RRF-fuse vector similarity (needs embedding_model)
+    embedding_model: ""        # models: entry with kind: embedding
+    auto_limit: 2              # max tools auto-enabled per turn
+    auto_min_score: 0.0        # floor below which a candidate isn't auto-enabled
+    rrf_k: 60
+  search:         # config for the explicit, model-invoked tools_search tool
+    vector_enabled: false      # let tools_search's fuzzy path use vector + BM25 (RRF), not BM25 alone
+    embedding_model: ""        # independent from passive.embedding_model
+    top_k: 5                   # max candidates listed per fuzzy search call
+    rrf_k: 60
+    min_score: 0.0
 web:
   browse_max_bytes: 2000000
   browse_max_chars: 20000
