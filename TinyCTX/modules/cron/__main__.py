@@ -603,11 +603,12 @@ class _CronRunner:
         # cue; the wrapper text below makes the situation explicit in words
         # too, and tells the agent where its reply actually goes.
         wrapped_message = (
-            "[Scheduled trigger — not a message from a person waiting in this "
-            f"conversation. This fired automatically on the schedule you set up. "
-            f"Your instruction to yourself was:]\n{job.message}\n\n"
-            "[Carry it out now. Whatever you write in reply is what gets sent "
-            "to this channel — there is no one here to reply \"to\".]"
+            "<cron_sentinel>"
+            f"Your scheduled cron job has fired for this conversation. This fired automatically on the schedule you set up. "
+            f"Your instruction to yourself was:[\n{job.message}\n]\n"
+            "Carry it out now. Whatever you write in reply gets sent "
+            "to this channel. If you have nothing to say return NO_REPLY."
+            "</cron_sentinel>"
         )
         msg = InboundMessage(
             tail_node_id=parent_id,
