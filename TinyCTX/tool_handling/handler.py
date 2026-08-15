@@ -69,9 +69,19 @@ class ToolCallHandler:
             if param.default == inspect.Parameter.empty:
                 required.append(param_name)
         
+        # Full raw docstring, kept separately from `description` (which is
+        # just the first line, shown to the LLM via get_tool_definitions).
+        # Used only as the search/embedding text — see search.py's
+        # _embed_text_for — so Args:/Returns: detail (channel names, units,
+        # format notes, etc.) is actually searchable/embeddable instead of
+        # being discarded after _extract_docstring_parts() strips it down to
+        # arg_descs, which never made it into the old BM25 corpus text.
+        docstring = inspect.getdoc(func) or description
+
         self.tools[name] = {
             'function': func,
             'description': description,
+            'docstring': docstring,
             'signature': sig,
             'properties': properties,
             'required': required,
@@ -300,8 +310,9 @@ class ToolCallHandler:
         callers should fall back to plain BM25 via utils.bm25 directly."""
         if self.vector_store is None:
             from TinyCTX.utils.bm25 import BM25
+            from TinyCTX.tool_handling.search import _embed_text_for
             corpus = {
-                name: f"{name.replace('_', ' ')} {tool['description']}"
+                name: _embed_text_for(name, tool)
                 for name, tool in self.tools.items()
             }
             scored = BM25(corpus).search(query, top_k=top_k)
@@ -357,8 +368,9 @@ class ToolCallHandler:
             # No cache-backed store, or BM25-only requested: plain BM25 pass,
             # no sync/embed cost.
             from TinyCTX.utils.bm25 import BM25
+            from TinyCTX.tool_handling.search import _embed_text_for
             corpus = {
-                name: f"{name.replace('_', ' ')} {tool['description']}"
+                name: _embed_text_for(name, tool)
                 for name, tool in self.tools.items()
             }
             scored = BM25(corpus).search(query, top_k=limit)

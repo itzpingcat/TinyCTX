@@ -10,27 +10,35 @@ Shared ranking logic for tool discovery — used by both:
 Both read the same ToolVectorStore corpus (one embedding per tool, synced
 fresh each turn since the tool registry itself is rebuilt every AgentCycle —
 see sync_store below) and both fuse BM25 + vector via reciprocal-rank fusion
-(TinyCTX.utils.rrf.rrf_fuse — the one fusion implementation shared across
-tool discovery, memory search, and RAG search): RRF is scale-invariant
-(no min-max normalization step) and was already proven in the memory module.
+using the single shared utils/rrf.py implementation (also used by
+modules/memory/tools.py) — not a local copy, per the project's RRF-over-
+rag/store.py's-normalize-and-linear-blend consolidation decision.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
 from TinyCTX.utils.bm25 import BM25
-from TinyCTX.utils.rrf import rrf_fuse as _rrf_fuse
+from TinyCTX.utils.rrf import rrf_fuse
 from TinyCTX.tool_handling.vector_store import ToolVectorStore, content_hash
 
 logger = logging.getLogger(__name__)
 
 
-def _embed_text_for(name: str, description: str) -> str:
-    """Canonical string embedded/hashed for a tool — same shape tools_search's
-    existing BM25 corpus already uses (name words + description), so BM25 and
-    vector rank the same text."""
-    return f"{name.replace('_', ' ')} {description}"
+def _embed_text_for(name: str, tool: dict) -> str:
+    """Canonical string embedded/hashed for a tool. Uses the FULL raw
+    docstring (tool['docstring'], set by ToolCallHandler.register_tool via
+    inspect.getdoc) rather than just tool['description'] (the docstring's
+    first line only). The Args:/Returns: detail — parameter names, units,
+    format notes, examples — often carries the words a query actually
+    matches ("post to Discord", "markdown supported") that the one-line
+    description alone doesn't mention. Falls back to 'description' for tool
+    dicts that predate the 'docstring' key (defensive; register_tool always
+    sets it)."""
+    text = tool.get("docstring") or tool.get("description", "")
+    return f"{name.replace('_', ' ')} {text}"
 
 
 async def sync_store(store: ToolVectorStore, tools: dict[str, Any], embedder, embedding_model: str) -> None:
@@ -54,7 +62,7 @@ async def sync_store(store: ToolVectorStore, tools: dict[str, Any], embedder, em
 
     dirty: list[tuple[str, str, str]] = []  # (name, text, text_hash)
     for name, tool in tools.items():
-        text = _embed_text_for(name, tool.get("description", ""))
+        text = _embed_text_for(name, tool)
         text_hash = content_hash(text)
         if store.is_dirty(name, text_hash, embedding_model):
             dirty.append((name, text, text_hash))
@@ -110,29 +118,40 @@ async def rank_tools(
     if not tools:
         return []
 
-    # -- BM25 --
-    bm25_ranks: dict[str, int] = {}
-    corpus = {name: _embed_text_for(name, tool.get("description", "")) for name, tool in tools.items()}
-    bm25 = BM25(corpus)
-    hits = bm25.search(query, top_k=len(corpus))
-    for rank, (name, score) in enumerate((h for h in hits if h[1] > 0.0), start=1):
-        bm25_ranks[name] = rank
+    corpus = {name: _embed_text_for(name, tool) for name, tool in tools.items()}
 
-    # -- vector (optional) --
-    vec_ranks: dict[str, int] = {}
-    if vector_enabled and embedder is not None:
+    async def _bm25_rank() -> dict[str, int]:
+        # No I/O — pure in-memory scoring. Wrapped as a coroutine purely so
+        # it can run concurrently with the embed() network call below via
+        # asyncio.gather, instead of paying for both sequentially. BM25(...)
+        # construction (O(N·L) over the corpus) happens here too, not before
+        # gather, so it doesn't front-load work onto the event loop before
+        # the embed request has a chance to go out.
+        ranks: dict[str, int] = {}
+        hits = BM25(corpus).search(query, top_k=len(corpus))
+        for rank, (name, score) in enumerate((h for h in hits if h[1] > 0.0), start=1):
+            ranks[name] = rank
+        return ranks
+
+    async def _vector_rank() -> dict[str, int]:
+        ranks: dict[str, int] = {}
+        if not (vector_enabled and embedder is not None):
+            return ranks
         try:
             qvec = (await embedder.embed([query], priority=5, kind="query"))[0]
             if qvec is not None:
                 hits = store.vector_search(qvec, limit=len(tools))
                 for rank, (name, _score) in enumerate(hits, start=1):
                     if name in tools:  # store may lag a beat behind sync_store on races
-                        vec_ranks[name] = rank
+                        ranks[name] = rank
         except Exception as exc:
             logger.warning("[tool_handling/search] vector rank failed: %s -- BM25 only", exc)
+        return ranks
+
+    bm25_ranks, vec_ranks = await asyncio.gather(_bm25_rank(), _vector_rank())
 
     if not bm25_ranks and not vec_ranks:
         return []
 
-    fused = _rrf_fuse(bm25_ranks, vec_ranks, bm25_w=rrf_w, rrf_k=rrf_k)
+    fused = rrf_fuse(bm25_ranks, vec_ranks, bm25_w=rrf_w, rrf_k=rrf_k)
     return [name for name, score in fused if score >= min_score][:top_k]
