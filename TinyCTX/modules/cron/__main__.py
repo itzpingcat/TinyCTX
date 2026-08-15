@@ -632,6 +632,7 @@ class _CronRunner:
 # ---------------------------------------------------------------------------
 
 _STORE_CACHE: CronStore | None = None
+_RUNNER_CACHE: "_CronRunner | None" = None
 
 
 def _get_config() -> dict:
@@ -644,7 +645,7 @@ def register_runtime(runtime) -> None:
     Called once at boot. Opens the CronStore under config.data.path and
     starts the background runner that triggers due jobs.
     """
-    global _STORE_CACHE
+    global _STORE_CACHE, _RUNNER_CACHE
 
     cfg = _get_config()
     data_path = Path(runtime.config.data.path).expanduser().resolve()
@@ -655,6 +656,7 @@ def register_runtime(runtime) -> None:
     min_run_permission = int(cfg.get("min_run_permission", 0))
     runner = _CronRunner(runtime, store, min_run_permission)
     runner.start()
+    _RUNNER_CACHE = runner
 
     logger.info("[cron] background runner active via register_runtime")
 
@@ -665,7 +667,8 @@ def register_agent(agent) -> None:
     the calling turn's real user identity and channel (cursor_key).
     """
     store = _STORE_CACHE
-    if store is None:
+    runner = _RUNNER_CACHE
+    if store is None or runner is None:
         logger.error("[cron] register_agent called before register_runtime — cron tools unavailable this turn")
         return
 
@@ -798,6 +801,15 @@ def register_agent(agent) -> None:
         )
         job.state.next_run_at_ms = _compute_next_run(job.schedule, now)
         store.add(job)
+        # The runner's sleep timer was armed for whatever was next due at
+        # the time it last woke up (or never armed at all, if this is the
+        # first job ever created — _next_wake_ms() had nothing to wake for).
+        # Without reloading + re-arming here, this new job's next_run_at_ms
+        # is correct in the DB and list_cron will show it fine, but nothing
+        # ever wakes the runner up to actually check it — it silently never
+        # fires until some other job's tick happens to reload the job list.
+        runner._reload()
+        runner._arm()
         logger.info("[cron] job '%s' created by %s in %s", job.id, caller.username, cursor_key)
         return json.dumps({"status": "ok", "job_id": job.id, "next_run": _fmt_ts(job.state.next_run_at_ms)})
 
@@ -859,6 +871,13 @@ def register_agent(agent) -> None:
             })
 
         store.delete(job_id)
+        # Re-arm in case the removed job was the one the runner's timer was
+        # currently sleeping toward — otherwise the runner wakes for a job
+        # that no longer exists (harmless, just a wasted tick) but more
+        # importantly won't pick up an earlier next_run_at_ms among the
+        # remaining jobs until that stale wake happens.
+        runner._reload()
+        runner._arm()
         logger.info("[cron] job '%s' removed by %s (creator=%s)", job_id, caller.username, job.creator_username)
         return json.dumps({"status": "ok"})
 
