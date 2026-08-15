@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 def make_tool_handler():
     """A ToolCallHandler exposing the FULL memory toolset to librarians."""
-    from TinyCTX.utils.tool_handler import ToolCallHandler
+    from TinyCTX.tool_handling import ToolCallHandler
     import TinyCTX.modules.memory.tools as tools
 
     handler = ToolCallHandler()
