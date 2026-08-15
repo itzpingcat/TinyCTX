@@ -243,6 +243,11 @@ class CronStore:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(_DDL)
+        cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(cron_jobs)")}
+        if "run_in" not in cols:
+            self._conn.execute(
+                "ALTER TABLE cron_jobs ADD COLUMN run_in TEXT NOT NULL DEFAULT 'main'"
+            )
         self._conn.commit()
         logger.info("[cron] store at %s", db_path)
 
