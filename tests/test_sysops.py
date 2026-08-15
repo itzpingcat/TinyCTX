@@ -5,13 +5,16 @@ Tests for modules/sysops — user/permission management tools, the /model
 slash command, and the set_active_model tool for per-branch LLM override.
 Rewritten for docs/PERMISSIONS-PLAN.md: permission_level's numeric ceiling
 logic ("can only grant up to your level - 1") is gone — user_modify_permissions
-now sets a named permission_template, gated on Permission.ROOT (total, no
-ceiling to enforce); user_list/user_info are gated on USER_READ;
-user_rename/user_merge on ROOT; set_active_model and /model both on
-MODEL_SWAP, checked through the same seam.
+now grants/revokes a single permission bool on a user's permission_overrides,
+gated on Permission.ROOT (total, no ceiling to enforce). There is a single
+global permissions.template (config.yaml) shared by every user; these tests
+use an empty template and grant roles purely through permission_overrides,
+so what each role can do is explicit at the call site. user_list/user_info
+are gated on USER_READ; user_rename/user_merge on ROOT; set_active_model and
+/model both on MODEL_SWAP, checked through the same seam.
 
 Uses real UserStore (sqlite, tmp_path), real ConversationDB (:memory:), and
-a real PermissionsConfig (so template resolution is exercised for real)
+a real PermissionsConfig (so permission resolution is exercised for real)
 rather than mocks. The runtime/agent objects themselves are lightweight
 fakes mirroring the minimal surface sysops actually touches (mirrors
 tests/test_tool_handler.py and tests/test_module_registry.py's
@@ -94,9 +97,29 @@ def config():
     return _FakeConfig()
 
 
-def _make_user(users, template, uid="u1", username_hint="alice"):
+# Test-only stand-ins for the roles the old multi-template system had —
+# there's a single global permissions.template now (empty, in _FakeConfig),
+# so these are granted per-test-user entirely through permission_overrides.
+_ROLE_PERMS: dict[str, frozenset[Permission]] = {
+    "guest": frozenset(),
+    "member": frozenset({
+        Permission.FILE_READ, Permission.NETWORK_READ, Permission.MEMORY_READ,
+    }),
+    "trusted": frozenset({
+        Permission.FILE_READ, Permission.FILE_WRITE,
+        Permission.NETWORK_READ, Permission.NETWORK_WRITE,
+        Permission.MEMORY_READ, Permission.MEMORY_WRITE,
+        Permission.MANAGE_CTX, Permission.MODEL_SWAP,
+        Permission.CRON_CREATE, Permission.DM_ACCESS,
+        Permission.USER_READ, Permission.IMAGE_GEN,
+    }),
+    "operator": frozenset(Permission),
+}
+
+
+def _make_user(users, role, uid="u1", username_hint="alice"):
     user = users.resolve_user(Platform.DISCORD, uid, username_hint, username_hint.title())
-    user.permission_template = template
+    user.permission_overrides = {p.value: True for p in _ROLE_PERMS[role]}
     users.update_user(user)
     return users.get_user(user.username)
 
@@ -128,46 +151,54 @@ async def _call(handler, caller, tool_name, **kwargs):
 
 
 # ---------------------------------------------------------------------------
-# user_modify_permissions — template assignment, ROOT-gated, no ceiling
+# user_modify_permissions — single-bool grant/revoke, ROOT-gated, no ceiling
 # ---------------------------------------------------------------------------
 
 class TestUserModifyPermissions:
     @pytest.mark.asyncio
-    async def test_root_holder_can_set_any_template(self, users, db, config):
+    async def test_root_holder_can_grant_a_permission(self, users, db, config):
         agent, handler, _ = _register(users, db, config, caller_template="operator")
         target = _make_user(users, "guest", uid="t1", username_hint="target1")
         result = await _call(handler, agent.caller, "user_modify_permissions",
-                              username=target.username, template="trusted")
+                              username=target.username, permission="file_write", value=True)
         assert result["success"] is True
-        assert "guest" in result["result"]
-        assert "trusted" in result["result"]
-        assert users.get_user(target.username).permission_template == "trusted"
+        assert "file_write" in result["result"]
+        assert users.get_user(target.username).permission_overrides.get("file_write") is True
 
     @pytest.mark.asyncio
-    async def test_root_holder_can_elevate_to_operator_including_self(self, users, db, config):
+    async def test_root_holder_can_revoke_a_permission(self, users, db, config):
+        agent, handler, _ = _register(users, db, config, caller_template="operator")
+        target = _make_user(users, "trusted", uid="t2", username_hint="target2")
+        result = await _call(handler, agent.caller, "user_modify_permissions",
+                              username=target.username, permission="file_write", value=False)
+        assert result["success"] is True
+        assert users.get_user(target.username).permission_overrides.get("file_write") is False
+
+    @pytest.mark.asyncio
+    async def test_root_holder_can_grant_root_to_self(self, users, db, config):
         """ROOT is total — no 'can only grant up to your own level' ceiling
-        left to enforce; a ROOT holder may promote anyone, including
-        themselves, to any template."""
+        left to enforce; a ROOT holder may grant or revoke any bool on
+        anyone, including themselves."""
         agent, handler, _ = _register(users, db, config, caller_template="operator")
         result = await _call(handler, agent.caller, "user_modify_permissions",
-                              username=agent.caller.username, template="operator")
+                              username=agent.caller.username, permission="root", value=True)
         assert result["success"] is True
 
     @pytest.mark.asyncio
-    async def test_unknown_template_rejected(self, users, db, config):
+    async def test_unknown_permission_rejected(self, users, db, config):
         agent, handler, _ = _register(users, db, config, caller_template="operator")
         target = _make_user(users, "guest", uid="t4", username_hint="target4")
         result = await _call(handler, agent.caller, "user_modify_permissions",
-                              username=target.username, template="not-a-real-template")
+                              username=target.username, permission="not-a-real-permission", value=True)
         assert result["success"] is True
         assert "Error" in result["result"]
-        assert "unknown template" in result["result"]
+        assert "unknown permission" in result["result"]
 
     @pytest.mark.asyncio
     async def test_unknown_user_returns_not_found(self, users, db, config):
         agent, handler, _ = _register(users, db, config, caller_template="operator")
         result = await _call(handler, agent.caller, "user_modify_permissions",
-                              username="ghost", template="member")
+                              username="ghost", permission="memory_read", value=True)
         assert "not found" in result["result"]
 
     @pytest.mark.asyncio
@@ -177,7 +208,7 @@ class TestUserModifyPermissions:
         agent, handler, _ = _register(users, db, config, caller_template="operator")
         low_caller = _make_user(users, "trusted", uid="low1", username_hint="lowcaller")
         result = await _call(handler, low_caller, "user_modify_permissions",
-                              username="whoever", template="guest")
+                              username="whoever", permission="root", value=True)
         assert result["success"] is False
         assert "PERMISSION DENIED" in result["error"]
         assert "root" in result["error"]
@@ -257,10 +288,10 @@ class TestUserListInfo:
         assert "PERMISSION DENIED" in result["error"]
 
     @pytest.mark.asyncio
-    async def test_user_list_shows_template(self, users, db, config):
+    async def test_user_list_shows_overrides(self, users, db, config):
         agent, handler, _ = _register(users, db, config, caller_template="trusted")
         result = await _call(handler, agent.caller, "user_list")
-        assert "template=" in result["result"]
+        assert "override(s)" in result["result"]
 
     @pytest.mark.asyncio
     async def test_user_info_unknown_user(self, users, db, config):

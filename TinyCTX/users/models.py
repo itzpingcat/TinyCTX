@@ -23,32 +23,29 @@ class User:
     identities:              list[PlatformIdentity]  # all known platform accounts for this human
     meta:                     dict                    # freeform per-user data for modules
     created_at:               float                   # unix timestamp
-    # Named template this user resolves against (e.g. "guest", "trusted").
-    # "" means "use PermissionsConfig.default_template". See
-    # docs/PERMISSIONS-PLAN.md §2 and TinyCTX/permissions.py.
-    permission_template:      str  = ""
-    # Sparse diff against the resolved template — only entries that differ
-    # from it are stored here. {permission_value: bool}, keyed by
-    # Permission.value (a plain str, since this round-trips through JSON in
-    # users.db). Override wins over the template either direction: True
-    # grants a bool the template didn't have, False revokes one it did.
+    # Sparse diff against the single global permissions.template (config.yaml)
+    # — only entries that differ from it are stored here. {permission_value:
+    # bool}, keyed by Permission.value (a plain str, since this round-trips
+    # through JSON in users.db). Override wins over the template either
+    # direction: True grants a bool the template didn't have, False revokes
+    # one it did. See docs/PERMISSIONS-PLAN.md §2 and TinyCTX/permissions.py.
     permission_overrides:     dict[str, bool] = field(default_factory=dict)
 
     def effective_permissions(self, permissions_config) -> frozenset[Permission]:
         """
         Resolve this user's actual granted permission set:
-        templates[permission_template or default_template] | permission_overrides,
-        override wins. `permissions_config` is a
-        TinyCTX.config.PermissionsConfig (passed in rather than imported,
-        since users/models.py must not import config — see users/store.py's
-        module docstring for the layering this avoids).
+        permissions_config.template | permission_overrides, override wins.
+        `permissions_config` is a TinyCTX.config.PermissionsConfig (passed
+        in rather than imported, since users/models.py must not import
+        config — see users/store.py's module docstring for the layering
+        this avoids).
 
         Unknown keys in permission_overrides (a permission since renamed or
         removed) are dropped with a warning rather than raising — a stale
         override must not make a user unloadable. See
         docs/PERMISSIONS-PLAN.md §2's robustness requirements.
         """
-        granted = set(permissions_config.resolve_template(self.permission_template))
+        granted = set(permissions_config.template)
         for name, value in self.permission_overrides.items():
             try:
                 perm = Permission(name)

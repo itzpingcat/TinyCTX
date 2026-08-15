@@ -5,11 +5,11 @@ Tests for TinyCTX/permissions.py directly: the Permission enum's shape,
 expand()'s implication table, and — the sharpest requirement in the plan —
 the "expand the REQUIREMENT, never the GRANT" assertion from
 docs/PERMISSIONS-PLAN.md §1.2. Also covers User.effective_permissions()'s
-merge logic (template | overrides, override wins either direction), since
-that's the other half of §1.2/§2 that isn't exercised anywhere else as a
-focused, isolated unit test (test_users_store.py covers it incidentally
-through UserStore persistence; this file tests the merge logic itself,
-independent of storage).
+merge logic (the single global template | overrides, override wins either
+direction), since that's the other half of §1.2/§2 that isn't exercised
+anywhere else as a focused, isolated unit test (test_users_store.py covers
+it incidentally through UserStore persistence; this file tests the merge
+logic itself, independent of storage).
 
 Run with:
     pytest tests/
@@ -118,13 +118,9 @@ class TestRequirementNotGrantExpansion:
         """Directly demonstrates why expand() must only ever be called on
         `needed`: naively expanding a user's raw template grant would
         fabricate a NETWORK_READ the user's override explicitly revoked."""
-        cfg = PermissionsConfig(
-            default_template="custom",
-            templates={"custom": frozenset({Permission.NETWORK_WRITE})},
-        )
+        cfg = PermissionsConfig(template=frozenset({Permission.NETWORK_WRITE}))
         user = User(
             username="u1", identities=[], meta={}, created_at=0.0,
-            permission_template="custom",
             permission_overrides={Permission.NETWORK_READ.value: False},
         )
         effective = user.effective_permissions(cfg)
@@ -148,12 +144,10 @@ class TestRequirementNotGrantExpansion:
         (§1.2) — so a user who holds NETWORK_WRITE but has explicitly denied
         NETWORK_READ via override must still fail that check."""
         cfg = PermissionsConfig(
-            default_template="custom",
-            templates={"custom": frozenset({Permission.NETWORK_WRITE, Permission.NETWORK_READ})},
+            template=frozenset({Permission.NETWORK_WRITE, Permission.NETWORK_READ}),
         )
         user = User(
             username="u2", identities=[], meta={}, created_at=0.0,
-            permission_template="custom",
             permission_overrides={Permission.NETWORK_READ.value: False},
         )
         effective = user.effective_permissions(cfg)
@@ -165,101 +159,82 @@ class TestRequirementNotGrantExpansion:
 
 
 # ---------------------------------------------------------------------------
-# User.effective_permissions() — template | overrides merge, override wins
+# User.effective_permissions() — single global template | overrides merge,
+# override wins
 # ---------------------------------------------------------------------------
 
 class TestEffectivePermissionsMerge:
     def _cfg(self):
-        return PermissionsConfig(
-            default_template="guest",
-            templates={
-                "guest": frozenset(),
-                "member": frozenset({Permission.FILE_READ, Permission.NETWORK_READ}),
-            },
-        )
+        return PermissionsConfig(template=frozenset({Permission.FILE_READ, Permission.NETWORK_READ}))
 
     def test_plain_template_no_overrides(self):
-        user = User(username="u", identities=[], meta={}, created_at=0.0, permission_template="member")
+        user = User(username="u", identities=[], meta={}, created_at=0.0)
         assert user.effective_permissions(self._cfg()) == frozenset({Permission.FILE_READ, Permission.NETWORK_READ})
 
     def test_override_true_grants_bool_template_lacked(self):
         user = User(
             username="u", identities=[], meta={}, created_at=0.0,
-            permission_template="guest",
-            permission_overrides={Permission.FILE_READ.value: True},
+            permission_overrides={Permission.FILE_WRITE.value: True},
         )
-        assert Permission.FILE_READ in user.effective_permissions(self._cfg())
+        assert Permission.FILE_WRITE in user.effective_permissions(self._cfg())
 
     def test_override_false_revokes_bool_template_granted(self):
         user = User(
             username="u", identities=[], meta={}, created_at=0.0,
-            permission_template="member",
             permission_overrides={Permission.FILE_READ.value: False},
         )
         effective = user.effective_permissions(self._cfg())
         assert Permission.FILE_READ not in effective
         assert Permission.NETWORK_READ in effective  # untouched by the override
 
-    def test_empty_template_falls_back_to_default(self):
-        user = User(username="u", identities=[], meta={}, created_at=0.0, permission_template="")
-        assert user.effective_permissions(self._cfg()) == frozenset()  # guest
+    def test_empty_overrides_yields_template_unchanged(self):
+        user = User(username="u", identities=[], meta={}, created_at=0.0, permission_overrides={})
+        assert user.effective_permissions(self._cfg()) == frozenset({Permission.FILE_READ, Permission.NETWORK_READ})
 
-    def test_unknown_template_falls_back_to_default_with_warning(self, caplog):
-        import logging
-        user = User(username="u", identities=[], meta={}, created_at=0.0, permission_template="ghost")
-        with caplog.at_level(logging.WARNING):
-            effective = user.effective_permissions(self._cfg())
-        assert effective == frozenset()  # falls back to guest (default_template)
-        assert any("unknown template" in rec.message for rec in caplog.records)
+    def test_default_template_is_empty(self):
+        """No config.yaml permissions.template key at all -> nothing granted
+        (fail-closed), same posture the old 'guest' tier had."""
+        user = User(username="u", identities=[], meta={}, created_at=0.0)
+        assert user.effective_permissions(PermissionsConfig()) == frozenset()
 
     def test_unknown_override_key_dropped_with_warning(self, caplog):
         import logging
         user = User(
             username="u", identities=[], meta={}, created_at=0.0,
-            permission_template="member",
             permission_overrides={"some_retired_permission": True},
         )
         with caplog.at_level(logging.WARNING):
             effective = user.effective_permissions(self._cfg())
-        # Doesn't raise, doesn't add anything real, member's grants intact.
+        # Doesn't raise, doesn't add anything real, the template's grants intact.
         assert effective == frozenset({Permission.FILE_READ, Permission.NETWORK_READ})
         assert any("unknown permission override" in rec.message for rec in caplog.records)
 
     def test_has_permission_wraps_effective_permissions(self):
-        user = User(username="u", identities=[], meta={}, created_at=0.0, permission_template="member")
+        user = User(username="u", identities=[], meta={}, created_at=0.0)
         cfg = self._cfg()
         assert user.has_permission(Permission.FILE_READ, cfg) is True
         assert user.has_permission(Permission.FILE_WRITE, cfg) is False
 
 
 # ---------------------------------------------------------------------------
-# PermissionsConfig.resolve_template()
+# PermissionsConfig — single global template, no named tiers
 # ---------------------------------------------------------------------------
 
-class TestResolveTemplate:
-    def test_known_template_resolves(self):
-        cfg = PermissionsConfig(templates={"x": frozenset({Permission.ROOT})})
-        assert cfg.resolve_template("x") == frozenset({Permission.ROOT})
-
-    def test_unknown_template_falls_back_to_default(self, caplog):
-        import logging
-        cfg = PermissionsConfig(default_template="guest", templates={"guest": frozenset()})
-        with caplog.at_level(logging.WARNING):
-            result = cfg.resolve_template("nonexistent")
-        assert result == frozenset()
-
-    def test_empty_name_uses_default_silently(self, caplog):
-        import logging
-        cfg = PermissionsConfig(default_template="guest", templates={"guest": frozenset({Permission.FILE_READ})})
-        with caplog.at_level(logging.WARNING):
-            result = cfg.resolve_template("")
-        assert result == frozenset({Permission.FILE_READ})
-        assert not any("unknown template" in rec.message for rec in caplog.records)
-
-    def test_default_builtin_templates_shape(self):
+class TestPermissionsConfigTemplate:
+    def test_default_template_is_empty(self):
         cfg = PermissionsConfig()
-        assert cfg.templates["guest"] == frozenset()
-        assert cfg.templates["operator"] == frozenset(Permission)
-        assert Permission.UNTRUSTED_EXEC not in cfg.templates["trusted"]
-        assert Permission.FILE_READ in cfg.templates["member"]
-        assert Permission.FILE_WRITE not in cfg.templates["member"]
+        assert cfg.template == frozenset()
+
+    def test_explicit_template_round_trips(self):
+        cfg = PermissionsConfig(template=frozenset({Permission.ROOT}))
+        assert cfg.template == frozenset({Permission.ROOT})
+
+    def test_no_resolve_template_method(self):
+        """resolve_template() named-lookup is retired along with named
+        tiers — there's nothing to look up by name anymore."""
+        assert not hasattr(PermissionsConfig(), "resolve_template")
+
+    def test_no_templates_or_default_template_fields(self):
+        cfg = PermissionsConfig()
+        assert not hasattr(cfg, "templates")
+        assert not hasattr(cfg, "default_template")

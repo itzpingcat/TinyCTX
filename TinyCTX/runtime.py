@@ -144,11 +144,15 @@ class Runtime:
         Register /user modify_permissions, /user info, and /user rename slash
         commands — §9 path B of docs/PERMISSIONS-PLAN.md.
 
-        /user modify_permissions <username> <template>  — set a user's named
-            permission template (see TinyCTX.config.PermissionsConfig; the
-            templates configured under permissions.templates).
+        /user modify_permissions <username> <permission> <true|false>  — grant
+            or revoke a single permission bool on a user's permission_overrides
+            (see TinyCTX.config.PermissionsConfig; the single global template
+            configured under permissions.template). There are no named tiers
+            to assign a user to anymore — every user resolves against the
+            same template, and per-user variation is entirely this sparse
+            override dict.
         /user info <username>                            — show a user's
-            stored identity, template, and effective permissions.
+            stored identity, overrides, and effective permissions.
         /user rename <username> <new>                    — rename a TinyCTX
             username.
 
@@ -156,8 +160,8 @@ class Runtime:
         register(), enforced by dispatch()) instead of hand-rolled level
         comparisons. ROOT is total (see permissions.py's docstring), so
         there is no "may only grant up to caller's own level" ceiling to
-        enforce anymore — a ROOT holder may set any user, including
-        themselves, to any template.
+        enforce anymore — a ROOT holder may set any bool on any user,
+        including themselves.
         """
         users = self.users
 
@@ -178,35 +182,40 @@ class Runtime:
 
         async def _cmd_modify_permissions(args: list[str], context: dict) -> None:
             send = context["send"]
-            if len(args) < 2:
+            valid = ", ".join(sorted(p.value for p in Permission))
+            if len(args) < 3:
                 await send(
-                    "Usage: /user modify_permissions <username> <template> "
-                    f"(known templates: {sorted(self.config.permissions.templates)})"
+                    "Usage: /user modify_permissions <username> <permission> <true|false> "
+                    f"(known permissions: {valid})"
                 )
                 return
             caller = _caller_user(context)
             if caller is None:
                 await send("⛔ Cannot resolve your identity.")
                 return
-            target_username, template = args[0], args[1]
-            if template not in self.config.permissions.templates:
-                await send(
-                    f"Unknown template {template!r}. Known templates: "
-                    f"{sorted(self.config.permissions.templates)}"
-                )
+            target_username, perm_name, value_str = args[0], args[1], args[2]
+            try:
+                perm = Permission(perm_name)
+            except ValueError:
+                await send(f"Unknown permission {perm_name!r}. Known permissions: {valid}")
                 return
+            value_lower = value_str.strip().lower()
+            if value_lower not in ("true", "false"):
+                await send("Value must be 'true' or 'false'.")
+                return
+            value = value_lower == "true"
             user = users.get_user(target_username)
             if user is None:
                 await send(f"User {target_username!r} not found.")
                 return
-            old_template = user.permission_template or self.config.permissions.default_template
-            user.permission_template = template
+            old = user.permission_overrides.get(perm.value)
+            user.permission_overrides[perm.value] = value
             users.update_user(user)
             logger.info(
-                "[user] %s set template %r on %s (was %r)",
-                caller.username, template, target_username, old_template,
+                "[user] %s set %s=%s on %s (was %r)",
+                caller.username, perm.value, value, target_username, old,
             )
-            await send(f"✅ {target_username}: {old_template} → {template}")
+            await send(f"✅ {target_username}: {perm.value} → {value}")
 
         async def _cmd_info(args: list[str], context: dict) -> None:
             send = context["send"]
@@ -221,10 +230,12 @@ class Runtime:
                 f"{i.platform.value}:{i.user_id} ({i.username})"
                 for i in user.identities
             ) or "none"
-            template = user.permission_template or f"{self.config.permissions.default_template} (default)"
+            overrides = ", ".join(
+                f"{k}={v}" for k, v in sorted(user.permission_overrides.items())
+            ) or "(none)"
             effective = sorted(p.value for p in user.effective_permissions(self.config.permissions))
             await send(
-                f"**{user.username}** — template: {template}\n"
+                f"**{user.username}** — overrides: {overrides}\n"
                 f"Effective permissions: {', '.join(effective) or '(none)'}\n"
                 f"Identities: {identities}\n"
                 f"Created: {user.created_at:.0f}"
@@ -244,8 +255,10 @@ class Runtime:
                 await send(f"Username {args[1]!r} is already taken.")
 
         self.commands.register("user", "modify_permissions", _cmd_modify_permissions,
-            help="Set a user's permission template",
-            params=[("username", str, "TinyCTX username"), ("template", str, "Permission template name")],
+            help="Grant or revoke a single permission bool for a user",
+            params=[("username", str, "TinyCTX username"),
+                    ("permission", str, "Permission name (e.g. file_write, root)"),
+                    ("value", str, "'true' or 'false'")],
             required_permissions={Permission.ROOT})
         self.commands.register("user", "info", _cmd_info,
             help="Show a user's stored identity and permissions",

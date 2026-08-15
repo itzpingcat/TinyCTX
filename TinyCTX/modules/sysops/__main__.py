@@ -9,7 +9,7 @@ Tools registered (all always_on=False), gated per docs/PERMISSIONS-PLAN.md
 §10.1 at the ToolCallHandler seam (TinyCTX.permissions.Permission):
   user_list                — list all users                    USER_READ
   user_info                — show one user's details            USER_READ
-  user_modify_permissions  — set a user's permission template    ROOT
+  user_modify_permissions  — grant/revoke one permission bool    ROOT
   user_rename              — rename a TinyCTX username           ROOT
   user_merge                — merge two users into one            ROOT
   set_active_model          — override/clear the LLM for this branch  MODEL_SWAP
@@ -200,7 +200,7 @@ def register_agent(agent) -> None:
                       Leave blank to show all users.
         """
         rows = users._conn.execute(
-            "SELECT username, permission_template, identities, created_at "
+            "SELECT username, permission_overrides, identities, created_at "
             "FROM users ORDER BY username ASC"
         ).fetchall()
 
@@ -218,9 +218,10 @@ def register_agent(agent) -> None:
             ]
             if platform and not id_strs:
                 continue
-            template = row["permission_template"] or f"{permissions_config.default_template} (default)"
+            overrides = _json.loads(row["permission_overrides"] or "{}")
+            override_str = f"{len(overrides)} override(s)" if overrides else "no overrides"
             lines.append(
-                f"{row['username']}  template={template}  "
+                f"{row['username']}  {override_str}  "
                 + (", ".join(id_strs) if id_strs else "no identities")
             )
 
@@ -249,11 +250,13 @@ def register_agent(agent) -> None:
         ) or "  (none)"
         created = _time.strftime("%Y-%m-%d %H:%M UTC", _time.gmtime(user.created_at))
         meta = _json.dumps(user.meta, indent=2) if user.meta else "{}"
-        template = user.permission_template or f"{permissions_config.default_template} (default)"
+        overrides = ", ".join(
+            f"{k}={v}" for k, v in sorted(user.permission_overrides.items())
+        ) or "(none)"
         effective = sorted(p.value for p in user.effective_permissions(permissions_config))
         return (
             f"username:    {user.username}\n"
-            f"template:    {template}\n"
+            f"overrides:   {overrides}\n"
             f"effective:   {', '.join(effective) or '(none)'}\n"
             f"created:     {created}\n"
             f"identities:\n{identities}\n"
@@ -264,36 +267,39 @@ def register_agent(agent) -> None:
     # user_modify_permissions
     # ------------------------------------------------------------------
 
-    def user_modify_permissions(username: str, template: str) -> str:
-        """Set a user's named permission template.
+    def user_modify_permissions(username: str, permission: str, value: bool) -> str:
+        """Grant or revoke a single permission bool for a user.
 
-        Templates are configured centrally under permissions.templates in
-        config.yaml (see TinyCTX.config.PermissionsConfig). There is no
-        ceiling check — ROOT is total, so a ROOT holder may set any user,
-        including themselves, to any known template.
+        There is a single global permissions.template in config.yaml now
+        (see TinyCTX.config.PermissionsConfig) shared by every user — this
+        is how a specific user gets more (or less) than everyone else,
+        via their sparse permission_overrides. There is no ceiling check —
+        ROOT is total, so a ROOT holder may grant or revoke any bool on any
+        user, including themselves.
 
         Args:
-            username: TinyCTX username to modify.
-            template: Name of a template configured under permissions.templates.
+            username:   TinyCTX username to modify.
+            permission: Name of a Permission (e.g. 'file_write', 'root').
+            value:      True to grant, False to revoke.
         """
-        if template not in permissions_config.templates:
-            return (
-                f"Error: unknown template {template!r}. "
-                f"Known templates: {sorted(permissions_config.templates)}"
-            )
+        try:
+            perm = Permission(permission)
+        except ValueError:
+            valid = ", ".join(sorted(p.value for p in Permission))
+            return f"Error: unknown permission {permission!r}. Valid names: {valid}"
 
         user = users.get_user(username)
         if user is None:
             return f"User '{username}' not found."
 
-        old_template = user.permission_template or permissions_config.default_template
-        user.permission_template = template
+        old = user.permission_overrides.get(perm.value)
+        user.permission_overrides[perm.value] = bool(value)
         users.update_user(user)
         logger.info(
-            "[sysops] user_modify_permissions: '%s' template %r → %r (caller=%s)",
-            username, old_template, template, agent.caller.username,
+            "[sysops] user_modify_permissions: '%s' %s %r → %r (caller=%s)",
+            username, perm.value, old, bool(value), agent.caller.username,
         )
-        return f"'{username}': {old_template} → {template}."
+        return f"'{username}': {perm.value} {old!r} → {bool(value)!r}."
 
     # ------------------------------------------------------------------
     # user_rename
@@ -303,7 +309,7 @@ def register_agent(agent) -> None:
         """Rename a TinyCTX username. Requires the root capability.
 
         Updates both the users table and the platform index atomically.
-        The user's identities, permission template, and meta are unchanged.
+        The user's identities, permission overrides, and meta are unchanged.
 
         Args:
             username:     Current TinyCTX username.

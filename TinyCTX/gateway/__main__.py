@@ -58,6 +58,7 @@ from pathlib import Path
 from aiohttp import web
 
 from TinyCTX.config import GatewayConfig
+from TinyCTX.permissions import Permission
 from TinyCTX.contracts import (
     Platform, SessionEnvironment, content_type_for,
     InboundMessage, Attachment,
@@ -571,18 +572,18 @@ async def handle_commands_list(request: web.Request) -> web.Response:
 # GET /v1/user/{username}  &  POST /v1/user/{username}/elevate
 # ---------------------------------------------------------------------------
 
-def _user_template(user, runtime) -> str:
-    """The user's stored template, or the configured default if unset —
-    same resolution User.effective_permissions() does, surfaced for the API
-    response so a caller sees what's actually in effect."""
-    return user.permission_template or runtime.config.permissions.default_template
+def _is_admin(user) -> bool:
+    """True if this user's overrides grant every Permission bool — the
+    single-global-template equivalent of the old 'operator' tier. Surfaced
+    on the API so a caller sees what's actually in effect."""
+    return all(user.permission_overrides.get(p.value) is True for p in Permission)
 
 
 async def handle_user_get(request: web.Request) -> web.Response:
     """
     Return basic info about a user by username.
 
-    Response (200): { "username": "...", "template": "member" }
+    Response (200): { "username": "...", "admin": false }
     Response (404): { "error": "user not found" }
     """
     runtime  = request.app["runtime"]
@@ -595,8 +596,7 @@ async def handle_user_get(request: web.Request) -> web.Response:
         )
     return web.Response(
         content_type="application/json",
-        body=json.dumps({"username": user.username,
-                         "template": _user_template(user, runtime)}),
+        body=json.dumps({"username": user.username, "admin": _is_admin(user)}),
     )
 
 
@@ -605,54 +605,46 @@ async def handle_user_create(request: web.Request) -> web.Response:
     Create a user with an exact username (no slugify/random fallback).
     Used by `tinyctx launch cli` when a typed-in username doesn't exist yet.
 
-    Body: { "template": "member" }   (optional; "" / omitted means "use the
-    configured default_template" — see UserStore.create_user's docstring)
-    Response (200): { "username": "...", "template": "member" }
+    New users always start on the single configured permissions.template
+    (config.yaml) with empty overrides — there's nothing to select at
+    create time now that templates aren't named. Any request body is
+    ignored.
+
+    Response (200): { "username": "..." }
     Response (409): { "error": "username already taken" }
-    Response (400): { "error": "unknown template '...'" }
     """
     runtime  = request.app["runtime"]
     username = request.match_info["username"]
 
-    body = {}
     try:
-        body = await request.json()
-    except Exception:
-        pass
-    template = str(body.get("template") or "").strip()
-    if template and template not in runtime.config.permissions.templates:
-        raise web.HTTPBadRequest(
-            content_type="application/json",
-            body=json.dumps({"error": f"unknown template {template!r}"}),
-        )
-
-    try:
-        user = runtime.users.create_user(username, permission_template=template)
+        user = runtime.users.create_user(username)
     except UsernameConflictError:
         raise web.HTTPConflict(
             content_type="application/json",
             body=json.dumps({"error": f"username {username!r} already taken"}),
         )
 
-    logger.info("gateway: created user %r (template %r)", username, _user_template(user, runtime))
+    logger.info("gateway: created user %r", username)
     return web.Response(
         content_type="application/json",
-        body=json.dumps({"username": user.username,
-                         "template": _user_template(user, runtime)}),
+        body=json.dumps({"username": user.username}),
     )
 
 
 async def handle_user_elevate(request: web.Request) -> web.Response:
     """
-    Set a user's permission template. Trusted endpoint — protected by the
-    gateway api_key. No compatibility shim for the old `permission_level`
-    body field — see docs/PERMISSIONS-PLAN.md §10.4.
+    Grant (or revoke) full admin access for a user. Trusted endpoint —
+    protected by the gateway api_key. No named templates to choose between
+    now — this endpoint's only job is setting every Permission bool in
+    permission_overrides, the single-global-template equivalent of the old
+    'operator' tier. No compatibility shim for the old `template` body
+    field — see docs/PERMISSIONS-PLAN.md §10.4.
 
-    Body: { "template": "operator" }   (optional; defaults to "operator" —
-    this endpoint's whole purpose is granting elevated access)
-    Response (200): { "username": "...", "template": "operator" }
+    Body: { "reset": true }   (optional; clears overrides instead of
+    granting them, returning the user to whatever permissions.template
+    grants everyone by default — omitted/false means "grant everything")
+    Response (200): { "username": "...", "admin": true }
     Response (404): { "error": "user not found" }
-    Response (400): { "error": "unknown template '...'" }
     """
     runtime  = request.app["runtime"]
     username = request.match_info["username"]
@@ -669,21 +661,18 @@ async def handle_user_elevate(request: web.Request) -> web.Response:
     except Exception:
         pass
 
-    template = str(body.get("template") or "operator").strip()
-    if template not in runtime.config.permissions.templates:
-        raise web.HTTPBadRequest(
-            content_type="application/json",
-            body=json.dumps({"error": f"unknown template {template!r}"}),
-        )
-
-    user.permission_template = template
+    if bool(body.get("reset")):
+        user.permission_overrides = {}
+        action = "reset"
+    else:
+        user.permission_overrides = {p.value: True for p in Permission}
+        action = "elevated"
     runtime.users.update_user(user)
-    logger.info("gateway: elevated %r to template %r", username, template)
+    logger.info("gateway: %s %r", action, username)
 
     return web.Response(
         content_type="application/json",
-        body=json.dumps({"username": user.username,
-                         "template": _user_template(user, runtime)}),
+        body=json.dumps({"username": user.username, "admin": _is_admin(user)}),
     )
 
 

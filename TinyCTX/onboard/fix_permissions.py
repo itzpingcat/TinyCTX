@@ -7,11 +7,11 @@ is total, but the point stands: physical access to the machine running
 TinyCTX is the authorization):
 
     python -m TinyCTX.onboard.fix_permissions --user USERNAME
-    python -m TinyCTX.onboard.fix_permissions --user USERNAME --template operator
+    python -m TinyCTX.onboard.fix_permissions --user USERNAME --reset
 
 Or imported and called from other code:
 
-    from TinyCTX.onboard.fix_permissions import elevate_user, list_users
+    from TinyCTX.onboard.fix_permissions import elevate_user, reset_user, list_users
 """
 
 from __future__ import annotations
@@ -19,31 +19,27 @@ from __future__ import annotations
 import argparse
 import sys
 
+from TinyCTX.permissions import Permission
 from TinyCTX.users import UserStore
 from TinyCTX.users.models import User
 
-# The template this module's CLI/step_bootstrap_admin flow assigns by
-# default — the operator template is expected to include ROOT (see
-# config/__main__.py's _BUILTIN_TEMPLATES and docs/PERMISSIONS-PLAN.md §2).
-DEFAULT_ELEVATE_TEMPLATE = "operator"
 
-
-def elevate_user(username: str, template: str = DEFAULT_ELEVATE_TEMPLATE, store: UserStore | None = None) -> User:
+def elevate_user(username: str, store: UserStore | None = None) -> User:
     """
-    Set a TinyCTX username's permission_template.
+    Grant a TinyCTX username every permission bool via a full
+    permission_overrides dict — the single-global-template equivalent of
+    the old "operator" tier. There is one permissions.template (config.yaml)
+    now, shared by every user, so "elevate" no longer means "reassign to a
+    different named tier"; it means "override every bool to true for this
+    one user".
 
     No caller-permission check — this is the privileged path used by the CLI
     admin console and the standalone script. Authorization is physical
     access to the machine (you already have the gateway api_key and shell
-    access). Does not validate `template` against permissions.templates in
-    config.yaml — this tool deliberately doesn't load the full Config, so an
-    unknown template name is accepted as-is (User.effective_permissions()
-    falls back to the empty set for an unknown template at read time, same
-    as any other unknown-template user).
+    access).
 
     Args:
         username: TinyCTX username to modify.
-        template: Name of the permission template to assign. Default "operator".
         store:    Existing UserStore. If None, a fresh one is opened.
 
     Returns the updated User.
@@ -51,9 +47,6 @@ def elevate_user(username: str, template: str = DEFAULT_ELEVATE_TEMPLATE, store:
     Raises:
         ValueError if username not found.
     """
-    if not template or not template.strip():
-        raise ValueError("template must be a non-empty string")
-
     if store is None:
         store = UserStore()
 
@@ -61,9 +54,33 @@ def elevate_user(username: str, template: str = DEFAULT_ELEVATE_TEMPLATE, store:
     if user is None:
         raise ValueError(f"User {username!r} not found in users.db")
 
-    user.permission_template = template.strip()
+    user.permission_overrides = {p.value: True for p in Permission}
     store.update_user(user)
     return user
+
+
+def reset_user(username: str, store: UserStore | None = None) -> User:
+    """
+    Clear a TinyCTX username's permission_overrides, returning them to
+    whatever the single global permissions.template (config.yaml) grants
+    everyone by default. The inverse of elevate_user().
+    """
+    if store is None:
+        store = UserStore()
+
+    user = store.get_user(username)
+    if user is None:
+        raise ValueError(f"User {username!r} not found in users.db")
+
+    user.permission_overrides = {}
+    store.update_user(user)
+    return user
+
+
+def is_elevated(user: User) -> bool:
+    """True if this user's overrides grant every Permission bool — i.e.
+    elevate_user() has been run on them and nothing since revoked a bool."""
+    return all(user.permission_overrides.get(p.value) is True for p in Permission)
 
 
 def list_users(store: UserStore | None = None) -> list[User]:
@@ -89,7 +106,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         prog="python -m TinyCTX.onboard.fix_permissions",
         description=(
-            "Directly set a TinyCTX user's permission template.\n"
+            "Grant or revoke full admin access for a TinyCTX user.\n"
             "No caller-permission check — requires shell access to the TinyCTX host."
         ),
     )
@@ -100,16 +117,15 @@ def main() -> None:
         help="TinyCTX username to modify.",
     )
     parser.add_argument(
-        "--template",
-        type=str,
-        default=DEFAULT_ELEVATE_TEMPLATE,
-        metavar="TEMPLATE",
-        help=f"Permission template to assign. Default: {DEFAULT_ELEVATE_TEMPLATE!r}.",
+        "--reset",
+        action="store_true",
+        help="Clear this user's overrides instead of granting every permission "
+             "(returns them to whatever permissions.template grants everyone).",
     )
     parser.add_argument(
         "--list",
         action="store_true",
-        help="List all users and their current permission templates.",
+        help="List all users and whether they're currently elevated.",
     )
     args = parser.parse_args()
 
@@ -120,18 +136,22 @@ def main() -> None:
         if not users:
             print("No users found.")
         else:
-            print(f"{'USERNAME':<32}  {'TEMPLATE':<16}  IDENTITIES")
+            print(f"{'USERNAME':<32}  {'ADMIN':<8}  IDENTITIES")
             print("-" * 80)
             for u in users:
                 identities = ", ".join(
                     f"{i.platform.value}:{i.user_id}" for i in u.identities
                 ) or "—"
-                print(f"{u.username:<32}  {(u.permission_template or '(default)'):<16}  {identities}")
+                print(f"{u.username:<32}  {('yes' if is_elevated(u) else 'no'):<8}  {identities}")
         return
 
     try:
-        user = elevate_user(args.user, args.template, store)
-        print(f"User '{user.username}' permission_template set to {user.permission_template!r}.")
+        if args.reset:
+            user = reset_user(args.user, store)
+            print(f"User '{user.username}' overrides cleared (back to permissions.template).")
+        else:
+            user = elevate_user(args.user, store)
+            print(f"User '{user.username}' elevated — every permission granted.")
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)

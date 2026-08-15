@@ -118,7 +118,7 @@ async def agent_loop(llm, system_prompt: str, user_prompt: str, handler, agent_l
 
     class _InternalCaller:
         """Synthetic caller for the librarian subagent — not a real user, so
-        it isn't resolved against PermissionsConfig.templates at all. Holds
+        it isn't resolved against PermissionsConfig.template at all. Holds
         exactly the two bools make_tool_handler()'s registrations ever
         require (§ this module's docstring)."""
         username = "librarian"

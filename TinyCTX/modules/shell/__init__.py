@@ -33,7 +33,8 @@ EXTENSION_META = {
         # permissions.access_backend are GONE — permission_level was fully
         # retired (see TinyCTX/permissions.py and docs/PERMISSIONS-PLAN.md).
         # Which commands a caller may run is now decided entirely by their
-        # granted capabilities (permissions.templates in config.yaml), via
+        # granted capabilities (the single permissions.template in
+        # config.yaml, plus any per-user permission_overrides), via
         # modules/shell/perms.py's per-command classification. There is
         # nothing left to configure here for that axis.
     },

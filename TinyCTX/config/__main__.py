@@ -14,30 +14,15 @@ from TinyCTX.permissions import Permission
 
 logger = logging.getLogger(__name__)
 
-# Built-in template defaults — used for any template name a config.yaml
-# doesn't override under permissions.templates. A config that specifies no
-# permissions.templates key at all gets exactly these four, matching
-# docs/PERMISSIONS-PLAN.md §2's worked example. Named templates are what
-# "elevate" becomes now that there's no int ladder to climb — see that
-# section for why full explicit lists (no inheritance) are deliberate.
-_BUILTIN_TEMPLATES: dict[str, frozenset[Permission]] = {
-    "guest": frozenset(),
-    "member": frozenset({
-        Permission.FILE_READ, Permission.NETWORK_READ, Permission.MEMORY_READ,
-    }),
-    "trusted": frozenset({
-        Permission.FILE_READ, Permission.FILE_WRITE,
-        Permission.NETWORK_READ, Permission.NETWORK_WRITE,
-        Permission.MEMORY_READ, Permission.MEMORY_WRITE,
-        Permission.MANAGE_CTX, Permission.MODEL_SWAP,
-        Permission.CRON_CREATE, Permission.DM_ACCESS,
-        Permission.USER_READ, Permission.IMAGE_GEN,
-        # NOTE: no UNTRUSTED_EXEC — see docs/PERMISSIONS-PLAN.md §5.1 for
-        # what this costs (python3/node/etc. fall through to UNTRUSTED_EXEC
-        # and a `trusted` user cannot run them until promoted).
-    }),
-    "operator": frozenset(Permission),  # every bool true
-}
+# Built-in default for the single global permissions template — used when
+# config.yaml doesn't override it under permissions.template. Empty: every
+# bool defaults to false (fail-closed), matching the old "guest" tier.
+#
+# There is exactly ONE template now — see docs/PERMISSIONS-PLAN.md §2. Named
+# tiers (guest/member/trusted/operator) are gone; per-user variation happens
+# entirely through User.permission_overrides (a sparse diff on the user
+# row), never by picking a different template.
+_DEFAULT_TEMPLATE: frozenset[Permission] = frozenset()
 
 
 @dataclass
@@ -103,26 +88,17 @@ class ModelConfig:
 class PermissionsConfig:
     """
     Controls how the permission system interacts with the LLM's tool list,
-    and defines the named permission templates users are assigned to.
+    and defines the single global permission template every user resolves
+    against.
 
     Configured via the top-level 'permissions:' key in config.yaml:
 
         permissions:
           minimal_tokens: true
-          default_template: guest
-          templates:
-            guest: {}
-            member:
-              file_read: true
-              network_read: true
-              memory_read: true
-            trusted:
-              file_read: true
-              file_write: true
-              ...
-            operator:
-              file_read: true
-              ...
+          template:
+            file_read: true
+            network_read: true
+            memory_read: true
 
     minimal_tokens: true  (default)
         Only tools the caller has permission to execute are sent to the LLM.
@@ -136,41 +112,20 @@ class PermissionsConfig:
         a PERMISSION DENIED error rather than execute. Useful when you want the
         agent to be aware of what exists and explain why it can't do something.
 
-    default_template
-        The template new users get when resolve_user() creates them, and the
-        fallback used when a stored user's permission_template is empty or
-        names a template that no longer exists in this config (with a
-        logged warning — see docs/PERMISSIONS-PLAN.md §2).
-
-    templates
-        Named, FULLY EXPLICIT permission sets — no inheritance between them.
-        Any permission bool not listed for a template is false. Each entry
-        not overridden here falls back to _BUILTIN_TEMPLATES (guest/member/
-        trusted/operator), so a config that says nothing under `templates:`
-        still gets sane behavior; a config that overrides one template name
-        leaves the other built-ins as-is unless it also names them.
+    template
+        ONE fully explicit permission set — no named tiers, no inheritance,
+        and nothing to pick between at user-creation time. Any permission
+        bool not listed here is false. Every user resolves against this
+        same set; the only per-user variation is User.permission_overrides,
+        a sparse diff stored on the user row (see docs/PERMISSIONS-PLAN.md
+        §2 and TinyCTX/users/models.py). To grant a specific user more (or
+        less) than everyone else, edit their overrides — via
+        `/user modify_permissions`, `onboard/fix_permissions.py`, or the
+        gateway's `/v1/user/{username}/elevate` endpoint — not by naming a
+        different template, because there isn't one.
     """
-    minimal_tokens:    bool = False
-    default_template:  str  = "guest"
-    templates:         dict[str, frozenset[Permission]] = field(
-        default_factory=lambda: dict(_BUILTIN_TEMPLATES)
-    )
-
-    def resolve_template(self, name: str) -> frozenset[Permission]:
-        """
-        Resolve a template name to its permission set. Falls back to
-        default_template with a logged warning if `name` is empty or not a
-        known template — deleting a template from config, or a stale
-        per-user permission_template value, must not brick that user.
-        """
-        if name and name in self.templates:
-            return self.templates[name]
-        if name:
-            logger.warning(
-                "permissions: unknown template %r, falling back to default_template %r",
-                name, self.default_template,
-            )
-        return self.templates.get(self.default_template, frozenset())
+    minimal_tokens: bool = False
+    template:       frozenset[Permission] = field(default_factory=lambda: _DEFAULT_TEMPLATE)
 
 
 @dataclass
@@ -590,16 +545,16 @@ def _parse_tool_search(raw: dict) -> ToolSearchConfig:
     )
 
 
-def _parse_permission_set(template_name: str, raw: dict) -> frozenset[Permission]:
+def _parse_permission_set(raw: dict) -> frozenset[Permission]:
     """
-    Parse one templates.<name> mapping into a frozenset of granted
-    Permission members. Templates are authored by the operator, so unlike
-    the runtime fallbacks in users/store.py (which must tolerate a stale
-    per-user override), an unknown permission name here is a config bug and
-    fails loudly at load time rather than being silently dropped.
+    Parse the permissions.template mapping into a frozenset of granted
+    Permission members. Authored by the operator, so unlike the runtime
+    fallback in users/store.py (which must tolerate a stale per-user
+    override), an unknown permission name here is a config bug and fails
+    loudly at load time rather than being silently dropped.
     """
     if not isinstance(raw, dict):
-        raise ValueError(f"permissions.templates.{template_name} must be a mapping")
+        raise ValueError("permissions.template must be a mapping")
     granted: set[Permission] = set()
     for perm_name, value in raw.items():
         try:
@@ -607,8 +562,8 @@ def _parse_permission_set(template_name: str, raw: dict) -> frozenset[Permission
         except ValueError:
             valid = ", ".join(sorted(p.value for p in Permission))
             raise ValueError(
-                f"permissions.templates.{template_name}: unknown permission "
-                f"{perm_name!r}. Valid names: {valid}"
+                f"permissions.template: unknown permission {perm_name!r}. "
+                f"Valid names: {valid}"
             )
         if bool(value):
             granted.add(perm)
@@ -617,21 +572,22 @@ def _parse_permission_set(template_name: str, raw: dict) -> frozenset[Permission
 
 def _parse_permissions(raw: dict) -> PermissionsConfig:
     raw = raw or {}
-    templates = dict(_BUILTIN_TEMPLATES)
-    for name, tmpl_raw in (raw.get("templates") or {}).items():
-        templates[name] = _parse_permission_set(name, tmpl_raw)
-
-    default_template = raw.get("default_template", "guest")
-    if default_template not in templates:
+    if "templates" in raw or "default_template" in raw:
+        # Clean break, no compat shim — same posture the plan took retiring
+        # permission_level (§10.4): fail loudly at the first load instead of
+        # silently ignoring an operator's intent.
         raise ValueError(
-            f"permissions.default_template {default_template!r} is not defined "
-            f"under permissions.templates (known: {sorted(templates)})"
+            "permissions.templates / permissions.default_template no longer "
+            "exist — there is a single global permissions.template now (a "
+            "flat mapping of permission name -> bool). See "
+            "docs/PERMISSIONS-PLAN.md §2."
         )
-
+    template = (
+        _parse_permission_set(raw["template"]) if "template" in raw else _DEFAULT_TEMPLATE
+    )
     return PermissionsConfig(
         minimal_tokens=bool(raw.get("minimal_tokens", False)),
-        default_template=default_template,
-        templates=templates,
+        template=template,
     )
 
 

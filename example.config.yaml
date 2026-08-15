@@ -126,12 +126,13 @@ models:
 parallel: 3
 permissions:
   minimal_tokens: false
-  default_template: guest
-  # templates: not shown here — omitting this key gets the four built-in
-  # templates (guest/member/trusted/operator) documented in
-  # TinyCTX/config/__main__.py's _BUILTIN_TEMPLATES and
-  # docs/PERMISSIONS-PLAN.md §2. Set this key to override one or more by
-  # name; unnamed templates keep their built-in definition.
+  # template: not shown here — omitting this key gets the built-in empty
+  # (fully closed) default documented in TinyCTX/config/__main__.py's
+  # _DEFAULT_TEMPLATE and docs/PERMISSIONS-PLAN.md §2. There is a single
+  # global template shared by every user; grant a specific user more via
+  # their permission_overrides (/user modify_permissions,
+  # onboard/fix_permissions.py, or the gateway's
+  # /v1/user/{username}/elevate endpoint for full admin).
 rag:
   auto_inject_priority: 25
   auto_inject_semantic: true

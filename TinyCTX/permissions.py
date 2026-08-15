@@ -53,9 +53,9 @@ the mount/network config that actually enforces it.
 FILE_READ/FILE_WRITE carry no scope — location does. Under BACKEND_EXEC
 those same bools reach config.yaml (API keys) and users.db (the permission
 table itself), so BACKEND_EXEC + FILE_WRITE is sufficient to grant yourself
-every other bool. That's why ROOT and BACKEND_EXEC + FILE_WRITE are grouped
-together in the `operator` template (§1.1) — not a flaw to fix, it's what
-"run in the main container" means.
+every other bool. That's why ROOT and BACKEND_EXEC + FILE_WRITE are meant to
+be granted together on any fully-elevated user (§1.1) — not a flaw to fix,
+it's what "run in the main container" means.
 """
 
 from __future__ import annotations
@@ -141,9 +141,8 @@ class Permission(str, Enum):
 # something you'd grant without instance authority.
 #
 # ROOT and BACKEND_EXEC + FILE_WRITE are equivalent in ultimate power. Both
-# let the holder rewrite users.db and grant themselves everything. They
-# belong in the `operator` template together; granting one while
-# withholding the other buys nothing.
+# let the holder rewrite users.db and grant themselves everything. Grant
+# them together on any fully-elevated user; withholding one buys nothing.
 
 # Implications are one level deep today; make expand() a fixpoint if that
 # ever stops being true.

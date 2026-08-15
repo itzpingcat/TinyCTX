@@ -12,6 +12,7 @@ from pathlib import Path
 import platformdirs
 
 from TinyCTX.contracts import Platform
+from TinyCTX.permissions import Permission
 from TinyCTX.users.models import PlatformIdentity, User
 
 logger = logging.getLogger(__name__)
@@ -112,7 +113,6 @@ def _user_from_row(row: sqlite3.Row) -> User:
         identities=[_identity_from_dict(d) for d in json.loads(row["identities"])],
         meta=json.loads(row["meta"]),
         created_at=row["created_at"],
-        permission_template=row["permission_template"] or "",
         permission_overrides=_parse_overrides(row["permission_overrides"], row["username"]),
     )
 
@@ -124,7 +124,6 @@ def _user_from_row(row: sqlite3.Row) -> User:
 _DDL = """
 CREATE TABLE IF NOT EXISTS users (
     username             TEXT PRIMARY KEY,
-    permission_template  TEXT NOT NULL DEFAULT '',
     permission_overrides TEXT NOT NULL DEFAULT '{}',
     identities           TEXT NOT NULL DEFAULT '[]',
     meta                  TEXT NOT NULL DEFAULT '{}',
@@ -139,9 +138,34 @@ CREATE TABLE IF NOT EXISTS user_platform_index (
 );
 """
 
-# permission_level -> permission_template backfill, per
+# ---------------------------------------------------------------------------
+# Migration-only history: the named tiers this codebase briefly had (first
+# as permission_level int ranges, then as a permission_template column)
+# before the plan was simplified to a single global template. Frozen here
+# ONLY so an existing users.db from either era can be converted without
+# changing what its users could already do — TinyCTX/config.py no longer
+# defines named templates at all, and nothing outside _migrate() below
+# should reference this dict. See docs/PERMISSIONS-PLAN.md §2's migration
+# note.
+_LEGACY_TEMPLATES: dict[str, frozenset[Permission]] = {
+    "guest": frozenset(),
+    "member": frozenset({
+        Permission.FILE_READ, Permission.NETWORK_READ, Permission.MEMORY_READ,
+    }),
+    "trusted": frozenset({
+        Permission.FILE_READ, Permission.FILE_WRITE,
+        Permission.NETWORK_READ, Permission.NETWORK_WRITE,
+        Permission.MEMORY_READ, Permission.MEMORY_WRITE,
+        Permission.MANAGE_CTX, Permission.MODEL_SWAP,
+        Permission.CRON_CREATE, Permission.DM_ACCESS,
+        Permission.USER_READ, Permission.IMAGE_GEN,
+    }),
+    "operator": frozenset(Permission),
+}
+
+# permission_level -> legacy template name, per the original
 # docs/PERMISSIONS-PLAN.md §2.1. Ranges are inclusive of their low bound;
-# checked in ascending order.
+# checked in ascending order. Migration-only, same as _LEGACY_TEMPLATES.
 _BACKFILL_RANGES: list[tuple[int, str]] = [
     (0, "guest"),
     (25, "member"),
@@ -150,12 +174,26 @@ _BACKFILL_RANGES: list[tuple[int, str]] = [
 ]
 
 
-def _template_for_level(level: int) -> str:
-    template = "guest"
-    for lo, name in _BACKFILL_RANGES:
+def _template_name_for_level(level: int) -> str:
+    name = "guest"
+    for lo, candidate in _BACKFILL_RANGES:
         if level >= lo:
-            template = name
-    return template
+            name = candidate
+    return name
+
+
+def _explicit_overrides_for(perms: frozenset[Permission]) -> dict[str, bool]:
+    """
+    Freeze a resolved permission set into a FULL explicit overrides dict —
+    every one of the enum's names, not just the ones that differ from
+    *something*. Used only when migrating a row off permission_template or
+    permission_level: at that point there is no live template to diff
+    against (UserStore doesn't import config — see this module's docstring),
+    so the only way to guarantee a migrated user's effective permissions
+    don't shift is to pin every bool explicitly. Freshly created users get
+    the normal sparse {} and diff cleanly against permissions.template.
+    """
+    return {p.value: (p in perms) for p in Permission}
 
 
 # ---------------------------------------------------------------------------
@@ -204,50 +242,89 @@ class UserStore:
         (CREATE TABLE IF NOT EXISTS is a no-op against an existing table
         with an older column set).
 
-        Two things can be true of an existing users.db:
-          1. It predates permission_template/permission_overrides entirely
-             (only has the old permission_level INTEGER column) — add the
-             new columns, backfill permission_template from
-             permission_level per docs/PERMISSIONS-PLAN.md §2.1, then drop
-             the retired int column.
-          2. It already has the new columns (created by a build of this
-             module before the int was dropped, or by _DDL above on a
-             fresh db) — nothing to do.
+        Three things can be true of an existing users.db, in the order this
+        codebase actually produced them:
+          1. Oldest — only the original permission_level INTEGER column.
+             Freeze each user's resolved legacy-template permissions into
+             permission_overrides (via _explicit_overrides_for), then drop
+             permission_level.
+          2. Short-lived middle state — has permission_template AND
+             permission_overrides (the multi-template system this file
+             briefly implemented). Resolve template + overrides into one
+             full explicit set the same way User.effective_permissions()
+             used to, write that back as permission_overrides, then drop
+             permission_template.
+          3. Current — only permission_overrides. Nothing to do.
+        These are checked as elif, not independently: by the time state 2
+        existed, state 1 had already been fully migrated into it (see the
+        original migration this replaces), so a real users.db is never in
+        both branches' preconditions at once.
         """
         cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(users)")}
 
-        if "permission_template" not in cols:
-            self._conn.execute(
-                "ALTER TABLE users ADD COLUMN permission_template TEXT NOT NULL DEFAULT ''"
-            )
         if "permission_overrides" not in cols:
             self._conn.execute(
                 "ALTER TABLE users ADD COLUMN permission_overrides TEXT NOT NULL DEFAULT '{}'"
             )
+            cols.add("permission_overrides")
 
-        if "permission_level" in cols:
+        if "permission_template" in cols:
             logger.warning(
-                "UserStore: %s has a legacy permission_level column — "
-                "backfilling permission_template and dropping it.", db_path,
+                "UserStore: %s has a legacy permission_template column (the "
+                "short-lived multi-template system) — freezing each user's "
+                "resolved permissions into permission_overrides and "
+                "dropping it.", db_path,
             )
             rows = self._conn.execute(
-                "SELECT username, permission_level, permission_template FROM users"
+                "SELECT username, permission_template, permission_overrides FROM users"
             ).fetchall()
             for row in rows:
-                if row["permission_template"]:
-                    continue  # already migrated this row
-                template = _template_for_level(row["permission_level"])
+                resolved = set(_LEGACY_TEMPLATES.get(row["permission_template"] or "guest", frozenset()))
+                for name, value in _parse_overrides(row["permission_overrides"], row["username"]).items():
+                    try:
+                        perm = Permission(name)
+                    except ValueError:
+                        continue
+                    if value:
+                        resolved.add(perm)
+                    else:
+                        resolved.discard(perm)
                 self._conn.execute(
-                    "UPDATE users SET permission_template = ? WHERE username = ?",
-                    (template, row["username"]),
+                    "UPDATE users SET permission_overrides = ? WHERE username = ?",
+                    (json.dumps(_explicit_overrides_for(frozenset(resolved))), row["username"]),
+                )
+            self._conn.commit()
+            try:
+                self._conn.execute("ALTER TABLE users DROP COLUMN permission_template")
+            except sqlite3.OperationalError:
+                # SQLite < 3.35 can't drop columns. Harmless to leave it —
+                # nothing reads it anymore — but log so an operator on an
+                # ancient SQLite knows the column is stale, not live.
+                logger.warning(
+                    "UserStore: could not DROP COLUMN permission_template "
+                    "(SQLite too old) — column left in place, unused."
+                )
+
+        elif "permission_level" in cols:
+            logger.warning(
+                "UserStore: %s has a legacy permission_level column — "
+                "freezing each user's resolved permissions into "
+                "permission_overrides and dropping it.", db_path,
+            )
+            rows = self._conn.execute(
+                "SELECT username, permission_level FROM users"
+            ).fetchall()
+            for row in rows:
+                name = _template_name_for_level(row["permission_level"])
+                resolved = _LEGACY_TEMPLATES.get(name, frozenset())
+                self._conn.execute(
+                    "UPDATE users SET permission_overrides = ? WHERE username = ?",
+                    (json.dumps(_explicit_overrides_for(resolved)), row["username"]),
                 )
             self._conn.commit()
             try:
                 self._conn.execute("ALTER TABLE users DROP COLUMN permission_level")
             except sqlite3.OperationalError:
-                # SQLite < 3.35 can't drop columns. Harmless to leave it —
-                # nothing reads it anymore — but log so an operator on an
-                # ancient SQLite knows the column is stale, not live.
                 logger.warning(
                     "UserStore: could not DROP COLUMN permission_level "
                     "(SQLite too old) — column left in place, unused."
@@ -303,7 +380,6 @@ class UserStore:
         username: str,
         *,
         platform: Platform = Platform.CLI,
-        permission_template: str = "",
     ) -> User:
         """
         Create a user with the exact requested username — no slugify/random
@@ -313,10 +389,10 @@ class UserStore:
         Used by the CLI launch flow when a typed-in username doesn't exist
         yet. Raises UsernameConflictError if the username is already taken.
 
-        permission_template: "" (default) means "use the configured
-        default_template" — resolved lazily by User.effective_permissions(),
-        not baked in here, so raising a config's default_template later
-        applies to users created with the implicit default too.
+        Every new user starts with empty permission_overrides — there is a
+        single global permissions.template (config.yaml) now, so there is
+        nothing to select at create time. Grant this user more (or less)
+        afterward by editing their overrides.
         """
         if self._username_taken(username):
             raise UsernameConflictError(f"Username already taken: {username!r}")
@@ -332,16 +408,14 @@ class UserStore:
             identities=[identity],
             meta={},
             created_at=time.time(),
-            permission_template=permission_template,
             permission_overrides={},
         )
         with self._conn:
             self._conn.execute(
-                "INSERT INTO users (username, permission_template, permission_overrides, identities, meta, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO users (username, permission_overrides, identities, meta, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
                 (
                     user.username,
-                    user.permission_template,
                     json.dumps(user.permission_overrides),
                     json.dumps([_identity_to_dict(identity)]),
                     json.dumps(user.meta),
@@ -376,9 +450,8 @@ class UserStore:
 
     def update_user(self, user: User) -> None:
         self._conn.execute(
-            "UPDATE users SET permission_template = ?, permission_overrides = ?, identities = ?, meta = ? WHERE username = ?",
+            "UPDATE users SET permission_overrides = ?, identities = ?, meta = ? WHERE username = ?",
             (
-                user.permission_template,
                 json.dumps(user.permission_overrides),
                 json.dumps([_identity_to_dict(i) for i in user.identities]),
                 json.dumps(user.meta),
@@ -475,16 +548,14 @@ class UserStore:
             identities=[identity],
             meta={},
             created_at=time.time(),
-            permission_template="",  # falls back to PermissionsConfig.default_template
-            permission_overrides={},
+            permission_overrides={},  # resolves against permissions.template
         )
         with self._conn:
             self._conn.execute(
-                "INSERT INTO users (username, permission_template, permission_overrides, identities, meta, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO users (username, permission_overrides, identities, meta, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
                 (
                     user.username,
-                    user.permission_template,
                     json.dumps(user.permission_overrides),
                     json.dumps([_identity_to_dict(identity)]),
                     json.dumps(user.meta),

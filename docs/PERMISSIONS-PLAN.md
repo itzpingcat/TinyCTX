@@ -144,8 +144,8 @@ In the enum docstring:
 
 > `ROOT` and `BACKEND_EXEC + FILE_WRITE` are equivalent in ultimate power.
 > Both let the holder rewrite `users.db` and grant themselves everything.
-> They belong in the `operator` template together; granting one while
-> withholding the other buys nothing.
+> Grant them together on any fully-elevated user; withholding one buys
+> nothing.
 
 ### 1.2 Implication between bools
 
@@ -186,99 +186,110 @@ denials authoritative. So `expand()` is called on `needed`, never on
 
 ---
 
-## 2. Named templates in config, per-user sparse diff in `users.db`
+## 2. A single global template in config, per-user sparse diff in `users.db`
 
-Templates live in **config**, and there are several, each a **full explicit
-list** — no inheritance between them. Inheritance would make "what can this
-user actually do" a computation rather than a read, and this is a file an
-operator audits by eye.
+There is **one** permission template, not several. It lives in config as a
+single flat mapping; per-user variation happens entirely through a sparse
+diff stored on the user row.
 
-Named templates are what "elevate" becomes. With the int gone there is no
-ladder to climb, so `gateway.handle_user_elevate` and
-`commands/launch.py:164-167` have nothing to set; without templates every
-provisioning call would enumerate seventeen booleans, and each newly added
-bool would silently fail to reach users provisioned before it existed.
+Naming tiers is a false economy: most of what distinguishes one "role"
+from another isn't a coherent bundle of capabilities, it's "this specific
+person needs this specific bool" — and a handful of fixed tier names can't
+express that without either overriding half the tier's grants (which
+defeats naming it in the first place) or multiplying tier names without
+end. One template makes this explicit: every user starts from the same
+fully-explicit set, and every deviation is a line in that user's
+`permission_overrides` — auditable by reading their row, not by
+cross-referencing a tier name against a templates table.
 
 ```yaml
 permissions:
-  default_template: guest
-
-  templates:
-    guest:
-      # everything unlisted is false; present/rag/skills are ungated
-      # entirely and so appear nowhere
-
-    member:
-      file_read: true
-      network_read: true
-      memory_read: true
-
-    trusted:
-      file_read: true
-      file_write: true
-      network_read: true
-      network_write: true
-      memory_read: true
-      memory_write: true
-      manage_ctx: true
-      model_swap: true
-      cron_create: true
-      dm_access: true
-      user_read: true
-      image_gen: true
-      # NOTE: no untrusted_exec — see §5.1 for what this costs
-
-    operator:
-      # every bool true, including backend_exec, untrusted_exec, root,
-      # cron_admin, equipment_trusted
+  template:
+    file_read: true
+    network_read: true
+    memory_read: true
+    # everything unlisted is false; present/rag/skills are ungated
+    # entirely and so appear nowhere
 ```
 
-`users` gains **two** columns:
+There is nothing to name and nothing to select between — `template` is a
+flat mapping. `gateway.handle_user_create` and `commands/launch.py` have
+nothing to pass at creation time as a result: every new user starts on
+this one template with empty overrides.
 
-- `permission_template` (TEXT, default `''` → "use `default_template`").
+`users` gains **one** column:
+
 - `permission_overrides` (TEXT, JSON, default `'{}'`) — sparse dict
-  `{permission_name: bool}`, storing only entries that *differ* from the
-  resolved template.
+  `{permission_name: bool}`, storing only entries that *differ* from
+  `permissions.template`.
 
-`User.effective_permissions()` =
-`templates[user.permission_template or default_template] | user.permission_overrides`,
-override wins.
+There is no `permission_template` column. With one template there is
+nothing per-user to select by name.
 
-The sparse diff is the point: adding `network_write: true` to `trusted`
-immediately affects every `trusted` user who has never had that key
-overridden, with no migration pass. Same for adding a *new* bool to the
-enum — it lands in templates, not in 400 user rows.
+`User.effective_permissions()` = `permissions_config.template |
+user.permission_overrides`, override wins.
 
-Two robustness requirements:
+"Elevate a user" means "give this one user overrides that make them
+different from everyone else", not "assign them to a tier". The common
+case, granting one user everything, is `{p.value: True for p in
+Permission}` written to their overrides; `onboard/fix_permissions.py`'s
+`elevate_user()`, the onboarding bootstrap step, and the gateway's `POST
+/v1/user/{username}/elevate` endpoint all do exactly this (with a
+`{"reset": true}` body / `--reset` flag as the inverse — clear the
+overrides, fall back to the template). Fine-grained admin work — grant one
+user `cron_admin` without touching anything else — is a single override
+key, via `/user modify_permissions <username> <permission> <true|false>`
+(slash command) or the `user_modify_permissions` tool, both ROOT-gated, no
+ceiling to enforce (§1.1).
 
-- Unknown keys in the stored JSON (a permission since renamed or removed)
-  are dropped on read with a warning, never raised. A stale override must
-  not make a user unloadable.
-- An unknown `permission_template` falls back to `default_template` with a
-  warning. Deleting a template from config must not brick its users.
+Unknown keys in the stored JSON (a permission since renamed or removed)
+are dropped on read with a warning, never raised — a stale override must
+not make a user unloadable.
 
-`users/store.py`: `_DDL` gains both columns with the same
-`PRAGMA table_info` + `ALTER TABLE ADD COLUMN` migration guard documented in
-project memory for `cron_jobs.run_in` — this codebase already hit that gap
-once (`CREATE TABLE IF NOT EXISTS` is a no-op against an existing table
-with an older column set). `_user_from_row`, `update_user`, `create_user`,
-`_create_user` all need both fields threaded through, same pattern as
-`identities`/`meta`.
+`users/store.py`: `_DDL` has the one column, with the same
+`PRAGMA table_info` + `ALTER TABLE ADD COLUMN` migration guard documented
+in project memory for `cron_jobs.run_in` — `CREATE TABLE IF NOT EXISTS` is
+a no-op against an existing table with an older column set. `_user_from_row`,
+`update_user`, `create_user`, `_create_user` all thread
+`permission_overrides` through, same pattern as `identities`/`meta`.
 
 ### 2.1 Backfilling existing users
 
-One-shot, alongside the column addition, then drop the int column:
+An existing `users.db` can carry permission state in one of two other
+shapes, depending on how old it is:
 
-| existing `permission_level` | template |
+| existing shape | migration |
 |---|---|
-| 0-24 | `guest` |
-| 25-49 | `member` |
-| 50-89 | `trusted` |
-| 90-100 | `operator` |
+| `permission_level` INTEGER only | resolve via the range table below (`_LEGACY_TEMPLATES` / `_BACKFILL_RANGES` in `users/store.py`), then freeze the resolved set |
+| `permission_template` TEXT + `permission_overrides` TEXT | resolve the stored template + overrides the same way `effective_permissions()` used to, then freeze that resolved set |
 
-75 is the value most worth eyeballing before the backfill runs — it's
-simultaneously the Discord DM threshold, the reset threshold, and the
-model-swap threshold, and it lands in `trusted` rather than `operator`.
+"Freeze the resolved set" means write a **full explicit**
+`permission_overrides` dict — every `Permission` name present, `true` or
+`false` — not a sparse diff against the single template. This isn't
+optional: `UserStore` deliberately doesn't import `TinyCTX.config` (see
+that module's docstring — the layering this avoids), so at migration time
+there is no live `permissions.template` to diff against. Explicit-everything
+is the only way to guarantee a migrated user's effective permissions don't
+shift regardless of what `permissions.template` is set to. A freshly
+created user still gets the normal sparse `{}` and resolves cleanly
+against the template at read time.
+
+The `permission_level` range table (migration-only — nothing else in this
+codebase resolves permissions by these names):
+
+| existing `permission_level` | resolves to |
+|---|---|
+| 0-24 | `guest`'s grants (empty) |
+| 25-49 | `member`'s grants (file_read, network_read, memory_read) |
+| 50-89 | `trusted`'s grants (see `_LEGACY_TEMPLATES` in `users/store.py`) |
+| 90-100 | every `Permission` |
+
+75 is worth eyeballing in that range — it lands in the `50-89` row rather
+than `90-100`.
+
+Both migration hops run as an `ALTER TABLE` + backfill + `DROP COLUMN`
+guard, same pattern as `cron_jobs.run_in`, checked in the order a real
+`users.db` could actually be in them (§11 step 3 in `users/store.py`).
 
 ---
 
@@ -343,7 +354,7 @@ via config would quietly lose that hardening on upgrade.
 
 `ToolOverride` keeps the field so old configs still parse, and the loader
 emits one `logger.warning` per stale override naming the tool and pointing
-at `permissions.templates`.
+at `permissions.template` (and per-user `permission_overrides`).
 
 Not doing: a per-tool `required_permissions: [file_read, ...]` config list.
 It works for static declarations but can't express an override for a
@@ -489,13 +500,14 @@ become explicit: `sort -o`, `shuf -o`, `dd of=`, `sed -i`, `awk > file` add
 `bash`, `make`, `docker`, `systemctl`, `apt`, `pip`, `npm`, and every
 command not named above.
 
-The consequence to be conscious of: a `trusted` user can run `python3
-script.py` today and won't be able to after this, because the `trusted`
-template doesn't grant `UNTRUSTED_EXEC`. That's the fail-closed posture
-working as intended, but it *is* the most visible behaviour change in the
-whole rework. Either grant `trusted` the bool, or promote specific commands
-out of the catch-all as they prove needed — the second is the point of
-starting minimal.
+The consequence to be conscious of: unless `permissions.template` (or a
+specific user's `permission_overrides`) grants `UNTRUSTED_EXEC`, nobody can
+run `python3 script.py`, even a user who otherwise holds everything else
+short of `ROOT`/`BACKEND_EXEC`. That's the fail-closed posture working as
+intended, but it *is* the most visible behaviour change in the whole
+rework. Either grant `UNTRUSTED_EXEC` in the global template (or per-user),
+or promote specific commands out of the catch-all as they prove needed —
+the second is the point of starting minimal.
 
 ### 5.2 Shape and construct validation stays
 
@@ -635,10 +647,10 @@ Network bools compose with `BACKEND_EXEC` rather than being subsumed:
 **`FILE_READ`/`FILE_WRITE` carry no scope — location does.** Under
 `BACKEND_EXEC` those same bools reach `config.yaml` (API keys) and
 `users.db` (the permission table itself), so `BACKEND_EXEC + FILE_WRITE` is
-sufficient to grant yourself every other bool. That's why §1.1 pairs it
-with `ROOT` in the `operator` template. Not a flaw to fix — it's what "run
-in the main container" means, and the mount topology is why it's a narrow
-deliberate grant rather than an ambient one.
+sufficient to grant yourself every other bool. That's why §1.1 says to
+grant it alongside `ROOT` on any fully-elevated user. Not a flaw to fix —
+it's what "run in the main container" means, and the mount topology is why
+it's a narrow deliberate grant rather than an ambient one.
 
 ---
 
@@ -759,7 +771,9 @@ behind `MEMORY_READ`. Intended, but a behaviour change, not a translation.
 
 **Path B — `runtime.py:239-245`**: `/user modify_permissions`, `/user
 info`, `/user rename` through the same registry → `ROOT`, `USER_READ`,
-`ROOT`.
+`ROOT`. `/user modify_permissions` takes `<username> <permission>
+<true|false>`, granting or revoking one bool on the target's
+`permission_overrides` (§2).
 
 **Path C — Discord's directly-registered commands
 (`bridges/discord/commands.py:42-54`).** `/reset` and `/shutdown` are built
@@ -826,8 +840,8 @@ but it's a different kind of thing from the rest.
 | `discord/bridge.py:_is_allowed_dm` | 75 | `DM_ACCESS` |
 | `discord/bridge.py:_can_reset` | 75 | `MANAGE_CTX` / `ROOT` |
 | `equipment_manifest` | `trusted_threshold: 90` | `EQUIPMENT_TRUSTED` (§10.3) |
-| `gateway` user-create / user-elevate | body `permission_level` | body `template` (§10.4) |
-| `commands/launch.py:161-180` | elevate to 100 | assign `operator` |
+| `gateway` user-create / user-elevate | body `permission_level` | user-create takes no body; user-elevate takes `{"reset": true}` or nothing (§10.4) |
+| `commands/launch.py:161-180` | elevate to 100 | grant every `Permission` via `permission_overrides` (§2) |
 | `bridges/cli:465` | hardcoded 100 | §10.4 |
 
 ### 10.3 `equipment_manifest` is disclosure, not authorisation
@@ -842,20 +856,25 @@ gates an action. The member needs a docstring comment saying what it is.
 ### 10.4 The gateway API breaks cleanly
 
 ```
-POST /v1/user/create   { "template": "member" }     → { "username", "template" }
-POST /v1/user/elevate  { "template": "operator" }   → { "username", "template" }
+POST /v1/user/create   {}                     → { "username" }
+POST /v1/user/elevate  {}                     → { "username", "admin": true }
+POST /v1/user/elevate  { "reset": true }       → { "username", "admin": false }
+GET  /v1/user/{username}                       → { "username", "admin" }
 ```
 
-No compatibility shim, no accepting `permission_level` for a release. A
-clean break makes unmigrated callers fail loudly at the first request
-instead of silently taking a default; that's the cheapest way to find the
-ones not in this inventory.
+No compatibility shim, no accepting `permission_level` or a `template` body
+field for a release. A clean break makes unmigrated callers fail loudly at
+the first request instead of silently taking a default; that's the
+cheapest way to find the ones not in this inventory. `admin` means "every
+`Permission` bool is set `true` in this user's `permission_overrides`" —
+there's no tier name to report.
 
 Known in-tree callers: `commands/launch.py`, the CLI bridge, the onboarding
 flow. `bridges/cli:465` hardcodes `"permission_level": 100` on every
-message, i.e. the CLI is implicitly the operator — that becomes an explicit
-template assignment, which does mean the CLI stops being unconditionally
-omnipotent.
+message, i.e. the CLI is implicitly the operator — that becomes the caller
+resolving to their real identity and, if not yet elevated, being prompted
+to grant themselves every permission via `/v1/user/{username}/elevate`,
+which does mean the CLI stops being unconditionally omnipotent.
 
 ---
 
@@ -868,9 +887,13 @@ it.
 1. `permissions.py` — enum, `_IMPLIES`, `expand()`, §6.1's definition as
    the module docstring, §1.1's `ROOT` warning and §6.5's `BACKEND_EXEC`
    warning on their members.
-2. Config: `permissions.templates` + `default_template` schema and loader.
-3. `users/models.py` + `users/store.py`: both columns, migration guard,
-   `effective_permissions()`, unknown-key and unknown-template fallbacks.
+2. Config: `permissions.template` schema and loader — one flat mapping, no
+   `templates` dict, no `default_template`.
+3. `users/models.py` + `users/store.py`: the one `permission_overrides`
+   column, the two-hop migration guard (§2.1 — `permission_level` int, and
+   the `permission_template` + `permission_overrides` shape), `effective_permissions()`,
+   unknown-key fallback (no unknown-template fallback needed — there's no
+   per-user template name anymore).
 4. `tool_handling/handler.py`: both new params, enforcement block,
    arg-coercion reorder, §3.1 warn-and-ignore, §3.2 listing rule, startup
    assertion. `min_permission` still honoured here.
@@ -889,8 +912,8 @@ it.
     outside the migration script is the completion criterion.
 11. Tests: extend `tests/test_tool_handler.py` (static + callable
     `required_permissions`, override precedence, classifier-raises→deny)
-    and `tests/test_users_store.py` (both columns round-trip, migration
-    guard, unknown-key drop, unknown-template fallback); add
+    and `tests/test_users_store.py` (`permission_overrides` round-trip,
+    both migration hops from §2.1, unknown-key drop); add
     `tests/test_permissions.py` for `effective_permissions()` merge logic
     and `expand()` — including the requirement-not-grant assertion from
     §1.2, the subtlety a future refactor is most likely to get backwards;

@@ -308,7 +308,7 @@ class ToolCallHandler:
         for it to act on; silently ignoring it would make an operator's
         override quietly stop taking effect on upgrade, so instead we warn
         loudly, once per stale override, naming the tool and pointing at
-        permissions.templates.
+        permissions.template.
         """
         for name, override in (overrides or {}).items():
             tool = self.tools.get(name)
@@ -320,7 +320,8 @@ class ToolCallHandler:
                 logger.warning(
                     "[tool_handler] tools.overrides.%s.min_permission is set but "
                     "permission_level has been retired — this value is IGNORED. "
-                    "Grant/deny capabilities via permissions.templates instead.",
+                    "Grant/deny capabilities via permissions.template (and "
+                    "per-user permission_overrides) instead.",
                     name,
                 )
 
@@ -384,10 +385,10 @@ class ToolCallHandler:
     def _permissions_cfg(self):
         """
         Resolve the PermissionsConfig to check callers against. Falls back
-        to a bare default (guest/member/trusted/operator built-ins, default
-        template 'guest') when nothing was wired — e.g. ToolCallHandler
-        constructed directly in tests. Imported lazily to avoid importing
-        TinyCTX.config at module load time for callers that never need it.
+        to a bare default (the built-in empty template — nothing granted)
+        when nothing was wired — e.g. ToolCallHandler constructed directly
+        in tests. Imported lazily to avoid importing TinyCTX.config at
+        module load time for callers that never need it.
         """
         cfg = getattr(self, "permissions_config", None)
         if cfg is not None:

@@ -61,11 +61,11 @@ DEFAULTS = {
     "token_env": "DISCORD_BOT_TOKEN",
     "allowed_servers": {},
     "dm_enabled": True,
-    # DM/reset/shutdown gating now reads the caller's named permission
-    # template (DM_ACCESS / MANAGE_CTX / ROOT — see TinyCTX/permissions.py
-    # and docs/PERMISSIONS-PLAN.md §9) instead of a per-bridge int
-    # threshold. There is nothing to configure here anymore; adjust
-    # permissions.templates in config.yaml instead.
+    # DM/reset/shutdown gating now reads the caller's effective permissions
+    # (DM_ACCESS / MANAGE_CTX / ROOT — see TinyCTX/permissions.py and
+    # docs/PERMISSIONS-PLAN.md §9) instead of a per-bridge int threshold.
+    # There is nothing to configure here anymore; adjust permissions.template
+    # (or a specific user's overrides) in config.yaml instead.
     "reset_command": "/reset",
     "shutdown_command": "/shutdown",
     "keyword_listen_keywords": [],

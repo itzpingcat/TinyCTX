@@ -4,11 +4,13 @@ tests/test_users_store.py
 Tests for users/store.py (UserStore) and users/models.py (User, PlatformIdentity).
 Covers user creation, resolve_user idempotency, username generation/uniqueness
 (_slugify, _random_username), rename/merge conflict behavior, persistence
-across store reopen with the same data_dir, and the permission_template /
-permission_overrides columns that replaced permission_level (see
-TinyCTX/permissions.py and docs/PERMISSIONS-PLAN.md) — round-trip, the
-legacy permission_level -> permission_template migration guard, unknown-key
-dropping, and unknown-template fallback.
+across store reopen with the same data_dir, and the permission_overrides
+column that's now the ONLY per-user permission state (see
+TinyCTX/permissions.py and docs/PERMISSIONS-PLAN.md §2) — round-trip,
+corrupt-column tolerance, unknown-key dropping, and the two-stage legacy
+migration guard (permission_level int -> permission_overrides directly, and
+the short-lived permission_template + permission_overrides middle state ->
+permission_overrides).
 
 Run with:
     pytest tests/
@@ -27,9 +29,11 @@ from TinyCTX.users.models import PlatformIdentity, User
 from TinyCTX.users.store import (
     UserStore,
     UsernameConflictError,
+    _LEGACY_TEMPLATES,
+    _explicit_overrides_for,
     _random_username,
     _slugify,
-    _template_for_level,
+    _template_name_for_level,
 )
 
 
@@ -48,9 +52,8 @@ class TestResolveUser:
         user = store.resolve_user(Platform.DISCORD, "u1", "alice", "Alice")
         assert isinstance(user, User)
         assert user.username
-        # "" means "use PermissionsConfig.default_template" — resolved
-        # lazily by effective_permissions(), not baked in at creation time.
-        assert user.permission_template == ""
+        # Empty overrides -> resolves entirely against the single global
+        # permissions.template, nothing baked in at creation time.
         assert user.permission_overrides == {}
         assert len(user.identities) == 1
         assert user.identities[0].platform == Platform.DISCORD
@@ -119,6 +122,29 @@ class TestGetters:
 
     def test_get_by_platform_missing_returns_none(self, store):
         assert store.get_by_platform(Platform.DISCORD, "nonexistent") is None
+
+
+# ---------------------------------------------------------------------------
+# create_user — exact username, no per-user template selection
+# ---------------------------------------------------------------------------
+
+class TestCreateUser:
+    def test_create_user_exact_username(self, store):
+        user = store.create_user("exact-name")
+        assert user.username == "exact-name"
+        assert user.permission_overrides == {}
+
+    def test_create_user_conflict_raises(self, store):
+        store.create_user("taken")
+        with pytest.raises(UsernameConflictError):
+            store.create_user("taken")
+
+    def test_create_user_takes_no_template_kwarg(self, store):
+        """There's a single global template now — create_user() has nothing
+        to select at creation time."""
+        import inspect
+        params = inspect.signature(store.create_user).parameters
+        assert "permission_template" not in params
 
 
 # ---------------------------------------------------------------------------
@@ -198,13 +224,6 @@ class TestUpdateUser:
         store.update_user(user)
         fetched = store.get_user(user.username)
         assert fetched.meta["key"] == "value"
-
-    def test_update_user_persists_permission_template(self, store):
-        user = store.resolve_user(Platform.DISCORD, "u1", "alice", "Alice")
-        user.permission_template = "trusted"
-        store.update_user(user)
-        fetched = store.get_user(user.username)
-        assert fetched.permission_template == "trusted"
 
     def test_update_user_persists_permission_overrides(self, store):
         user = store.resolve_user(Platform.DISCORD, "u1", "alice", "Alice")
@@ -326,36 +345,75 @@ class TestModels:
             identities=[ident],
             meta={},
             created_at=123.0,
-            permission_template="trusted",
+            permission_overrides={"root": True},
         )
         assert user.username == "a"
         assert user.identities == [ident]
         assert user.created_at == 123.0
-        assert user.permission_template == "trusted"
-        assert user.permission_overrides == {}  # default_factory
+        assert user.permission_overrides == {"root": True}
 
-    def test_user_permission_template_and_overrides_default_empty(self):
+    def test_user_permission_overrides_default_empty(self):
         ident = PlatformIdentity(
             platform=Platform.DISCORD, user_id="1", username="a", display_name="A"
         )
         user = User(username="a", identities=[ident], meta={}, created_at=123.0)
-        assert user.permission_template == ""
         assert user.permission_overrides == {}
 
+    def test_user_has_no_permission_template_field(self):
+        """Named tiers are gone — User no longer stores a template name."""
+        import dataclasses
+        field_names = {f.name for f in dataclasses.fields(User)}
+        assert "permission_template" not in field_names
+
 
 # ---------------------------------------------------------------------------
-# Legacy permission_level -> permission_template migration guard
-# (docs/PERMISSIONS-PLAN.md §2.1, §11 step 10's completion criterion)
+# Legacy migration guard (docs/PERMISSIONS-PLAN.md §2's migration note)
+#
+# Two historical shapes an existing users.db can be in, checked in the order
+# this codebase actually produced them:
+#   1. Oldest: only permission_level INTEGER (pre-dates templates entirely).
+#   2. Short-lived middle state: permission_template TEXT +
+#      permission_overrides TEXT (the multi-template system this file
+#      briefly implemented before being simplified to one global template).
+# Both must land on permission_overrides holding a FULL explicit dict (every
+# Permission name present) so a migrated user's effective permissions don't
+# shift no matter what permissions.template ends up being configured to.
 # ---------------------------------------------------------------------------
 
-class TestLegacyMigration:
-    """
-    Simulates a pre-rework users.db (permission_level INTEGER, no
-    permission_template/permission_overrides columns) and verifies
-    UserStore._migrate backfills the template per _BACKFILL_RANGES, then
-    drops the retired column — same PRAGMA table_info + ALTER TABLE guard
-    pattern as modules/cron's cron_jobs.run_in column.
-    """
+class TestTemplateNameForLevel:
+    @pytest.mark.parametrize("level,expected_template", [
+        (0, "guest"),
+        (10, "guest"),
+        (25, "member"),
+        (49, "member"),
+        (50, "trusted"),
+        (89, "trusted"),
+        (90, "operator"),
+        (100, "operator"),
+    ])
+    def test_template_name_for_level_backfill_ranges(self, level, expected_template):
+        assert _template_name_for_level(level) == expected_template
+
+
+class TestExplicitOverridesFor:
+    def test_every_permission_present(self):
+        overrides = _explicit_overrides_for(frozenset({Permission.FILE_READ}))
+        assert set(overrides) == {p.value for p in Permission}
+
+    def test_values_match_membership(self):
+        overrides = _explicit_overrides_for(frozenset({Permission.FILE_READ, Permission.ROOT}))
+        assert overrides[Permission.FILE_READ.value] is True
+        assert overrides[Permission.ROOT.value] is True
+        assert overrides[Permission.NETWORK_WRITE.value] is False
+
+    def test_empty_set_yields_all_false(self):
+        overrides = _explicit_overrides_for(frozenset())
+        assert all(v is False for v in overrides.values())
+
+
+class TestLegacyMigrationFromPermissionLevel:
+    """Oldest shape: only permission_level INTEGER, no permission_template
+    or permission_overrides columns at all."""
 
     def _make_legacy_db(self, tmp_path, rows: list[tuple[str, int]]) -> None:
         db_path = tmp_path / "users.db"
@@ -384,41 +442,39 @@ class TestLegacyMigration:
         conn.commit()
         conn.close()
 
-    @pytest.mark.parametrize("level,expected_template", [
-        (0, "guest"),
-        (10, "guest"),
-        (25, "member"),
-        (49, "member"),
-        (50, "trusted"),
-        (89, "trusted"),
-        (90, "operator"),
-        (100, "operator"),
-    ])
-    def test_template_for_level_backfill_ranges(self, level, expected_template):
-        assert _template_for_level(level) == expected_template
-
-    def test_legacy_column_backfilled_on_open(self, tmp_path):
+    def test_legacy_level_frozen_into_full_explicit_overrides(self, tmp_path):
         self._make_legacy_db(tmp_path, [("alice", 50), ("bob", 0), ("carol", 100)])
 
         store = UserStore(data_dir=tmp_path)
 
-        assert store.get_user("alice").permission_template == "trusted"
-        assert store.get_user("bob").permission_template == "guest"
-        assert store.get_user("carol").permission_template == "operator"
+        alice_expected = _explicit_overrides_for(_LEGACY_TEMPLATES["trusted"])
+        bob_expected   = _explicit_overrides_for(_LEGACY_TEMPLATES["guest"])
+        carol_expected = _explicit_overrides_for(_LEGACY_TEMPLATES["operator"])
 
-    def test_legacy_column_dropped_or_left_harmless_after_migration(self, tmp_path):
+        assert store.get_user("alice").permission_overrides == alice_expected
+        assert store.get_user("bob").permission_overrides == bob_expected
+        assert store.get_user("carol").permission_overrides == carol_expected
+
+    def test_effective_permissions_unaffected_by_new_global_template(self, tmp_path):
+        """A migrated user's behaviour must not shift just because the
+        (now single) global template is configured differently than
+        whatever they used to resolve against."""
+        self._make_legacy_db(tmp_path, [("alice", 50)])  # -> "trusted"
+        store = UserStore(data_dir=tmp_path)
+        alice = store.get_user("alice")
+
+        weird_cfg = PermissionsConfig(template=frozenset({Permission.ROOT}))
+        assert alice.effective_permissions(weird_cfg) == _LEGACY_TEMPLATES["trusted"]
+
+    def test_permission_level_column_dropped_or_left_harmless(self, tmp_path):
         self._make_legacy_db(tmp_path, [("alice", 50)])
         UserStore(data_dir=tmp_path)
 
-        # Reading permission_overrides must work regardless of whether this
-        # SQLite could DROP COLUMN (>= 3.35) or had to leave the stale
-        # column in place (older SQLite) — either way the new columns exist
-        # and are usable.
         conn = sqlite3.connect(str(tmp_path / "users.db"))
         cols = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
         conn.close()
-        assert "permission_template" in cols
         assert "permission_overrides" in cols
+        assert "permission_template" not in cols  # never introduced by this path
 
     def test_reopen_after_migration_is_a_no_op(self, tmp_path):
         """A second UserStore() over an already-migrated db must not choke
@@ -426,23 +482,90 @@ class TestLegacyMigration:
         self._make_legacy_db(tmp_path, [("alice", 25)])
         UserStore(data_dir=tmp_path)  # migrates
         store2 = UserStore(data_dir=tmp_path)  # reopen — must not raise
-        assert store2.get_user("alice").permission_template == "member"
+        assert store2.get_user("alice").permission_overrides == _explicit_overrides_for(
+            _LEGACY_TEMPLATES["member"]
+        )
 
-    def test_already_migrated_row_is_not_reprocessed(self, tmp_path):
-        """A row that already has a non-empty permission_template (e.g. a
-        user who was explicitly re-templated between two migration runs on
-        an old SQLite that couldn't drop the column) must not be clobbered
-        by a stale permission_level value on a later reopen."""
-        self._make_legacy_db(tmp_path, [("alice", 0)])  # would backfill to "guest"
+
+class TestLegacyMigrationFromTemplateColumn:
+    """Short-lived middle shape: permission_template TEXT +
+    permission_overrides TEXT (the multi-template system, since
+    simplified away)."""
+
+    def _make_middle_db(self, tmp_path, rows: list[tuple[str, str, dict]]) -> None:
+        db_path = tmp_path / "users.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript("""
+            CREATE TABLE users (
+                username             TEXT PRIMARY KEY,
+                permission_template  TEXT NOT NULL DEFAULT '',
+                permission_overrides TEXT NOT NULL DEFAULT '{}',
+                identities           TEXT NOT NULL DEFAULT '[]',
+                meta                 TEXT NOT NULL DEFAULT '{}',
+                created_at           REAL NOT NULL
+            );
+            CREATE TABLE user_platform_index (
+                platform TEXT NOT NULL,
+                user_id  TEXT NOT NULL,
+                username TEXT NOT NULL REFERENCES users(username),
+                PRIMARY KEY (platform, user_id)
+            );
+        """)
+        for username, template, overrides in rows:
+            conn.execute(
+                "INSERT INTO users (username, permission_template, permission_overrides, "
+                "identities, meta, created_at) VALUES (?, ?, ?, '[]', '{}', 0.0)",
+                (username, template, json.dumps(overrides)),
+            )
+        conn.commit()
+        conn.close()
+
+    def test_template_and_overrides_merged_into_full_explicit_overrides(self, tmp_path):
+        self._make_middle_db(tmp_path, [
+            ("alice", "member", {"file_write": True}),   # member + an extra grant
+            ("bob",   "trusted", {"model_swap": False}),  # trusted minus one bool
+        ])
+
+        store = UserStore(data_dir=tmp_path)
+
+        alice_resolved = set(_LEGACY_TEMPLATES["member"]) | {Permission.FILE_WRITE}
+        bob_resolved = set(_LEGACY_TEMPLATES["trusted"]) - {Permission.MODEL_SWAP}
+
+        assert store.get_user("alice").permission_overrides == _explicit_overrides_for(frozenset(alice_resolved))
+        assert store.get_user("bob").permission_overrides == _explicit_overrides_for(frozenset(bob_resolved))
+
+    def test_effective_permissions_unaffected_by_new_global_template(self, tmp_path):
+        self._make_middle_db(tmp_path, [("alice", "trusted", {})])
         store = UserStore(data_dir=tmp_path)
         alice = store.get_user("alice")
-        alice.permission_template = "operator"
-        store.update_user(alice)
 
-        # Manually resurrect a legacy-shaped column state is impractical
-        # post-DROP; instead just confirm the value survives a reopen.
-        store2 = UserStore(data_dir=tmp_path)
-        assert store2.get_user("alice").permission_template == "operator"
+        weird_cfg = PermissionsConfig(template=frozenset({Permission.ROOT}))
+        assert alice.effective_permissions(weird_cfg) == _LEGACY_TEMPLATES["trusted"]
+
+    def test_permission_template_column_dropped_or_left_harmless(self, tmp_path):
+        self._make_middle_db(tmp_path, [("alice", "guest", {})])
+        UserStore(data_dir=tmp_path)
+
+        conn = sqlite3.connect(str(tmp_path / "users.db"))
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
+        conn.close()
+        assert "permission_overrides" in cols
+        # If SQLite couldn't DROP COLUMN, the stale column is left in place
+        # but harmless (nothing reads it) — either outcome is acceptable.
+
+    def test_empty_template_name_falls_back_to_guest(self, tmp_path):
+        self._make_middle_db(tmp_path, [("alice", "", {"root": True})])
+        store = UserStore(data_dir=tmp_path)
+        expected = _explicit_overrides_for(frozenset({Permission.ROOT}))
+        assert store.get_user("alice").permission_overrides == expected
+
+    def test_reopen_after_migration_is_a_no_op(self, tmp_path):
+        self._make_middle_db(tmp_path, [("alice", "operator", {})])
+        UserStore(data_dir=tmp_path)  # migrates
+        store2 = UserStore(data_dir=tmp_path)  # reopen — must not raise
+        assert store2.get_user("alice").permission_overrides == _explicit_overrides_for(
+            _LEGACY_TEMPLATES["operator"]
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -498,26 +621,16 @@ class TestOverridesRobustness:
 
 
 # ---------------------------------------------------------------------------
-# Unknown-template fallback (PermissionsConfig.resolve_template, exercised
-# via User.effective_permissions — docs/PERMISSIONS-PLAN.md §2)
+# Single global template — a fresh user resolves directly against
+# PermissionsConfig.template, nothing to look up by name.
 # ---------------------------------------------------------------------------
 
-class TestUnknownTemplateFallback:
-    def test_unknown_stored_template_falls_back_to_default(self, store):
+class TestSingleGlobalTemplate:
+    def test_fresh_user_resolves_directly_against_global_template(self, store):
         user = store.resolve_user(Platform.DISCORD, "u1", "alice", "Alice")
-        user.permission_template = "some-deleted-template"
-        store.update_user(user)
-        fetched = store.get_user(user.username)
+        cfg = PermissionsConfig(template=frozenset({Permission.FILE_READ, Permission.MEMORY_READ}))
+        assert user.effective_permissions(cfg) == frozenset({Permission.FILE_READ, Permission.MEMORY_READ})
 
-        cfg = PermissionsConfig(default_template="guest")
-        # guest is the empty template — falling back to it must not raise,
-        # and must NOT resolve to the (nonexistent) stored template's set.
-        assert fetched.effective_permissions(cfg) == frozenset()
-
-    def test_empty_stored_template_uses_configured_default(self, store):
+    def test_default_config_template_is_empty(self, store):
         user = store.resolve_user(Platform.DISCORD, "u1", "alice", "Alice")
-        assert user.permission_template == ""
-
-        cfg = PermissionsConfig(default_template="member")
-        effective = user.effective_permissions(cfg)
-        assert effective == cfg.templates["member"]
+        assert user.effective_permissions(PermissionsConfig()) == frozenset()

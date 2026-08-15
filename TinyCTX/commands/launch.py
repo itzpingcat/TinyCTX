@@ -14,11 +14,12 @@ Flags
   --dir PATH       Path to a .tinyctx instance directory.
   --config PATH    Path to config.yaml directly (overrides --dir/autodetect).
   --user USERNAME  TinyCTX username to log in as. If it doesn't exist yet,
-                   you will be prompted to create it (default permission
-                   template). If the user isn't on the operator template,
-                   you will also be prompted to elevate it (CLI is a
-                   trusted admin console — no ROOT-holding caller is
-                   required; physical/API-key access is the authorization).
+                   you will be prompted to create it (starts on the single
+                   configured permissions.template, no overrides). If the
+                   user isn't already elevated, you will also be prompted to
+                   grant full admin access (CLI is a trusted admin console —
+                   no ROOT-holding caller is required; physical/API-key
+                   access is the authorization).
 
 Docker
 ------
@@ -56,16 +57,16 @@ def _prompt_create(username: str) -> bool:
     return answer in ("y", "yes")
 
 
-def _prompt_elevate(username: str, current_template: str) -> bool:
-    """Ask the user if they want to elevate to the operator template. Returns True if yes."""
+def _prompt_elevate(username: str) -> bool:
+    """Ask the user if they want to grant full admin access. Returns True if yes."""
     print(
-        f"\n  User '{username}' is on the {current_template!r} template.\n"
-        "  The CLI is a trusted admin console — you can elevate this user to\n"
-        "  the 'operator' template now. This grants every agent capability.\n"
+        f"\n  User '{username}' is not currently elevated.\n"
+        "  The CLI is a trusted admin console — you can grant this user\n"
+        "  every agent capability now.\n"
     )
     while True:
         try:
-            answer = input("  Elevate to 'operator'? [y/N] ").strip().lower()
+            answer = input("  Grant full admin access? [y/N] ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             return False
         if answer in ("y", "yes"):
@@ -159,13 +160,13 @@ def run(args: argparse.Namespace) -> None:
         print(f"error: could not reach gateway to look up user: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    template = user_data["template"]
+    is_admin = bool(user_data.get("admin"))
 
-    # ── Offer elevation if not already on the operator template ──────────────
-    if template != "operator":
-        if _prompt_elevate(username, template):
+    # ── Offer elevation if not already an admin ─────────────────────────────────
+    if not is_admin:
+        if _prompt_elevate(username):
             try:
-                payload = json.dumps({"template": "operator"}).encode()
+                payload = json.dumps({}).encode()
                 req = urllib.request.Request(
                     f"{gateway_url}/v1/user/{username}/elevate",
                     data=payload,
@@ -174,11 +175,11 @@ def run(args: argparse.Namespace) -> None:
                 )
                 with urllib.request.urlopen(req, timeout=5) as r:
                     json.loads(r.read().decode())  # confirm success
-                print(f"  \u2713 '{username}' elevated to 'operator'.\n")
+                print(f"  \u2713 '{username}' elevated — every permission granted.\n")
             except Exception as exc:
                 print(f"  warning: elevation failed: {exc}", file=sys.stderr)
         else:
-            print(f"  Continuing on the {template!r} template.\n")
+            print(f"  Continuing without admin access.\n")
 
     # ── Launch CLI ────────────────────────────────────────────────────────────
     options: dict = {}
