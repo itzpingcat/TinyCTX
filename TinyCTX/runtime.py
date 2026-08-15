@@ -7,6 +7,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Awaitable, Callable
 
 from TinyCTX.config import Config
 from TinyCTX.contracts import AgentError, InboundMessage, SessionEnvironment
@@ -82,6 +83,9 @@ class Runtime:
         self._runs: dict[str, Run] = {}
         self._settled: dict[str, str] = {}
         self._session_locks: dict[str, asyncio.Lock] = {}
+
+        # Platform renderers — see register_platform_handler / deliver below.
+        self._platform_handlers: dict[str, Callable[[str, object], Awaitable[None]]] = {}
 
     async def start(self) -> None:
         self._register_user_commands()
@@ -202,6 +206,57 @@ class Runtime:
             params=[("username", str, "Current username"), ("new_username", str, "New username")])
 
     # ------------------------------------------------------------------
+    # Platform delivery — render events to a destination outside a live
+    # bridge-owned reply_queue drain loop (e.g. a cron job's output).
+    # ------------------------------------------------------------------
+
+    def register_platform_handler(
+        self,
+        platform: str,
+        handler: Callable[[str, object], Awaitable[None]],
+    ) -> None:
+        """
+        Register a renderer for `platform`: an async callable
+        `(destination, event) -> None` that renders one AgentEvent to
+        `destination` (a platform-specific address — e.g. a Discord
+        cursor_key or a Telegram chat_key).
+
+        Bridges call this once at startup with the same render_event
+        function their own turn-handling loop uses, so any caller that
+        isn't a live bridge turn (cron, and any future non-interactive
+        trigger source) can deliver output through the identical
+        rendering path a live user turn would use — same message
+        chunking, same file-upload handling, same error formatting.
+
+        Overwrites any previously registered handler for `platform`.
+        """
+        self._platform_handlers[platform] = handler
+        logger.info("[runtime] platform handler registered for %r", platform)
+
+    async def deliver(self, platform: str, destination: str, event: object) -> bool:
+        """
+        Render one AgentEvent to `destination` via the handler registered
+        for `platform`. Returns False (and logs) if no handler is
+        registered, or if the handler itself raises — a delivery failure
+        must never propagate up and abort the caller's larger loop (e.g.
+        a cron tick processing several due jobs).
+        """
+        handler = self._platform_handlers.get(platform)
+        if handler is None:
+            logger.warning(
+                "[runtime] deliver: no platform handler registered for %r — dropping event", platform
+            )
+            return False
+        try:
+            await handler(destination, event)
+            return True
+        except Exception:
+            logger.exception(
+                "[runtime] deliver: handler for %r raised while rendering to %r", platform, destination
+            )
+            return False
+
+    # ------------------------------------------------------------------
     # Entry Point: push()
     # ------------------------------------------------------------------
 
@@ -264,20 +319,35 @@ class Runtime:
         content_str = json.dumps(content, ensure_ascii=False) if isinstance(content, list) else str(content)
 
         # 2. Write User Node to DB
-        author_id = msg.author.username
-        if not author_id:
-            # author_id being empty/None means the prefix will be silently skipped
-            # in context assembly, making multi-user attribution invisible to the LLM.
-            logger.error(
-                "[push] author_id is empty for inbound message (tail=%s, platform=%s, user_id=%s). "
-                "User node will be written without author_id — prefix will be missing in LLM context.",
-                msg.tail_node_id,
-                msg.env.platform,
-                getattr(msg.author, 'user_id', '<unknown>'),
-            )
-        state_delta = self._compute_state_delta(msg)
-
+        if msg.suppress_attribution:
+            # Deliberate — see InboundMessage.suppress_attribution and
+            # context.py's NO_ATTRIBUTION_SENTINEL. msg.author is still the
+            # real caller (used below via _spawn_task for permission checks);
+            # only the DB node's author_id — and therefore the 【label】:
+            # prefix Context.assemble() would otherwise add — is affected.
+            from TinyCTX.context import NO_ATTRIBUTION_SENTINEL
+            author_id = NO_ATTRIBUTION_SENTINEL
+        else:
+            author_id = msg.author.username
+            if not author_id:
+                # author_id being empty/None means the prefix will be silently skipped
+                # in context assembly, making multi-user attribution invisible to the LLM.
+                logger.error(
+                    "[push] author_id is empty for inbound message (tail=%s, platform=%s, user_id=%s). "
+                    "User node will be written without author_id — prefix will be missing in LLM context.",
+                    msg.tail_node_id,
+                    msg.env.platform,
+                    getattr(msg.author, 'user_id', '<unknown>'),
+                )
         effective_session_key = parent.session_key if parent is not None else (session_key or msg.tail_node_id)
+
+        # session_key IS the bridge's cursor_key for real (non-internal) turns
+        # — e.g. Discord's handle_turn calls push(msg, session_key=cursor_key).
+        # Internal callers (cron, heartbeat) never pass session_key, so it
+        # defaults to msg.tail_node_id — a one-off value, correctly excluded
+        # below so it's never mistaken for a real channel address.
+        cursor_key = session_key if (parent is None and session_key) else None
+        state_delta = self._compute_state_delta(msg, cursor_key)
 
         # --- R1 attach + §6 race fix: resolve settled_tail, write the node,
         # and (if triggering) register the Run, all under one session lock. ---
@@ -517,7 +587,7 @@ class Runtime:
     # Internal Helpers
     # ------------------------------------------------------------------
 
-    def _compute_state_delta(self, msg: InboundMessage) -> dict:
+    def _compute_state_delta(self, msg: InboundMessage, cursor_key: str | None = None) -> dict:
         prior_state, _ = self.db.load_session_state(msg.tail_node_id)
         delta = {}
         mapping = {
@@ -526,6 +596,12 @@ class Runtime:
             "server_name":  msg.env.server_name,
             "channel_name": msg.env.channel_name,
             "author_id":    msg.author.username,
+            # Stable channel/chat address (e.g. "group:<id>", "tg:<id>") —
+            # see push()'s cursor_key derivation above. Recorded so
+            # non-live callers (cron's add_cron tool) can recover "the
+            # channel this turn is happening in" without importing any
+            # bridge module — read back via db.get_state(tail, "cursor_key").
+            "cursor_key":   cursor_key,
         }
         for k, v in mapping.items():
             if v is not None and prior_state.get(k) != v:

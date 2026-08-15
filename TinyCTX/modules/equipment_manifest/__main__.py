@@ -27,8 +27,12 @@ Footer template resolution
 
 Available template variables (both templates):
   system          — OS name: "Windows", "Darwin", "Linux", etc.
-  date            — today's date, e.g. "2025-01-15"
-  time            — current time, e.g. "14:32"
+  date            — today's date in UTC, e.g. "2025-01-15"
+  time            — current time in UTC, e.g. "14:32 UTC" (explicitly
+                    labelled — this is always UTC regardless of the host
+                    machine's local timezone, so callers computing a future
+                    timestamp from it, e.g. modules/cron's one-shot
+                    reminders, never need to guess or convert)
   workspace_path  — resolved absolute path to the workspace directory
   config_path     — resolved absolute path to config.yaml (best-effort)
   source_root     — cwd at launch time (where TinyCTX's own code lives);
@@ -66,7 +70,7 @@ from __future__ import annotations
 
 import logging
 import platform as platform_module
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader, TemplateNotFound, TemplateSyntaxError
@@ -90,7 +94,11 @@ _DEFAULT_FOOTER_TEMPLATE = "<clock>{{ time }}</clock>"
 # ---------------------------------------------------------------------------
 
 def _build_variables(agent, ctx=None, trusted_threshold: int = 90, last_message_at: float | None = None) -> dict:
-    now         = datetime.now()
+    # UTC, not host-local time — see module docstring. datetime.now() with no
+    # tz arg previously rendered naive local time with no timezone label
+    # anywhere in the string, so nothing reading {{ time }} (including
+    # modules/cron's one-shot reminder math) could tell what zone it was in.
+    now         = datetime.now(timezone.utc)
     workspace   = Path(agent.config.workspace.path).expanduser().resolve()
     source_root = Path.cwd().resolve()
 
@@ -116,10 +124,11 @@ def _build_variables(agent, ctx=None, trusted_threshold: int = 90, last_message_
         except Exception as exc:
             logger.debug("[equipment_manifest] trusted lookup failed: %s", exc)
 
-    # Format time since last message
+    # Format time since last message. (epoch-seconds delta — tz-agnostic by
+    # construction, but using `now` keeps this consistent with the UTC clock above.)
     time_since_last_message = ""
     if last_message_at is not None:
-        elapsed = int(datetime.now().timestamp() - last_message_at)
+        elapsed = int(now.timestamp() - last_message_at)
         if elapsed < 60:
             time_since_last_message = f"{elapsed}s"
         elif elapsed < 3600:
@@ -130,7 +139,7 @@ def _build_variables(agent, ctx=None, trusted_threshold: int = 90, last_message_
     return {
         "system":         platform_module.system(),
         "date":           now.strftime("%Y-%m-%d"),
-        "time":           now.strftime("%H:%M"),
+        "time":           now.strftime("%H:%M UTC"),
         "workspace_path": str(workspace),
         "config_path":    config_path,
         "source_root":    str(source_root),
@@ -173,7 +182,7 @@ def _build_static_variables(agent, ctx=None, trusted_threshold: int = 90) -> dic
 
     return {
         "system":         platform_module.system(),
-        "date":           datetime.now().strftime("%Y-%m-%d"),  # changes at midnight only
+        "date":           datetime.now(timezone.utc).strftime("%Y-%m-%d"),  # UTC; changes at midnight UTC only
         "workspace_path": str(workspace),
         "config_path":    config_path,
         "source_root":    str(source_root),

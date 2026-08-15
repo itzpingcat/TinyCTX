@@ -69,6 +69,29 @@ ROLE_ASSISTANT = "assistant"
 ROLE_TOOL      = "tool"
 ROLE_SYSTEM    = "system"
 
+# Reserved author_id sentinel: a role="user" node written with this exact
+# author_id is intentionally unattributed — assemble() (below) skips the
+# "【label】:" prefix for it and does NOT log the "missing author_id"
+# warning that fires for a genuinely blank author_id (which usually means a
+# real bug in whatever wrote the node — see Runtime.push()'s own error log
+# for that case).
+#
+# This is per-NODE, not per-cycle: a triggered turn (e.g. cron) is often
+# still attached to a channel's existing history, which may contain real
+# people's messages that must keep their own 【label】: prefixes — only the
+# one node the trigger itself writes should go unattributed. Written by
+# Runtime.push() when InboundMessage.suppress_attribution is True (see
+# contracts.py) — the caller's *identity* for permission purposes
+# (msg.author, AgentCycle.caller / caller.permission_level) is completely
+# separate from this and is never affected: push() derives the DB node's
+# author_id column from msg.author.username unless suppress_attribution
+# asks for this sentinel instead, but msg.author itself (the full User
+# object used for permissions) is untouched either way. See
+# modules/cron/__main__.py::_CronRunner._run_job, which sets
+# suppress_attribution=True while still passing author=creator (the real
+# user) so caller.permission_level resolves correctly.
+NO_ATTRIBUTION_SENTINEL = "\x00no_attribution"
+
 # ---------------------------------------------------------------------------
 # Hook stages
 # ---------------------------------------------------------------------------
@@ -643,7 +666,11 @@ class Context:
                         entry.id, age, entry.id,
                     )
 
-            if entry.role == ROLE_USER and entry.author_id is not None:
+            if (
+                entry.role == ROLE_USER
+                and entry.author_id is not None
+                and entry.author_id != NO_ATTRIBUTION_SENTINEL
+            ):
                 label = entry.author_id
                 raw = entry.content
                 # Fullwidth 【】 delimiters are visually distinct from ASCII []
