@@ -8,9 +8,32 @@ from typing import Dict, Any, Callable, List, Optional
 logger = logging.getLogger(__name__)
 
 class ToolCallHandler:
-    def __init__(self):
+    def __init__(self, vector_store=None, embedder=None):
+        """
+        vector_store: TinyCTX.tool_handling.vector_store.ToolVectorStore | None.
+            Process-wide singleton owned by Runtime (built once, reused across
+            every AgentCycle's ToolCallHandler — see runtime.py). None disables
+            both passive auto-enable and vector-assisted tools_search; the
+            handler still works exactly as before (BM25-only, explicit
+            tools_search) when vector_store is absent.
+        embedder: TinyCTX.ai.Embedder | None. Also process-wide, built once
+            alongside vector_store from config.tools.passive/search's
+            embedding_model. None means vector ranking is skipped even if
+            vector_store is present (BM25/FTS still works without an embedder).
+        """
         self.tools: Dict[str, Any] = {}
         self.enabled: set[str] = set()
+        self.vector_store = vector_store
+        self.embedder = embedder
+        # ToolSearchConfig instance, set by agent.py after construction. Read
+        # by _search_cfg() / tools_search(); left None in bare/test usage,
+        # where _search_cfg()'s defaults apply.
+        self.search_config = None
+        # Tool names auto-enabled by the current turn's passive_search() call —
+        # NOT part of `enabled` persistence; agent.py unions this set into
+        # get_tool_definitions() for the turn and never writes it to session
+        # state. Reset at the start of every passive_search() call.
+        self.auto_enabled: set[str] = set()
 
     def register_tool(self,
                       func: Callable,
@@ -224,7 +247,7 @@ class ToolCallHandler:
         self.enabled.add(name)
         return True
 
-    def tools_search(self, query: str) -> str:
+    async def tools_search(self, query: str) -> str:
         """Search for available tools by keyword and enable them for use. If the query exactly matches a tool name, that tool is enabled immediately.
         Otherwise, returns a list of candidates — call tools_search again with the
         exact tool name you want to enable.
@@ -232,8 +255,6 @@ class ToolCallHandler:
         Args:
             query: Exact tool name to enable, or a keyword/description to search for.
         """
-        from TinyCTX.utils.bm25 import BM25
-
         # --- Exact match: enable immediately ---
         if query in self.tools:
             if query in self.enabled:
@@ -242,16 +263,16 @@ class ToolCallHandler:
             return f"Enabled: {query}"
 
         # --- Fuzzy search: suggest candidates, do NOT enable anything ---
-        corpus = {
-            name: f"{name.replace('_', ' ')} {tool['description']}"
-            for name, tool in self.tools.items()
-        }
-        if not corpus:
+        if not self.tools:
             return "No tools available."
 
-        bm25   = BM25(corpus)
-        scored = bm25.search(query, top_k=len(corpus))
-        hits   = [name for name, score in scored if score > 0.0]
+        hits = await self._ranked_candidates(
+            query,
+            vector_enabled=self._search_cfg("vector_enabled", False),
+            top_k=self._search_cfg("top_k", 5),
+            min_score=self._search_cfg("min_score", 0.0),
+            rrf_k=self._search_cfg("rrf_k", 60),
+        )
 
         if not hits:
             return "No tools found matching that query."
@@ -263,9 +284,107 @@ class ToolCallHandler:
             lines.append(f"  - {name}{already}: {desc}")
         return "\n".join(lines)
 
+    def _search_cfg(self, key: str, default):
+        """Read one field from the ToolSearchConfig this handler was
+        configured with, or fall back to `default` when unset (no config
+        wired — e.g. in tests constructing ToolCallHandler bare)."""
+        cfg = getattr(self, "search_config", None)
+        return getattr(cfg, key, default) if cfg is not None else default
+
+    async def _ranked_candidates(
+        self, query: str, *, vector_enabled: bool, top_k: int, min_score: float, rrf_k: int,
+    ) -> List[str]:
+        """Shared entry into tool_handling/search.py's rank_tools — used by
+        both tools_search (above) and passive_search (below). Returns []
+        (BM25/vector both no-op) when vector_store is absent, in which case
+        callers should fall back to plain BM25 via utils.bm25 directly."""
+        if self.vector_store is None:
+            from TinyCTX.utils.bm25 import BM25
+            corpus = {
+                name: f"{name.replace('_', ' ')} {tool['description']}"
+                for name, tool in self.tools.items()
+            }
+            scored = BM25(corpus).search(query, top_k=top_k)
+            return [name for name, score in scored if score >= min_score]
+
+        from TinyCTX.tool_handling.search import sync_store, rank_tools
+        embedding_model = self._search_cfg("embedding_model", "")
+        await sync_store(self.vector_store, self.tools, self.embedder if vector_enabled else None, embedding_model)
+        return await rank_tools(
+            query,
+            self.tools,
+            self.vector_store,
+            embedder=self.embedder,
+            embedding_model=embedding_model,
+            vector_enabled=vector_enabled,
+            top_k=top_k,
+            min_score=min_score,
+            rrf_k=rrf_k,
+        )
+
+    async def passive_search(self, query: str, passive_config) -> set[str]:
+        """
+        Automatic, un-requested tool enabling — run once per user turn by
+        agent.py, before the model's tool list is assembled. Ranks the full
+        registry against `query` (the incoming user message) and populates
+        self.auto_enabled with up to passive_config.auto_limit hits scoring
+        >= passive_config.auto_min_score.
+
+        Does NOT touch self.enabled — the caller (agent.py) is responsible
+        for unioning self.auto_enabled into get_tool_definitions() for this
+        turn only and never persisting it to session state. Resets
+        self.auto_enabled on every call, so calling this again (e.g. on a
+        later turn cycle) replaces rather than accumulates.
+
+        No-ops (returns empty set) when passive_config disables both
+        auto_bm25_enabled and auto_vector_enabled, or when the registry is
+        empty.
+        """
+        self.auto_enabled = set()
+        if not self.tools:
+            return self.auto_enabled
+
+        bm25_on = getattr(passive_config, "auto_bm25_enabled", True)
+        vec_on  = getattr(passive_config, "auto_vector_enabled", False)
+        if not bm25_on and not vec_on:
+            return self.auto_enabled
+
+        limit     = getattr(passive_config, "auto_limit", 2)
+        min_score = getattr(passive_config, "auto_min_score", 0.0)
+        rrf_k     = getattr(passive_config, "rrf_k", 60)
+
+        if self.vector_store is None or not bm25_on:
+            # No cache-backed store, or BM25-only requested: plain BM25 pass,
+            # no sync/embed cost.
+            from TinyCTX.utils.bm25 import BM25
+            corpus = {
+                name: f"{name.replace('_', ' ')} {tool['description']}"
+                for name, tool in self.tools.items()
+            }
+            scored = BM25(corpus).search(query, top_k=limit)
+            hits = [name for name, score in scored if score >= min_score]
+        else:
+            from TinyCTX.tool_handling.search import sync_store, rank_tools
+            embedding_model = getattr(passive_config, "embedding_model", "")
+            await sync_store(self.vector_store, self.tools, self.embedder if vec_on else None, embedding_model)
+            hits = await rank_tools(
+                query,
+                self.tools,
+                self.vector_store,
+                embedder=self.embedder,
+                embedding_model=embedding_model,
+                vector_enabled=vec_on,
+                top_k=limit,
+                min_score=min_score,
+                rrf_k=rrf_k,
+            )
+
+        self.auto_enabled = set(hits)
+        return self.auto_enabled
+
     def get_tool_definitions(self, caller_level: int = 100, minimal_tokens: bool = False) -> List[Dict[str, Any]]:
         definitions = []
-        for name in self.enabled:
+        for name in self.enabled | self.auto_enabled:
             tool = self.tools.get(name)
             if tool is None:
                 continue
@@ -313,7 +432,11 @@ class ToolCallHandler:
                     'success': False
                 }
 
-            if function_name not in self.enabled:
+            # A tool is callable if it's persistently enabled OR was
+            # auto-enabled for this turn by passive_search() — both sets
+            # were unioned into the tool list the model actually saw via
+            # get_tool_definitions(), so both must be accepted here.
+            if function_name not in self.enabled and function_name not in self.auto_enabled:
                 return {
                     'tool_call_id': tool_call_id,
                     'error': "Tool not found or not enabled",

@@ -68,6 +68,17 @@ class Runtime:
         self.module_registry = ModuleRegistry()
         self.users = UserStore(data_path)
 
+        # Tool discovery — one ToolVectorStore for the process lifetime,
+        # shared by every AgentCycle's ToolCallHandler (see agent.py). The
+        # tool registry itself is rebuilt fresh each turn, but embeddings are
+        # content-hash cached here across turns and restarts. Embedders are
+        # built lazily per model name (see get_tool_embedder below) since
+        # tools.passive and tools.search may name different embedding
+        # models, or neither — no sense connecting one that's never used.
+        from TinyCTX.tool_handling.vector_store import ToolVectorStore
+        self.tool_vector_store = ToolVectorStore(data_path / "tools_vector_cache.db")
+        self._tool_embedders: dict[str, object] = {}  # model name -> ai.Embedder
+
         # Concurrency Management
         max_workers = getattr(config, "max_workers", 8)
         self._semaphore = asyncio.Semaphore(max_workers)
@@ -91,6 +102,36 @@ class Runtime:
         self._register_user_commands()
         self.module_registry.load_modules(self)
         logger.info("Runtime started")
+
+    def get_tool_embedder(self, model_name: str):
+        """
+        Return a cached ai.Embedder for `model_name` (tools.passive.embedding_model
+        or tools.search.embedding_model), building it on first request. Returns
+        None for an empty model_name, or if the name doesn't resolve to a usable
+        'kind: embedding' models: entry — callers (agent.py) treat None as "fall
+        back to BM25-only", same graceful-degrade contract modules/rag uses.
+
+        Cached per model name rather than built once in __init__: tools.passive
+        and tools.search may name different models (or one/both may be unset),
+        so nothing is connected until something actually asks for it.
+        """
+        model_name = (model_name or "").strip()
+        if not model_name:
+            return None
+        if model_name in self._tool_embedders:
+            return self._tool_embedders[model_name]
+        try:
+            from TinyCTX.ai import Embedder
+            emb_cfg = self.config.get_embedding_model(model_name)
+            embedder = Embedder.from_config(emb_cfg)
+        except (KeyError, ValueError, AttributeError) as exc:
+            logger.warning(
+                "[runtime] tool embedding_model '%s' not usable (%s) — BM25 only",
+                model_name, exc,
+            )
+            embedder = None
+        self._tool_embedders[model_name] = embedder
+        return embedder
 
     def _register_user_commands(self) -> None:
         """

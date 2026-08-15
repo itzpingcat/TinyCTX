@@ -13,7 +13,7 @@ from TinyCTX.contracts import (
 )
 from TinyCTX.context import Context, HistoryEntry, HOOK_PRE_ASSEMBLE_ASYNC
 from TinyCTX.ai import LLM, TextDelta, ThinkingDelta, ToolCallAssembled, LLMError
-from TinyCTX.utils.tool_handler import ToolCallHandler
+from TinyCTX.tool_handling import ToolCallHandler
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +102,25 @@ class AgentCycle:
         }
 
         # Build Tools
-        self.tool_handler = ToolCallHandler()
+        # vector_store/embedder come from Runtime (process-wide singletons —
+        # see runtime.py) so embeddings are cached across turns even though
+        # ToolCallHandler itself is rebuilt fresh every cycle. runtime is
+        # None in tests/bare usage, in which case tool discovery falls back
+        # to plain BM25 (ToolCallHandler's default when vector_store=None).
+        tool_vector_store = getattr(self._runtime, "tool_vector_store", None) if self._runtime else None
+        search_cfg = self.config.tools.search
+        passive_cfg = self.config.tools.passive
+        # Prefer search's embedding_model for the shared embedder if set,
+        # else passive's — either may be "" (unset). Both configs are read
+        # independently at call time in tools_search()/passive_search(), this
+        # only decides which single embedder instance backs both this turn.
+        embed_model_name = search_cfg.embedding_model or passive_cfg.embedding_model
+        tool_embedder = (
+            self._runtime.get_tool_embedder(embed_model_name)
+            if self._runtime and embed_model_name else None
+        )
+        self.tool_handler = ToolCallHandler(vector_store=tool_vector_store, embedder=tool_embedder)
+        self.tool_handler.search_config = search_cfg
         self.tool_handler.register_tool(self.tool_handler.tools_search, always_on=True)
         enabled_tools = state.get("enabled_tools")
         if enabled_tools:
@@ -127,6 +145,18 @@ class AgentCycle:
         # last so they win over whatever each module's register_tool() call set.
         if self.config.tools.overrides:
             self.tool_handler.apply_overrides(self.config.tools.overrides)
+
+        # Passive tool discovery — auto-enable up to tools.passive.auto_limit
+        # tools for THIS TURN ONLY, ranked against the incoming user message.
+        # Not persisted to session state (unlike enabled_tools above); reruns
+        # every turn against that turn's own message. No-ops (auto_enabled
+        # stays empty) when both tools.passive.auto_bm25_enabled and
+        # auto_vector_enabled are false, or when the incoming node has no
+        # text (e.g. a synthetic/system-originated turn).
+        incoming_node = self.db.get_node(node_id)
+        incoming_text = incoming_node.content if incoming_node else ""
+        if incoming_text:
+            await self.tool_handler.passive_search(incoming_text, self.config.tools.passive)
 
         # --- 2. Generation Loop ---
         # Tracker for metadata yielded in events

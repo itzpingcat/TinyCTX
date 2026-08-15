@@ -7,7 +7,10 @@ command_introspection: false
 concurrency:
   roster_priority: 13
 cron:
-  store_file: CRON.json
+  admin_override_permission: 90
+  min_create_permission: 25
+  min_run_permission: 0
+  store_file: cron.db
 ctx_tools:
   cot_keep_recent_turns: 10000
   same_call_dedup_after: 2
@@ -39,17 +42,6 @@ gateway:
   enabled: false
   host: 127.0.0.1
   port: 8085
-heartbeat:
-  ack_max_chars: 300
-  active_hours: null
-  branch_from: root
-  continuation_prompt: <heartbeat_sentinel>Continue the task, or reply NO_REPLY when
-    you are done.</heartbeat_sentinel>
-  every_minutes: 30
-  max_continuations: 5
-  prompt: <heartbeat_sentinel>Read HEARTBEAT.md if it exists (workspace context).
-    Follow it strictly. Do not infer or repeat old tasks from prior chats. If nothing
-    needs attention, reply NO_REPLY.</heartbeat_sentinel>
 llm:
   fallback: []
   fallback_on:
@@ -191,35 +183,35 @@ system_prompt:
     priority: 15
 token_fuzz: 1.1
 tools:
-  overrides: {}   # per-tool always_on / min_permission overrides, e.g. shell: {min_permission: 80}
-  passive:        # automatic per-turn tool enabling (no model action required)
-    auto_bm25_enabled: true    # BM25-rank the tool corpus against the user's message each turn
-    auto_vector_enabled: false # also embed + RRF-fuse vector similarity (needs embedding_model)
-    embedding_model: ""        # models: entry with kind: embedding
-    auto_limit: 2              # max tools auto-enabled per turn
-    auto_min_score: 0.0        # floor below which a candidate isn't auto-enabled
+  overrides: {}
+  passive:
+    auto_bm25_enabled: true
+    auto_limit: 2
+    auto_min_score: 0.0
+    auto_vector_enabled: false
+    embedding_model: ''
     rrf_k: 60
-  search:         # config for the explicit, model-invoked tools_search tool
-    vector_enabled: false      # let tools_search's fuzzy path use vector + BM25 (RRF), not BM25 alone
-    embedding_model: ""        # independent from passive.embedding_model
-    top_k: 5                   # max candidates listed per fuzzy search call
-    rrf_k: 60
+  search:
+    embedding_model: ''
     min_score: 0.0
+    rrf_k: 60
+    top_k: 5
+    vector_enabled: false
 web:
   browse_max_bytes: 2000000
   browse_max_chars: 20000
   browse_user_agent: TinyCTX/1.1
-  output_dir: outputs/browser   # screenshots land here; also returned inline
-  headless: virtual   # true | false | virtual (Xvfb-backed headful; needed for bot-checked sites)
+  headless: virtual
   ignore_tags:
   - script
   - style
   max_discovery_elements: 40
+  output_dir: outputs/browser
   prompt_priority: 12
+  screenshot_max_bytes: 1500000
   search_results: 5
+  settle_timeout_ms: 15000
   shift_enter_for_newline: true
-  screenshot_max_bytes: 1500000   # larger screenshots are saved but not shown inline
-  settle_timeout_ms: 15000   # extra wait for JS interstitials (Reddit, Cloudflare)
   timeout_ms: 30000
   tools: {}
   wait_until: domcontentloaded
