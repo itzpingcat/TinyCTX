@@ -34,6 +34,7 @@ from TinyCTX.modules.memory.graph import (
     new_uuid,
     now_ts,
 )
+from TinyCTX.utils.rrf import rrf_fuse as _rrf_fuse
 
 logger = logging.getLogger(__name__)
 
@@ -690,19 +691,9 @@ async def _merge_internal(c: dict, d: dict, merged_description: str, verdict: st
 # ---------------------------------------------------------------------------
 # Pure helpers (unit-tested directly)
 # ---------------------------------------------------------------------------
-
-def _rrf_fuse(
-    bm25_ranks: dict, vec_ranks: dict, *, bm25_w: float = 0.4, rrf_k: int = 60
-) -> list[tuple[str, float]]:
-    """Reciprocal-rank fusion over two {uid: rank} maps. Inputs are assumed
-    already min-p filtered. Returns [(uid, score)] descending."""
-    vec_w = 1.0 - bm25_w
-    scores: dict[str, float] = {}
-    for uid, rank in bm25_ranks.items():
-        scores[uid] = scores.get(uid, 0.0) + bm25_w / (rrf_k + rank)
-    for uid, rank in vec_ranks.items():
-        scores[uid] = scores.get(uid, 0.0) + vec_w / (rrf_k + rank)
-    return sorted(scores.items(), key=lambda x: x[1], reverse=True)
+# _rrf_fuse now lives in TinyCTX/utils/rrf.py (rrf_fuse), imported above as
+# _rrf_fuse — kept as one implementation shared with tool_handling/search.py
+# and modules/rag/store.py rather than three copies.
 
 
 def _apply_unified_diff(base: str, diff: str) -> tuple[bool, str]:

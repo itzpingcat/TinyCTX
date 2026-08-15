@@ -156,9 +156,10 @@ class FilesDataBank:
         embedder,
         top_k: int,
         bm25_weight: float,
+        rrf_k: int = 60,
     ) -> list[dict]:
         """Hybrid BM25+vector search against this bank's index."""
-        return await _hybrid_search(self._name, query, store, embedder, top_k, bm25_weight)
+        return await _hybrid_search(self._name, query, store, embedder, top_k, bm25_weight, rrf_k)
 
     async def auto_inject(
         self,
@@ -167,6 +168,7 @@ class FilesDataBank:
         embedder=None,
         top_k: int = 0,
         bm25_weight: float = 0.3,
+        rrf_k: int = 60,
     ) -> list[dict]:
         """
         Deterministic ST-style keyword/regex matching over any frontmatter
@@ -203,7 +205,7 @@ class FilesDataBank:
                 seen_paths.add(resolved)
 
         if store is not None and top_k > 0:
-            semantic = await _hybrid_search(self._name, text, store, embedder, top_k, bm25_weight)
+            semantic = await _hybrid_search(self._name, text, store, embedder, top_k, bm25_weight, rrf_k)
             for r in semantic:
                 if r["path"] in semantic_excluded or r["path"] in seen_paths:
                     continue
@@ -323,6 +325,7 @@ async def _hybrid_search(
     embedder,
     top_k: int,
     bm25_weight: float,
+    rrf_k: int = 60,
 ) -> list[dict]:
     """Run hybrid BM25+vector search against `store`. Used by both bank types."""
     q_vec = None
@@ -332,7 +335,7 @@ async def _hybrid_search(
         except Exception as exc:
             logger.warning("[rag/databanks] embed failed for '%s': %s — BM25 only", bank_name, exc)
     try:
-        return store.hybrid_search(query, q_vec, top_k, bm25_weight)
+        return store.hybrid_search(query, q_vec, top_k, bm25_weight, rrf_k=rrf_k)
     except Exception as exc:
         logger.warning("[rag/databanks] search failed for '%s': %s", bank_name, exc)
         return []

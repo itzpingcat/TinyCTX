@@ -34,8 +34,12 @@ EXTENSION_META = {
         # --- Retrieval ---
         # Default max chunks returned by rag_search when max_results is not specified.
         "top_k": 5,
-        # BM25 share of hybrid score (vector weight = 1 - bm25_weight).
+        # BM25 share of hybrid score (vector weight = 1 - bm25_weight),
+        # fused via reciprocal-rank fusion.
         "bm25_weight": 0.3,
+        # RRF's rank-damping constant — higher values flatten the fusion
+        # curve (top ranks matter less relative to lower ones).
+        "rrf_k": 60,
 
         # --- Result budget ---
         # Maximum tokens the formatted result block may occupy.

@@ -145,6 +145,7 @@ rag:
   - .rst
   rag_dir: rag
   result_budget_tokens: 2048
+  rrf_k: 60
   top_k: 5
 router:
   host: 127.0.0.1

@@ -9,11 +9,10 @@ Shared ranking logic for tool discovery — used by both:
 
 Both read the same ToolVectorStore corpus (one embedding per tool, synced
 fresh each turn since the tool registry itself is rebuilt every AgentCycle —
-see sync_store below) and both fuse BM25 + vector via reciprocal-rank fusion,
-matching modules/memory/tools.py's _rrf_fuse rather than
-modules/rag/store.py's normalize-and-linear-blend, per the project's
-consolidation decision: RRF is scale-invariant (no min-max normalization
-step) and was already proven in the memory module.
+see sync_store below) and both fuse BM25 + vector via reciprocal-rank fusion
+(TinyCTX.utils.rrf.rrf_fuse — the one fusion implementation shared across
+tool discovery, memory search, and RAG search): RRF is scale-invariant
+(no min-max normalization step) and was already proven in the memory module.
 """
 from __future__ import annotations
 
@@ -21,25 +20,10 @@ import logging
 from typing import Any
 
 from TinyCTX.utils.bm25 import BM25
+from TinyCTX.utils.rrf import rrf_fuse as _rrf_fuse
 from TinyCTX.tool_handling.vector_store import ToolVectorStore, content_hash
 
 logger = logging.getLogger(__name__)
-
-
-def _rrf_fuse(
-    bm25_ranks: dict[str, int], vec_ranks: dict[str, int], *, bm25_w: float = 0.4, rrf_k: int = 60
-) -> list[tuple[str, float]]:
-    """Reciprocal-rank fusion over two {name: rank} maps (rank is 1-based,
-    best = 1). Ported verbatim from modules/memory/tools.py._rrf_fuse — kept
-    as the one fusion implementation both modules should converge on.
-    Returns [(name, score)] descending."""
-    vec_w = 1.0 - bm25_w
-    scores: dict[str, float] = {}
-    for name, rank in bm25_ranks.items():
-        scores[name] = scores.get(name, 0.0) + bm25_w / (rrf_k + rank)
-    for name, rank in vec_ranks.items():
-        scores[name] = scores.get(name, 0.0) + vec_w / (rrf_k + rank)
-    return sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
 
 def _embed_text_for(name: str, description: str) -> str:
