@@ -375,13 +375,51 @@ class _CronRunner:
         self._timer_task: asyncio.Task | None = None
         self._running = False
         self._job_lock = asyncio.Lock()
+        self._loop: asyncio.AbstractEventLoop | None = None
 
     def start(self) -> None:
+        # Captured here because start() always runs on the loop the runner
+        # must schedule its timer on. add_cron/remove_cron are plain sync
+        # tool functions that the agent's tool dispatcher runs off-loop
+        # (e.g. via asyncio.to_thread) — calling self._arm() directly from
+        # there hits asyncio.create_task() with no running loop in that
+        # thread ("no running event loop"). reload_and_rearm() below uses
+        # this stashed loop to hop back via call_soon_threadsafe instead.
+        self._loop = asyncio.get_running_loop()
         self._running = True
         self._reload()
         self._recompute_next_runs()
         self._arm()
         logger.info("[cron] runner started")
+
+    def reload_and_rearm(self) -> None:
+        """
+        Thread-safe entry point for add_cron/remove_cron (and anything else
+        outside the runner's own loop) to tell the runner "the job list
+        changed, recheck what you should wake up for." Must not call
+        self._reload()/self._arm() directly off-loop — see start()'s
+        comment on self._loop.
+        """
+        def _do() -> None:
+            self._reload()
+            self._arm()
+
+        if self._loop is None:
+            # Runner never started (shouldn't happen in practice) — best
+            # effort, may raise if there's truly no loop anywhere.
+            _do()
+            return
+
+        try:
+            asyncio.get_running_loop()
+            on_loop = True
+        except RuntimeError:
+            on_loop = False
+
+        if on_loop:
+            _do()
+        else:
+            self._loop.call_soon_threadsafe(_do)
 
     def _reload(self) -> None:
         self._jobs = self._store.all()
@@ -808,8 +846,9 @@ def register_agent(agent) -> None:
         # is correct in the DB and list_cron will show it fine, but nothing
         # ever wakes the runner up to actually check it — it silently never
         # fires until some other job's tick happens to reload the job list.
-        runner._reload()
-        runner._arm()
+        # reload_and_rearm() (not _reload()/_arm() directly) — this tool
+        # function runs off the runner's event loop thread.
+        runner.reload_and_rearm()
         logger.info("[cron] job '%s' created by %s in %s", job.id, caller.username, cursor_key)
         return json.dumps({"status": "ok", "job_id": job.id, "next_run": _fmt_ts(job.state.next_run_at_ms)})
 
@@ -875,9 +914,9 @@ def register_agent(agent) -> None:
         # currently sleeping toward — otherwise the runner wakes for a job
         # that no longer exists (harmless, just a wasted tick) but more
         # importantly won't pick up an earlier next_run_at_ms among the
-        # remaining jobs until that stale wake happens.
-        runner._reload()
-        runner._arm()
+        # remaining jobs until that stale wake happens. reload_and_rearm()
+        # (not _reload()/_arm() directly) — off-loop thread, same as add_cron.
+        runner.reload_and_rearm()
         logger.info("[cron] job '%s' removed by %s (creator=%s)", job_id, caller.username, job.creator_username)
         return json.dumps({"status": "ok"})
 
