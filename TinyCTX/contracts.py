@@ -133,8 +133,9 @@ class InboundMessage:
                     "【label】:" prefix for this one node only — everything else
                     in the same conversation (other real people's messages)
                     keeps its normal attribution. `author` itself is untouched
-                    either way: it's still used for permission_level checks
-                    (AgentCycle.caller) regardless of this flag. Used by
+                    either way: it's still used for permission checks
+                    (AgentCycle.caller.effective_permissions()) regardless of
+                    this flag. Used by
                     non-interactive trigger sources (e.g. modules/cron) whose
                     message is attributed to a real user for permission
                     purposes but shouldn't visually read as that user having

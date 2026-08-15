@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from TinyCTX.context import HOOK_PRE_ASSEMBLE_ASYNC
+from TinyCTX.permissions import Permission
 
 logger = logging.getLogger(__name__)
 
@@ -416,7 +417,7 @@ def register_agent(cycle) -> None:
             return "No results found in the specified databank(s)"
         return "\n\n".join(all_parts)
 
-    cycle.tool_handler.register_tool(rag_search, always_on=True, min_permission=25)
+    cycle.tool_handler.register_tool(rag_search, always_on=True, required_permissions=None)
 
     # ------------------------------------------------------------------
     # Tool: set_auto_rag_databanks
@@ -459,7 +460,7 @@ def register_agent(cycle) -> None:
             return "Auto-rag cleared — no databanks will be injected automatically"
         return f"Auto-rag set to: {targets}"
 
-    cycle.tool_handler.register_tool(set_auto_rag_databanks, always_on=False, min_permission=25)
+    cycle.tool_handler.register_tool(set_auto_rag_databanks, always_on=False, required_permissions={Permission.MANAGE_CTX})
 
     # ------------------------------------------------------------------
     # Tool: rag_list_databanks
@@ -478,4 +479,4 @@ def register_agent(cycle) -> None:
             lines.append(f"  {name}  ({bank.kind})")
         return "\n".join(lines)
 
-    cycle.tool_handler.register_tool(rag_list_databanks, always_on=False, min_permission=25)
+    cycle.tool_handler.register_tool(rag_list_databanks, always_on=False, required_permissions=None)

@@ -32,12 +32,22 @@ import logging
 from dataclasses import dataclass, field
 from typing import Callable, Awaitable
 
+from TinyCTX import permissions as _permissions
+from TinyCTX.permissions import Permission
+
 logger = logging.getLogger(__name__)
 
 Handler = Callable[[list[str], dict], Awaitable[None]]
 
 # Param spec: (name, python_type, description)
 ParamSpec = list[tuple[str, type, str]]
+
+# Sentinel distinguishing "required_permissions not passed at all" (a
+# forgotten declaration) from "required_permissions=None passed explicitly"
+# (a deliberately ungated command) — same reasoning as
+# tool_handling/handler.py's _UNSET. See docs/PERMISSIONS-PLAN.md §9 and
+# assert_permissions_declared() below.
+_UNSET = object()
 
 
 @dataclass
@@ -47,6 +57,8 @@ class _Entry:
     handler:   Handler
     help:      str = ""
     params:    ParamSpec = field(default_factory=list)
+    required_permissions: "frozenset[Permission] | None" = None
+    _permissions_declared: bool = False
 
 
 class CommandRegistry:
@@ -65,6 +77,7 @@ class CommandRegistry:
         *,
         help: str = "",
         params: ParamSpec | None = None,
+        required_permissions: "set[Permission] | frozenset[Permission] | None" = _UNSET,
     ) -> None:
         """
         Register a command handler.
@@ -79,9 +92,22 @@ class CommandRegistry:
                       Discord slash command parameters). Types should be
                       str or int. If omitted, the command takes no parameters
                       on native bridges.
+        required_permissions — the capability set the caller must hold for
+                      dispatch() to invoke this handler at all. Checked
+                      before the handler runs, using the caller resolved
+                      from `context` (see _resolve_caller below) — same
+                      expand-the-requirement rule as
+                      tool_handling.handler.ToolCallHandler (§9). Pass None
+                      explicitly for a deliberately ungated command; passing
+                      nothing at all is a forgotten declaration and trips
+                      assert_permissions_declared().
         """
         namespace = namespace.lower().strip()
         sub       = sub.lower().strip()
+        declared = required_permissions is not _UNSET
+        perms = None if required_permissions is _UNSET else required_permissions
+        if perms is not None:
+            perms = frozenset(perms)
         self._entries = [e for e in self._entries if not (e.namespace == namespace and e.sub == sub)]
         self._entries.append(_Entry(
             namespace=namespace,
@@ -89,11 +115,32 @@ class CommandRegistry:
             handler=handler,
             help=help,
             params=params or [],
+            required_permissions=perms,
+            _permissions_declared=declared,
         ))
         logger.debug(
             "[commands] registered /%s%s",
             namespace, f" {sub}" if sub else "",
         )
+
+    def assert_permissions_declared(self) -> None:
+        """
+        Startup assertion (docs/PERMISSIONS-PLAN.md §9, mirroring
+        tool_handling.handler's): every registered command must have called
+        register() with an explicit required_permissions — a set, or None
+        for a deliberately ungated command. A command that never passed the
+        argument at all is a bug, not an ungated command.
+        """
+        undeclared = sorted(
+            f"/{e.namespace}" + (f" {e.sub}" if e.sub else "")
+            for e in self._entries if not e._permissions_declared
+        )
+        if undeclared:
+            raise RuntimeError(
+                "[commands] command(s) registered without declaring "
+                f"required_permissions (pass a set[Permission] or explicitly "
+                f"None): {undeclared}"
+            )
 
     # ------------------------------------------------------------------
     # Dispatch
@@ -133,6 +180,17 @@ class CommandRegistry:
             logger.debug("[commands] no handler for /%s %s", namespace, sub)
             return False
 
+        denial = self._check_permission(entry, context)
+        if denial is not None:
+            logger.info("[commands] denied /%s %s: %s", namespace, sub, denial)
+            send = context.get("send")
+            if callable(send):
+                try:
+                    await send(denial)
+                except Exception:
+                    logger.exception("[commands] failed to deliver permission denial for /%s %s", namespace, sub)
+            return True  # handled (denied) — don't push to router
+
         try:
             await entry.handler(args, context)
         except Exception:
@@ -140,6 +198,30 @@ class CommandRegistry:
         else:
             self._record_command_introspection(namespace, sub, args, context)
         return True
+
+    @staticmethod
+    def _check_permission(entry: _Entry, context: dict) -> str | None:
+        """
+        Returns a denial message if `entry` is gated and the resolved caller
+        is missing a required permission (or no caller could be resolved at
+        all for a gated command); None if the call may proceed.
+        """
+        if entry.required_permissions is None:
+            return None
+        runtime = context.get("runtime")
+        caller = CommandRegistry._resolve_caller(runtime, context)
+        if caller is None:
+            return "[PERMISSION DENIED] could not resolve caller for this command."
+        permissions_config = getattr(getattr(runtime, "config", None), "permissions", None)
+        if permissions_config is None:
+            from TinyCTX.config import PermissionsConfig
+            permissions_config = PermissionsConfig()
+        effective = caller.effective_permissions(permissions_config)
+        needed = _permissions.expand(entry.required_permissions)
+        missing = {p for p in needed if p not in effective}
+        if missing:
+            return f"[PERMISSION DENIED] missing: {sorted(p.value for p in missing)}"
+        return None
 
     @staticmethod
     def _record_command_introspection(
@@ -208,36 +290,46 @@ class CommandRegistry:
             logger.exception("[commands] command_introspection: failed to record %r", cmd_str)
 
     @staticmethod
+    def _resolve_caller(runtime, context: dict):
+        """
+        Resolve the TinyCTX.users.models.User of whoever actually ran the
+        command. Preference order: an already-resolved User
+        (context["caller"]) beats a platform/user_id pair
+        (context["caller_platform"] + "caller_user_id"), resolved via
+        runtime.users.get_by_platform(). Returns None if the bridge supplied
+        neither, or if runtime is unavailable to resolve a platform pair —
+        callers should treat that as "unattributable" rather than guessing.
+        """
+        caller = context.get("caller")
+        if caller is not None:
+            return caller
+
+        platform = context.get("caller_platform")
+        user_id = context.get("caller_user_id")
+        if runtime is not None and platform and user_id:
+            try:
+                from TinyCTX.contracts import Platform
+                return runtime.users.get_by_platform(Platform(platform), str(user_id))
+            except Exception:
+                logger.debug(
+                    "[commands] failed to resolve caller for "
+                    "platform=%s user_id=%s", platform, user_id, exc_info=True,
+                )
+                return None
+        return None
+
+    @staticmethod
     def _resolve_caller_username(runtime, context: dict) -> str | None:
         """
         Resolve the TinyCTX username of whoever actually ran the command, so
         the replayed [user: ...] turn gets the same 【username】 prefix real
         dialogue gets (see context.py's assemble — a user entry with no
         author_id is missing that prefix entirely and logs an error).
-        Mirrors sysops/__main__.py's _resolve_model_caller preference order:
-        an already-resolved User (context["caller"]) beats a platform/user_id
-        pair (context["caller_platform"] + "caller_user_id"). Returns None
-        if the bridge supplied neither — callers should treat that as
-        "unattributable" rather than guessing.
+        Thin wrapper over _resolve_caller — see that method for the
+        preference order.
         """
-        caller = context.get("caller")
-        if caller is not None:
-            return getattr(caller, "username", None)
-
-        platform = context.get("caller_platform")
-        user_id = context.get("caller_user_id")
-        if platform and user_id:
-            try:
-                from TinyCTX.contracts import Platform
-                user = runtime.users.get_by_platform(Platform(platform), str(user_id))
-                return user.username if user else None
-            except Exception:
-                logger.debug(
-                    "[commands] command_introspection: failed to resolve username for "
-                    "platform=%s user_id=%s", platform, user_id, exc_info=True,
-                )
-                return None
-        return None
+        user = CommandRegistry._resolve_caller(runtime, context)
+        return getattr(user, "username", None)
 
     def _find(self, namespace: str, sub: str) -> _Entry | None:
         for e in self._entries:

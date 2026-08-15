@@ -11,6 +11,7 @@ from typing import Awaitable, Callable
 
 from TinyCTX.config import Config
 from TinyCTX.contracts import AgentError, InboundMessage, SessionEnvironment
+from TinyCTX.permissions import Permission
 from TinyCTX.users import UserStore
 from TinyCTX.utils.attachments import build_content_blocks as _build_content_blocks
 from TinyCTX.db import ConversationDB
@@ -101,6 +102,11 @@ class Runtime:
     async def start(self) -> None:
         self._register_user_commands()
         self.module_registry.load_modules(self)
+        # Startup assertion (docs/PERMISSIONS-PLAN.md §9): every command
+        # registered by runtime.py itself or by any loaded module must have
+        # declared required_permissions. Runs once, after every module had
+        # its chance to register commands via runtime.commands.register().
+        self.commands.assert_permissions_declared()
         logger.info("Runtime started")
 
     def get_tool_embedder(self, model_name: str):
@@ -135,15 +141,23 @@ class Runtime:
 
     def _register_user_commands(self) -> None:
         """
-        Register /user modify_permissions, /user info, and /user rename slash commands.
+        Register /user modify_permissions, /user info, and /user rename slash
+        commands — §9 path B of docs/PERMISSIONS-PLAN.md.
 
-        /user modify_permissions <username> <level>  — set a user's permission_level
-        /user info <username>                        — show a user's stored info
-        /user rename <username> <new>                — rename a TinyCTX username (requires caller level 100)
+        /user modify_permissions <username> <template>  — set a user's named
+            permission template (see TinyCTX.config.PermissionsConfig; the
+            templates configured under permissions.templates).
+        /user info <username>                            — show a user's
+            stored identity, template, and effective permissions.
+        /user rename <username> <new>                    — rename a TinyCTX
+            username.
 
-        Permission rules match the agent tool:
-          - caller can only promote to at most (their level - 1)
-          - caller can only modify users whose current level is at most (their level - 1)
+        Gating is now via the CommandRegistry seam (required_permissions on
+        register(), enforced by dispatch()) instead of hand-rolled level
+        comparisons. ROOT is total (see permissions.py's docstring), so
+        there is no "may only grant up to caller's own level" ceiling to
+        enforce anymore — a ROOT holder may set any user, including
+        themselves, to any template.
         """
         users = self.users
 
@@ -158,47 +172,41 @@ class Runtime:
                     username=interaction.user.name,
                     display_name=interaction.user.display_name,
                 )
-            return None
+            return context.get("caller")
 
         from TinyCTX.users import UsernameConflictError
 
         async def _cmd_modify_permissions(args: list[str], context: dict) -> None:
             send = context["send"]
             if len(args) < 2:
-                await send("Usage: /user modify_permissions <username> <level>")
+                await send(
+                    "Usage: /user modify_permissions <username> <template> "
+                    f"(known templates: {sorted(self.config.permissions.templates)})"
+                )
                 return
             caller = _caller_user(context)
             if caller is None:
                 await send("⛔ Cannot resolve your identity.")
                 return
-            target_username = args[0]
-            try:
-                level = int(args[1])
-            except ValueError:
-                await send(f"Invalid level {args[1]!r} — must be an integer.")
-                return
-            if not (0 <= level <= 100):
-                await send("Level must be between 0 and 100.")
-                return
-            max_grantable = caller.permission_level - 1
-            if level > max_grantable:
-                await send(f"⛔ Cannot set level {level} — you may only grant up to {max_grantable} (your level − 1).")
+            target_username, template = args[0], args[1]
+            if template not in self.config.permissions.templates:
+                await send(
+                    f"Unknown template {template!r}. Known templates: "
+                    f"{sorted(self.config.permissions.templates)}"
+                )
                 return
             user = users.get_user(target_username)
             if user is None:
                 await send(f"User {target_username!r} not found.")
                 return
-            if user.permission_level >= caller.permission_level:
-                await send(f"⛔ {target_username!r} is at level {user.permission_level} — not below your level ({caller.permission_level}).")
-                return
-            old_level = user.permission_level
-            user.permission_level = level
+            old_template = user.permission_template or self.config.permissions.default_template
+            user.permission_template = template
             users.update_user(user)
             logger.info(
-                "[user] %s set level %d on %s (was %d)",
-                caller.username, level, target_username, old_level,
+                "[user] %s set template %r on %s (was %r)",
+                caller.username, template, target_username, old_template,
             )
-            await send(f"✅ {target_username}: {old_level} → {level}")
+            await send(f"✅ {target_username}: {old_template} → {template}")
 
         async def _cmd_info(args: list[str], context: dict) -> None:
             send = context["send"]
@@ -213,8 +221,11 @@ class Runtime:
                 f"{i.platform.value}:{i.user_id} ({i.username})"
                 for i in user.identities
             ) or "none"
+            template = user.permission_template or f"{self.config.permissions.default_template} (default)"
+            effective = sorted(p.value for p in user.effective_permissions(self.config.permissions))
             await send(
-                f"**{user.username}** — level {user.permission_level}\n"
+                f"**{user.username}** — template: {template}\n"
+                f"Effective permissions: {', '.join(effective) or '(none)'}\n"
                 f"Identities: {identities}\n"
                 f"Created: {user.created_at:.0f}"
             )
@@ -223,10 +234,6 @@ class Runtime:
             send = context["send"]
             if len(args) < 2:
                 await send("Usage: /user rename <username> <new_username>")
-                return
-            caller = _caller_user(context)
-            if caller is None or caller.permission_level < 100:
-                await send("⛔ Permission denied. Requires level 100.")
                 return
             try:
                 updated = users.rename_user(args[0], args[1])
@@ -237,14 +244,17 @@ class Runtime:
                 await send(f"Username {args[1]!r} is already taken.")
 
         self.commands.register("user", "modify_permissions", _cmd_modify_permissions,
-            help="Set a user's permission level",
-            params=[("username", str, "TinyCTX username"), ("level", int, "Permission level (0-100)")])
+            help="Set a user's permission template",
+            params=[("username", str, "TinyCTX username"), ("template", str, "Permission template name")],
+            required_permissions={Permission.ROOT})
         self.commands.register("user", "info", _cmd_info,
-            help="Show a user's stored identity and level",
-            params=[("username", str, "TinyCTX username")])
+            help="Show a user's stored identity and permissions",
+            params=[("username", str, "TinyCTX username")],
+            required_permissions={Permission.USER_READ})
         self.commands.register("user", "rename", _cmd_rename,
             help="Rename a TinyCTX username (admin only)",
-            params=[("username", str, "Current username"), ("new_username", str, "New username")])
+            params=[("username", str, "Current username"), ("new_username", str, "New username")],
+            required_permissions={Permission.ROOT})
 
     # ------------------------------------------------------------------
     # Platform delivery — render events to a destination outside a live

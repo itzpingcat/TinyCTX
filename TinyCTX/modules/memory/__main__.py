@@ -32,6 +32,7 @@ from pathlib import Path
 
 from TinyCTX.modules.memory import scopes as _scopes
 from TinyCTX.modules.memory.format import format_entity
+from TinyCTX.permissions import Permission
 
 logger = logging.getLogger(__name__)
 
@@ -392,7 +393,8 @@ def register_runtime(runtime) -> None:
             await send(result)
 
     runtime.commands.register("memory", "librarian", _cmd_librarian,
-                              help="Trigger the memory librarian. Optional: a prompt for priority review.")
+                              help="Trigger the memory librarian. Optional: a prompt for priority review.",
+                              required_permissions={Permission.MEMORY_WRITE})
 
     async def _cmd_stats(args, context):
         # Diagnostics command: show full totals across every scope in the graph,
@@ -405,7 +407,8 @@ def register_runtime(runtime) -> None:
 
     runtime.commands.register("memory", "stats", _cmd_stats,
                               help="Show memory graph diagnostics: entity/edge counts, "
-                                   "pins, reviewer backlog, and live dedup progress.")
+                                   "pins, reviewer backlog, and live dedup progress.",
+                              required_permissions={Permission.MEMORY_READ})
     logger.info("[memory] ready — graph: %s | embedder: %s", graph_path, emb_model or "none")
 
 
@@ -560,10 +563,10 @@ def register_agent(cycle) -> None:
     assert _tools is not None
 
     cycle.tool_handler.register_tool(_scope_bound(_tools.search_memory, cycle),
-                                     always_on=True, min_permission=25)
+                                     always_on=True, required_permissions={Permission.MEMORY_READ})
     cycle.tool_handler.register_tool(_scope_bound(_tools.memory_stats, cycle),
-                                     always_on=False, min_permission=25)
-    cycle.tool_handler.register_tool(call_librarian, always_on=True, min_permission=35)
+                                     always_on=False, required_permissions={Permission.MEMORY_READ})
+    cycle.tool_handler.register_tool(call_librarian, always_on=True, required_permissions={Permission.MEMORY_WRITE})
 
     # pressure ingest
     librarian_cfg = _cfg.get("librarian", {})

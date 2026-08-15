@@ -1,6 +1,8 @@
 """
 config.py — Configuration loader.
-Imports only from stdlib and PyYAML. Never imports from contracts or gateway.
+Imports only from stdlib, PyYAML, and TinyCTX.permissions (pure enum data,
+no I/O — same foundational layer as contracts.py). Never imports from
+contracts or gateway.
 """
 from __future__ import annotations
 import logging, os
@@ -8,7 +10,34 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import yaml
 
+from TinyCTX.permissions import Permission
+
 logger = logging.getLogger(__name__)
+
+# Built-in template defaults — used for any template name a config.yaml
+# doesn't override under permissions.templates. A config that specifies no
+# permissions.templates key at all gets exactly these four, matching
+# docs/PERMISSIONS-PLAN.md §2's worked example. Named templates are what
+# "elevate" becomes now that there's no int ladder to climb — see that
+# section for why full explicit lists (no inheritance) are deliberate.
+_BUILTIN_TEMPLATES: dict[str, frozenset[Permission]] = {
+    "guest": frozenset(),
+    "member": frozenset({
+        Permission.FILE_READ, Permission.NETWORK_READ, Permission.MEMORY_READ,
+    }),
+    "trusted": frozenset({
+        Permission.FILE_READ, Permission.FILE_WRITE,
+        Permission.NETWORK_READ, Permission.NETWORK_WRITE,
+        Permission.MEMORY_READ, Permission.MEMORY_WRITE,
+        Permission.MANAGE_CTX, Permission.MODEL_SWAP,
+        Permission.CRON_CREATE, Permission.DM_ACCESS,
+        Permission.USER_READ, Permission.IMAGE_GEN,
+        # NOTE: no UNTRUSTED_EXEC — see docs/PERMISSIONS-PLAN.md §5.1 for
+        # what this costs (python3/node/etc. fall through to UNTRUSTED_EXEC
+        # and a `trusted` user cannot run them until promoted).
+    }),
+    "operator": frozenset(Permission),  # every bool true
+}
 
 
 @dataclass
@@ -73,12 +102,27 @@ class ModelConfig:
 @dataclass
 class PermissionsConfig:
     """
-    Controls how the permission system interacts with the LLM's tool list.
+    Controls how the permission system interacts with the LLM's tool list,
+    and defines the named permission templates users are assigned to.
 
     Configured via the top-level 'permissions:' key in config.yaml:
 
         permissions:
           minimal_tokens: true
+          default_template: guest
+          templates:
+            guest: {}
+            member:
+              file_read: true
+              network_read: true
+              memory_read: true
+            trusted:
+              file_read: true
+              file_write: true
+              ...
+            operator:
+              file_read: true
+              ...
 
     minimal_tokens: true  (default)
         Only tools the caller has permission to execute are sent to the LLM.
@@ -91,30 +135,69 @@ class PermissionsConfig:
         in execute_tool_call() still enforces permissions — the call will return
         a PERMISSION DENIED error rather than execute. Useful when you want the
         agent to be aware of what exists and explain why it can't do something.
+
+    default_template
+        The template new users get when resolve_user() creates them, and the
+        fallback used when a stored user's permission_template is empty or
+        names a template that no longer exists in this config (with a
+        logged warning — see docs/PERMISSIONS-PLAN.md §2).
+
+    templates
+        Named, FULLY EXPLICIT permission sets — no inheritance between them.
+        Any permission bool not listed for a template is false. Each entry
+        not overridden here falls back to _BUILTIN_TEMPLATES (guest/member/
+        trusted/operator), so a config that says nothing under `templates:`
+        still gets sane behavior; a config that overrides one template name
+        leaves the other built-ins as-is unless it also names them.
     """
-    minimal_tokens: bool = False
+    minimal_tokens:    bool = False
+    default_template:  str  = "guest"
+    templates:         dict[str, frozenset[Permission]] = field(
+        default_factory=lambda: dict(_BUILTIN_TEMPLATES)
+    )
+
+    def resolve_template(self, name: str) -> frozenset[Permission]:
+        """
+        Resolve a template name to its permission set. Falls back to
+        default_template with a logged warning if `name` is empty or not a
+        known template — deleting a template from config, or a stale
+        per-user permission_template value, must not brick that user.
+        """
+        if name and name in self.templates:
+            return self.templates[name]
+        if name:
+            logger.warning(
+                "permissions: unknown template %r, falling back to default_template %r",
+                name, self.default_template,
+            )
+        return self.templates.get(self.default_template, frozenset())
 
 
 @dataclass
 class ToolOverrideConfig:
     """
-    Per-tool override of registration-time defaults (always_on / min_permission).
+    Per-tool override of registration-time defaults (currently: always_on).
 
     Configured via 'tools.overrides:' in config.yaml:
 
         tools:
           overrides:
-            shell:
-              min_permission: 80
             present:
               always_on: true
             memory_search:
               always_on: false
-              min_permission: 10
 
     Fields left unset (null/omitted) leave that aspect of the tool untouched —
     only the fields you specify are overridden. Unknown tool names are ignored
     (logged at debug level) since not every module is loaded in every config.
+
+    min_permission is DEPRECATED — permission_level was fully retired in
+    favor of named boolean capabilities (see TinyCTX/permissions.py and
+    docs/PERMISSIONS-PLAN.md). The field is kept here only so old configs
+    still parse; tool_handling/handler.py's apply_overrides() logs one
+    warning per stale override naming the tool and pointing at
+    permissions.templates, then ignores the value — it is NOT silently
+    honored, and it is NOT a no-op that could look like it's still working.
     """
     always_on:      bool | None = None
     min_permission: int | None  = None
@@ -507,6 +590,51 @@ def _parse_tool_search(raw: dict) -> ToolSearchConfig:
     )
 
 
+def _parse_permission_set(template_name: str, raw: dict) -> frozenset[Permission]:
+    """
+    Parse one templates.<name> mapping into a frozenset of granted
+    Permission members. Templates are authored by the operator, so unlike
+    the runtime fallbacks in users/store.py (which must tolerate a stale
+    per-user override), an unknown permission name here is a config bug and
+    fails loudly at load time rather than being silently dropped.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError(f"permissions.templates.{template_name} must be a mapping")
+    granted: set[Permission] = set()
+    for perm_name, value in raw.items():
+        try:
+            perm = Permission(perm_name)
+        except ValueError:
+            valid = ", ".join(sorted(p.value for p in Permission))
+            raise ValueError(
+                f"permissions.templates.{template_name}: unknown permission "
+                f"{perm_name!r}. Valid names: {valid}"
+            )
+        if bool(value):
+            granted.add(perm)
+    return frozenset(granted)
+
+
+def _parse_permissions(raw: dict) -> PermissionsConfig:
+    raw = raw or {}
+    templates = dict(_BUILTIN_TEMPLATES)
+    for name, tmpl_raw in (raw.get("templates") or {}).items():
+        templates[name] = _parse_permission_set(name, tmpl_raw)
+
+    default_template = raw.get("default_template", "guest")
+    if default_template not in templates:
+        raise ValueError(
+            f"permissions.default_template {default_template!r} is not defined "
+            f"under permissions.templates (known: {sorted(templates)})"
+        )
+
+    return PermissionsConfig(
+        minimal_tokens=bool(raw.get("minimal_tokens", False)),
+        default_template=default_template,
+        templates=templates,
+    )
+
+
 def _parse_tools(raw: dict) -> ToolsConfig:
     raw = raw or {}
     return ToolsConfig(
@@ -688,10 +816,7 @@ def load(path="config.yaml") -> Config:
     )
 
     # ------------------------------------------------------------------ permissions
-    perm_raw = raw.get("permissions", {})
-    permissions = PermissionsConfig(
-        minimal_tokens=bool(perm_raw.get("minimal_tokens", False)),
-    )
+    permissions = _parse_permissions(raw.get("permissions", {}))
 
     # ------------------------------------------------------------------ parallel
     parallel = int(raw.get("parallel", 3))

@@ -121,7 +121,14 @@ class AgentCycle:
         )
         self.tool_handler = ToolCallHandler(vector_store=tool_vector_store, embedder=tool_embedder)
         self.tool_handler.search_config = search_cfg
-        self.tool_handler.register_tool(self.tool_handler.tools_search, always_on=True)
+        self.tool_handler.permissions_config = self.config.permissions
+        # tools_search only toggles what's visible in this cycle's tool
+        # list — it doesn't itself touch files/network/memory/etc. Those
+        # effects are gated individually at the tools it enables, so gating
+        # tools_search too would be double-counting (docs/PERMISSIONS-PLAN.md §7.1).
+        self.tool_handler.register_tool(
+            self.tool_handler.tools_search, always_on=True, required_permissions=None,
+        )
         enabled_tools = state.get("enabled_tools")
         if enabled_tools:
             for t in enabled_tools:
@@ -141,10 +148,16 @@ class AgentCycle:
         # Wire modules into this cycle turn
         self.module_registry.register_agent(self)
 
-        # Config-driven per-tool overrides (always_on / min_permission) — applied
-        # last so they win over whatever each module's register_tool() call set.
+        # Config-driven per-tool overrides (always_on) — applied last so they
+        # win over whatever each module's register_tool() call set.
         if self.config.tools.overrides:
             self.tool_handler.apply_overrides(self.config.tools.overrides)
+
+        # Startup assertion (docs/PERMISSIONS-PLAN.md §3): every tool must
+        # have declared required_permissions, explicitly, even if that
+        # declaration is None. Runs once per cycle since the tool registry
+        # itself is rebuilt fresh every cycle (see this method's docstring).
+        self.tool_handler.assert_permissions_declared()
 
         # Passive tool discovery — auto-enable up to tools.passive.auto_limit
         # tools for THIS TURN ONLY, ranked against the incoming user message.
@@ -202,7 +215,7 @@ class AgentCycle:
             logger.debug("[agent] running async hooks")
             await self.context.run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC)
             tools = self.tool_handler.get_tool_definitions(
-                caller_level=self.caller.permission_level,
+                caller=self.caller,
                 minimal_tokens=self.config.permissions.minimal_tokens,
             ) or None
             messages, _ = self.context.assemble(tools=tools)

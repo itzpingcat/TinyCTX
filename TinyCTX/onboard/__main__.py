@@ -31,7 +31,7 @@ from .helpers import (
     write_config,
 )
 from . import providers_setup, bridges_setup, workspace_setup, gateway_setup
-from .fix_permissions import elevate_user, list_users
+from .fix_permissions import DEFAULT_ELEVATE_TEMPLATE, elevate_user, list_users
 
 
 # ── Step 0a: detect existing config ──────────────────────────────────────────
@@ -161,7 +161,9 @@ That's it! Re-run `python -m onboard` at any time to reconfigure.
 
 def step_bootstrap_admin() -> None:
     """
-    After a fresh install, offer to elevate one existing user to level 100.
+    After a fresh install, offer to elevate one existing user to the
+    operator template (docs/PERMISSIONS-PLAN.md — operator holds every
+    Permission, replacing the old "level 100" notion of admin).
 
     If no users exist yet (gateway just launched, nobody has sent a message),
     we skip this step silently — the user can run `tinyctx launch cli` without
@@ -187,18 +189,18 @@ def step_bootstrap_admin() -> None:
         )
         return
 
-    already_admin = [u for u in users if u.permission_level >= 100]
+    already_admin = [u for u in users if u.permission_template == DEFAULT_ELEVATE_TEMPLATE]
     if already_admin:
         success(
             "Admin already set: "
-            + ", ".join(f"[bold]{u.username}[/] (level {u.permission_level})" for u in already_admin)
+            + ", ".join(f"[bold]{u.username}[/] (template {u.permission_template})" for u in already_admin)
         )
         return
 
-    c.print("  Elevate a user to level 100 to grant full admin access.\n")
+    c.print(f"  Elevate a user to the {DEFAULT_ELEVATE_TEMPLATE!r} template to grant full admin access.\n")
     choices = [
         questionary.Choice(
-            title=f"{u.username}  (level {u.permission_level})",
+            title=f"{u.username}  (template {u.permission_template or '(default)'})",
             value=u.username,
         )
         for u in users
@@ -218,8 +220,8 @@ def step_bootstrap_admin() -> None:
         return
 
     try:
-        elevate_user(chosen, 100, store)
-        success(f"[bold]{chosen}[/] elevated to level 100.")
+        elevate_user(chosen, DEFAULT_ELEVATE_TEMPLATE, store)
+        success(f"[bold]{chosen}[/] elevated to the {DEFAULT_ELEVATE_TEMPLATE!r} template.")
     except Exception as exc:
         warn(f"Could not elevate user: {exc}")
 
@@ -326,8 +328,8 @@ def run_wizard(providers: dict, beginner_providers: dict, existing: dict | None,
 
     # ── Bootstrap admin user ───────────────────────────────────────────────────
     # Only on fresh setup (not modify). Lists all known users and asks which
-    # one to elevate to level 100. Skipped if users.db has no users yet
-    # (first-ever launch — users appear after the first message is sent).
+    # one to elevate to the operator template. Skipped if users.db has no
+    # users yet (first-ever launch — users appear after the first message is sent).
     if not modify:
         step_bootstrap_admin()
 

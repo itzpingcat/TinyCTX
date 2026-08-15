@@ -40,6 +40,7 @@ from TinyCTX.contracts import (
     SessionEnvironment,
     Platform,
 )
+from TinyCTX.permissions import Permission
 
 from .compat   import CompatRules
 from .cursors  import CursorStore, make_session_node
@@ -60,8 +61,11 @@ DEFAULTS = {
     "token_env": "DISCORD_BOT_TOKEN",
     "allowed_servers": {},
     "dm_enabled": True,
-    "dm_requires_permission": 75,       # minimum user registry level to use the bot in DMs
-    "reset_requires_permission": 75,    # minimum user registry level to /reset in a server
+    # DM/reset/shutdown gating now reads the caller's named permission
+    # template (DM_ACCESS / MANAGE_CTX / ROOT — see TinyCTX/permissions.py
+    # and docs/PERMISSIONS-PLAN.md §9) instead of a per-bridge int
+    # threshold. There is nothing to configure here anymore; adjust
+    # permissions.templates in config.yaml instead.
     "reset_command": "/reset",
     "shutdown_command": "/shutdown",
     "keyword_listen_keywords": [],
@@ -312,19 +316,19 @@ class DiscordBridge:
     # Permission helpers
     # ------------------------------------------------------------------
 
-    def _user_permission_level(self, platform_user_id: int) -> int:
-        """Look up the TinyCTX user registry level for a Discord user id."""
+    def _user_has_permission(self, platform_user_id: int, perm: Permission) -> bool:
+        """Look up the TinyCTX user registry entry for a Discord user id and
+        check one named capability against their effective permission set."""
         user = self._runtime.users.resolve_user(
             platform=Platform.DISCORD,
             user_id=str(platform_user_id),
             username="",
             display_name="",
         )
-        return user.permission_level
+        return perm in user.effective_permissions(self._runtime.config.permissions)
 
     def _is_allowed_dm(self, user_id: int) -> bool:
-        required = int(self._opts["dm_requires_permission"])
-        return self._user_permission_level(user_id) >= required
+        return self._user_has_permission(user_id, Permission.DM_ACCESS)
 
     def _is_allowed_server(self, guild_id: int, channel_id: int) -> bool:
         if guild_id not in self._allowed_servers:
@@ -333,8 +337,14 @@ class DiscordBridge:
         return not allowed_channels or channel_id in allowed_channels
 
     def _can_reset(self, user_id: int) -> bool:
-        required = int(self._opts["reset_requires_permission"])
-        return self._user_permission_level(user_id) >= required
+        """/reset — clearing the session — is MANAGE_CTX (docs/PERMISSIONS-PLAN.md §9).
+        Deliberately separate from _can_shutdown: killing the gateway used to
+        share a threshold with resetting a session; they're split now."""
+        return self._user_has_permission(user_id, Permission.MANAGE_CTX)
+
+    def _can_shutdown(self, user_id: int) -> bool:
+        """/shutdown — killing the gateway — is ROOT (instance administration)."""
+        return self._user_has_permission(user_id, Permission.ROOT)
 
     def _is_group_trigger(self, text: str, cursor_key: str = "") -> bool:
         bot_name = self._client.user.name if self._client.user else ""

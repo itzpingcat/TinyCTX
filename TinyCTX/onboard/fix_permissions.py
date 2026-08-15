@@ -1,11 +1,13 @@
 """
 onboard/fix_permissions.py — Permission elevation utility for TinyCTX.
 
-Callable standalone (bypasses normal "can't grant above your own level" check —
-physical access to the machine running TinyCTX is the authorization):
+Callable standalone (bypasses normal permission checks entirely — this tool
+has no ROOT-holder ceiling logic to bypass in the first place now that ROOT
+is total, but the point stands: physical access to the machine running
+TinyCTX is the authorization):
 
     python -m TinyCTX.onboard.fix_permissions --user USERNAME
-    python -m TinyCTX.onboard.fix_permissions --user USERNAME --level 50
+    python -m TinyCTX.onboard.fix_permissions --user USERNAME --template operator
 
 Or imported and called from other code:
 
@@ -20,27 +22,37 @@ import sys
 from TinyCTX.users import UserStore
 from TinyCTX.users.models import User
 
+# The template this module's CLI/step_bootstrap_admin flow assigns by
+# default — the operator template is expected to include ROOT (see
+# config/__main__.py's _BUILTIN_TEMPLATES and docs/PERMISSIONS-PLAN.md §2).
+DEFAULT_ELEVATE_TEMPLATE = "operator"
 
-def elevate_user(username: str, level: int = 100, store: UserStore | None = None) -> User:
+
+def elevate_user(username: str, template: str = DEFAULT_ELEVATE_TEMPLATE, store: UserStore | None = None) -> User:
     """
-    Set permission_level for a TinyCTX username.
+    Set a TinyCTX username's permission_template.
 
-    No caller-level check — this is the privileged path used by the CLI admin
-    console and the standalone script.  Authorization is physical access to
-    the machine (you already have the gateway api_key and shell access).
+    No caller-permission check — this is the privileged path used by the CLI
+    admin console and the standalone script. Authorization is physical
+    access to the machine (you already have the gateway api_key and shell
+    access). Does not validate `template` against permissions.templates in
+    config.yaml — this tool deliberately doesn't load the full Config, so an
+    unknown template name is accepted as-is (User.effective_permissions()
+    falls back to the empty set for an unknown template at read time, same
+    as any other unknown-template user).
 
     Args:
         username: TinyCTX username to modify.
-        level:    Permission level to assign (0-100). Default 100.
+        template: Name of the permission template to assign. Default "operator".
         store:    Existing UserStore. If None, a fresh one is opened.
 
     Returns the updated User.
 
     Raises:
-        ValueError       if username not found or level out of range.
+        ValueError if username not found.
     """
-    if not (0 <= level <= 100):
-        raise ValueError(f"level must be 0-100, got {level}")
+    if not template or not template.strip():
+        raise ValueError("template must be a non-empty string")
 
     if store is None:
         store = UserStore()
@@ -49,17 +61,17 @@ def elevate_user(username: str, level: int = 100, store: UserStore | None = None
     if user is None:
         raise ValueError(f"User {username!r} not found in users.db")
 
-    user.permission_level = level
+    user.permission_template = template.strip()
     store.update_user(user)
     return user
 
 
 def list_users(store: UserStore | None = None) -> list[User]:
-    """Return all users sorted by permission_level descending, then username."""
+    """Return all users sorted by username."""
     if store is None:
         store = UserStore()
     rows = store._conn.execute(
-        "SELECT username FROM users ORDER BY permission_level DESC, username ASC"
+        "SELECT username FROM users ORDER BY username ASC"
     ).fetchall()
     users = []
     for row in rows:
@@ -77,8 +89,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         prog="python -m TinyCTX.onboard.fix_permissions",
         description=(
-            "Directly set a TinyCTX user's permission level.\n"
-            "No caller-level check — requires shell access to the TinyCTX host."
+            "Directly set a TinyCTX user's permission template.\n"
+            "No caller-permission check — requires shell access to the TinyCTX host."
         ),
     )
     parser.add_argument(
@@ -88,16 +100,16 @@ def main() -> None:
         help="TinyCTX username to modify.",
     )
     parser.add_argument(
-        "--level",
-        type=int,
-        default=100,
-        metavar="LEVEL",
-        help="Permission level to assign (0-100). Default: 100.",
+        "--template",
+        type=str,
+        default=DEFAULT_ELEVATE_TEMPLATE,
+        metavar="TEMPLATE",
+        help=f"Permission template to assign. Default: {DEFAULT_ELEVATE_TEMPLATE!r}.",
     )
     parser.add_argument(
         "--list",
         action="store_true",
-        help="List all users and their current permission levels.",
+        help="List all users and their current permission templates.",
     )
     args = parser.parse_args()
 
@@ -108,18 +120,18 @@ def main() -> None:
         if not users:
             print("No users found.")
         else:
-            print(f"{'USERNAME':<32}  {'LEVEL':>5}  IDENTITIES")
-            print("-" * 72)
+            print(f"{'USERNAME':<32}  {'TEMPLATE':<16}  IDENTITIES")
+            print("-" * 80)
             for u in users:
                 identities = ", ".join(
                     f"{i.platform.value}:{i.user_id}" for i in u.identities
                 ) or "—"
-                print(f"{u.username:<32}  {u.permission_level:>5}  {identities}")
+                print(f"{u.username:<32}  {(u.permission_template or '(default)'):<16}  {identities}")
         return
 
     try:
-        user = elevate_user(args.user, args.level, store)
-        print(f"User '{user.username}' permission_level set to {user.permission_level}.")
+        user = elevate_user(args.user, args.template, store)
+        print(f"User '{user.username}' permission_template set to {user.permission_template!r}.")
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)

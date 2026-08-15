@@ -3,12 +3,19 @@ tests/test_sysops.py
 
 Tests for modules/sysops — user/permission management tools, the /model
 slash command, and the set_active_model tool for per-branch LLM override.
+Rewritten for docs/PERMISSIONS-PLAN.md: permission_level's numeric ceiling
+logic ("can only grant up to your level - 1") is gone — user_modify_permissions
+now sets a named permission_template, gated on Permission.ROOT (total, no
+ceiling to enforce); user_list/user_info are gated on USER_READ;
+user_rename/user_merge on ROOT; set_active_model and /model both on
+MODEL_SWAP, checked through the same seam.
 
-Uses real UserStore (sqlite, tmp_path) and real ConversationDB (:memory:)
-rather than mocks, since both are cheap and give realistic behavior. The
-runtime/agent objects themselves are lightweight fakes mirroring the
-minimal surface sysops actually touches (mirrors tests/test_tool_handler.py
-and tests/test_module_registry.py's _FakeRuntime/_FakeCycle style).
+Uses real UserStore (sqlite, tmp_path), real ConversationDB (:memory:), and
+a real PermissionsConfig (so template resolution is exercised for real)
+rather than mocks. The runtime/agent objects themselves are lightweight
+fakes mirroring the minimal surface sysops actually touches (mirrors
+tests/test_tool_handler.py and tests/test_module_registry.py's
+_FakeRuntime/_FakeCycle style).
 
 Run with:
     pytest tests/
@@ -17,13 +24,15 @@ from __future__ import annotations
 
 import pytest
 
+from TinyCTX.config import PermissionsConfig
+from TinyCTX.config.__main__ import LLMRoutingConfig, ModelConfig
 from TinyCTX.contracts import Platform
 from TinyCTX.db import ConversationDB
+from TinyCTX.modules.sysops import __main__ as sysops
+from TinyCTX.permissions import Permission
+from TinyCTX.tool_handling import ToolCallHandler
 from TinyCTX.users.store import UserStore
 from TinyCTX.utils.commands import CommandRegistry
-from TinyCTX.utils.tool_handler import ToolCallHandler
-from TinyCTX.config.__main__ import LLMRoutingConfig, ModelConfig
-from TinyCTX.modules.sysops import __main__ as sysops
 
 
 # ---------------------------------------------------------------------------
@@ -31,14 +40,15 @@ from TinyCTX.modules.sysops import __main__ as sysops
 # ---------------------------------------------------------------------------
 
 class _FakeConfig:
-    def __init__(self, primary="main", models=None, extra=None):
+    def __init__(self, primary="main", models=None, permissions=None):
         self.llm = LLMRoutingConfig(primary=primary)
         self.models = models if models is not None else {
             "main": ModelConfig(model="m", base_url="http://x"),
             "alt":  ModelConfig(model="m2", base_url="http://x"),
             "embed": ModelConfig(model="e", base_url="http://x", kind="embedding"),
         }
-        self.extra = extra if extra is not None else {}
+        self.permissions = permissions if permissions is not None else PermissionsConfig()
+        self.extra = {}
 
 
 class _FakeContext:
@@ -84,9 +94,9 @@ def config():
     return _FakeConfig()
 
 
-def _make_user(users, level, uid="u1", username_hint="alice"):
+def _make_user(users, template, uid="u1", username_hint="alice"):
     user = users.resolve_user(Platform.DISCORD, uid, username_hint, username_hint.title())
-    user.permission_level = level
+    user.permission_template = template
     users.update_user(user)
     return users.get_user(user.username)
 
@@ -96,11 +106,11 @@ def _node(db):
     return db.add_node(root.id, "user", "hi").id
 
 
-def _register(users, db, config, caller_level=100, uid="caller"):
+def _register(users, db, config, caller_template="operator", uid="caller"):
     """Sets up runtime + agent with sysops registered, returns (agent, tool_handler, node_id)."""
     runtime = _FakeRuntime(users, db, config)
     sysops.register_runtime(runtime)
-    caller = _make_user(users, caller_level, uid=uid, username_hint=f"caller{uid}")
+    caller = _make_user(users, caller_template, uid=uid, username_hint=f"caller{uid}")
     node_id = _node(db)
     agent = _FakeAgent(caller, db, config, node_id)
     sysops.register_agent(agent)
@@ -118,75 +128,70 @@ async def _call(handler, caller, tool_name, **kwargs):
 
 
 # ---------------------------------------------------------------------------
-# user_modify_permissions — permission rules
+# user_modify_permissions — template assignment, ROOT-gated, no ceiling
 # ---------------------------------------------------------------------------
 
 class TestUserModifyPermissions:
     @pytest.mark.asyncio
-    async def test_caller_can_promote_up_to_level_minus_one(self, users, db, config):
-        agent, handler, _ = _register(users, db, config, caller_level=50)
-        target = _make_user(users, 10, uid="t1", username_hint="target1")
+    async def test_root_holder_can_set_any_template(self, users, db, config):
+        agent, handler, _ = _register(users, db, config, caller_template="operator")
+        target = _make_user(users, "guest", uid="t1", username_hint="target1")
         result = await _call(handler, agent.caller, "user_modify_permissions",
-                              username=target.username, level=49)
+                              username=target.username, template="trusted")
         assert result["success"] is True
-        assert "49" in result["result"]
+        assert "guest" in result["result"]
+        assert "trusted" in result["result"]
+        assert users.get_user(target.username).permission_template == "trusted"
 
     @pytest.mark.asyncio
-    async def test_caller_cannot_promote_to_own_level_or_above(self, users, db, config):
-        agent, handler, _ = _register(users, db, config, caller_level=50)
-        target = _make_user(users, 10, uid="t2", username_hint="target2")
+    async def test_root_holder_can_elevate_to_operator_including_self(self, users, db, config):
+        """ROOT is total — no 'can only grant up to your own level' ceiling
+        left to enforce; a ROOT holder may promote anyone, including
+        themselves, to any template."""
+        agent, handler, _ = _register(users, db, config, caller_template="operator")
         result = await _call(handler, agent.caller, "user_modify_permissions",
-                              username=target.username, level=50)
-        assert result["success"] is True  # tool returns a string result either way
-        assert "Error" in result["result"]
-        assert "may only grant up to level 49" in result["result"]
+                              username=agent.caller.username, template="operator")
+        assert result["success"] is True
 
     @pytest.mark.asyncio
-    async def test_caller_cannot_touch_user_at_or_above_own_level(self, users, db, config):
-        agent, handler, _ = _register(users, db, config, caller_level=50)
-        target = _make_user(users, 50, uid="t3", username_hint="target3")
+    async def test_unknown_template_rejected(self, users, db, config):
+        agent, handler, _ = _register(users, db, config, caller_template="operator")
+        target = _make_user(users, "guest", uid="t4", username_hint="target4")
         result = await _call(handler, agent.caller, "user_modify_permissions",
-                              username=target.username, level=10)
+                              username=target.username, template="not-a-real-template")
+        assert result["success"] is True
         assert "Error" in result["result"]
-        assert "not below your level" in result["result"]
-
-    @pytest.mark.asyncio
-    async def test_level_out_of_range_rejected(self, users, db, config):
-        agent, handler, _ = _register(users, db, config, caller_level=100)
-        target = _make_user(users, 10, uid="t4", username_hint="target4")
-        result = await _call(handler, agent.caller, "user_modify_permissions",
-                              username=target.username, level=101)
-        assert "Error" in result["result"]
-        assert "0-100" in result["result"]
+        assert "unknown template" in result["result"]
 
     @pytest.mark.asyncio
     async def test_unknown_user_returns_not_found(self, users, db, config):
-        agent, handler, _ = _register(users, db, config, caller_level=100)
+        agent, handler, _ = _register(users, db, config, caller_template="operator")
         result = await _call(handler, agent.caller, "user_modify_permissions",
-                              username="ghost", level=10)
+                              username="ghost", template="member")
         assert "not found" in result["result"]
 
     @pytest.mark.asyncio
-    async def test_tool_handler_denies_below_min_permission(self, users, db, config):
-        """min_permission=50 is enforced by ToolCallHandler itself, independent
-        of the closure's own logic."""
-        agent, handler, _ = _register(users, db, config, caller_level=100)
-        low_caller = _make_user(users, 10, uid="low1", username_hint="lowcaller")
+    async def test_tool_handler_denies_caller_without_root(self, users, db, config):
+        """ROOT is enforced by ToolCallHandler itself, independent of the
+        closure's own logic — a non-ROOT caller never reaches the body."""
+        agent, handler, _ = _register(users, db, config, caller_template="operator")
+        low_caller = _make_user(users, "trusted", uid="low1", username_hint="lowcaller")
         result = await _call(handler, low_caller, "user_modify_permissions",
-                              username="whoever", level=1)
+                              username="whoever", template="guest")
         assert result["success"] is False
         assert "PERMISSION DENIED" in result["error"]
+        assert "root" in result["error"]
 
 
 # ---------------------------------------------------------------------------
-# user_rename / user_merge — require level 100
+# user_rename / user_merge — ROOT-gated
 # ---------------------------------------------------------------------------
 
 class TestUserRenameMerge:
     @pytest.mark.asyncio
-    async def test_rename_allowed_at_level_100(self, users, db, config):
-        agent, handler, _ = _register(users, db, config, caller_level=100)
-        target = _make_user(users, 10, uid="r1", username_hint="renameme")
+    async def test_rename_allowed_for_root_holder(self, users, db, config):
+        agent, handler, _ = _register(users, db, config, caller_template="operator")
+        target = _make_user(users, "guest", uid="r1", username_hint="renameme")
         result = await _call(handler, agent.caller, "user_rename",
                               username=target.username, new_username="renamed")
         assert result["success"] is True
@@ -194,12 +199,8 @@ class TestUserRenameMerge:
         assert users.get_user("renamed") is not None
 
     @pytest.mark.asyncio
-    async def test_rename_denied_below_level_100_by_closure(self, users, db, config):
-        """caller_level=99 clears the tool_handler's min_permission=100 gate
-        too, so this exercises the ToolCallHandler denial path, not the
-        closure's own `if caller_level < 100` branch directly — both exist
-        in the source (belt-and-suspenders)."""
-        agent, handler, _ = _register(users, db, config, caller_level=99)
+    async def test_rename_denied_without_root(self, users, db, config):
+        agent, handler, _ = _register(users, db, config, caller_template="trusted")
         result = await _call(handler, agent.caller, "user_rename",
                               username="whoever", new_username="whatever")
         assert result["success"] is False
@@ -207,18 +208,18 @@ class TestUserRenameMerge:
 
     @pytest.mark.asyncio
     async def test_rename_conflict_returns_error(self, users, db, config):
-        agent, handler, _ = _register(users, db, config, caller_level=100)
-        a = _make_user(users, 10, uid="ra", username_hint="usera")
-        b = _make_user(users, 10, uid="rb", username_hint="userb")
+        agent, handler, _ = _register(users, db, config, caller_template="operator")
+        a = _make_user(users, "guest", uid="ra", username_hint="usera")
+        b = _make_user(users, "guest", uid="rb", username_hint="userb")
         result = await _call(handler, agent.caller, "user_rename",
                               username=a.username, new_username=b.username)
         assert "already taken" in result["result"]
 
     @pytest.mark.asyncio
-    async def test_merge_allowed_at_level_100(self, users, db, config):
-        agent, handler, _ = _register(users, db, config, caller_level=100)
-        primary = _make_user(users, 10, uid="mp", username_hint="primaryuser")
-        secondary = _make_user(users, 10, uid="ms", username_hint="secondaryuser")
+    async def test_merge_allowed_for_root_holder(self, users, db, config):
+        agent, handler, _ = _register(users, db, config, caller_template="operator")
+        primary = _make_user(users, "guest", uid="mp", username_hint="primaryuser")
+        secondary = _make_user(users, "guest", uid="ms", username_hint="secondaryuser")
         result = await _call(handler, agent.caller, "user_merge",
                               primary_username=primary.username,
                               secondary_username=secondary.username)
@@ -227,8 +228,8 @@ class TestUserRenameMerge:
         assert users.get_user(secondary.username) is None
 
     @pytest.mark.asyncio
-    async def test_merge_denied_below_level_100(self, users, db, config):
-        agent, handler, _ = _register(users, db, config, caller_level=99)
+    async def test_merge_denied_without_root(self, users, db, config):
+        agent, handler, _ = _register(users, db, config, caller_template="trusted")
         result = await _call(handler, agent.caller, "user_merge",
                               primary_username="a", secondary_username="b")
         assert result["success"] is False
@@ -236,48 +237,56 @@ class TestUserRenameMerge:
 
 
 # ---------------------------------------------------------------------------
-# user_list / user_info — min_permission=50, read-only
+# user_list / user_info — USER_READ-gated, read-only
 # ---------------------------------------------------------------------------
 
 class TestUserListInfo:
     @pytest.mark.asyncio
-    async def test_user_list_allowed_at_min_permission(self, users, db, config):
-        agent, handler, _ = _register(users, db, config, caller_level=50)
+    async def test_user_list_allowed_with_user_read(self, users, db, config):
+        agent, handler, _ = _register(users, db, config, caller_template="trusted")  # trusted holds USER_READ
         result = await _call(handler, agent.caller, "user_list")
         assert result["success"] is True
         assert "user(s)" in result["result"]
 
     @pytest.mark.asyncio
-    async def test_user_list_denied_below_min_permission(self, users, db, config):
-        agent, handler, _ = _register(users, db, config, caller_level=100)
-        low_caller = _make_user(users, 49, uid="low2", username_hint="lowcaller2")
+    async def test_user_list_denied_without_user_read(self, users, db, config):
+        agent, handler, _ = _register(users, db, config, caller_template="operator")
+        low_caller = _make_user(users, "guest", uid="low2", username_hint="lowcaller2")
         result = await _call(handler, low_caller, "user_list")
         assert result["success"] is False
         assert "PERMISSION DENIED" in result["error"]
 
     @pytest.mark.asyncio
+    async def test_user_list_shows_template(self, users, db, config):
+        agent, handler, _ = _register(users, db, config, caller_template="trusted")
+        result = await _call(handler, agent.caller, "user_list")
+        assert "template=" in result["result"]
+
+    @pytest.mark.asyncio
     async def test_user_info_unknown_user(self, users, db, config):
-        agent, handler, _ = _register(users, db, config, caller_level=50)
+        agent, handler, _ = _register(users, db, config, caller_template="trusted")
         result = await _call(handler, agent.caller, "user_info", username="ghost")
         assert result["success"] is True
         assert "not found" in result["result"]
 
     @pytest.mark.asyncio
-    async def test_user_info_known_user(self, users, db, config):
-        agent, handler, _ = _register(users, db, config, caller_level=50)
+    async def test_user_info_known_user_shows_effective_permissions(self, users, db, config):
+        agent, handler, _ = _register(users, db, config, caller_template="trusted")
         result = await _call(handler, agent.caller, "user_info", username=agent.caller.username)
         assert result["success"] is True
         assert agent.caller.username in result["result"]
+        assert "effective:" in result["result"]
+        assert "model_swap" in result["result"]  # trusted holds MODEL_SWAP
 
 
 # ---------------------------------------------------------------------------
-# set_active_model tool
+# set_active_model tool — MODEL_SWAP-gated
 # ---------------------------------------------------------------------------
 
 class TestSetActiveModel:
     @pytest.mark.asyncio
     async def test_valid_model_sets_override(self, users, db, config):
-        agent, handler, node_id = _register(users, db, config, caller_level=75)
+        agent, handler, node_id = _register(users, db, config, caller_template="trusted")
         result = await _call(handler, agent.caller, "set_active_model", name="alt")
         assert result["success"] is True
         assert "alt" in result["result"]
@@ -285,7 +294,7 @@ class TestSetActiveModel:
 
     @pytest.mark.asyncio
     async def test_unknown_model_rejected(self, users, db, config):
-        agent, handler, node_id = _register(users, db, config, caller_level=75)
+        agent, handler, node_id = _register(users, db, config, caller_template="trusted")
         result = await _call(handler, agent.caller, "set_active_model", name="nonexistent")
         assert result["success"] is True
         assert "Error" in result["result"]
@@ -297,14 +306,14 @@ class TestSetActiveModel:
     async def test_embedding_model_rejected(self, users, db, config):
         """Embedding models are excluded from _chat_model_names, so set_active_model
         should refuse them even though they're a real entry in config.models."""
-        agent, handler, node_id = _register(users, db, config, caller_level=75)
+        agent, handler, node_id = _register(users, db, config, caller_template="trusted")
         result = await _call(handler, agent.caller, "set_active_model", name="embed")
         assert "unknown model" in result["result"]
         assert db.get_state(node_id, "model", "") == ""
 
     @pytest.mark.asyncio
     async def test_empty_name_clears_override(self, users, db, config):
-        agent, handler, node_id = _register(users, db, config, caller_level=75)
+        agent, handler, node_id = _register(users, db, config, caller_template="trusted")
         db.set_state(node_id, "model", "alt")
         result = await _call(handler, agent.caller, "set_active_model", name="")
         assert result["success"] is True
@@ -313,7 +322,7 @@ class TestSetActiveModel:
 
     @pytest.mark.asyncio
     async def test_default_keyword_clears_override(self, users, db, config):
-        agent, handler, node_id = _register(users, db, config, caller_level=75)
+        agent, handler, node_id = _register(users, db, config, caller_template="trusted")
         db.set_state(node_id, "model", "alt")
         result = await _call(handler, agent.caller, "set_active_model", name="default")
         assert "cleared" in result["result"]
@@ -323,41 +332,32 @@ class TestSetActiveModel:
     async def test_override_persists_for_branch(self, users, db, config):
         """Writes go through db.set_state on the branch's tail node — a
         second read against that same node id sees the persisted value."""
-        agent, handler, node_id = _register(users, db, config, caller_level=75)
+        agent, handler, node_id = _register(users, db, config, caller_template="trusted")
         await _call(handler, agent.caller, "set_active_model", name="alt")
         # Simulate a later cycle re-reading state for the same branch/node.
         state, _ = db.load_session_state(node_id)
         assert state.get("model") == "alt"
 
     @pytest.mark.asyncio
-    async def test_denied_below_model_min_permission(self, users, db, config):
-        agent, handler, node_id = _register(users, db, config, caller_level=100)
-        low_caller = _make_user(users, 74, uid="low3", username_hint="lowcaller3")
+    async def test_denied_without_model_swap(self, users, db, config):
+        agent, handler, node_id = _register(users, db, config, caller_template="operator")
+        low_caller = _make_user(users, "member", uid="low3", username_hint="lowcaller3")  # member lacks MODEL_SWAP
         result = await _call(handler, low_caller, "set_active_model", name="alt")
         assert result["success"] is False
         assert "PERMISSION DENIED" in result["error"]
         assert db.get_state(node_id, "model", "") == ""
 
-    @pytest.mark.asyncio
-    async def test_custom_min_permission_from_config_extra(self, users, db):
-        """EXTENSION_META.default_config.model_min_permission=75 can be overridden
-        per-instance via config.extra['sysops']['model_min_permission']."""
-        config = _FakeConfig(extra={"sysops": {"model_min_permission": 10}})
-        agent, handler, node_id = _register(users, db, config, caller_level=10)
-        result = await _call(handler, agent.caller, "set_active_model", name="alt")
-        assert result["success"] is True
-        assert db.get_state(node_id, "model", "") == "alt"
-
 
 # ---------------------------------------------------------------------------
-# /model slash command
+# /model slash command — same MODEL_SWAP bool, checked at the CommandRegistry
+# seam (docs/PERMISSIONS-PLAN.md §9's whole point: two entry points, one bool)
 # ---------------------------------------------------------------------------
 
 class TestModelCommand:
-    def _setup(self, users, db, config, caller_level=75, uid="modelcaller"):
+    def _setup(self, users, db, config, caller_template="trusted", uid="modelcaller"):
         runtime = _FakeRuntime(users, db, config)
         sysops.register_runtime(runtime)
-        caller = _make_user(users, caller_level, uid=uid, username_hint=f"mcaller{uid}")
+        caller = _make_user(users, caller_template, uid=uid, username_hint=f"mcaller{uid}")
         node_id = _node(db)
         return runtime, caller, node_id
 
@@ -365,7 +365,7 @@ class TestModelCommand:
     async def test_no_args_shows_status_default(self, users, db, config):
         runtime, caller, node_id = self._setup(users, db, config)
         sent = []
-        context = {"node_id": node_id, "caller": caller, "send": sent.append}
+        context = {"runtime": runtime, "node_id": node_id, "caller": caller, "send": sent.append}
         handled = await runtime.commands.dispatch("/model", context)
         assert handled is True
         assert "default" in sent[0]
@@ -375,7 +375,7 @@ class TestModelCommand:
     async def test_list_shows_chat_models_only(self, users, db, config):
         runtime, caller, node_id = self._setup(users, db, config)
         sent = []
-        context = {"node_id": node_id, "caller": caller, "send": sent.append}
+        context = {"runtime": runtime, "node_id": node_id, "caller": caller, "send": sent.append}
         await runtime.commands.dispatch("/model list", context)
         text = sent[0]
         assert "main" in text
@@ -386,7 +386,7 @@ class TestModelCommand:
     async def test_set_valid_model_writes_override(self, users, db, config):
         runtime, caller, node_id = self._setup(users, db, config)
         sent = []
-        context = {"node_id": node_id, "caller": caller, "send": sent.append}
+        context = {"runtime": runtime, "node_id": node_id, "caller": caller, "send": sent.append}
         await runtime.commands.dispatch("/model alt", context)
         assert "Model override set: alt" in sent[0]
         assert db.get_state(node_id, "model", "") == "alt"
@@ -395,7 +395,7 @@ class TestModelCommand:
     async def test_set_unknown_model_rejected(self, users, db, config):
         runtime, caller, node_id = self._setup(users, db, config)
         sent = []
-        context = {"node_id": node_id, "caller": caller, "send": sent.append}
+        context = {"runtime": runtime, "node_id": node_id, "caller": caller, "send": sent.append}
         await runtime.commands.dispatch("/model bogus", context)
         assert "Unknown model" in sent[0]
         assert db.get_state(node_id, "model", "") == ""
@@ -405,7 +405,7 @@ class TestModelCommand:
         runtime, caller, node_id = self._setup(users, db, config)
         db.set_state(node_id, "model", "alt")
         sent = []
-        context = {"node_id": node_id, "caller": caller, "send": sent.append}
+        context = {"runtime": runtime, "node_id": node_id, "caller": caller, "send": sent.append}
         await runtime.commands.dispatch("/model clear", context)
         assert "cleared" in sent[0]
         assert db.get_state(node_id, "model", "") == ""
@@ -415,18 +415,19 @@ class TestModelCommand:
         runtime, caller, node_id = self._setup(users, db, config)
         db.set_state(node_id, "model", "alt")
         sent = []
-        context = {"node_id": node_id, "caller": caller, "send": sent.append}
+        context = {"runtime": runtime, "node_id": node_id, "caller": caller, "send": sent.append}
         await runtime.commands.dispatch("/model", context)
         assert "override" in sent[0]
         assert "alt" in sent[0]
 
     @pytest.mark.asyncio
-    async def test_denied_below_min_permission(self, users, db, config):
-        runtime, caller, node_id = self._setup(users, db, config, caller_level=74)
+    async def test_denied_without_model_swap(self, users, db, config):
+        runtime, caller, node_id = self._setup(users, db, config, caller_template="member")  # lacks MODEL_SWAP
         sent = []
-        context = {"node_id": node_id, "caller": caller, "send": sent.append}
-        await runtime.commands.dispatch("/model alt", context)
-        assert "requires permission level" in sent[0]
+        context = {"runtime": runtime, "node_id": node_id, "caller": caller, "send": sent.append}
+        handled = await runtime.commands.dispatch("/model alt", context)
+        assert handled is True
+        assert "PERMISSION DENIED" in sent[0]
         assert db.get_state(node_id, "model", "") == ""
 
     @pytest.mark.asyncio
@@ -442,22 +443,25 @@ class TestModelCommand:
                 self.lines.append(text)
 
         console = _Console()
-        context = {"node_id": node_id, "caller": caller, "console": console}
+        context = {"runtime": runtime, "node_id": node_id, "caller": caller, "console": console}
         await runtime.commands.dispatch("/model", context)
         assert len(console.lines) == 1
         assert "default" in console.lines[0]
 
     @pytest.mark.asyncio
     async def test_no_resolvable_caller_denied(self, users, db, config):
-        """No context['caller'], no caller_platform/user_id, and no author_id
-        in session state on the node — resolution fails entirely."""
+        """No context['caller'] and no caller_platform/user_id — the
+        CommandRegistry seam denies before _cmd_model ever runs (it no
+        longer has its own caller-resolution fallback)."""
         runtime = _FakeRuntime(users, db, config)
         sysops.register_runtime(runtime)
         node_id = _node(db)
         sent = []
-        context = {"node_id": node_id, "send": sent.append}
-        await runtime.commands.dispatch("/model", context)
-        assert "Cannot resolve your identity" in sent[0]
+        context = {"runtime": runtime, "node_id": node_id, "send": sent.append}
+        handled = await runtime.commands.dispatch("/model", context)
+        assert handled is True
+        assert "PERMISSION DENIED" in sent[0]
+        assert "could not resolve caller" in sent[0]
         assert db.get_state(node_id, "model", "") == ""
 
     @pytest.mark.asyncio
@@ -466,10 +470,11 @@ class TestModelCommand:
         an already-resolved caller object."""
         runtime = _FakeRuntime(users, db, config)
         sysops.register_runtime(runtime)
-        user = _make_user(users, 75, uid="plat1", username_hint="platcaller")
+        _make_user(users, "trusted", uid="plat1", username_hint="platcaller")
         node_id = _node(db)
         sent = []
         context = {
+            "runtime": runtime,
             "node_id": node_id,
             "caller_platform": "discord",
             "caller_user_id": "plat1",
@@ -483,6 +488,13 @@ class TestModelCommand:
         """Discord bridge uses 'cursor' instead of 'node_id'."""
         runtime, caller, node_id = self._setup(users, db, config)
         sent = []
-        context = {"cursor": node_id, "caller": caller, "send": sent.append}
+        context = {"runtime": runtime, "cursor": node_id, "caller": caller, "send": sent.append}
         await runtime.commands.dispatch("/model", context)
         assert "default" in sent[0]
+
+    def test_model_command_declares_required_permissions(self, users, db, config):
+        """assert_permissions_declared() must not trip on /model — it
+        declares required_permissions={MODEL_SWAP} explicitly."""
+        runtime = _FakeRuntime(users, db, config)
+        sysops.register_runtime(runtime)
+        runtime.commands.assert_permissions_declared()  # must not raise

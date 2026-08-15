@@ -19,6 +19,8 @@ from __future__ import annotations
 import json
 import logging
 
+from TinyCTX.permissions import Permission
+
 logger = logging.getLogger(__name__)
 
 # Module-global, set once by register_runtime — matches modules/sysops.
@@ -126,5 +128,7 @@ def register_agent(agent) -> None:
             return json.dumps({"status": "error", "error": "That fork already completed (or is unknown)."})
         return json.dumps({"status": "ok"})
 
-    agent.tool_handler.register_tool(spawn_fork, always_on=False, min_permission=50)
-    agent.tool_handler.register_tool(nudge_fork, always_on=False, min_permission=50)
+    # spawn_fork / nudge_fork change the shape of the agent's working
+    # context (spawning a concurrent peer, advisory-messaging one) — MANAGE_CTX.
+    agent.tool_handler.register_tool(spawn_fork, always_on=False, required_permissions={Permission.MANAGE_CTX})
+    agent.tool_handler.register_tool(nudge_fork, always_on=False, required_permissions={Permission.MANAGE_CTX})

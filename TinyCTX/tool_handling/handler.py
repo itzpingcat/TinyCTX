@@ -3,9 +3,21 @@ import functools
 import inspect
 import json
 import logging
-from typing import Dict, Any, Callable, List, Optional
+from typing import Dict, Any, Callable, List, Optional, Iterable
+
+from TinyCTX import permissions as _permissions
+from TinyCTX.permissions import Permission
 
 logger = logging.getLogger(__name__)
+
+# Sentinel distinguishing "required_permissions not passed at all" (a
+# forgotten declaration — bug) from "required_permissions=None passed
+# explicitly" (a deliberately ungated tool). See docs/PERMISSIONS-PLAN.md §3
+# and assert_permissions_declared() below.
+_UNSET = object()
+
+RequiredPermissions = Callable[..., "Iterable[Permission]"] | "set[Permission] | frozenset[Permission]" | None
+
 
 class ToolCallHandler:
     def __init__(self, vector_store=None, embedder=None):
@@ -29,6 +41,11 @@ class ToolCallHandler:
         # by _search_cfg() / tools_search(); left None in bare/test usage,
         # where _search_cfg()'s defaults apply.
         self.search_config = None
+        # TinyCTX.config.PermissionsConfig, set by agent.py after
+        # construction (self.tool_handler.permissions_config = ...), same
+        # pattern as search_config above. Left None in bare/test usage — see
+        # _permissions_cfg()'s fallback below.
+        self.permissions_config = None
         # Tool names auto-enabled by the current turn's passive_search() call —
         # NOT part of `enabled` persistence; agent.py unions this set into
         # get_tool_definitions() for the turn and never writes it to session
@@ -40,26 +57,44 @@ class ToolCallHandler:
                       name: Optional[str] = None,
                       description: Optional[str] = None,
                       always_on: bool = False,
-                      min_permission: int = 25):
+                      required_permissions: RequiredPermissions = _UNSET,
+                      listing_permissions: Optional["set[Permission]"] = None):
         """Register a tool function - auto-extracts name and description if not provided
-        
+
         Args:
             func: The function to register
             name: Tool name (defaults to function name)
             description: Tool description (defaults to first paragraph of docstring)
+            required_permissions: The capability set this tool needs to run.
+                A plain set/frozenset[Permission] is static. A callable
+                receives the same coerced kwargs execute_tool_call computes
+                and returns the set needed for THIS call's arguments — used
+                by tools with per-argument nuance (shell, present). Pass
+                None explicitly for a deliberately ungated tool (e.g.
+                use_skill, rag_search) — that's different from never passing
+                this argument at all, which is a forgotten declaration and
+                trips assert_permissions_declared(). See
+                docs/PERMISSIONS-PLAN.md §3.
+            listing_permissions: Only consulted for callable
+                required_permissions, when filtering the tool list under
+                minimal_tokens (§3.2). A callable can't be evaluated before a
+                call exists, so this is a static hint of what a caller would
+                need for *some* invocation. If omitted for a callable-based
+                tool, the tool is always listed (e.g. shell — any caller
+                might be permitted to run *some* command).
         """
         if name is None:
             name = func.__name__
-        
+
         if description is None:
             description, arg_descs = self._extract_docstring_parts(func)
         else:
             arg_descs = {}
-        
+
         sig = inspect.signature(func)
         properties = {}
         required = []
-        
+
         for param_name, param in sig.parameters.items():
             param_type = self._python_type_to_json_schema(param.annotation) if param.annotation != inspect.Parameter.empty else {"type": "string"}
             param_description = arg_descs.get(param_name, "")
@@ -68,7 +103,7 @@ class ToolCallHandler:
                 properties[param_name]["description"] = param_description
             if param.default == inspect.Parameter.empty:
                 required.append(param_name)
-        
+
         # Full raw docstring, kept separately from `description` (which is
         # just the first line, shown to the LLM via get_tool_definitions).
         # Used only as the search/embedding text — see search.py's
@@ -78,6 +113,17 @@ class ToolCallHandler:
         # arg_descs, which never made it into the old BM25 corpus text.
         docstring = inspect.getdoc(func) or description
 
+        declared = required_permissions is not _UNSET
+        raw_required = None if required_permissions is _UNSET else required_permissions
+
+        static_permissions: Optional[frozenset] = None
+        required_fn: Optional[Callable[..., Any]] = None
+        if isinstance(raw_required, (set, frozenset)):
+            static_permissions = frozenset(raw_required)
+            required_fn = _static_permission_fn(static_permissions)
+        elif raw_required is not None:
+            required_fn = raw_required  # callable — evaluated per-call
+
         self.tools[name] = {
             'function': func,
             'description': description,
@@ -85,10 +131,33 @@ class ToolCallHandler:
             'signature': sig,
             'properties': properties,
             'required': required,
-            'min_permission': min_permission,
+            'required_permissions': required_fn,
+            'static_permissions': static_permissions,
+            'listing_permissions': listing_permissions,
+            '_permissions_declared': declared,
         }
         if always_on:
             self.enabled.add(name)
+
+    def assert_permissions_declared(self) -> None:
+        """
+        Startup assertion (docs/PERMISSIONS-PLAN.md §3): every registered
+        tool must have called register_tool with an explicit
+        required_permissions — either a set/callable, or None for a
+        deliberately ungated tool. A tool that never passed the argument at
+        all is a forgotten declaration, not an ungated tool, and is a bug we
+        want to fail loudly on rather than silently treat as unrestricted.
+        """
+        undeclared = sorted(
+            name for name, t in self.tools.items()
+            if not t.get('_permissions_declared', False)
+        )
+        if undeclared:
+            raise RuntimeError(
+                "[permissions] tool(s) registered without declaring "
+                "required_permissions (pass a set[Permission], a callable, "
+                f"or explicitly None): {undeclared}"
+            )
 
     def _extract_docstring_parts(self, func: Callable) -> tuple[str, Dict[str, str]]:
         """
@@ -226,13 +295,20 @@ class ToolCallHandler:
         return coerced
 
     def apply_overrides(self, overrides: Dict[str, Any]) -> None:
-        """Apply config-driven per-tool overrides of always_on / min_permission.
+        """Apply config-driven per-tool overrides of always_on.
 
         Call after all modules have registered their tools (register_tool
         calls set the baseline; this runs last and wins). Unset fields on an
         override (None) leave that aspect of the tool untouched. Tool names
         not currently registered are skipped with a debug log — not every
-        module is loaded in every config, so this isn't an error.
+        module is loaded in every config.
+
+        min_permission on an override is DEPRECATED (permission_level was
+        fully retired — see TinyCTX/permissions.py). There is nothing left
+        for it to act on; silently ignoring it would make an operator's
+        override quietly stop taking effect on upgrade, so instead we warn
+        loudly, once per stale override, naming the tool and pointing at
+        permissions.templates.
         """
         for name, override in (overrides or {}).items():
             tool = self.tools.get(name)
@@ -240,9 +316,13 @@ class ToolCallHandler:
                 logger.debug("[tool_handler] override for unknown tool '%s' skipped", name)
                 continue
 
-            min_permission = getattr(override, "min_permission", None)
-            if min_permission is not None:
-                tool["min_permission"] = min_permission
+            if getattr(override, "min_permission", None) is not None:
+                logger.warning(
+                    "[tool_handler] tools.overrides.%s.min_permission is set but "
+                    "permission_level has been retired — this value is IGNORED. "
+                    "Grant/deny capabilities via permissions.templates instead.",
+                    name,
+                )
 
             always_on = getattr(override, "always_on", None)
             if always_on is True:
@@ -300,6 +380,20 @@ class ToolCallHandler:
         wired — e.g. in tests constructing ToolCallHandler bare)."""
         cfg = getattr(self, "search_config", None)
         return getattr(cfg, key, default) if cfg is not None else default
+
+    def _permissions_cfg(self):
+        """
+        Resolve the PermissionsConfig to check callers against. Falls back
+        to a bare default (guest/member/trusted/operator built-ins, default
+        template 'guest') when nothing was wired — e.g. ToolCallHandler
+        constructed directly in tests. Imported lazily to avoid importing
+        TinyCTX.config at module load time for callers that never need it.
+        """
+        cfg = getattr(self, "permissions_config", None)
+        if cfg is not None:
+            return cfg
+        from TinyCTX.config import PermissionsConfig
+        return PermissionsConfig()
 
     async def _ranked_candidates(
         self, query: str, *, vector_enabled: bool, top_k: int, min_score: float, rrf_k: int,
@@ -394,14 +488,44 @@ class ToolCallHandler:
         self.auto_enabled = set(hits)
         return self.auto_enabled
 
-    def get_tool_definitions(self, caller_level: int = 100, minimal_tokens: bool = False) -> List[Dict[str, Any]]:
+    def _tool_visible(self, tool: Dict[str, Any], effective: "frozenset[Permission]") -> bool:
+        """
+        minimal_tokens listing filter (docs/PERMISSIONS-PLAN.md §3.2). A
+        static required_permissions filters on itself. A callable filters on
+        listing_permissions if the tool declared one, else is always listed
+        (e.g. shell — any caller might be permitted to run *some* command,
+        so hiding it entirely would be wrong). An ungated tool
+        (required_permissions=None) is always listed.
+        """
+        if tool['required_permissions'] is None:
+            return True
+        static = tool.get('static_permissions')
+        if static is not None:
+            return static.issubset(effective)
+        listing = tool.get('listing_permissions')
+        if listing is not None:
+            return set(listing).issubset(effective)
+        return True
+
+    def get_tool_definitions(self, caller=None, minimal_tokens: bool = False) -> List[Dict[str, Any]]:
+        """
+        caller: TinyCTX.users.models.User | None. Only consulted when
+        minimal_tokens is True — a caller of None with minimal_tokens=True
+        lists nothing gated (fail-closed), matching bare/test usage where no
+        real caller identity exists.
+        """
+        effective = None
+        if minimal_tokens and caller is not None:
+            effective = caller.effective_permissions(self._permissions_cfg())
+
         definitions = []
         for name in self.enabled | self.auto_enabled:
             tool = self.tools.get(name)
             if tool is None:
                 continue
-            if minimal_tokens and caller_level < tool.get('min_permission', 25):
-                continue  # silently excluded — LLM never sees this tool
+            if minimal_tokens:
+                if effective is None or not self._tool_visible(tool, effective):
+                    continue
             definitions.append({
                 "type": "function",
                 "function": {
@@ -415,10 +539,9 @@ class ToolCallHandler:
                 }
             })
         return definitions
-    
+
     async def execute_tool_call(self, tool_call, caller) -> Dict[str, Any]:
         """Execute a tool call from the LLM."""
-        caller_level    = caller.permission_level
         caller_username = caller.username
         try:
             if hasattr(tool_call, 'function'):
@@ -429,14 +552,14 @@ class ToolCallHandler:
                 function_name = tool_call.get('function', {}).get('name')
                 arguments = tool_call.get('function', {}).get('arguments', '{}')
                 tool_call_id = tool_call.get('id', 'unknown')
-                
+
             if not function_name:
                 return {
                     'tool_call_id': tool_call_id,
                     'error': "No function name provided",
                     'success': False
                 }
-                        
+
             if function_name not in self.tools:
                 return {
                     'tool_call_id': tool_call_id,
@@ -455,18 +578,6 @@ class ToolCallHandler:
                     'success': False
                 }
 
-            # Permission guard — enforce even if LLM hallucinated a filtered tool.
-            min_perm = self.tools[function_name].get('min_permission', 25)
-            if caller_level < min_perm:
-                return {
-                    'tool_call_id': tool_call_id,
-                    'error': (
-                        f"[PERMISSION DENIED] '{caller_username}' has permission level "
-                        f"{caller_level} but '{function_name}' requires {min_perm}."
-                    ),
-                    'success': False,
-                }
-                        
             if isinstance(arguments, str):
                 try:
                     args = json.loads(arguments)
@@ -478,10 +589,41 @@ class ToolCallHandler:
                     }
             else:
                 args = arguments
-                        
+
             # Coerce args to their annotated types where possible.
             # This handles LLMs serializing integers as strings, etc.
+            # Deliberately BEFORE the permission check below: a
+            # required_permissions callable must see real types (e.g.
+            # backend_access as an actual bool), not whatever primitive the
+            # LLM happened to serialize — see docs/PERMISSIONS-PLAN.md §3.
             args = self._coerce_args(function_name, args)
+
+            # Permission guard — enforce even if LLM hallucinated a filtered
+            # tool. required_permissions=None means this tool is ungated.
+            required_fn = self.tools[function_name].get('required_permissions')
+            if required_fn is not None:
+                try:
+                    needed = _permissions.expand(required_fn(**args))
+                except Exception:
+                    logger.exception(
+                        "[tool_handler] permission classifier failed for '%s'", function_name,
+                    )
+                    return {
+                        'tool_call_id': tool_call_id,
+                        'error': "[PERMISSION DENIED] could not classify call",
+                        'success': False,
+                    }
+                effective = caller.effective_permissions(self._permissions_cfg())
+                missing = {p for p in needed if p not in effective}
+                if missing:
+                    return {
+                        'tool_call_id': tool_call_id,
+                        'error': (
+                            f"[PERMISSION DENIED] '{caller_username}' is missing: "
+                            f"{sorted(p.value for p in missing)}"
+                        ),
+                        'success': False,
+                    }
 
             # Call the function.
             # Async functions are awaited directly.
@@ -495,14 +637,14 @@ class ToolCallHandler:
                 result = await loop.run_in_executor(
                     None, functools.partial(fn, **args)
                 )
-                        
+
             return {
                 'tool_call_id': tool_call_id,
                 'function_name': function_name,
                 'result': result,
                 'success': True
             }
-                    
+
         except Exception as e:
             return {
                 'tool_call_id': getattr(tool_call, 'id', 'unknown'),
@@ -510,3 +652,12 @@ class ToolCallHandler:
                 'error': str(e),
                 'success': False
             }
+
+
+def _static_permission_fn(perms: "frozenset[Permission]") -> Callable[..., "frozenset[Permission]"]:
+    """Wrap a static permission set as a `**_ -> frozenset` callable, so
+    execute_tool_call has exactly one code path (always call required_fn)
+    regardless of whether the tool declared a static set or a classifier."""
+    def _fn(**_ignored) -> "frozenset[Permission]":
+        return perms
+    return _fn

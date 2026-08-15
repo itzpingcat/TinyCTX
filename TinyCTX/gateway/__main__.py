@@ -220,9 +220,6 @@ async def handle_lane_message(request: web.Request) -> web.StreamResponse:
             ))
         attachments = tuple(parsed)
 
-    permission_level = int(body.get("permission_level", 25))
-    permission_level = max(0, min(100, permission_level))  # clamp to 0-100
-
     # If a cli_username is present, the request came from a CLI session.
     # Resolve the named user from users.db and author the message as them.
     # The gateway trusts this field because CLI access requires the gateway
@@ -574,11 +571,18 @@ async def handle_commands_list(request: web.Request) -> web.Response:
 # GET /v1/user/{username}  &  POST /v1/user/{username}/elevate
 # ---------------------------------------------------------------------------
 
+def _user_template(user, runtime) -> str:
+    """The user's stored template, or the configured default if unset —
+    same resolution User.effective_permissions() does, surfaced for the API
+    response so a caller sees what's actually in effect."""
+    return user.permission_template or runtime.config.permissions.default_template
+
+
 async def handle_user_get(request: web.Request) -> web.Response:
     """
     Return basic info about a user by username.
 
-    Response (200): { "username": "...", "permission_level": 25 }
+    Response (200): { "username": "...", "template": "member" }
     Response (404): { "error": "user not found" }
     """
     runtime  = request.app["runtime"]
@@ -592,7 +596,7 @@ async def handle_user_get(request: web.Request) -> web.Response:
     return web.Response(
         content_type="application/json",
         body=json.dumps({"username": user.username,
-                         "permission_level": user.permission_level}),
+                         "template": _user_template(user, runtime)}),
     )
 
 
@@ -601,9 +605,11 @@ async def handle_user_create(request: web.Request) -> web.Response:
     Create a user with an exact username (no slugify/random fallback).
     Used by `tinyctx launch cli` when a typed-in username doesn't exist yet.
 
-    Body: { "permission_level": 25 }   (optional; defaults to 25)
-    Response (200): { "username": "...", "permission_level": 25 }
+    Body: { "template": "member" }   (optional; "" / omitted means "use the
+    configured default_template" — see UserStore.create_user's docstring)
+    Response (200): { "username": "...", "template": "member" }
     Response (409): { "error": "username already taken" }
+    Response (400): { "error": "unknown template '...'" }
     """
     runtime  = request.app["runtime"]
     username = request.match_info["username"]
@@ -613,32 +619,40 @@ async def handle_user_create(request: web.Request) -> web.Response:
         body = await request.json()
     except Exception:
         pass
-    permission_level = max(0, min(100, int(body.get("permission_level", 25))))
+    template = str(body.get("template") or "").strip()
+    if template and template not in runtime.config.permissions.templates:
+        raise web.HTTPBadRequest(
+            content_type="application/json",
+            body=json.dumps({"error": f"unknown template {template!r}"}),
+        )
 
     try:
-        user = runtime.users.create_user(username, permission_level=permission_level)
+        user = runtime.users.create_user(username, permission_template=template)
     except UsernameConflictError:
         raise web.HTTPConflict(
             content_type="application/json",
             body=json.dumps({"error": f"username {username!r} already taken"}),
         )
 
-    logger.info("gateway: created user %r (permission_level %d)", username, permission_level)
+    logger.info("gateway: created user %r (template %r)", username, _user_template(user, runtime))
     return web.Response(
         content_type="application/json",
         body=json.dumps({"username": user.username,
-                         "permission_level": user.permission_level}),
+                         "template": _user_template(user, runtime)}),
     )
 
 
 async def handle_user_elevate(request: web.Request) -> web.Response:
     """
-    Set a user's permission_level to the requested level (clamped 0-100).
-    Trusted endpoint — protected by the gateway api_key.
+    Set a user's permission template. Trusted endpoint — protected by the
+    gateway api_key. No compatibility shim for the old `permission_level`
+    body field — see docs/PERMISSIONS-PLAN.md §10.4.
 
-    Body: { "permission_level": 100 }   (optional; defaults to 100)
-    Response (200): { "username": "...", "permission_level": 100 }
+    Body: { "template": "operator" }   (optional; defaults to "operator" —
+    this endpoint's whole purpose is granting elevated access)
+    Response (200): { "username": "...", "template": "operator" }
     Response (404): { "error": "user not found" }
+    Response (400): { "error": "unknown template '...'" }
     """
     runtime  = request.app["runtime"]
     username = request.match_info["username"]
@@ -655,17 +669,21 @@ async def handle_user_elevate(request: web.Request) -> web.Response:
     except Exception:
         pass
 
-    new_level = int(body.get("permission_level", 100))
-    new_level = max(0, min(100, new_level))
+    template = str(body.get("template") or "operator").strip()
+    if template not in runtime.config.permissions.templates:
+        raise web.HTTPBadRequest(
+            content_type="application/json",
+            body=json.dumps({"error": f"unknown template {template!r}"}),
+        )
 
-    user.permission_level = new_level
+    user.permission_template = template
     runtime.users.update_user(user)
-    logger.info("gateway: elevated %r to permission_level %d", username, new_level)
+    logger.info("gateway: elevated %r to template %r", username, template)
 
     return web.Response(
         content_type="application/json",
         body=json.dumps({"username": user.username,
-                         "permission_level": user.permission_level}),
+                         "template": _user_template(user, runtime)}),
     )
 
 

@@ -82,14 +82,15 @@ ROLE_SYSTEM    = "system"
 # one node the trigger itself writes should go unattributed. Written by
 # Runtime.push() when InboundMessage.suppress_attribution is True (see
 # contracts.py) — the caller's *identity* for permission purposes
-# (msg.author, AgentCycle.caller / caller.permission_level) is completely
-# separate from this and is never affected: push() derives the DB node's
-# author_id column from msg.author.username unless suppress_attribution
-# asks for this sentinel instead, but msg.author itself (the full User
-# object used for permissions) is untouched either way. See
+# (msg.author, AgentCycle.caller / caller.effective_permissions()) is
+# completely separate from this and is never affected: push() derives the
+# DB node's author_id column from msg.author.username unless
+# suppress_attribution asks for this sentinel instead, but msg.author itself
+# (the full User object used for permissions) is untouched either way. See
 # modules/cron/__main__.py::_CronRunner._run_job, which sets
 # suppress_attribution=True while still passing author=creator (the real
-# user) so caller.permission_level resolves correctly.
+# user) so caller.effective_permissions() resolves against the creator's
+# *current* grants.
 NO_ATTRIBUTION_SENTINEL = "\x00no_attribution"
 
 # ---------------------------------------------------------------------------

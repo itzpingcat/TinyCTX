@@ -16,44 +16,42 @@ Execution modes:
     for bare-metal installs. Linux only — PowerShell support was removed with
     the container refactor.
 
-Command policy is enforced here, before any dispatch, in both modes. The
-sandbox itself runs whatever it receives — it trusts the agent.
+Two independent checks run before any dispatch, in both modes. The sandbox
+itself runs whatever it receives — it trusts the agent.
 
-Policy is AST-based: the command is parsed with tree-sitter-bash and each
-resolved command in it is checked separately (see validate.py, and PLAN.md for
-the design). This replaced substring-glob blacklist.txt / whitelist.txt files,
-which could not tell a command from a quoted argument that happened to contain
-the same text.
+  1. CAPABILITY — "is this caller permitted to do this at all". Per-command
+     tagging in perms.py classifies each resolved command into the
+     TinyCTX.permissions.Permission bools it needs (FILE_WRITE,
+     NETWORK_WRITE, UNTRUSTED_EXEC, ...); shell's `required_permissions`
+     callable (registered below) is checked once, centrally, by
+     tool_handling.handler.ToolCallHandler — same seam every other tool
+     uses. See docs/PERMISSIONS-PLAN.md §5.
 
-Which policies apply to whom is config, not code. Each policy carries the level
-at which a caller outgrows it:
+  2. SHAPE — "is this invocation syntactically safe, independent of who's
+     asking". `_dispatch` below still runs validate.check() against a
+     single always-applied policy built from allow.yaml's `constructs` map,
+     which is what makes injection structurally impossible (see
+     validate.py's module docstring) — the `constructs` allow-map rejects
+     `$()`, unquoted globs used as commands, and control-flow constructs a
+     tree-sitter-bash grammar upgrade might introduce, BEFORE any command
+     is even classified. This is a different, complementary concern from
+     capability checking (§5.2) — retired is the old per-command
+     allow/deny RULE matching that used to stand in for capability
+     declarations (`applies_below` tier selection); retained is the
+     construct/shape check underneath it.
 
-    min_permission: 30
-    policies:
-      - {policy: builtin:allow, applies_below: 45}
-      - {policy: builtin:deny,  applies_below: 90}
+Command policy — both checks — is AST-based: the command is parsed with
+tree-sitter-bash and each resolved command in it is checked separately (see
+validate.py). This replaced substring-glob blacklist.txt / whitelist.txt
+files, which could not tell a command from a quoted argument that happened
+to contain the same text.
 
-Level 20 is subject to both, 50 to the deny-list only, 95 to nothing. Omit
-`applies_below` for a policy that binds everyone. `min_permission` is the level
-below which the tool isn't offered at all.
-
-Tier selection is therefore one comparison per policy, and this module has no
-opinion on how many tiers exist or which policy is an allow-list vs a
-deny-list — each file declares its own posture via `default_action`. Note what
-the shape rules out: a policy cannot bind a HIGHER-privileged caller while
-sparing a lower one. That would be incoherent, and a flat threshold list makes
-it unrepresentable.
-
-A relative `policy:` name resolves against the instance's config directory
-(`<instance>/config`, bound read-only at /app/config in the container), so the
-same config.yaml works on the host and in Docker where that directory has a
-different absolute path.
-
-`extra.shell.permissions.access_backend` remains a scalar: it gates *where* a
-command runs, not which policy applies to it.
-
-Levels are resolved from the *actual caller* (agent.caller.permission_level),
-captured once per cycle — never from a static config value.
+`backend_access=True` no longer compares against a scalar level — it adds
+Permission.BACKEND_EXEC to what the classifier requires (perms.py), enforced
+by the same central seam as everything else. See permissions.py's
+BACKEND_EXEC docstring for why this is a *location* permission (which
+container the command runs in), not a capability about what the command
+itself does.
 """
 from __future__ import annotations
 
@@ -68,23 +66,11 @@ from pathlib import Path
 
 from TinyCTX.utils.instance import runtime_config_dir
 
+from . import perms as shell_perms
 from . import policy as policy_mod
 from . import validate
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Permission tiers
-# ---------------------------------------------------------------------------
-
-# Fallbacks when extra.shell is unset. Kept in sync with __init__.py's
-# EXTENSION_META default_config, which is what an operator actually sees.
-_DEFAULT_MIN_PERMISSION = 30
-_DEFAULT_POLICIES = [
-    {"policy": "builtin:allow", "applies_below": 45},
-    {"policy": "builtin:deny", "applies_below": 90},
-]
 
 
 # ---------------------------------------------------------------------------
@@ -194,75 +180,51 @@ def register_agent(agent) -> None:
     _default_sandbox_url = f"http://{os.environ.get('TINYCTX_INSTANCE', 'tinyctx')}_sandbox:8700"
     sandbox_url = _extra.get("sandbox_url", _default_sandbox_url) or None
 
-    _perm_raw = _extra.get("permissions", {}) or {}
-    _removed = {"use_whitelist", "neutral", "bypass_blacklist"} & set(_perm_raw)
-    access_backend = int(_perm_raw.get("access_backend", 80))
-
     if sandbox_url:
         logger.info("shell: dispatching via sandbox at %s", sandbox_url)
     else:
         logger.info("shell: dispatching locally (no sandbox configured)")
 
-    # Which policies apply at which permission level is config, not code.
-    # Relative policy names resolve against the instance's config directory,
-    # which is at a different absolute path inside the container than on the
-    # host — so `policy: shell-allow.yaml` works in both. Files are read-only
-    # by design (compose binds /app/config read-only) and cached by path.
+    # SHAPE policy only — construct/redirect/glob-shape validation that runs
+    # regardless of who's calling (§5.2). Built from builtin:allow's
+    # `constructs` map (the strictest available — it's what makes injection
+    # structurally impossible, see validate.py) but with default_action
+    # forced to "allow" and no rules: the per-command allow/deny RULES that
+    # used to stand in for capability decisions are retired — perms.py's
+    # classify() + the central ToolCallHandler seam owns that now (§5, §5.2).
     #
     # Fail closed. A policy that won't load blocks every command — it must
     # never degrade into an unrestricted shell, which is what the old
     # blacklist.txt did when its file was missing.
-    min_permission = int(_extra.get("min_permission", _DEFAULT_MIN_PERMISSION))
     config_dir = runtime_config_dir(workspace)
-
     policy_error: str | None = None
-    policies = None
-    if _removed:
-        # Silently ignoring these would be a security bug in the loosening
-        # direction: someone who set use_whitelist: 90 to lock the shell down
-        # would get the permissive default instead.
-        policy_error = (
-            f"extra.shell.permissions no longer accepts {sorted(_removed)} — "
-            "these were replaced by extra.shell.min_permission and the "
-            "extra.shell.policies list (see modules/shell/__init__.py). "
-            "Migrate the config to re-enable the shell."
+    shape_policy = None
+    try:
+        _base = policy_mod.load_policy(policy_mod.ALLOW_PATH, workspace)
+        shape_policy = policy_mod.Policy(
+            name="shape-only (derived from builtin:allow constructs)",
+            default_action="allow",
+            constructs=_base.constructs,
+            rules=(),
+            max_command_bytes=_base.max_command_bytes,
         )
-        logger.error("shell: %s", policy_error)
-    else:
-        try:
-            policies = policy_mod.load_policy_set(
-                _extra.get("policies") or _DEFAULT_POLICIES, workspace, config_dir,
-            )
-        except policy_mod.PolicyError as exc:
-            policy_error = str(exc)
-            logger.error("shell: policies failed to load — all commands blocked: %s", exc)
-
-    # Caller's permission level for this cycle, resolved once. Mirrors
-    # modules/sysops/__main__.py's caller_level snapshot: agent.caller is
-    # set before register_agent runs and never changes mid-cycle, so this
-    # closure-captured int always reflects the actual caller.
-    caller_level = agent.caller.permission_level
+    except policy_mod.PolicyError as exc:
+        policy_error = str(exc)
+        logger.error("shell: shape policy failed to load — all commands blocked: %s", exc)
 
     def _dispatch(command: str, local: bool = False, call_timeout: int | None = None) -> str:
-        """Shared pipeline: apply every policy this caller is subject to, then
-        dispatch.
-
-        Note what this doesn't know: which policy is an allow-list and which is
-        a deny-list, or how many tiers exist. Each file declares its own
-        posture and carries its own threshold, so tier selection is one
-        comparison per policy.
-        """
+        """Shared pipeline: shape-validate, then dispatch. Capability
+        checking already happened before this function is ever reached — see
+        the required_permissions=shell_perms.required_permissions_for_shell
+        registration below, enforced by ToolCallHandler."""
         if policy_error is not None:
             return f"Blocked: shell policy could not be loaded — {policy_error}"
 
-        warnings: list[str] = []
-        for policy in policies.for_level(caller_level):
-            verdict = validate.check(command, policy, workspace)
-            if not verdict.allowed:
-                logger.warning("shell: blocked by %s — %s", policy.name, verdict.reason)
-                return f"Blocked: {verdict.reason}. Your permission level is {caller_level}."
-            warnings.extend(verdict.warnings)
-        prefix = "\n".join(dict.fromkeys(warnings)) + "\n" if warnings else ""
+        verdict = validate.check(command, shape_policy, workspace)
+        if not verdict.allowed:
+            logger.warning("shell: blocked by shape check — %s", verdict.reason)
+            return f"Blocked: {verdict.reason}."
+        prefix = "\n".join(dict.fromkeys(verdict.warnings)) + "\n" if verdict.warnings else ""
 
         effective_timeout = min(call_timeout, max_timeout) if call_timeout is not None else default_timeout
         if local or not sandbox_url:
@@ -272,16 +234,13 @@ def register_agent(agent) -> None:
         return prefix + output
 
     def shell(command: str, timeout: int | None = None, backend_access: bool = False) -> str:
-        if backend_access:
-            if caller_level < access_backend:
-                return (
-                    f"Blocked: backend_access=True requires permission level "
-                    f"{access_backend} (yours is {caller_level})."
-                )
-            return _dispatch(command, local=True, call_timeout=timeout)
-        return _dispatch(command, call_timeout=timeout)
+        # No hand-rolled backend_access gate here anymore — perms.py's
+        # required_permissions_for_shell adds Permission.BACKEND_EXEC to what
+        # this call needs, and ToolCallHandler.execute_tool_call already
+        # denied the call before shell() ever ran if the caller lacks it.
+        return _dispatch(command, local=backend_access, call_timeout=timeout)
 
-    shell.__doc__ = f"""Run a shell command.
+    shell.__doc__ = """Run a shell command.
 
         By default runs in the isolated sandbox container, which has outbound
         internet access (HTTP/S, git, pip, npm, etc.) but is NETWORK-ISOLATED:
@@ -295,13 +254,17 @@ def register_agent(agent) -> None:
           - LAN services (192.168.x.x, 10.x.x.x)
           - Internal APIs (ComfyUI, local databases, self-hosted services)
           - Docker host or sibling containers by hostname
-        Requires permission level {access_backend}. Command policy still applies in both modes.
+        Requires the backend_exec capability. Command policy still applies in
+        both modes.
 
         The command is parsed as bash and each command in it is checked
         separately, so chaining with ; && || and pipes is fine and quoted
         arguments are treated as data. Blocked commands say which rule
-        objected. Which policies apply depends on your permission level; at
-        lower levels only an explicitly allow-listed set of commands runs.
+        objected. Which specific commands you may run depends on your
+        granted capabilities (file_read, file_write, network_read,
+        network_write, untrusted_exec, ...) — most everyday commands
+        (cat, ls, grep, curl, git clone, ...) need only a narrow one or two
+        of these; anything unrecognized requires untrusted_exec.
 
         Args:
             command: The shell command to run.
@@ -309,7 +272,14 @@ def register_agent(agent) -> None:
                      configured maximum (default {max_timeout}s).
             backend_access: If True, run in the main container with full
                             network access and access to its own backend
-                            files (requires permission level {access_backend}).
-        """
+                            files (requires the backend_exec capability).
+        """.format(max_timeout=max_timeout)
 
-    agent.tool_handler.register_tool(shell, always_on=True, min_permission=min_permission)
+    # docs/PERMISSIONS-PLAN.md §5 — dynamic classifier, third alongside
+    # `present` (§7.1). listing_permissions is deliberately left unset
+    # (empty) — under minimal_tokens, any caller might be permitted to run
+    # *some* command, so hiding the tool entirely would be wrong (§3.2).
+    agent.tool_handler.register_tool(
+        shell, always_on=True,
+        required_permissions=shell_perms.required_permissions_for_shell,
+    )

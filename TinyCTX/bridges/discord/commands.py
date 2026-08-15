@@ -244,7 +244,7 @@ async def handle_shutdown_interaction(
     """Handle the /shutdown slash command — kills the gateway process."""
     await interaction.response.defer(ephemeral=True)
 
-    if not bridge._can_reset(interaction.user.id):
+    if not bridge._can_shutdown(interaction.user.id):
         await interaction.followup.send(
             "? Only admins can shut down the gateway.", ephemeral=True
         )

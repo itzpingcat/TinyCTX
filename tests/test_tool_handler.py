@@ -1,22 +1,39 @@
 """
 tests/test_tool_handler.py
 
-Tests for ToolCallHandler — registration, schema extraction, and execution.
+Tests for ToolCallHandler — registration, schema extraction, execution, and
+the required_permissions gating seam (docs/PERMISSIONS-PLAN.md §3): static
+sets, callable (dynamic) classifiers, override precedence, and
+classifier-raises -> deny.
 
 Run with:
     pytest tests/
 """
 import pytest
-from TinyCTX.utils.tool_handler import ToolCallHandler
+from TinyCTX.tool_handling import ToolCallHandler
+from TinyCTX.permissions import Permission
 from TinyCTX.utils.bm25 import BM25, _tokenise
 
 
 class _FakeCaller:
-    """Minimal stand-in for the caller object execute_tool_call() now requires
-    (needs .permission_level and .username; mirrors TinyCTX.users.models.User)."""
-    def __init__(self, permission_level: int = 100, username: str = "test-caller"):
-        self.permission_level = permission_level
+    """Minimal stand-in for the caller object execute_tool_call() now
+    requires — needs .username and .effective_permissions(permissions_config),
+    mirroring TinyCTX.users.models.User. Defaults to holding every Permission
+    (the old _FakeCaller(permission_level=100) equivalent) so tests that
+    don't care about gating are unaffected; pass granted_permissions to
+    exercise the gate itself."""
+    def __init__(self, granted_permissions=None, username: str = "test-caller"):
+        self._granted = (
+            frozenset(granted_permissions) if granted_permissions is not None
+            else frozenset(Permission)
+        )
         self.username = username
+
+    def effective_permissions(self, permissions_config=None) -> "frozenset[Permission]":
+        return self._granted
+
+    def has_permission(self, perm, permissions_config=None) -> bool:
+        return perm in self._granted
 
 
 # ---------------------------------------------------------------------------
@@ -251,71 +268,71 @@ class TestToolsSearch:
         fn.__doc__ = description
         self.handler.register_tool(fn, always_on=always_on)
 
-    def test_search_lists_matching_tool_as_candidate(self):
+    async def test_search_lists_matching_tool_as_candidate(self):
         """Fuzzy match doesn't enable — it lists the tool as a candidate to
         re-search for by exact name (see tools_search docstring)."""
         self._add("web_search", "Search the web for information")
-        result = self.handler.tools_search("web search")
+        result = await self.handler.tools_search("web search")
         assert "web_search" not in self.handler.enabled
         assert "web_search" in result
 
-    def test_search_exact_name_enables_immediately(self):
+    async def test_search_exact_name_enables_immediately(self):
         """An exact tool-name match is a one-step enable, unlike a fuzzy query."""
         self._add("web_search", "Search the web for information")
-        result = self.handler.tools_search("web_search")
+        result = await self.handler.tools_search("web_search")
         assert "web_search" in self.handler.enabled
         assert "Enabled" in result
 
-    def test_search_matches_description(self):
+    async def test_search_matches_description(self):
         self._add("fetch_page", "Download and return the HTML of a URL")
-        result = self.handler.tools_search("HTML")
+        result = await self.handler.tools_search("HTML")
         assert "fetch_page" not in self.handler.enabled
         assert "fetch_page" in result
 
-    def test_search_case_insensitive(self):
+    async def test_search_case_insensitive(self):
         """BM25 tokeniser lowercases everything so queries are case-insensitive."""
         self._add("screenshot", "Take a screenshot of the page")
-        result = self.handler.tools_search("SCREENSHOT")
+        result = await self.handler.tools_search("SCREENSHOT")
         assert "screenshot" not in self.handler.enabled
         assert "screenshot" in result
 
-    def test_search_no_match_returns_message(self):
+    async def test_search_no_match_returns_message(self):
         """A query with no BM25-positive matches returns a no-results message."""
         self._add("shell", "Run shell commands in the workspace")
-        result = self.handler.tools_search("zzznomatch")
+        result = await self.handler.tools_search("zzznomatch")
         assert "No" in result or "no" in result
         assert "shell" not in self.handler.enabled
 
-    def test_search_skips_already_enabled(self):
+    async def test_search_skips_already_enabled(self):
         self._add("already", "Already enabled unique tool", always_on=True)
-        result = self.handler.tools_search("already enabled")
+        result = await self.handler.tools_search("already enabled")
         # Should not re-add, should report it's already enabled
         assert "already" in result.lower()
         assert "No new" in result or "Already" in result
 
-    def test_search_ranks_best_match_first(self):
+    async def test_search_ranks_best_match_first(self):
         """The tool most relevant to the query should be listed first among candidates."""
         self._add("read_file", "Read the contents of a file from disk")
         self._add("view_file", "View a file with line numbers")
-        result = self.handler.tools_search("read file")
+        result = await self.handler.tools_search("read file")
         assert "read_file" not in self.handler.enabled
         assert result.index("read_file") < result.index("view_file")
 
-    def test_search_multiple_matches(self):
+    async def test_search_multiple_matches(self):
         """Both tools sharing query terms should be listed as candidates."""
         self._add("click", "Click an element on the page")
         self._add("double_click", "Double click an element on the page")
-        result = self.handler.tools_search("click element")
+        result = await self.handler.tools_search("click element")
         assert "click" not in self.handler.enabled
         assert "double_click" not in self.handler.enabled
         assert "click" in result
         assert "double_click" in result
 
-    def test_underscore_names_matched_as_words(self):
+    async def test_underscore_names_matched_as_words(self):
         """web_search is tokenised as ['web', 'search'] so query 'search' hits it."""
         self._add("web_search", "Search the web for current information")
         self._add("view", "Read a file with line numbers")
-        result = self.handler.tools_search("search")
+        result = await self.handler.tools_search("search")
         assert "web_search" not in self.handler.enabled
         assert "web_search" in result
         assert "view" not in result
@@ -538,3 +555,313 @@ class TestExecuteToolAsync:
         }, _FakeCaller())
         assert result["success"] is False
         assert "async failure" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# required_permissions — static set (docs/PERMISSIONS-PLAN.md §3)
+# ---------------------------------------------------------------------------
+
+class TestRequiredPermissionsStatic:
+    def setup_method(self):
+        self.handler = ToolCallHandler()
+
+    async def _call(self, name: str, caller, args=None):
+        return await self.handler.execute_tool_call({
+            "id": "c1",
+            "function": {"name": name, "arguments": args or {}},
+        }, caller)
+
+    @pytest.mark.asyncio
+    async def test_caller_with_required_permission_succeeds(self):
+        def read_thing() -> str:
+            """Reads something."""
+            return "ok"
+
+        self.handler.register_tool(
+            read_thing, always_on=True, required_permissions={Permission.FILE_READ},
+        )
+        caller = _FakeCaller(granted_permissions={Permission.FILE_READ})
+        result = await self._call("read_thing", caller)
+        assert result["success"] is True
+        assert result["result"] == "ok"
+
+    @pytest.mark.asyncio
+    async def test_caller_missing_required_permission_denied(self):
+        def write_thing() -> str:
+            """Writes something."""
+            return "ok"
+
+        self.handler.register_tool(
+            write_thing, always_on=True, required_permissions={Permission.FILE_WRITE},
+        )
+        caller = _FakeCaller(granted_permissions={Permission.FILE_READ})
+        result = await self._call("write_thing", caller)
+        assert result["success"] is False
+        assert "PERMISSION DENIED" in result["error"]
+        assert "file_write" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_required_permissions_none_is_ungated(self):
+        """required_permissions=None must be usable regardless of what the
+        caller holds — an explicitly ungated tool, not one requiring the
+        empty set of a mis-specified gate."""
+        def anyone_can_call() -> str:
+            """Ungated."""
+            return "ok"
+
+        self.handler.register_tool(
+            anyone_can_call, always_on=True, required_permissions=None,
+        )
+        caller = _FakeCaller(granted_permissions=set())  # holds nothing
+        result = await self._call("anyone_can_call", caller)
+        assert result["success"] is True
+
+    @pytest.mark.asyncio
+    async def test_multiple_required_permissions_all_must_be_held(self):
+        def both() -> str:
+            """Needs two."""
+            return "ok"
+
+        self.handler.register_tool(
+            both, always_on=True,
+            required_permissions={Permission.FILE_READ, Permission.FILE_WRITE},
+        )
+        partial_caller = _FakeCaller(granted_permissions={Permission.FILE_READ})
+        result = await self._call("both", partial_caller)
+        assert result["success"] is False
+
+        full_caller = _FakeCaller(granted_permissions={Permission.FILE_READ, Permission.FILE_WRITE})
+        result = await self._call("both", full_caller)
+        assert result["success"] is True
+
+    @pytest.mark.asyncio
+    async def test_network_write_implies_network_read_requirement(self):
+        """expand() applies implications to the REQUIREMENT — a tool
+        declaring NETWORK_WRITE actually demands both bools of the caller
+        (docs/PERMISSIONS-PLAN.md §1.2)."""
+        def send() -> str:
+            """Sends data."""
+            return "ok"
+
+        self.handler.register_tool(
+            send, always_on=True, required_permissions={Permission.NETWORK_WRITE},
+        )
+        # Holds NETWORK_WRITE but NOT NETWORK_READ — must still be denied,
+        # since expand() makes the requirement include NETWORK_READ too.
+        caller = _FakeCaller(granted_permissions={Permission.NETWORK_WRITE})
+        result = await self._call("send", caller)
+        assert result["success"] is False
+
+        full_caller = _FakeCaller(granted_permissions={Permission.NETWORK_WRITE, Permission.NETWORK_READ})
+        result = await self._call("send", full_caller)
+        assert result["success"] is True
+
+
+# ---------------------------------------------------------------------------
+# required_permissions — callable (dynamic classifier)
+# ---------------------------------------------------------------------------
+
+class TestRequiredPermissionsCallable:
+    def setup_method(self):
+        self.handler = ToolCallHandler()
+
+    @pytest.mark.asyncio
+    async def test_callable_receives_coerced_kwargs(self):
+        """The classifier must see the call's own (coerced) arguments, not
+        just a fixed set — e.g. shell's/present's per-argument classifiers."""
+        seen_args = {}
+
+        def classify(path: str, **_ignored):
+            seen_args["path"] = path
+            if path.startswith("/system/"):
+                return {Permission.ROOT}
+            return {Permission.FILE_READ}
+
+        def deliver(path: str) -> str:
+            """Deliver a file."""
+            return f"delivered {path}"
+
+        self.handler.register_tool(deliver, always_on=True, required_permissions=classify)
+
+        reader = _FakeCaller(granted_permissions={Permission.FILE_READ})
+        result = await self.handler.execute_tool_call({
+            "id": "c1",
+            "function": {"name": "deliver", "arguments": {"path": "/workspace/notes.md"}},
+        }, reader)
+        assert result["success"] is True
+        assert seen_args["path"] == "/workspace/notes.md"
+
+        # Same tool, different argument -> different requirement (ROOT) ->
+        # the same FILE_READ-only caller is now denied.
+        result = await self.handler.execute_tool_call({
+            "id": "c2",
+            "function": {"name": "deliver", "arguments": {"path": "/system/SOUL.md"}},
+        }, reader)
+        assert result["success"] is False
+
+        root_caller = _FakeCaller(granted_permissions={Permission.ROOT})
+        result = await self.handler.execute_tool_call({
+            "id": "c3",
+            "function": {"name": "deliver", "arguments": {"path": "/system/SOUL.md"}},
+        }, root_caller)
+        assert result["success"] is True
+
+    @pytest.mark.asyncio
+    async def test_classifier_raises_denies_the_call(self):
+        """A required_permissions callable that raises must DENY, not crash
+        the caller or (worse) fail open."""
+        def broken_classifier(**_ignored):
+            raise RuntimeError("classifier bug")
+
+        def risky() -> str:
+            """Risky tool."""
+            return "should never run"
+
+        self.handler.register_tool(risky, always_on=True, required_permissions=broken_classifier)
+        caller = _FakeCaller()  # holds every Permission
+        result = await self.handler.execute_tool_call({
+            "id": "c1",
+            "function": {"name": "risky", "arguments": {}},
+        }, caller)
+        assert result["success"] is False
+        assert "PERMISSION DENIED" in result["error"] or "could not classify" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_coercion_happens_before_classifier_sees_args(self):
+        """backend_access=True serialized as the string 'true' by a
+        forgetful LLM must reach the classifier as an actual bool, not the
+        literal string — see handler.py's _coerce_args ordering comment."""
+        seen = {}
+
+        def classify(flag: bool = False, **_ignored):
+            seen["flag"] = flag
+            seen["flag_type"] = type(flag)
+            return set()
+
+        def fn(flag: bool = False) -> str:
+            """Takes a bool."""
+            return "ok"
+
+        self.handler.register_tool(fn, always_on=True, required_permissions=classify)
+        caller = _FakeCaller()
+        await self.handler.execute_tool_call({
+            "id": "c1",
+            "function": {"name": "fn", "arguments": '{"flag": "true"}'},
+        }, caller)
+        assert seen["flag"] is True
+        assert seen["flag_type"] is bool
+
+
+# ---------------------------------------------------------------------------
+# assert_permissions_declared() — forgotten declaration is a bug, not an
+# ungated tool (docs/PERMISSIONS-PLAN.md §3)
+# ---------------------------------------------------------------------------
+
+class TestAssertPermissionsDeclared:
+    def setup_method(self):
+        self.handler = ToolCallHandler()
+
+    def test_forgotten_declaration_trips_assertion(self):
+        def fn() -> str:
+            """No required_permissions passed at all."""
+            return "ok"
+
+        self.handler.register_tool(fn, always_on=True)  # forgot required_permissions
+        with pytest.raises(RuntimeError):
+            self.handler.assert_permissions_declared()
+
+    def test_explicit_none_does_not_trip_assertion(self):
+        def fn() -> str:
+            """Deliberately ungated."""
+            return "ok"
+
+        self.handler.register_tool(fn, always_on=True, required_permissions=None)
+        self.handler.assert_permissions_declared()  # must not raise
+
+    def test_explicit_set_does_not_trip_assertion(self):
+        def fn() -> str:
+            """Gated."""
+            return "ok"
+
+        self.handler.register_tool(fn, always_on=True, required_permissions={Permission.FILE_READ})
+        self.handler.assert_permissions_declared()  # must not raise
+
+    def test_callable_does_not_trip_assertion(self):
+        def fn(**_ignored) -> str:
+            """Dynamically gated."""
+            return "ok"
+
+        self.handler.register_tool(
+            fn, always_on=True, required_permissions=lambda **_: {Permission.FILE_READ},
+        )
+        self.handler.assert_permissions_declared()  # must not raise
+
+    def test_assertion_names_every_undeclared_tool(self):
+        def a() -> str:
+            """A."""
+            return ""
+        def b() -> str:
+            """B."""
+            return ""
+
+        self.handler.register_tool(a, always_on=True)
+        self.handler.register_tool(b, always_on=True)
+        with pytest.raises(RuntimeError) as excinfo:
+            self.handler.assert_permissions_declared()
+        assert "a" in str(excinfo.value)
+        assert "b" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# apply_overrides() — always_on precedence, and the deprecated
+# min_permission field (warn + ignore, not silently honored)
+# ---------------------------------------------------------------------------
+
+class TestApplyOverridesPrecedence:
+    def setup_method(self):
+        self.handler = ToolCallHandler()
+
+    def test_always_on_true_override_enables_deferred_tool(self):
+        def fn() -> str:
+            """Deferred by default."""
+            return ""
+        self.handler.register_tool(fn, always_on=False, required_permissions=None)
+        assert "fn" not in self.handler.enabled
+
+        from TinyCTX.config import ToolOverrideConfig
+        self.handler.apply_overrides({"fn": ToolOverrideConfig(always_on=True)})
+        assert "fn" in self.handler.enabled
+
+    def test_always_on_false_override_disables_always_on_tool(self):
+        def fn() -> str:
+            """Always on by default."""
+            return ""
+        self.handler.register_tool(fn, always_on=True, required_permissions=None)
+        assert "fn" in self.handler.enabled
+
+        from TinyCTX.config import ToolOverrideConfig
+        self.handler.apply_overrides({"fn": ToolOverrideConfig(always_on=False)})
+        assert "fn" not in self.handler.enabled
+
+    def test_min_permission_override_is_ignored_not_fatal(self, caplog):
+        """A stale config still naming min_permission must not error, and
+        must not affect who can call the tool — the value is IGNORED, with
+        a loud warning, per handler.py's apply_overrides docstring."""
+        def fn() -> str:
+            """Gated tool."""
+            return "ok"
+        self.handler.register_tool(fn, always_on=True, required_permissions={Permission.ROOT})
+
+        from TinyCTX.config import ToolOverrideConfig
+        import logging
+        with caplog.at_level(logging.WARNING):
+            self.handler.apply_overrides({"fn": ToolOverrideConfig(min_permission=90)})
+        assert any("min_permission" in rec.message for rec in caplog.records)
+        # Still gated on ROOT — the override did not weaken the real check.
+        assert self.handler.tools["fn"]["required_permissions"] is not None
+
+    def test_override_for_unknown_tool_is_skipped(self):
+        """Overriding a tool name that was never registered must not raise
+        — not every module is loaded in every config."""
+        from TinyCTX.config import ToolOverrideConfig
+        self.handler.apply_overrides({"never_registered": ToolOverrideConfig(always_on=True)})  # no raise

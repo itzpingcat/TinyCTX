@@ -10,7 +10,16 @@ from __future__ import annotations
 import json
 import logging
 
+from TinyCTX.permissions import Permission
+
 logger = logging.getLogger(__name__)
+
+# Tools that only read the graph vs. tools that mutate it — the librarian's
+# internal caller (_InternalCaller below) holds both MEMORY_READ and
+# MEMORY_WRITE, so this split doesn't change what the librarian itself can
+# do; it keeps each tool's declared required_permissions honest rather than
+# gating every tool — reads and writes alike — behind a single flat bool.
+_READ_TOOLS = frozenset({"search_memory", "memory_stats"})
 
 
 def make_tool_handler():
@@ -31,7 +40,8 @@ def make_tool_handler():
         tools.memory_merge_into,
         tools.memory_stats,
     ]:
-        handler.register_tool(fn, always_on=True, min_permission=0)
+        perm = Permission.MEMORY_READ if fn.__name__ in _READ_TOOLS else Permission.MEMORY_WRITE
+        handler.register_tool(fn, always_on=True, required_permissions={perm})
     return handler
 
 
@@ -107,10 +117,18 @@ async def agent_loop(llm, system_prompt: str, user_prompt: str, handler, agent_l
     from TinyCTX.ai import TextDelta, ToolCallAssembled, LLMError
 
     class _InternalCaller:
-        permission_level = 25
+        """Synthetic caller for the librarian subagent — not a real user, so
+        it isn't resolved against PermissionsConfig.templates at all. Holds
+        exactly the two bools make_tool_handler()'s registrations ever
+        require (§ this module's docstring)."""
         username = "librarian"
 
-    tool_defs = handler.get_tool_definitions(caller_level=25)
+        def effective_permissions(self, permissions_config=None) -> frozenset[Permission]:
+            return frozenset({Permission.MEMORY_READ, Permission.MEMORY_WRITE})
+
+    # minimal_tokens defaults False, so `caller` isn't consulted here — this
+    # handler only ever holds the librarian's own dedicated toolset anyway.
+    tool_defs = handler.get_tool_definitions()
     messages: list[dict] = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},

@@ -5,34 +5,32 @@ System operation tools: user/permission management, plus the /model
 command and its set_active_model tool equivalent for switching the LLM
 used on a conversation branch.
 
-Tools registered (all always_on=False):
-  user_list           — list all users                       min_permission=50
-  user_info           — show one user's details               min_permission=50
-  user_modify_permissions — set a user's permission_level     min_permission=50
-  user_rename         — rename a TinyCTX username             min_permission=100
-  user_merge          — merge two users into one              min_permission=100
-  set_active_model    — override/clear the LLM for this branch  min_permission=75
-                        (see __init__.py's EXTENSION_META.default_config.model_min_permission)
+Tools registered (all always_on=False), gated per docs/PERMISSIONS-PLAN.md
+§10.1 at the ToolCallHandler seam (TinyCTX.permissions.Permission):
+  user_list                — list all users                    USER_READ
+  user_info                — show one user's details            USER_READ
+  user_modify_permissions  — set a user's permission template    ROOT
+  user_rename              — rename a TinyCTX username           ROOT
+  user_merge                — merge two users into one            ROOT
+  set_active_model          — override/clear the LLM for this branch  MODEL_SWAP
 
-Slash commands registered (via runtime.commands):
+Slash commands registered (via runtime.commands), gated at the
+CommandRegistry seam with the same bool:
   /model              — show the current effective model
   /model list         — list configured chat models
   /model clear        — clear the override
   /model <name>       — set the override
-  (same min_permission as set_active_model, enforced independently since
-  slash-command dispatch happens outside an AgentCycle — see
-  _resolve_model_caller below)
+  (MODEL_SWAP, same named bool as set_active_model — dispatch() checks it
+  centrally before _cmd_model ever runs; see docs/PERMISSIONS-PLAN.md §9)
 
-Permission rules enforced at call time (not just at registration):
-  - user_modify_permissions: caller can only promote to at most (their level - 1).
-  - user_modify_permissions: caller can only demote users whose current level is at most (their level - 1).
-  - user_rename / user_merge: caller must be level 100.
-  - set_active_model / /model: caller must be >= model_min_permission.
+There is no more numeric ceiling logic ("can only promote to at most your
+own level - 1"): ROOT is total (see permissions.py's docstring), and every
+tool/command above is gated by a bool the caller either holds or doesn't —
+by the time each function body below runs, the seam has already confirmed
+the caller holds what's required.
 
 The runtime's UserStore is captured once in register_runtime and shared
-across all cycles via a module-level reference. Tool closures read
-agent.permission_level at call time so the check reflects the actual
-caller, not a stale snapshot.
+across all cycles via a module-level reference.
 
 How the model override takes effect
 -------------------------------------
@@ -54,6 +52,8 @@ multi-writer nodes.
 from __future__ import annotations
 
 import logging
+
+from TinyCTX.permissions import Permission
 
 logger = logging.getLogger(__name__)
 
@@ -102,66 +102,6 @@ def _resolve_model_node_id(context: dict) -> str:
     return (context.get("node_id") or context.get("cursor") or "").strip()
 
 
-def _resolve_model_caller(runtime, node_id: str, context: dict | None = None):
-    """
-    Resolve the user who actually issued /model right now.
-
-    Preferred: an explicit caller identity supplied by the bridge in
-    `context` — either an already-resolved User object (context["caller"],
-    used by the gateway) or a platform/user_id pair (context["caller_platform"]
-    + context["caller_user_id"], used by Discord). Bridges that supply this
-    are giving us the true requester.
-
-    Fallback (legacy, unreliable): infer from node_id's session state
-    "author_id". This is whoever authored the *last message on the branch*,
-    not necessarily whoever just ran /model — a bridge that doesn't push a
-    node for the slash command itself (e.g. the gateway's
-    /v1/lane/command, which dispatches against the pre-existing cursor) will
-    silently attribute the command to the wrong person on any branch with
-    more than one participant. Only used if the bridge didn't supply an
-    explicit caller.
-    """
-    context = context or {}
-
-    caller = context.get("caller")
-    if caller is not None:
-        return caller
-
-    platform = context.get("caller_platform")
-    user_id = context.get("caller_user_id")
-    if platform and user_id:
-        try:
-            from TinyCTX.contracts import Platform
-            return runtime.users.get_by_platform(Platform(platform), str(user_id))
-        except Exception:
-            logger.debug(
-                "[sysops] failed to resolve /model caller via platform=%s user_id=%s",
-                platform, user_id, exc_info=True,
-            )
-            return None
-
-    if not node_id:
-        return None
-    logger.debug(
-        "[sysops] /model: no explicit caller in context for node %s — "
-        "falling back to last-speaker inference (may be wrong)", node_id,
-    )
-    state, _ = runtime.db.load_session_state(node_id)
-    # NOTE: session state's "author_id" is the TinyCTX username (see
-    # runtime.py's _compute_state_delta — mapping["author_id"] =
-    # msg.author.username), not the platform-native user_id. Look it up
-    # via get_user(), not get_by_platform() (which expects a platform user_id
-    # and would never match a username).
-    author_id = state.get("author_id")
-    if not author_id:
-        return None
-    try:
-        return runtime.users.get_user(author_id)
-    except Exception:
-        logger.debug("[sysops] failed to resolve /model caller for node %s", node_id, exc_info=True)
-        return None
-
-
 def _chat_model_names(config) -> list[str]:
     """Names of configured models usable as a primary/fallback LLM (excludes embedding models)."""
     return sorted(name for name, mc in config.models.items() if not mc.is_embedding)
@@ -193,33 +133,13 @@ def _model_list_text(db, config, node_id: str) -> str:
     return "\n".join(lines)
 
 
-def _model_min_permission(runtime) -> int:
-    try:
-        from TinyCTX.modules.sysops import EXTENSION_META
-        cfg: dict = EXTENSION_META.get("default_config", {})
-    except ImportError:
-        cfg = {}
-    if hasattr(runtime.config, "extra") and isinstance(runtime.config.extra, dict):
-        cfg = {**cfg, **runtime.config.extra.get("sysops", {})}
-    return int(cfg.get("model_min_permission", 75))
-
-
 def _register_model_command(runtime) -> None:
-    min_permission = _model_min_permission(runtime)
-
     async def _cmd_model(args: list[str], context: dict) -> None:
+        # Permission (MODEL_SWAP) was already checked by
+        # CommandRegistry.dispatch() before this handler ever ran — see the
+        # required_permissions= passed to register() below. This handler
+        # only needs the node_id to attach state to, no caller resolution.
         node_id = _resolve_model_node_id(context)
-        caller = _resolve_model_caller(runtime, node_id, context)
-        if caller is None:
-            await _model_reply(context, "⛔ Cannot resolve your identity for this conversation.")
-            return
-        if caller.permission_level < min_permission:
-            await _model_reply(
-                context,
-                f"⛔ /model requires permission level {min_permission} "
-                f"(yours is {caller.permission_level}).",
-            )
-            return
         if not node_id:
             await _model_reply(context, "⛔ No conversation to attach the override to.")
             return
@@ -253,10 +173,11 @@ def _register_model_command(runtime) -> None:
 
     runtime.commands.register(
         "model", "", _cmd_model,
-        help=f"Show/set/clear the LLM model for this conversation (permission {min_permission}+)",
+        help="Show/set/clear the LLM model for this conversation (requires model_swap)",
         params=[("model_name", str, "Model name, or 'list' / 'clear' — leave blank to show current")],
+        required_permissions={Permission.MODEL_SWAP},
     )
-    logger.info("[sysops] /model registered (min_permission=%d)", min_permission)
+    logger.info("[sysops] /model registered (required: model_swap)")
 
 
 def register_agent(agent) -> None:
@@ -265,10 +186,7 @@ def register_agent(agent) -> None:
         return
 
     users = _users
-    # Snapshot caller level once per cycle. The closure captures the *variable*
-    # not the value, but agent.permission_level is set before register_agent is
-    # called and never changes within a cycle, so this is safe.
-    caller_level = agent.caller.permission_level
+    permissions_config = agent.config.permissions
 
     # ------------------------------------------------------------------
     # user_list
@@ -282,8 +200,8 @@ def register_agent(agent) -> None:
                       Leave blank to show all users.
         """
         rows = users._conn.execute(
-            "SELECT username, permission_level, identities, created_at "
-            "FROM users ORDER BY permission_level DESC, username ASC"
+            "SELECT username, permission_template, identities, created_at "
+            "FROM users ORDER BY username ASC"
         ).fetchall()
 
         if not rows:
@@ -300,8 +218,9 @@ def register_agent(agent) -> None:
             ]
             if platform and not id_strs:
                 continue
+            template = row["permission_template"] or f"{permissions_config.default_template} (default)"
             lines.append(
-                f"{row['username']}  level={row['permission_level']}  "
+                f"{row['username']}  template={template}  "
                 + (", ".join(id_strs) if id_strs else "no identities")
             )
 
@@ -330,9 +249,12 @@ def register_agent(agent) -> None:
         ) or "  (none)"
         created = _time.strftime("%Y-%m-%d %H:%M UTC", _time.gmtime(user.created_at))
         meta = _json.dumps(user.meta, indent=2) if user.meta else "{}"
+        template = user.permission_template or f"{permissions_config.default_template} (default)"
+        effective = sorted(p.value for p in user.effective_permissions(permissions_config))
         return (
             f"username:    {user.username}\n"
-            f"level:       {user.permission_level}\n"
+            f"template:    {template}\n"
+            f"effective:   {', '.join(effective) or '(none)'}\n"
             f"created:     {created}\n"
             f"identities:\n{identities}\n"
             f"meta: {meta}"
@@ -342,74 +264,57 @@ def register_agent(agent) -> None:
     # user_modify_permissions
     # ------------------------------------------------------------------
 
-    def user_modify_permissions(username: str, level: int) -> str:
-        """Set a user's permission_level.
+    def user_modify_permissions(username: str, template: str) -> str:
+        """Set a user's named permission template.
 
-        Permission rules:
-          - You can only promote a user to at most (your level - 1).
-          - You can only demote users whose current level is at most (your level - 1).
-          - Level must be between 0 and 100.
+        Templates are configured centrally under permissions.templates in
+        config.yaml (see TinyCTX.config.PermissionsConfig). There is no
+        ceiling check — ROOT is total, so a ROOT holder may set any user,
+        including themselves, to any known template.
 
         Args:
             username: TinyCTX username to modify.
-            level:    New permission level (0-100).
+            template: Name of a template configured under permissions.templates.
         """
-        try:
-            level = int(level)
-        except (ValueError, TypeError):
-            return f"Error: level must be an integer, got {level!r}."
-        if not (0 <= level <= 100):
-            return f"Error: level must be 0-100, got {level}."
-        max_grantable = caller_level - 1
-        if level > max_grantable:
+        if template not in permissions_config.templates:
             return (
-                f"Error: cannot set level {level} — "
-                f"you may only grant up to level {max_grantable} (your level - 1)."
+                f"Error: unknown template {template!r}. "
+                f"Known templates: {sorted(permissions_config.templates)}"
             )
 
         user = users.get_user(username)
         if user is None:
             return f"User '{username}' not found."
 
-        if user.permission_level >= caller_level:
-            return (
-                f"Error: '{username}' has level {user.permission_level}, "
-                f"which is not below your level ({caller_level}). "
-                "You can only modify users at least 1 level below you."
-            )
-
-        old = user.permission_level
-        user.permission_level = level
+        old_template = user.permission_template or permissions_config.default_template
+        user.permission_template = template
         users.update_user(user)
         logger.info(
-            "[sysops] user_modify_permissions: '%s' level %d → %d (caller_level=%d)",
-            username, old, level, caller_level,
+            "[sysops] user_modify_permissions: '%s' template %r → %r (caller=%s)",
+            username, old_template, template, agent.caller.username,
         )
-        return f"'{username}': permission_level {old} → {level}."
+        return f"'{username}': {old_template} → {template}."
 
     # ------------------------------------------------------------------
     # user_rename
     # ------------------------------------------------------------------
 
     def user_rename(username: str, new_username: str) -> str:
-        """Rename a TinyCTX username. Requires caller level 100.
+        """Rename a TinyCTX username. Requires the root capability.
 
         Updates both the users table and the platform index atomically.
-        The user's identities, level, and meta are unchanged.
+        The user's identities, permission template, and meta are unchanged.
 
         Args:
             username:     Current TinyCTX username.
             new_username: New TinyCTX username (must not already be taken).
         """
-        if caller_level < 100:
-            return f"Error: user_rename requires level 100 (yours is {caller_level})."
-
         from TinyCTX.users import UsernameConflictError
         try:
             updated = users.rename_user(username, new_username)
             logger.info(
-                "[sysops] user_rename: '%s' → '%s' (caller_level=%d)",
-                username, updated.username, caller_level,
+                "[sysops] user_rename: '%s' → '%s' (caller=%s)",
+                username, updated.username, agent.caller.username,
             )
             return f"Renamed '{username}' → '{updated.username}'."
         except ValueError as exc:
@@ -423,7 +328,7 @@ def register_agent(agent) -> None:
 
     def user_merge(primary_username: str, secondary_username: str) -> str:
         """Merge two users: move all platform identities from secondary into primary,
-        then delete the secondary user. Requires caller level 100.
+        then delete the secondary user. Requires the root capability.
 
         Use this when the same human has two separate TinyCTX user records
         (e.g. created separately on Discord and Matrix before being linked).
@@ -433,15 +338,12 @@ def register_agent(agent) -> None:
             primary_username:   The user to keep. Receives all identities.
             secondary_username: The user to delete after merging.
         """
-        if caller_level < 100:
-            return f"Error: user_merge requires level 100 (yours is {caller_level})."
-
         try:
             merged = users.merge_users(primary_username, secondary_username)
             id_count = len(merged.identities)
             logger.info(
-                "[sysops] user_merge: '%s' absorbed '%s', now %d identities (caller_level=%d)",
-                primary_username, secondary_username, id_count, caller_level,
+                "[sysops] user_merge: '%s' absorbed '%s', now %d identities (caller=%s)",
+                primary_username, secondary_username, id_count, agent.caller.username,
             )
             return (
                 f"Merged '{secondary_username}' into '{primary_username}'. "
@@ -453,8 +355,6 @@ def register_agent(agent) -> None:
     # ------------------------------------------------------------------
     # set_active_model — agent-callable equivalent of /model
     # ------------------------------------------------------------------
-
-    model_min_permission = _model_min_permission(_runtime) if _runtime is not None else 75
 
     def set_active_model(name: str) -> str:
         """Set (or clear) the LLM model override for this conversation branch.
@@ -469,13 +369,10 @@ def register_agent(agent) -> None:
         Args:
             name: Model name from config.yaml's models: block, or "" / "default" to clear.
         """
-        if caller_level < model_min_permission:
-            return f"Error: set_active_model requires level {model_min_permission} (yours is {caller_level})."
-
         default = agent.config.llm.primary
         if name in ("", "default"):
             agent.db.set_state(agent.context.tail_node_id, "model", "")
-            logger.info("[sysops] set_active_model: cleared (caller_level=%d)", caller_level)
+            logger.info("[sysops] set_active_model: cleared (caller=%s)", agent.caller.username)
             return f"Model override cleared — back to default ({default})."
 
         valid = _chat_model_names(agent.config)
@@ -483,22 +380,22 @@ def register_agent(agent) -> None:
             return f"Error: unknown model '{name}'. Available: {', '.join(valid) or '(none configured)'}"
 
         agent.db.set_state(agent.context.tail_node_id, "model", name)
-        logger.info("[sysops] set_active_model: '%s' (caller_level=%d)", name, caller_level)
+        logger.info("[sysops] set_active_model: '%s' (caller=%s)", name, agent.caller.username)
         return f"Model override set: {name}"
 
     # ------------------------------------------------------------------
     # Register
     # ------------------------------------------------------------------
 
-    agent.tool_handler.register_tool(user_list,   always_on=False, min_permission=50)
-    agent.tool_handler.register_tool(user_info,   always_on=False, min_permission=50)
-    agent.tool_handler.register_tool(user_modify_permissions, always_on=False, min_permission=50)
-    agent.tool_handler.register_tool(user_rename, always_on=False, min_permission=100)
-    agent.tool_handler.register_tool(user_merge,  always_on=False, min_permission=100)
-    agent.tool_handler.register_tool(set_active_model, always_on=False, min_permission=model_min_permission)
+    agent.tool_handler.register_tool(user_list,   always_on=False, required_permissions={Permission.USER_READ})
+    agent.tool_handler.register_tool(user_info,   always_on=False, required_permissions={Permission.USER_READ})
+    agent.tool_handler.register_tool(user_modify_permissions, always_on=False, required_permissions={Permission.ROOT})
+    agent.tool_handler.register_tool(user_rename, always_on=False, required_permissions={Permission.ROOT})
+    agent.tool_handler.register_tool(user_merge,  always_on=False, required_permissions={Permission.ROOT})
+    agent.tool_handler.register_tool(set_active_model, always_on=False, required_permissions={Permission.MODEL_SWAP})
 
     logger.debug(
-        "[sysops] registered 6 tools for caller=%s level=%d",
-        agent.caller.username, caller_level,
+        "[sysops] registered 6 tools for caller=%s",
+        agent.caller.username,
     )
 

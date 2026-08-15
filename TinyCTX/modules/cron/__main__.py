@@ -15,10 +15,12 @@ synthetic runner identity) had:
   2. Hardcoded permission: v1 ran every job as one synthetic "cron-system"
      user, so permission-gated tools were either open to all cron jobs or
      none. Jobs now store the *real* creating user's username, and at run
-     time the job executes with that user's *current* permission_level
-     (re-resolved via UserStore.get_user, not cached) — a promotion or
-     demotion since the job was created takes effect on the job's very
-     next run. The agent-facing tools never mention this: the agent isn't
+     time the job executes with that user's *current* effective_permissions()
+     (re-resolved via UserStore.get_user, not cached) — a grant or revocation
+     since the job was created takes effect on the job's very next run, and
+     tool calls made inside a firing job are checked against the creator's
+     current permissions by the normal ToolCallHandler seam, same as any
+     live turn. The agent-facing tools never mention this: the agent isn't
      "running the job as itself" in any permission sense — see add_cron's
      docstring, which is written entirely from the agent's point of view
      (schedule things, reminders/recurring checks, message goes to itself).
@@ -55,9 +57,9 @@ add_cron recovers "what channel is this turn happening in" without
 importing any bridge module. list_cron only returns jobs whose cursor_key
 matches the caller's current channel; remove_cron only acts on a job in
 the caller's channel, and additionally requires either being the job's
-creator or having permission_level >= admin_override_permission (config,
-default 90) — so Alice cannot see or delete Bob's job in Bob's channel, and
-a same-channel non-admin cannot delete another user's job either.
+creator or holding Permission.CRON_ADMIN (docs/PERMISSIONS-PLAN.md §8) —
+so Alice cannot see or delete Bob's job in Bob's channel, and a
+same-channel non-admin cannot delete another user's job either.
 
 Convention: register_agent(agent) — no imports from gateway or bridges
 (delivery goes through Runtime.deliver, which is bridge-agnostic).
@@ -79,6 +81,7 @@ from TinyCTX.contracts import (
     InboundMessage, SessionEnvironment, ContentType,
     Platform,
 )
+from TinyCTX.permissions import Permission
 
 logger = logging.getLogger(__name__)
 
@@ -367,11 +370,10 @@ class _CronRunner:
     Watches CronStore and triggers turns via the Runtime, delivering each
     job's output back to its origin channel via Runtime.deliver().
     """
-    def __init__(self, runtime, store: CronStore, min_run_permission: int,
+    def __init__(self, runtime, store: CronStore,
                  poll_seconds: float = 20.0) -> None:
         self.runtime = runtime
         self._store = store
-        self._min_run_permission = min_run_permission
         self._poll_seconds = max(1.0, float(poll_seconds))
         self._jobs: list[CronJob] = []
         self._timer_task: asyncio.Task | None = None
@@ -521,9 +523,11 @@ class _CronRunner:
     async def _run_job(self, job: CronJob) -> None:
         start_ms = _now_ms()
 
-        # 1. Re-resolve the job's *current* permission level from the real
-        # creator's user record — not a cached/synthetic value. A demotion
-        # since the job was created takes effect on this run.
+        # 1. Re-resolve the job's *current* permissions from the real
+        # creator's user record — not a cached/synthetic value. A grant or
+        # revocation since the job was created takes effect on this run
+        # (docs/PERMISSIONS-PLAN.md §8: a demoted creator's job is skipped
+        # wholesale, not partially executed).
         creator = self.runtime.users.get_user(job.creator_username)
         if creator is None:
             job.state.last_status = "error"
@@ -534,16 +538,15 @@ class _CronRunner:
             logger.warning("[cron] job '%s' skipped — creator user missing", job.id)
             return
 
-        if creator.permission_level < self._min_run_permission:
+        if not creator.has_permission(Permission.CRON_CREATE, self.runtime.config.permissions):
             job.state.last_status = "skipped"
             job.state.last_error = (
-                f"creator '{creator.username}' permission_level "
-                f"{creator.permission_level} < required {self._min_run_permission}"
+                f"creator '{creator.username}' no longer holds cron_create"
             )
             job.state.last_run_at_ms = start_ms
             job.state.next_run_at_ms = _compute_next_run(job.schedule, _now_ms())
             await asyncio.to_thread(self._store.save_state, job)
-            logger.info("[cron] job '%s' skipped — creator permission too low", job.id)
+            logger.info("[cron] job '%s' skipped — creator lacks cron_create", job.id)
             return
 
         logger.info("[cron] running job '%s' (creator=%s, run_in=%s, reset=%s)",
@@ -580,8 +583,8 @@ class _CronRunner:
             parent_id = self.runtime.db.get_root().id
 
         # 3. Prepare the turn — runs as the real creator, so permission-gated
-        # tools see this job's actual current permission_level, not a fixed
-        # system identity's.
+        # tools see this job's actual current effective_permissions(), not a
+        # fixed system identity's.
         #
         # job.message is wrapped, not sent verbatim, and suppress_attribution
         # is set so this ONE node gets no 【label】: prefix — not the whole
@@ -593,7 +596,7 @@ class _CronRunner:
         # NO_ATTRIBUTION_SENTINEL for how Runtime.push() and Context.assemble()
         # implement this per-node, not per-Context — author=creator below is
         # completely unaffected by suppress_attribution and still drives
-        # caller.permission_level normally.
+        # caller.effective_permissions() normally.
         #
         # Two complementary fixes for one root cause: without
         # suppress_attribution, the LLM would see what looks exactly like the
@@ -719,9 +722,8 @@ def register_runtime(runtime) -> None:
     store = CronStore(data_path / store_file)
     _STORE_CACHE = store
 
-    min_run_permission = int(cfg.get("min_run_permission", 0))
     poll_seconds = float(cfg.get("poll_seconds", 20))
-    runner = _CronRunner(runtime, store, min_run_permission, poll_seconds)
+    runner = _CronRunner(runtime, store, poll_seconds)
     runner.start()
     _RUNNER_CACHE = runner
 
@@ -738,10 +740,6 @@ def register_agent(agent) -> None:
     if store is None or runner is None:
         logger.error("[cron] register_agent called before register_runtime — cron tools unavailable this turn")
         return
-
-    cfg = _get_config()
-    min_create_permission = int(cfg.get("min_create_permission", 25))
-    admin_override_permission = int(cfg.get("admin_override_permission", 90))
 
     def _current_channel() -> tuple[str, str] | None:
         """
@@ -840,14 +838,12 @@ def register_agent(agent) -> None:
             reset_after_run: Only meaningful with run_in="isolated" — wipes that private scratch conversation after each run. No effect in the default "main" mode.
             run_in: "main" (default) to fire into this conversation, or "isolated" for a private one-off scratch conversation. Leave as "main" unless you have a specific reason not to.
         """
+        # Permission (CRON_CREATE) was already checked by
+        # ToolCallHandler.execute_tool_call before this function ever ran —
+        # see the required_permissions= passed to register_tool() below.
         caller = agent.caller
         if caller is None:
             return json.dumps({"status": "error", "error": "Cannot resolve your identity."})
-        if caller.permission_level < min_create_permission:
-            return json.dumps({
-                "status": "error",
-                "error": f"permission_level {caller.permission_level} < required {min_create_permission} to create cron jobs.",
-            })
 
         channel = _current_channel()
         if channel is None:
@@ -977,12 +973,20 @@ def register_agent(agent) -> None:
             # that a job with this id exists in a different channel.
             return json.dumps({"status": "error", "error": f"No such job '{job_id}'."})
 
+        # Not statically decidable at the required_permissions seam: whether
+        # CRON_ADMIN is needed depends on whether job_id belongs to the
+        # caller, which requires a store lookup + comparing to caller
+        # identity — neither available to a required_permissions callable
+        # (it only ever sees the call's own coerced kwargs, docs/
+        # PERMISSIONS-PLAN.md §3). So remove_cron is registered ungated at
+        # the seam, and this ownership/CRON_ADMIN check happens here instead
+        # (§10.1: "CRON_ADMIN for others' jobs, ungated for own").
         is_creator = job.creator_username == caller.username
-        is_admin = caller.permission_level >= admin_override_permission
+        is_admin = caller.has_permission(Permission.CRON_ADMIN, agent.config.permissions)
         if not (is_creator or is_admin):
             return json.dumps({
                 "status": "error",
-                "error": "Only the job's creator, or a channel admin, may remove it.",
+                "error": "Only the job's creator, or someone holding cron_admin, may remove it.",
             })
 
         store.delete(job_id)
@@ -996,6 +1000,8 @@ def register_agent(agent) -> None:
         logger.info("[cron] job '%s' removed by %s (creator=%s)", job_id, caller.username, job.creator_username)
         return json.dumps({"status": "ok"})
 
-    agent.tool_handler.register_tool(add_cron, min_permission=min_create_permission)
-    agent.tool_handler.register_tool(list_cron, always_on=True, min_permission=0)
-    agent.tool_handler.register_tool(remove_cron, min_permission=0)
+    agent.tool_handler.register_tool(add_cron, required_permissions={Permission.CRON_CREATE})
+    agent.tool_handler.register_tool(list_cron, always_on=True, required_permissions=None)
+    # remove_cron: ungated at the seam — see the ownership/CRON_ADMIN check
+    # inside the function body above for why.
+    agent.tool_handler.register_tool(remove_cron, required_permissions=None)

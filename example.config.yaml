@@ -7,9 +7,6 @@ command_introspection: false
 concurrency:
   roster_priority: 13
 cron:
-  admin_override_permission: 90
-  min_create_permission: 25
-  min_run_permission: 0
   store_file: cron.db
 ctx_tools:
   cot_keep_recent_turns: 10000
@@ -31,7 +28,6 @@ equipment_manifest:
   em_path: ''
   enabled: true
   prompt_priority: 5
-  trusted_threshold: 90
 error_introspection: false
 filesystem:
   cache_size: 128
@@ -130,6 +126,12 @@ models:
 parallel: 3
 permissions:
   minimal_tokens: false
+  default_template: guest
+  # templates: not shown here — omitting this key gets the four built-in
+  # templates (guest/member/trusted/operator) documented in
+  # TinyCTX/config/__main__.py's _BUILTIN_TEMPLATES and
+  # docs/PERMISSIONS-PLAN.md §2. Set this key to override one or more by
+  # name; unnamed templates keep their built-in definition.
 rag:
   auto_inject_priority: 25
   auto_inject_semantic: true
@@ -153,14 +155,6 @@ router:
 shell:
   default_timeout: 120
   max_timeout: 1200
-  min_permission: 30
-  permissions:
-    access_backend: 80
-  policies:
-  - applies_below: 45
-    policy: builtin:allow
-  - applies_below: 90
-    policy: builtin:deny
   sandbox_url: null
 skills:
   dropped_footer_priority: 50
@@ -170,8 +164,6 @@ skills:
   skill_dirs:
   - skills
   tools: {}
-sysops:
-  model_min_permission: 75
 system_prompt:
   agents:
     file: AGENTS.md
