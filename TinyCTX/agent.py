@@ -167,6 +167,18 @@ class AgentCycle:
         }
 
         max_cycles = self.config.max_tool_cycles
+        # A completion that returns neither text nor a tool call is always a
+        # malfunction, not a deliberate silence — the sanctioned way to say
+        # nothing is the NO_REPLY_TOKEN, which is non-empty. It usually means
+        # the model spent the whole completion in its reasoning channel and
+        # stopped without ever opening the content channel, so response_text
+        # comes back "" and the turn ends with an empty AgentTextFinal: the
+        # caller sees silence, with nothing logged as an error. Resend rather
+        # than let that through — a fresh sample almost always produces real
+        # content.
+        max_empty_retries = int(getattr(self.config, "max_empty_retries", 2))
+        empty_retries = 0
+
         final_text = ""
         streaming_active = False
         no_reply = False
@@ -198,12 +210,14 @@ class AgentCycle:
 
             # Inference with Fallback logic
             text_chunks, tool_calls_list, error = [], [], None
+            thinking_len = 0
             async for _ev in self._stream_inference(messages, tools, model_chain, abort_event, meta):
                 if isinstance(_ev, tuple):
                     # sentinel: (_chunks, _calls, _error)
                     text_chunks, tool_calls_list, error = _ev
                 elif isinstance(_ev, AgentThinkingChunk):
                     # logger.debug("[agent] thinking chunk (%d chars)", len(_ev.text))
+                    thinking_len += len(_ev.text)
                     yield AgentThinkingChunk(text=_ev.text, **meta)
                 elif isinstance(_ev, AgentTextChunk):
                     # logger.debug("[agent] text chunk (%d chars)", len(_ev.text))
@@ -217,8 +231,40 @@ class AgentCycle:
                 yield AgentError(message=f"[LLM error: {error}]", **meta)
                 return
 
-            # Record Assistant response in Context
             response_text = "".join(text_chunks)
+
+            # Empty completion (no content, no tool call) — resend.
+            #
+            # Deliberately BEFORE context.add(): an empty assistant node must
+            # not be written, or the retry re-assembles a history containing a
+            # blank assistant turn, which makes another blank one likelier and
+            # leaves a dead node in the tree for every attempt. Retries also
+            # don't advance cycle_num — this consumed no tool cycle — so the
+            # bound on total inferences is max_cycles * (1 + max_empty_retries),
+            # and empty_retries resets after any non-empty completion.
+            if not tool_calls_list and not response_text.strip():
+                if empty_retries < max_empty_retries:
+                    empty_retries += 1
+                    logger.warning(
+                        "[agent] empty completion (thinking=%d chars, no text, no tool calls) "
+                        "— resending, attempt %d/%d",
+                        thinking_len, empty_retries, max_empty_retries,
+                    )
+                    continue
+
+                logger.error(
+                    "[agent] model produced no output after %d attempts "
+                    "(last had %d chars of thinking) — giving up",
+                    max_empty_retries + 1, thinking_len,
+                )
+                self._record_error_introspection("[no output from model]")
+                meta["tail_node_id"] = self.context.tail_node_id
+                yield AgentError(message="[no output from model]", **meta)
+                return
+
+            empty_retries = 0
+
+            # Record Assistant response in Context
             self.context.add(HistoryEntry.assistant(
                 content=response_text,
                 tool_calls=tool_calls_list or None,
