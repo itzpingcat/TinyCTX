@@ -98,6 +98,29 @@ commands:
     permissions: []
     known_flags: ["-s", "-w", "-f", "-t"]
 
+  # Introspection commands — report on the environment/process/machine
+  # rather than doing pure computation on their arguments. Kept separate
+  # from pure-compute since they're reads OF the system, not context-free
+  # transforms, even though none needs a permission bool today. Each has
+  # its own entry (not a shared known_flags list) for the same reason
+  # date/seq are split above: e.g. -a means "all" for uname but nothing
+  # for whoami/pwd, and sharing one list would falsely register it as
+  # known everywhere.
+  - id: whoami
+    name: whoami
+    permissions: []
+    known_flags: []
+
+  - id: pwd
+    name: pwd
+    permissions: []
+    known_flags: ["-L", "-P"]
+
+  - id: uname
+    name: uname
+    permissions: []
+    known_flags: ["-a", "-s", "-n", "-r", "-v", "-m", "-p", "-i", "-o"]
+
   - id: file-read-cmds
     name: [ls, find, stat, file, du, df, tree, readlink, realpath]
     permissions: [file_read]
@@ -224,6 +247,29 @@ commands:
       - "-g"
       - "-d"
       - "-D"
+
+  - id: zip-cmds
+    name: [zip, unzip]
+    # Both directions read the source and write the archive/extracted files —
+    # zip reads the files it's compressing and writes the archive; unzip
+    # reads the archive and writes the extracted files. Not split by
+    # direction (unlike scp/rsync) since both permissions apply either way.
+    permissions: [file_read, file_write]
+    known_flags:
+      - "-r"
+      - "-v"
+      - "-q"
+      - "-j"
+      - "-x"
+      - "-d"
+      - "-o"
+      - "-n"
+      - "-l"
+      - "-t"
+      - "-p"
+      - "-9"
+      - "-1"
+      - "-6"
 
   - id: network-read-cmds
     name: [ping, dig, nslookup, host, http, httpie]
