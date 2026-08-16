@@ -703,5 +703,5 @@ def register_agent(agent) -> None:
     agent.tool_handler.register_tool(view,        always_on=True, required_permissions={Permission.FILE_READ})
     agent.tool_handler.register_tool(write_file,  always_on=True, required_permissions={Permission.FILE_WRITE})
     agent.tool_handler.register_tool(edit_file,   always_on=True, required_permissions={Permission.FILE_READ, Permission.FILE_WRITE})
-    agent.tool_handler.register_tool(grep,        always_on=True, required_permissions={Permission.FILE_READ})
-    agent.tool_handler.register_tool(glob_search, always_on=True, required_permissions={Permission.FILE_READ})
+    agent.tool_handler.register_tool(grep,        always_on=False, required_permissions={Permission.FILE_READ})
+    agent.tool_handler.register_tool(glob_search, always_on=False, required_permissions={Permission.FILE_READ})
