@@ -16,35 +16,38 @@ Execution modes:
     for bare-metal installs. Linux only — PowerShell support was removed with
     the container refactor.
 
-Two independent checks run before any dispatch, in both modes. The sandbox
-itself runs whatever it receives — it trusts the agent.
+One gate runs before any dispatch, in both modes. The sandbox itself runs
+whatever it receives — it trusts the agent.
 
-  1. CAPABILITY — "is this caller permitted to do this at all". Per-command
-     tagging, compiled from modules/shell/perms.yaml by perms.py, classifies
-     each resolved command into the TinyCTX.permissions.Permission bools it
-     needs (FILE_WRITE, NETWORK_WRITE, UNTRUSTED_EXEC, ...); shell's
-     `required_permissions` callable (registered below) is checked once,
-     centrally, by tool_handling.handler.ToolCallHandler — same seam every
-     other tool uses. See docs/PERMISSIONS-PLAN.md §5.
+  CAPABILITY — "is this caller permitted to do this at all", including
+  whether the invocation is even syntactically safe to run. Per-command
+  tagging, compiled from modules/shell/perms.yaml by perms.py, classifies
+  each resolved command into the TinyCTX.permissions.Permission bools it
+  needs (FILE_WRITE, NETWORK_WRITE, UNTRUSTED_EXEC, ...); shell's
+  `required_permissions` callable (registered below) is checked once,
+  centrally, by tool_handling.handler.ToolCallHandler — same seam every
+  other tool uses. See docs/PERMISSIONS-PLAN.md §5.
 
-  2. SHAPE — "is this invocation syntactically safe, independent of who's
-     asking". `_dispatch` below still runs validate.check() against a
-     single always-applied policy built from allow.yaml's `constructs` map,
-     which is what makes injection structurally impossible (see
-     validate.py's module docstring) — the `constructs` allow-map rejects
-     `$()`, unquoted globs used as commands, and control-flow constructs a
-     tree-sitter-bash grammar upgrade might introduce, BEFORE any command
-     is even classified. This is a different, complementary concern from
-     capability checking (§5.2) — retired is the old per-command
-     allow/deny RULE matching that used to stand in for capability
-     declarations (`applies_below` tier selection); retained is the
-     construct/shape check underneath it.
+  Construct/shape denial — unmapped bash syntax, `$()`, backgrounding, or
+  anything else allow.yaml's `constructs` map doesn't mark "allow" — is
+  folded into that same classification instead of living as a second check
+  run after the fact: any denied construct anywhere in the parsed tree
+  requires Permission.UNTRUSTED_EXEC, same as an unrecognized command or an
+  unaccounted flag. A caller who holds UNTRUSTED_EXEC is trusted to run
+  syntax that can't be statically verified safe; a caller who doesn't gets
+  the same "[PERMISSION DENIED] missing: UNTRUSTED_EXEC" every other
+  worst-cased command produces. See perms.py's module docstring and
+  required_permissions_for_shell(). `_dispatch` below still parses the
+  command once more, but only for runtime diagnostics that were never
+  permission decisions in the first place — empty command, over the byte
+  limit, unparseable syntax — not for construct denial, which never reaches
+  this function for a caller who was already turned away by ToolCallHandler.
 
-Command policy — both checks — is AST-based: the command is parsed with
-tree-sitter-bash and each resolved command in it is checked separately (see
-validate.py). This replaced substring-glob blacklist.txt / whitelist.txt
-files, which could not tell a command from a quoted argument that happened
-to contain the same text.
+Command policy is AST-based: the command is parsed with tree-sitter-bash and
+each resolved command in it is checked separately (see validate.py). This
+replaced substring-glob blacklist.txt / whitelist.txt files, which could not
+tell a command from a quoted argument that happened to contain the same
+text.
 
 `backend_access=True` no longer compares against a scalar level — it adds
 Permission.BACKEND_EXEC to what the classifier requires (perms.py), enforced
@@ -221,18 +224,32 @@ def register_agent(agent) -> None:
         logger.error("shell: shape policy failed to load — all commands blocked: %s", exc)
 
     def _dispatch(command: str, local: bool = False, call_timeout: int | None = None) -> str:
-        """Shared pipeline: shape-validate, then dispatch. Capability
-        checking already happened before this function is ever reached — see
-        the required_permissions=shell_perms.required_permissions_for_shell
-        registration below, enforced by ToolCallHandler."""
+        """Shared pipeline: validate, then dispatch. Capability checking —
+        INCLUDING construct/shape denial, folded into
+        shell_perms.required_permissions_for_shell (see that module's
+        docstring) — already happened before this function is ever reached,
+        enforced once by ToolCallHandler. There is no second gate here: this
+        call to validate.check() only surfaces runtime diagnostics that
+        aren't permission decisions (empty command, over the byte limit,
+        unparseable syntax) — its construct check is dead weight against a
+        command that already cleared ToolCallHandler and would only ever
+        re-deny what UNTRUSTED_EXEC already covered, so it isn't consulted
+        here."""
         if policy_error is not None:
             return f"Blocked: shell policy could not be loaded — {policy_error}"
 
-        verdict = validate.check(command, shape_policy, workspace)
-        if not verdict.allowed:
-            logger.warning("shell: blocked by shape check — %s", verdict.reason)
-            return f"Blocked: {verdict.reason}."
-        prefix = "\n".join(dict.fromkeys(verdict.warnings)) + "\n" if verdict.warnings else ""
+        if not command.strip():
+            return "Blocked: empty command."
+        source = command.encode("utf-8", errors="surrogateescape")
+        if len(source) > shape_policy.max_command_bytes:
+            return (
+                f"Blocked: command is {len(source)} bytes, over the "
+                f"{shape_policy.max_command_bytes}-byte limit."
+            )
+        root = validate._get_parser().parse(source).root_node
+        if root.has_error:
+            return "Blocked: could not be parsed as bash (syntax error)."
+        prefix = ""
 
         effective_timeout = min(call_timeout, max_timeout) if call_timeout is not None else default_timeout
         if local or not sandbox_url:

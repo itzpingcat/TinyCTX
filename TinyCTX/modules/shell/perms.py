@@ -7,10 +7,15 @@ from perms.yaml (this module compiles and interprets it), checked once by
 tool_handling.handler.ToolCallHandler via required_permissions, instead of
 from a per-level allow/deny rule set.
 
-validate.py's construct/shape checking is UNCHANGED and still runs inside
-__main__.py's `_dispatch` — it is what makes injection structurally
-impossible (see validate.py's module docstring), which is a different,
-complementary concern from "is this capability permitted at all" (§5.2).
+validate.py's construct/shape checking is folded into classification here:
+a denied construct (unmapped bash syntax, `$()`, backgrounding, ...) adds
+Permission.UNTRUSTED_EXEC to what the command requires, the same as an
+unrecognized command or an unaccounted flag. There is one gate, checked once
+by tool_handling.handler.ToolCallHandler — a caller who holds UNTRUSTED_EXEC
+is trusted to run syntax that can't be statically verified safe; a caller who
+doesn't gets the same "[PERMISSION DENIED] missing: UNTRUSTED_EXEC" message
+every other worst-cased command produces, instead of a separate, differently
+worded hard stop from a second check after the fact.
 
 The classification table itself lives in perms.yaml (data), not in this
 module (code) — see that file's header for the schema and
@@ -52,8 +57,8 @@ import yaml
 
 from TinyCTX.permissions import Permission
 
-from .policy import PolicyError
-from .validate import Command, _extract, _get_parser
+from .policy import ALLOW_PATH, Policy, PolicyError, load_policy
+from .validate import Command, _extract, _first_denied_construct, _get_parser
 
 logger = logging.getLogger(__name__)
 
@@ -330,6 +335,21 @@ except PolicyError as exc:
     _load_error = str(exc)
     logger.error("shell: perms.yaml failed to load — every command will require ROOT: %s", exc)
 
+# Shape policy, for construct/background-token checking only — see
+# classify()'s and required_permissions_for_shell()'s docstrings. Only the
+# `constructs` map is consumed, which doesn't vary by workspace (unlike the
+# `rules` this same file can carry), so a fixed sentinel workspace is loaded
+# once at import time rather than per-call. Same fail-closed posture as
+# _table: a broken/missing allow.yaml worst-cases every command to ROOT
+# rather than silently skipping the shape check.
+_shape_policy: Policy | None = None
+
+try:
+    _shape_policy = load_policy(ALLOW_PATH, "__perms_shape_check__")
+except PolicyError as exc:
+    _load_error = _load_error or str(exc)
+    logger.error("shell: shape policy failed to load — every command will require ROOT: %s", exc)
+
 
 # ---------------------------------------------------------------------------
 # Parsing helper — mirrors validate.check()'s parse step (encode + parse +
@@ -461,9 +481,16 @@ def required_permissions_for_shell(
     command: str, timeout: int | None = None, backend_access: bool = False, **_ignored,
 ) -> set[Permission]:
     """The `required_permissions` classifier registered for the `shell`
-    tool. Consumes the exact Command objects validate._extract already
-    produces — no new parsing beyond what shell() itself will reparse via
-    check() a moment later for construct/shape validation (§5.2)."""
+    tool — the single gate, checked once by ToolCallHandler before shell()
+    ever runs. Consumes the exact Command objects validate._extract already
+    produces — no separate re-check afterward.
+
+    Construct/shape denial (unmapped bash syntax, `$()`, backgrounding, ...)
+    is folded in here rather than left as a second pass: any denied
+    construct anywhere in the parsed tree adds UNTRUSTED_EXEC, the same as
+    an unrecognized command or an unaccounted flag. It's evaluated once for
+    the whole tree (not per-Command) because a construct like `$()` isn't
+    attached to any single resolved command."""
     if _load_error is not None:
         return {Permission.ROOT}
 
@@ -471,11 +498,15 @@ def required_permissions_for_shell(
     if root is None:
         # Unparseable/empty — can't classify at all, so worst-case it. The
         # friendlier "could not be parsed as bash" message still surfaces
-        # from validate.check() inside __main__.py's _dispatch, for callers
-        # who DO hold UNTRUSTED_EXEC and reach that far.
+        # from __main__.py's _dispatch (its own parse, for diagnostics only),
+        # for callers who DO hold UNTRUSTED_EXEC and reach that far.
         return {Permission.UNTRUSTED_EXEC}
-    commands = _extract(root)
+
     needed: set[Permission] = set()
+    if _first_denied_construct(root, _shape_policy) is not None:
+        needed.add(Permission.UNTRUSTED_EXEC)
+
+    commands = _extract(root)
     for cmd in commands:
         needed |= classify(cmd)
     if backend_access:

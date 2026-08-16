@@ -2,26 +2,29 @@
 tests/test_shell.py
 
 End-to-end tests for modules/shell — the registered `shell` tool, through
-ToolCallHandler.execute_tool_call, covering the two-layer model
+ToolCallHandler.execute_tool_call, covering the single-gate model
 docs/PERMISSIONS-PLAN.md §5/§5.2 replaced the old applies_below tiers with:
 
-  1. CAPABILITY — modules/shell/perms.py classifies each resolved command
-     into the Permission bools it needs; shell's required_permissions
-     callable (required_permissions_for_shell) is checked once, centrally,
-     by ToolCallHandler.execute_tool_call, exactly like every other tool.
-     Per-command tag-table coverage lives in tests/test_shell_perms.py —
-     this file exercises the seam end to end (a caller without the right
-     capability gets denied before shell() ever runs), not the table itself.
+  CAPABILITY — modules/shell/perms.py classifies each resolved command into
+  the Permission bools it needs; shell's required_permissions callable
+  (required_permissions_for_shell) is checked once, centrally, by
+  ToolCallHandler.execute_tool_call, exactly like every other tool.
+  Per-command tag-table coverage lives in tests/test_shell_perms.py — this
+  file exercises the seam end to end (a caller without the right capability
+  gets denied before shell() ever runs), not the table itself.
 
-  2. SHAPE — modules/shell/__main__.py still builds a single always-applied
-     "shape-only" Policy (default_action="allow", rules=(), constructs from
-     builtin:allow) and runs validate.check() against it inside _dispatch.
-     This is what makes injection structurally impossible (`$()`, unquoted
-     globs used as a command, unrecognized bash syntax) — independent of who
-     is calling. Rule-level behaviour of the real shipped policy files lives
-     in tests/test_shell_policy.py; this file uses throwaway constructs-only
-     policy text so shape-check plumbing is tested independently of rule
-     content drifting over time.
+  Construct/shape denial is folded into that same classification: a denied
+  construct (`$()`, unquoted globs used as a command, unrecognized bash
+  syntax) requires Permission.UNTRUSTED_EXEC, the same as an unrecognized
+  command. There is no second check after ToolCallHandler — a caller without
+  UNTRUSTED_EXEC gets PERMISSION DENIED before shell() ever runs, same as any
+  other worst-cased command; a caller who holds it may actually run the
+  construct. modules/shell/__main__.py's _dispatch only re-parses for
+  runtime diagnostics that were never permission decisions (empty command,
+  over the byte limit, unparseable syntax). Rule-level behaviour of the real
+  shipped policy files lives in tests/test_shell_policy.py; this file uses
+  throwaway constructs-only policy text so shape-check plumbing is tested
+  independently of rule content drifting over time.
 
 Also covers: fail-closed behaviour when the shape policy won't load, and the
 backend_access -> BACKEND_EXEC location-permission wiring (§5, "backend_access
@@ -223,22 +226,24 @@ class TestBackendAccess:
 
     @pytest.mark.asyncio
     async def test_backend_access_still_shape_checked(self, tmp_path):
-        """Holding BACKEND_EXEC does not bypass the shape check — the two
-        layers are independent (§5.2)."""
+        """Holding BACKEND_EXEC does not also grant UNTRUSTED_EXEC — a
+        construct denial (command substitution) is still enforced, now via
+        the same capability gate as everything else, not a separate check."""
         agent = _register(
             tmp_path,
-            granted_permissions=frozenset(Permission),
+            granted_permissions={Permission.BACKEND_EXEC},
             extra_shell={},
         )
-        # Force a shape violation regardless of backend_access: command
-        # substitution is rejected structurally.
+        # Command substitution requires UNTRUSTED_EXEC, which this caller
+        # doesn't hold — denied before shell() ever runs.
         result = await _call(agent, command="echo $(id)", backend_access=True)
-        assert result["success"] is True  # tool itself ran, returned a Blocked: string
-        assert "Blocked" in result["result"]
+        assert result["success"] is False
+        assert "PERMISSION DENIED" in result["error"]
 
 
 # ---------------------------------------------------------------------------
-# Shape checking — the single always-applied constructs policy
+# Shape checking — construct denial folded into required_permissions_for_shell
+# as an UNTRUSTED_EXEC requirement (§5.2), not a separate post-capability gate.
 # ---------------------------------------------------------------------------
 
 class TestShapeChecking:
@@ -256,13 +261,25 @@ class TestShapeChecking:
         assert "Blocked" not in result["result"]
 
     @pytest.mark.asyncio
-    async def test_command_substitution_is_shape_rejected(self, tmp_path):
-        """$() is rejected structurally regardless of capability — the
-        construct itself isn't in the shape policy's allow-map."""
-        agent = _register(tmp_path)  # unrestricted caller
+    async def test_command_substitution_denied_without_untrusted_exec(self, tmp_path):
+        """$() requires UNTRUSTED_EXEC — a caller without it is denied
+        before shell() ever runs, same seam as any other worst-cased
+        command, not a separate 'Blocked:' shape message."""
+        agent = _register(tmp_path, granted_permissions=set())
         result = await _call(agent, command="echo $(id)")
+        assert result["success"] is False
+        assert "PERMISSION DENIED" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_command_substitution_allowed_with_untrusted_exec(self, tmp_path):
+        """A caller who holds UNTRUSTED_EXEC is trusted to run syntax that
+        can't be statically verified safe — the construct actually runs,
+        it isn't hard-blocked regardless of capability."""
+        agent = _register(tmp_path, granted_permissions={Permission.UNTRUSTED_EXEC})
+        result = await _call(agent, command="echo $(echo nested)")
         assert result["success"] is True
-        assert "Blocked" in result["result"]
+        assert "Blocked" not in result["result"]
+        assert "nested" in result["result"]
 
     @pytest.mark.asyncio
     async def test_quoted_metacharacters_are_data_not_shape_violations(self, tmp_path):
