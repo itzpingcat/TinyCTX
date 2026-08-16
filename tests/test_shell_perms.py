@@ -8,9 +8,11 @@ ACCESS-CONTROL mechanism for the shell tool (docs/PERMISSIONS-PLAN.md §5).
 Exercises required_permissions_for_shell() end-to-end from a command string
 (the same entry point ToolCallHandler calls), covering:
   - the static tag table (pure-compute, always-touch-filesystem, network
-    markers)
-  - the dynamic per-command classifiers (filters, dd, curl, wget, git,
-    scp/rsync/sftp, package managers)
+    markers) — compiled from perms.yaml, not hardcoded here
+  - the per-command matcher rules (filters, dd, curl, wget, git, package
+    managers) that perms.yaml expresses declaratively
+  - scp/rsync/sftp falling through to UNTRUSTED_EXEC — direction detection
+    isn't expressible in the table, so they're deliberately unlisted
   - the additive `dynamic` worst-case rule (§5's "must be additive, never
     replace" invariant — a regression here would silently under-classify
     `curl $URL` relative to `curl -d @f $URL`)
@@ -168,23 +170,25 @@ def test_dd_with_neither_operand_needs_nothing_from_dd_itself():
 # curl
 # ---------------------------------------------------------------------------
 
-def test_curl_plain_get_is_network_read_only():
-    assert _classify_str("curl https://example.com") == frozenset({Permission.NETWORK_READ})
+def test_curl_plain_get_is_network_read_and_write():
+    # network_write is granted unconditionally on curl "for now, just to be
+    # safe" — even a bare GET is treated as a potential exfiltration path,
+    # so there's no longer a flag-free invocation that's network_read only.
+    assert _classify_str("curl https://example.com") == frozenset(
+        {Permission.NETWORK_READ, Permission.NETWORK_WRITE}
+    )
 
 
-def test_curl_data_flag_adds_network_write():
+def test_curl_data_flag_still_carries_network_write():
     result = _classify_str("curl -d payload https://example.com")
     assert Permission.NETWORK_WRITE in result
 
 
-def test_curl_explicit_post_method_adds_network_write():
-    result = _classify_str("curl -X POST https://example.com")
-    assert Permission.NETWORK_WRITE in result
-
-
-def test_curl_explicit_get_method_does_not_add_network_write():
+def test_curl_explicit_get_method_still_carries_network_write():
+    # Was previously the negative case proving -X GET doesn't add
+    # network_write; now every curl call carries it regardless of verb.
     result = _classify_str("curl -X GET https://example.com")
-    assert Permission.NETWORK_WRITE not in result
+    assert Permission.NETWORK_WRITE in result
 
 
 def test_curl_output_flag_adds_file_write():
@@ -242,18 +246,20 @@ def test_git_local_subcommand_falls_through_to_untrusted_exec():
 
 
 # ---------------------------------------------------------------------------
-# scp / rsync / sftp — direction-dependent
+# scp / rsync / sftp — unlisted (perms.yaml doesn't attempt direction
+# detection — see that file's header), so every shape falls through to the
+# same UNTRUSTED_EXEC any other unrecognized command gets.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("cmd_name", ["scp", "rsync", "sftp"])
-class TestRemoteCopyDirection:
-    def test_uploading_is_file_read_plus_network_write(self, cmd_name):
+class TestRemoteCopyIsUnclassified:
+    def test_uploading_is_untrusted_exec(self, cmd_name):
         result = _classify_str(f"{cmd_name} localfile.txt user@host:/remote/path")
-        assert result == frozenset({Permission.FILE_READ, Permission.NETWORK_WRITE})
+        assert result == frozenset({Permission.UNTRUSTED_EXEC})
 
-    def test_downloading_is_network_read_plus_file_write(self, cmd_name):
+    def test_downloading_is_untrusted_exec(self, cmd_name):
         result = _classify_str(f"{cmd_name} user@host:/remote/path localfile.txt")
-        assert result == frozenset({Permission.NETWORK_READ, Permission.FILE_WRITE})
+        assert result == frozenset({Permission.UNTRUSTED_EXEC})
 
     def test_no_remote_operand_is_untrusted_exec(self, cmd_name):
         result = _classify_str(f"{cmd_name} localfile.txt otherlocal.txt")
@@ -305,6 +311,81 @@ def test_empty_command_needs_untrusted_exec():
 
 
 # ---------------------------------------------------------------------------
+# echo/cat with only a redirect (no named operand): the global redirect
+# rule alone must be enough — no FILE_READ leaks in from a command that
+# never named a file.
+# ---------------------------------------------------------------------------
+
+def test_echo_redirect_only_is_file_write_only():
+    assert _classify_str("echo > file.txt") == frozenset({Permission.FILE_WRITE})
+
+
+def test_cat_redirect_only_is_file_write_only():
+    assert _classify_str("cat > file.txt") == frozenset({Permission.FILE_WRITE})
+
+
+# ---------------------------------------------------------------------------
+# Unregistered flags: a flag this table doesn't recognize for a given
+# command adds UNTRUSTED_EXEC rather than riding along unnoticed on the
+# command's base permissions. --help is the one universal exemption; every
+# other flag has to be named somewhere (an entry's known_flags, or a rule's
+# any_flag) to avoid it.
+# ---------------------------------------------------------------------------
+
+def test_unregistered_flag_adds_untrusted_exec():
+    result = _classify_str("ls --some-made-up-flag")
+    assert Permission.UNTRUSTED_EXEC in result
+    assert Permission.FILE_READ in result  # base permission is still there — additive
+
+
+def test_registered_flag_does_not_add_untrusted_exec():
+    assert _classify_str("ls -la") == frozenset({Permission.FILE_READ})
+
+
+def test_help_flag_is_exempt_on_any_command():
+    assert _classify_str("curl --help") == frozenset(
+        {Permission.NETWORK_READ, Permission.NETWORK_WRITE}
+    )
+
+
+def test_find_delete_is_not_silently_safe():
+    """The exact case this mechanism exists for: -delete on a command
+    that's otherwise plain FILE_READ. Regression guard for a real bug this
+    module hit during development — decomposing "-delete" character by
+    character (the same decomposition validate.py uses for genuine short
+    clusters like "-la") lets it slip through as "known" if its individual
+    letters happen to be registered elsewhere, which they usually are."""
+    result = _classify_str("find . -delete")
+    assert Permission.UNTRUSTED_EXEC in result
+
+
+def test_find_exec_is_not_silently_safe():
+    result = _classify_str("find . -exec rm {} ;")
+    assert Permission.UNTRUSTED_EXEC in result
+
+
+def test_date_set_clock_is_not_silently_safe():
+    result = _classify_str('date -s "2020-01-01"')
+    assert Permission.UNTRUSTED_EXEC in result
+
+
+def test_date_display_flags_stay_clean():
+    assert _classify_str("date -u") == frozenset()
+
+
+def test_curl_unregistered_flag_adds_untrusted_exec():
+    result = _classify_str("curl --resolve x:80:1.2.3.4 https://example.com")
+    assert Permission.UNTRUSTED_EXEC in result
+    assert Permission.NETWORK_READ in result
+
+
+def test_unregistered_flag_on_unlisted_command_is_still_just_untrusted_exec():
+    # An unlisted command already gets UNTRUSTED_EXEC unconditionally — the
+    # flag-check has nothing to add on top.
+    assert _classify_str("python3 --made-up-flag") == frozenset({Permission.UNTRUSTED_EXEC})
+
+
+# ---------------------------------------------------------------------------
 # Redirects always add FILE_WRITE, even to pure-compute commands
 # ---------------------------------------------------------------------------
 
@@ -326,14 +407,15 @@ def test_redirect_on_network_read_command_adds_file_write():
 # ---------------------------------------------------------------------------
 
 class TestDynamicAdditive:
-    def test_dynamic_curl_keeps_static_network_read_and_adds_worst_case(self):
-        # $URL makes the operand dynamic; curl itself still statically shows
-        # only a GET (NETWORK_READ) — the dynamic worst-case must ADD
-        # NETWORK_WRITE/FILE_WRITE/UNTRUSTED_EXEC on top, not replace the
-        # NETWORK_READ that's already known to be true.
+    def test_dynamic_curl_keeps_static_permissions_and_adds_worst_case(self):
+        # $URL makes the operand dynamic; curl itself statically shows
+        # NETWORK_READ + NETWORK_WRITE (curl's base is unconditionally
+        # both, "just to be safe") — the dynamic worst-case must still ADD
+        # FILE_WRITE/UNTRUSTED_EXEC on top, not replace anything already
+        # known to be true.
         result = _classify_str("curl $URL")
         assert Permission.NETWORK_READ in result       # kept (static)
-        assert Permission.NETWORK_WRITE in result       # added (worst case)
+        assert Permission.NETWORK_WRITE in result       # kept (static, unconditional now)
         assert Permission.FILE_WRITE in result           # added (worst case)
         assert Permission.UNTRUSTED_EXEC in result        # added (dynamic flag)
 
@@ -342,11 +424,13 @@ class TestDynamicAdditive:
         assert Permission.UNTRUSTED_EXEC in result
 
     def test_non_dynamic_curl_does_not_get_worst_case_added(self):
-        """The control: a fully static curl call must NOT carry the dynamic
-        worst-case tags at all."""
+        """The control: a fully static curl call must NOT carry the
+        dynamic-only worst-case tags. NETWORK_WRITE is excluded from this
+        check now — curl carries it unconditionally, static or not — so
+        this checks the tags that are still exclusively worst-case:
+        FILE_WRITE and UNTRUSTED_EXEC."""
         result = _classify_str("curl -X GET https://example.com")
         assert Permission.UNTRUSTED_EXEC not in result
-        assert Permission.NETWORK_WRITE not in result
         assert Permission.FILE_WRITE not in result
 
     def test_dynamic_unlisted_command_still_gets_untrusted_exec(self):

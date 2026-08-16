@@ -414,14 +414,15 @@ deny-posture rules (`command`, `subcommand`, `any_flag`, `all_flags`,
 `path_under`, `redirect_under`, ...), selected by which `ScopedPolicy` tier
 the caller's `permission_level` falls under.
 
-**Replacement — per-command capability tagging.** The callable classifies
-each resolved command and returns the union of bools those commands need,
-consuming the exact `Command` objects `validate._extract` already produces.
-No new parsing; a lookup table over existing output.
+**Replacement — per-command capability tagging, compiled from data.** The
+classification table itself lives in `modules/shell/perms.yaml` — a
+declarative file, not Python — and `perms.py` compiles it once at import and
+interprets it against the exact `Command` objects `validate._extract`
+already produces. No new parsing; a data-driven lookup over existing output.
 
 ```python
-def _shell_perms(command: str, timeout: int | None = None,
-                 backend_access: bool = False, **_) -> set[Permission]:
+def required_permissions_for_shell(command: str, timeout: int | None = None,
+                                    backend_access: bool = False, **_) -> set[Permission]:
     commands = validate._extract(_parse(command))
     needed = set().union(*(classify(c) for c in commands)) if commands else set()
     if backend_access:
@@ -431,10 +432,12 @@ def _shell_perms(command: str, timeout: int | None = None,
 def classify(cmd: Command) -> frozenset[Permission]:
     if cmd.name is None:
         return frozenset({Permission.UNTRUSTED_EXEC})
-    base = (_DYNAMIC_TAGS[cmd.name](cmd) if cmd.name in _DYNAMIC_TAGS
-            else _STATIC_TAGS.get(cmd.name, frozenset({Permission.UNTRUSTED_EXEC})))
+    spec = _table.by_name.get(cmd.name)
+    base = _eval_spec(spec, cmd) if spec is not None else frozenset({Permission.UNTRUSTED_EXEC})
+    if cmd.redirects:
+        base = base | {Permission.FILE_WRITE}
     if cmd.dynamic:
-        return base | _WORST_CASE.get(cmd.name, frozenset()) | {Permission.UNTRUSTED_EXEC}
+        return base | _table.worst_case.get(cmd.name, frozenset()) | {Permission.UNTRUSTED_EXEC}
     return base
 ```
 
@@ -443,8 +446,20 @@ glob, so its values aren't knowable statically — is handled **additively**:
 keep the name's tags, add the worst case that name could ever need, add
 `UNTRUSTED_EXEC`. Not as a replacement. Replacing would make the dynamic
 form demand *less* than the static one: a caller holding `UNTRUSTED_EXEC`
-but denied `NETWORK_WRITE` could run `curl $URL` while being blocked from
-`curl -d @f https://x`.
+but denied `NETWORK_WRITE` could run `wget $URL` while being blocked from
+`wget --post-data=x https://x` — the two forms must never trade the
+guarantee the flag-based one already gave. (`curl` no longer illustrates
+this split as cleanly as it used to: as of 2026-08-16 it carries
+`NETWORK_WRITE` unconditionally — see §6.3.)
+
+`perms.yaml` supports the same `extends:` / `disable:` / `builtin:<name>`
+layering `allow.yaml` and `deny.yaml` already use, compiled independently
+(perms.py doesn't share code with policy.py — different schema, same
+posture). Loading happens once, at import time: a missing or malformed
+`perms.yaml` is captured, never raised out of import, and every call to
+`classify()`/`required_permissions_for_shell()` returns `{Permission.ROOT}`
+until it's fixed — the same "must never degrade into an unrestricted shell"
+posture §5.2's shape policy already uses.
 
 ### 5.1 The minimal tag table
 
@@ -459,31 +474,28 @@ echo, printf, date, cal, expr, seq, factor, basename, dirname,
 true, false, sleep, yes
 ```
 
-These are exactly `allow.yaml`'s current low tier, and its closure argument
+These are exactly `allow.yaml`'s old low tier, and its closure argument
 carries over unchanged: with no way to name a file, reach the network, or
 read the environment, a pipeline of these can only transform text the
 caller typed.
 
 **Stdin filters — `FILE_READ` only when they name a file:**
 
-```python
-_FILTERS = {"cat","tr","rev","tac","sort","uniq","wc","head","tail","cut",
-            "paste","nl","grep","sed","awk","cksum","md5sum","sha1sum","sha256sum"}
-
-def _classify_filter(cmd: Command) -> frozenset[Permission]:
-    perms = set()
-    if cmd.operands:                       # named a file rather than reading stdin
-        perms.add(Permission.FILE_READ)
-    if cmd.redirects:                      # `> file`
-        perms.add(Permission.FILE_WRITE)
-    return frozenset(perms)
+```yaml
+- id: filters-plain
+  name: [cat, tr, rev, tac, uniq, head, tail, cut, paste, nl, grep, awk,
+         cksum, md5sum, sha1sum, sha256sum]
+  permissions: []
+  if_operands: [file_read]
 ```
 
-One classifier covers nineteen commands, and it subsumes the
-`cat file` / `cat > file` split without special-casing `cat`. The
-write-flag exceptions `allow.yaml` currently handles with `allowed_flags`
-become explicit: `sort -o`, `shuf -o`, `dd of=`, `sed -i`, `awk > file` add
-`FILE_WRITE`; `wc --files0-from=F` and `dd if=` add `FILE_READ`.
+One entry covers sixteen commands, and it subsumes the `cat file` /
+`cat > file` split without special-casing `cat` — the redirect-adds-
+`FILE_WRITE` rule applies globally, to every command, not just filters. The
+write-flag exceptions get their own small entries with a conditional `rules:`
+list: `sort -o` / `shuf -o` / `sed -i` add `FILE_WRITE`; `wc --files0-from=F`
+adds `FILE_READ`; `dd`'s `if=`/`of=` are matched by operand prefix rather
+than by flag.
 
 **Always touch the filesystem:**
 
@@ -494,7 +506,21 @@ become explicit: `sort -o`, `shuf -o`, `dd of=`, `sed -i`, `awk > file` add
 | `FILE_READ + FILE_WRITE` | `cp`, `mv`, `ln`, `install` |
 
 **Network** — §6.3's marker table (`curl`, `wget`, `git`, `ping`, `dig`,
-`nslookup`, `host`, `nc`, `ssh`, `scp`, `rsync`).
+`nslookup`, `host`, `nc`, `ssh`), each expressed as a `permissions:` base
+plus a handful of `rules:` (a flag present, or a flag present together with
+a matching operand value — e.g. `curl -X POST` needs an operand-value check
+alongside the flag check to tell it apart from `curl -X GET`).
+
+**`scp`/`rsync`/`sftp` are deliberately unlisted.** Their real
+classification is direction-dependent: uploading needs `FILE_READ +
+NETWORK_WRITE`, downloading needs `NETWORK_READ + FILE_WRITE`, and telling
+them apart means judging whether an operand's *shape* looks like a remote
+`user@host:path` spec — not a condition the table's matcher primitives
+(flag presence, operand membership, operand prefix, subcommand) can express.
+Rather than carve out bespoke Python for just these three, they fall
+through to the same `UNTRUSTED_EXEC` every other unrecognized command gets.
+Precision is traded for keeping the whole table auditable as data; this can
+be revisited if scp/rsync/sftp usage proves common enough to justify it.
 
 **Everything else → `UNTRUSTED_EXEC`.** Including `python`, `node`, `sh`,
 `bash`, `make`, `docker`, `systemctl`, `apt`, `pip`, `npm`, and every
@@ -508,6 +534,25 @@ intended, but it *is* the most visible behaviour change in the whole
 rework. Either grant `UNTRUSTED_EXEC` in the global template (or per-user),
 or promote specific commands out of the catch-all as they prove needed —
 the second is the point of starting minimal.
+
+**Fail-closed reaches down to individual flags, too.** A *recognized*
+command's base permissions cover its ordinary behaviour, not every flag it
+could ever be called with — a flag that isn't declared safe via that
+entry's `known_flags`, or matched by one of its `rules:` conditions, adds
+`UNTRUSTED_EXEC` on top. `--help` is the one flag exempt everywhere;
+nothing else is assumed harmless without being named. This is what stops
+`find . -delete` from riding along on `find`'s bare `FILE_READ` tag — the
+command is recognized, but `-delete` isn't one of the query/traversal flags
+`perms.yaml` lists as known-safe for it, so it needs `UNTRUSTED_EXEC` like
+any unclassified action would. The check deliberately does not try to
+decompose a combined short-flag cluster (`ls -la`) into its constituent
+letters the way `validate.py` builds `Command.atoms` — a single-dash
+GNU-style "spelled out" option (`find`'s `-delete`, `-exec`, `-ok`)
+decomposes into ordinary letters the same way a real cluster does, and
+those letters are usually legitimately registered elsewhere on the same
+entry for unrelated reasons; decomposing would silently wave the dangerous
+flag through. `perms.yaml` lists the combined spellings it wants recognized
+(`-la`, `-rf`, ...) explicitly instead.
 
 ### 5.2 Shape and construct validation stays
 
@@ -567,22 +612,29 @@ Keyed off `Command.atoms` / `.flags` / `.operands` / `.subcommand`:
 
 | command | marker | permissions |
 |---|---|---|
-| `curl`, `wget`, `http`, `httpie` | default | `NETWORK_READ` |
-| `curl` | `-d`/`--data*`, `-F`/`--form`, `-T`/`--upload-file`, `--json`, `-X` with `POST\|PUT\|PATCH\|DELETE` | `+ NETWORK_WRITE` |
+| `curl` | any | `NETWORK_READ + NETWORK_WRITE` (unconditional as of 2026-08-16 — see note below) |
+| `wget`, `http`, `httpie` | default | `NETWORK_READ` |
 | `wget` | `--post-data`, `--post-file`, `--method=` non-GET | `+ NETWORK_WRITE` |
 | `curl`, `wget` | `-o`/`-O`/`--output`, or a redirect target | `+ FILE_WRITE` |
 | `git` | `clone`, `fetch`, `pull`, `ls-remote` | `NETWORK_READ` |
 | `git` | `push` | `NETWORK_WRITE` (deny.yaml:291 blocks this today) |
-| `scp`, `rsync`, `sftp` | remote → local | `NETWORK_READ + FILE_WRITE` |
-| `scp`, `rsync` | local → remote | `FILE_READ + NETWORK_WRITE` |
+| `scp`, `rsync`, `sftp` | any | not classified — falls to `UNTRUSTED_EXEC` (§5.1: direction detection isn't expressible in `perms.yaml`'s matcher primitives) |
 | `ssh` | any | `NETWORK_WRITE + UNTRUSTED_EXEC` |
 | `pip`, `npm`, `apt`, `cargo`, `gem` | `install`/`add` | `NETWORK_READ + FILE_WRITE + UNTRUSTED_EXEC` |
 | `ping`, `dig`, `nslookup`, `host` | any | `NETWORK_READ` |
 | `nc`, `netcat`, `socat` | any | `NETWORK_WRITE` |
 
 Rows declaring `NETWORK_WRITE` don't also list `NETWORK_READ` — `expand()`
-adds it (§1.2). Three deserve a note:
+adds it (§1.2). Four deserve a note:
 
+- **`curl` carries `NETWORK_WRITE` unconditionally, "for now, just to be
+  safe."** Previously it followed the same flag-conditioned split `wget`
+  still uses (default `NETWORK_READ`, `-d`/`-F`/`-X POST` etc. adding
+  `NETWORK_WRITE`). That was judged too easy to route around — a body can
+  ride out in ways the flag list doesn't anticipate, and even a bare `GET`'s
+  URL/headers can carry data out (§6.4). Coarsening curl to always require
+  both is a deliberate precaution, not a claim that every curl call is
+  actually a write; `wget` keeps the finer-grained split for now.
 - **`pip install` is an exec, not a fetch.** Install scripts run arbitrary
   code by design; tagging it `NETWORK_READ` alone would be a hole big
   enough to drive the model through. This is the general case of *inbound
@@ -600,13 +652,23 @@ adds it (§1.2). Three deserve a note:
 
 Classification is **best-effort intent labelling from observable markers.**
 The server, not the flags, decides what a request does:
-`curl 'https://api.example.com/delete?id=5'` is a `GET` with a destructive
-effect and will be tagged `NETWORK_READ`.
+`wget 'https://api.example.com/delete?id=5'` is a `GET` with a destructive
+effect and will be tagged `NETWORK_READ` alone — `wget` still follows the
+flag-conditioned split (§6.3); `curl` no longer has a `NETWORK_READ`-only
+form to make this same point with.
 
 > `NETWORK_READ` without `NETWORK_WRITE` is a guardrail against accident and
 > against a confused agent. It is **not** a boundary against a motivated
 > exfiltrator. Anyone holding `NETWORK_READ` can move data out in a URL
-> path, a query string, a DNS label, or request timing.
+> path, a query string, a DNS label, or request timing — this is exactly
+> why `ping`, `dig`, and the rest of `network-read-cmds` stay `NETWORK_READ`
+> only rather than getting the same unconditional `NETWORK_WRITE` bump curl
+> just got: the exfil channel already exists at `NETWORK_READ`, so bumping
+> read-only commands to also require `NETWORK_WRITE` wouldn't close
+> anything — it would just make `NETWORK_READ` alone meaningless as a
+> guardrail. `curl`'s bump is really about the *legitimate*, structured
+> write path (POST/PUT/DATA) being one flag away, not about closing the
+> covert-channel gap this paragraph describes.
 
 A real egress boundary can only be enforced at the network layer — an
 allow-listed egress proxy on the sandbox's compose network, exactly how LAN
@@ -641,8 +703,10 @@ protects `users.db`, when policy has never been what protects it.
 
 Network bools compose with `BACKEND_EXEC` rather than being subsumed:
 
-- `curl https://pypi.org` → `NETWORK_READ`
-- `curl http://192.168.1.5` → `NETWORK_READ + BACKEND_EXEC`
+- `curl https://pypi.org` → `NETWORK_READ + NETWORK_WRITE` (curl's unconditional bump — §6.3)
+- `curl http://192.168.1.5` → `NETWORK_READ + NETWORK_WRITE + BACKEND_EXEC`
+- `wget https://pypi.org` → `NETWORK_READ` (still flag-conditioned)
+- `wget http://192.168.1.5` → `NETWORK_READ + BACKEND_EXEC`
 
 **`FILE_READ`/`FILE_WRITE` carry no scope — location does.** Under
 `BACKEND_EXEC` those same bools reach `config.yaml` (API keys) and

@@ -20,12 +20,12 @@ Two independent checks run before any dispatch, in both modes. The sandbox
 itself runs whatever it receives — it trusts the agent.
 
   1. CAPABILITY — "is this caller permitted to do this at all". Per-command
-     tagging in perms.py classifies each resolved command into the
-     TinyCTX.permissions.Permission bools it needs (FILE_WRITE,
-     NETWORK_WRITE, UNTRUSTED_EXEC, ...); shell's `required_permissions`
-     callable (registered below) is checked once, centrally, by
-     tool_handling.handler.ToolCallHandler — same seam every other tool
-     uses. See docs/PERMISSIONS-PLAN.md §5.
+     tagging, compiled from modules/shell/perms.yaml by perms.py, classifies
+     each resolved command into the TinyCTX.permissions.Permission bools it
+     needs (FILE_WRITE, NETWORK_WRITE, UNTRUSTED_EXEC, ...); shell's
+     `required_permissions` callable (registered below) is checked once,
+     centrally, by tool_handling.handler.ToolCallHandler — same seam every
+     other tool uses. See docs/PERMISSIONS-PLAN.md §5.
 
   2. SHAPE — "is this invocation syntactically safe, independent of who's
      asking". `_dispatch` below still runs validate.check() against a
@@ -52,6 +52,14 @@ by the same central seam as everything else. See permissions.py's
 BACKEND_EXEC docstring for why this is a *location* permission (which
 container the command runs in), not a capability about what the command
 itself does.
+
+Two commands that used to have a bespoke Python classifier — scp/rsync/sftp,
+whose real classification is direction-dependent (upload vs download turns
+on which operand looks like a remote host:path) — are deliberately unlisted
+in perms.yaml now: that judgment isn't expressible in the table's matcher
+primitives, and rather than keep one-off Python for just those three, they
+fall through to the same UNTRUSTED_EXEC every unrecognized command gets. See
+perms.yaml's header.
 """
 from __future__ import annotations
 

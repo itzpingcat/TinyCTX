@@ -8,12 +8,13 @@ EXTENSION_META = {
         "and its own backend files (requires the backend_exec capability). "
         "Commands are parsed with tree-sitter-bash. Each resolved command is classified "
         "into the capability bools it needs (file_read, file_write, network_read, "
-        "network_write, untrusted_exec, ...) and checked once, centrally, by "
-        "tool_handling.handler.ToolCallHandler — see modules/shell/perms.py and "
-        "docs/PERMISSIONS-PLAN.md §5. A single always-applied shape policy (derived from "
-        "allow.yaml's `constructs` map) still runs underneath that, rejecting `$()`, "
-        "unquoted globs used as commands, and unrecognized bash syntax — structural "
-        "injection defense, orthogonal to capability checking (§5.2)."
+        "network_write, untrusted_exec, ...) per a declarative table in "
+        "modules/shell/perms.yaml (compiled by perms.py), checked once, centrally, by "
+        "tool_handling.handler.ToolCallHandler — see docs/PERMISSIONS-PLAN.md §5. A "
+        "single always-applied shape policy (derived from allow.yaml's `constructs` map) "
+        "still runs underneath that, rejecting `$()`, unquoted globs used as commands, "
+        "and unrecognized bash syntax — structural injection defense, orthogonal to "
+        "capability checking (§5.2)."
     ),
     "default_config": {
         # Timeout used when the agent does not pass an explicit timeout arg.
