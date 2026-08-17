@@ -6,6 +6,14 @@
 
 FROM python:3.12-slim
 
+# Fixed UID/GID for the tinyctx user — MUST match the top-level Dockerfile
+# exactly. Both containers bind-mount the same host workspace to
+# /home/tinyctx; without a pinned, shared UID here, this image's own
+# `useradd -r` can land on a different number than the agent image's, and
+# each rebuild silently locks the other container out of files it wrote.
+ARG TINYCTX_UID=10000
+ARG TINYCTX_GID=10000
+
 # ── system packages ────────────────────────────────────────────────────────
 # Core utils, VCS, media, build tools, language runtimes
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -105,8 +113,8 @@ RUN pip install --no-cache-dir \
     anyio trio
 
 # ── non-root user ──────────────────────────────────────────────────────────
-RUN groupadd -r tinyctx && \
-    useradd -r -g tinyctx -d /home/tinyctx -m -s /bin/bash tinyctx
+RUN groupadd -g ${TINYCTX_GID} tinyctx && \
+    useradd -u ${TINYCTX_UID} -g tinyctx -d /home/tinyctx -m -s /bin/bash tinyctx
 
 # Workspace mount point
 RUN mkdir -p /home/tinyctx && chown tinyctx:tinyctx /home/tinyctx

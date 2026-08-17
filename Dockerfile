@@ -1,6 +1,17 @@
 # TinyCTX — containerized agent runtime
 FROM python:3.14-rc-slim
 
+# Fixed UID/GID for the tinyctx user — MUST match sandbox/Dockerfile exactly.
+# Both containers bind-mount the same host workspace to /home/tinyctx, so if
+# these drift apart (or drift from whatever `useradd -r` felt like assigning
+# on a given rebuild), one container silently loses write access to files the
+# other created. useradd -r with no explicit --uid picks "the next free
+# system UID," which depends on the base image's snapshot — it is NOT stable
+# across rebuilds, especially since this image tracks the moving
+# python:3.14-rc-slim tag. Pinning it here is what makes it stable.
+ARG TINYCTX_UID=10000
+ARG TINYCTX_GID=10000
+
 # --- env -------------------------------------------------------------------
 ENV HOME=/home/tinyctx
 
@@ -27,7 +38,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # --- create non-root user --------------------------------------------------
-RUN groupadd -r tinyctx && useradd -r -g tinyctx -d /home/tinyctx -m -s /sbin/nologin tinyctx
+RUN groupadd -g ${TINYCTX_GID} tinyctx && \
+    useradd -u ${TINYCTX_UID} -g tinyctx -d /home/tinyctx -m -s /sbin/nologin tinyctx
 
 WORKDIR /app
 
