@@ -1,6 +1,8 @@
 """
 config.py — Configuration loader.
-Imports only from stdlib and PyYAML. Never imports from contracts or gateway.
+Imports only from stdlib, PyYAML, and TinyCTX.permissions (pure enum data,
+no I/O — same foundational layer as contracts.py). Never imports from
+contracts or gateway.
 """
 from __future__ import annotations
 import logging, os
@@ -8,7 +10,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import yaml
 
+from TinyCTX.permissions import Permission
+
 logger = logging.getLogger(__name__)
+
+# Built-in default for the single global permissions template — used when
+# config.yaml doesn't override it under permissions.template. Empty: every
+# bool defaults to false (fail-closed), matching the old "guest" tier.
+#
+# There is exactly ONE template now — see docs/PERMISSIONS-PLAN.md §2. Named
+# tiers (guest/member/trusted/operator) are gone; per-user variation happens
+# entirely through User.permission_overrides (a sparse diff on the user
+# row), never by picking a different template.
+_DEFAULT_TEMPLATE: frozenset[Permission] = frozenset()
 
 
 @dataclass
@@ -73,12 +87,18 @@ class ModelConfig:
 @dataclass
 class PermissionsConfig:
     """
-    Controls how the permission system interacts with the LLM's tool list.
+    Controls how the permission system interacts with the LLM's tool list,
+    and defines the single global permission template every user resolves
+    against.
 
     Configured via the top-level 'permissions:' key in config.yaml:
 
         permissions:
           minimal_tokens: true
+          template:
+            file_read: true
+            network_read: true
+            memory_read: true
 
     minimal_tokens: true  (default)
         Only tools the caller has permission to execute are sent to the LLM.
@@ -91,32 +111,167 @@ class PermissionsConfig:
         in execute_tool_call() still enforces permissions — the call will return
         a PERMISSION DENIED error rather than execute. Useful when you want the
         agent to be aware of what exists and explain why it can't do something.
+
+    template
+        ONE fully explicit permission set — no named tiers, no inheritance,
+        and nothing to pick between at user-creation time. Any permission
+        bool not listed here is false. Every user resolves against this
+        same set; the only per-user variation is User.permission_overrides,
+        a sparse diff stored on the user row (see docs/PERMISSIONS-PLAN.md
+        §2 and TinyCTX/users/models.py). To grant a specific user more (or
+        less) than everyone else, edit their overrides — via
+        `/user modify_permissions`, `onboard/fix_permissions.py`, or the
+        gateway's `/v1/user/{username}/elevate` endpoint — not by naming a
+        different template, because there isn't one.
     """
     minimal_tokens: bool = False
+    template:       frozenset[Permission] = field(default_factory=lambda: _DEFAULT_TEMPLATE)
 
 
 @dataclass
 class ToolOverrideConfig:
     """
-    Per-tool override of registration-time defaults (always_on / min_permission).
+    Per-tool override of registration-time defaults (currently: always_on).
 
-    Configured via the top-level 'tool_overrides:' key in config.yaml:
+    Configured via 'tools.overrides:' in config.yaml:
 
-        tool_overrides:
-          shell:
-            min_permission: 80
-          present:
-            always_on: true
-          memory_search:
-            always_on: false
-            min_permission: 10
+        tools:
+          overrides:
+            present:
+              always_on: true
+            memory_search:
+              always_on: false
 
     Fields left unset (null/omitted) leave that aspect of the tool untouched —
     only the fields you specify are overridden. Unknown tool names are ignored
     (logged at debug level) since not every module is loaded in every config.
+
+    min_permission is DEPRECATED — permission_level was fully retired in
+    favor of named boolean capabilities (see TinyCTX/permissions.py and
+    docs/PERMISSIONS-PLAN.md). The field is kept here only so old configs
+    still parse; tool_handling/handler.py's apply_overrides() logs one
+    warning per stale override naming the tool and pointing at
+    permissions.templates, then ignores the value — it is NOT silently
+    honored, and it is NOT a no-op that could look like it's still working.
     """
     always_on:      bool | None = None
     min_permission: int | None  = None
+
+
+@dataclass
+class ToolPassiveConfig:
+    """
+    Automatic, un-requested tool enabling — run once per user turn, before the
+    model sees its tool list, over the same tools_vector_cache.db corpus that
+    the explicit tools_search tool (see ToolSearchConfig) reads from.
+
+    Up to `auto_limit` tools scoring above `auto_min_score` are enabled for
+    that turn only; the enable is not persisted to session state, so the next
+    turn re-runs the search fresh against its own query.
+
+    Configured via 'tools.passive:' in config.yaml:
+
+        tools:
+          passive:
+            auto_bm25_enabled: true
+            auto_vector_enabled: false
+            embedding_model: ""
+            auto_limit: 2
+            auto_min_score: 0.0
+            rrf_k: 60
+
+    auto_bm25_enabled: true  (default)
+        Every turn, BM25-rank the full tool corpus against the user's message
+        and auto-enable the top `auto_limit` hits. No network call, no
+        embedding_model dependency — this is today's tools_search fuzzy-match
+        logic, just run automatically instead of waiting for the model to
+        call it.
+
+    auto_vector_enabled: false  (default)
+        Also embed the user's message and RRF-fuse vector similarity with the
+        BM25 ranks (same fusion as modules/memory's search_memory). Requires
+        embedding_model to name a 'kind: embedding' entry under models: — if
+        unset, or the embed call fails, this silently falls back to
+        auto_bm25_enabled's behavior. Off by default: unlike BM25 this costs
+        a real embed() call every turn.
+
+    embedding_model
+        Model name to embed with when auto_vector_enabled is true. Resolved
+        via Config.get_embedding_model() at use time, not at config load —
+        intentionally independent from tools.search.embedding_model so
+        passive (every turn) and explicit search (model-initiated, rarer)
+        can point at different models.
+    """
+    auto_bm25_enabled:   bool  = True
+    auto_vector_enabled: bool  = False
+    embedding_model:     str   = ""
+    auto_limit:          int   = 2
+    auto_min_score:       float = 0.0
+    rrf_k:                int   = 60
+
+
+@dataclass
+class ToolSearchConfig:
+    """
+    Config for the explicit, model-invoked tools_search tool — distinct from
+    ToolPassiveConfig's automatic per-turn pass. The model deliberately calls
+    this, so it can afford to be more thorough; it still only lists
+    candidates, it does not auto-enable them (the model must call it again
+    with an exact tool name to enable one).
+
+    Configured via 'tools.search:' in config.yaml:
+
+        tools:
+          search:
+            vector_enabled: false
+            embedding_model: ""
+            top_k: 5
+            rrf_k: 60
+            min_score: 0.0
+
+    vector_enabled: false  (default)
+        Whether tools_search's fuzzy (non-exact-name) path also uses vector
+        similarity, RRF-fused with BM25, instead of BM25 alone. Requires
+        embedding_model. Reads the same tools_vector_cache.db corpus as
+        ToolPassiveConfig — tool descriptions are embedded once and shared
+        between the two entry points, never twice.
+
+    embedding_model
+        Independent from tools.passive.embedding_model — see that field's
+        docstring for why they're kept separate.
+
+    top_k
+        Max candidates listed per fuzzy search call.
+
+    min_score
+        Floor below which a candidate isn't listed at all, so a query that
+        barely matches anything doesn't dump the whole registry back at the
+        model.
+    """
+    vector_enabled:   bool  = False
+    embedding_model:  str   = ""
+    top_k:            int   = 5
+    rrf_k:             int   = 60
+    min_score:         float = 0.0
+
+
+@dataclass
+class ToolsConfig:
+    """
+    Top-level 'tools:' key in config.yaml — groups per-tool overrides and the
+    two tool-discovery config blocks:
+
+        tools:
+          overrides: {}
+          passive: {}
+          search: {}
+
+    See ToolOverrideConfig, ToolPassiveConfig, ToolSearchConfig for each
+    sub-key's fields and defaults.
+    """
+    overrides: dict[str, ToolOverrideConfig] = field(default_factory=dict)
+    passive:   ToolPassiveConfig             = field(default_factory=ToolPassiveConfig)
+    search:    ToolSearchConfig              = field(default_factory=ToolSearchConfig)
 
 
 @dataclass
@@ -286,7 +441,7 @@ class Config:
     token_fuzz:      float                   = 1.1   # multiplier applied to counted tokens to account for tokenizer inaccuracy
     attachments:     AttachmentConfig        = field(default_factory=AttachmentConfig)
     permissions:     PermissionsConfig       = field(default_factory=PermissionsConfig)
-    tool_overrides:  dict[str, ToolOverrideConfig] = field(default_factory=dict)
+    tools:           ToolsConfig             = field(default_factory=ToolsConfig)
     # When True, AgentError events (LLM error, abort) are written into the
     # conversation as a node so the LLM can see, on its next turn, that its
     # previous turn errored out — instead of the error vanishing silently
@@ -355,7 +510,7 @@ def _parse_tool_overrides(raw: dict) -> dict[str, ToolOverrideConfig]:
     overrides: dict[str, ToolOverrideConfig] = {}
     for tool_name, o in (raw or {}).items():
         if not isinstance(o, dict):
-            raise ValueError(f"tool_overrides.{tool_name} must be a mapping")
+            raise ValueError(f"tools.overrides.{tool_name} must be a mapping")
         always_on = o.get("always_on")
         min_permission = o.get("min_permission")
         if always_on is not None:
@@ -367,6 +522,82 @@ def _parse_tool_overrides(raw: dict) -> dict[str, ToolOverrideConfig]:
             min_permission=min_permission,
         )
     return overrides
+
+
+def _parse_tool_passive(raw: dict) -> ToolPassiveConfig:
+    return ToolPassiveConfig(
+        auto_bm25_enabled=bool(raw.get("auto_bm25_enabled", True)),
+        auto_vector_enabled=bool(raw.get("auto_vector_enabled", False)),
+        embedding_model=str(raw.get("embedding_model", "")),
+        auto_limit=int(raw.get("auto_limit", 2)),
+        auto_min_score=float(raw.get("auto_min_score", 0.0)),
+        rrf_k=int(raw.get("rrf_k", 60)),
+    )
+
+
+def _parse_tool_search(raw: dict) -> ToolSearchConfig:
+    return ToolSearchConfig(
+        vector_enabled=bool(raw.get("vector_enabled", False)),
+        embedding_model=str(raw.get("embedding_model", "")),
+        top_k=int(raw.get("top_k", 5)),
+        rrf_k=int(raw.get("rrf_k", 60)),
+        min_score=float(raw.get("min_score", 0.0)),
+    )
+
+
+def _parse_permission_set(raw: dict) -> frozenset[Permission]:
+    """
+    Parse the permissions.template mapping into a frozenset of granted
+    Permission members. Authored by the operator, so unlike the runtime
+    fallback in users/store.py (which must tolerate a stale per-user
+    override), an unknown permission name here is a config bug and fails
+    loudly at load time rather than being silently dropped.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError("permissions.template must be a mapping")
+    granted: set[Permission] = set()
+    for perm_name, value in raw.items():
+        try:
+            perm = Permission(perm_name)
+        except ValueError:
+            valid = ", ".join(sorted(p.value for p in Permission))
+            raise ValueError(
+                f"permissions.template: unknown permission {perm_name!r}. "
+                f"Valid names: {valid}"
+            )
+        if bool(value):
+            granted.add(perm)
+    return frozenset(granted)
+
+
+def _parse_permissions(raw: dict) -> PermissionsConfig:
+    raw = raw or {}
+    if "templates" in raw or "default_template" in raw:
+        # Clean break, no compat shim — same posture the plan took retiring
+        # permission_level (§10.4): fail loudly at the first load instead of
+        # silently ignoring an operator's intent.
+        raise ValueError(
+            "permissions.templates / permissions.default_template no longer "
+            "exist — there is a single global permissions.template now (a "
+            "flat mapping of permission name -> bool). See "
+            "docs/PERMISSIONS-PLAN.md §2."
+        )
+    template = (
+        _parse_permission_set(raw["template"]) if "template" in raw else _DEFAULT_TEMPLATE
+    )
+    return PermissionsConfig(
+        minimal_tokens=bool(raw.get("minimal_tokens", False)),
+        template=template,
+    )
+
+
+def _parse_tools(raw: dict) -> ToolsConfig:
+    raw = raw or {}
+    return ToolsConfig(
+        overrides=_parse_tool_overrides(raw.get("overrides", {})),
+        passive=_parse_tool_passive(raw.get("passive", {})),
+        search=_parse_tool_search(raw.get("search", {})),
+    )
 
 
 def _parse_model(raw: dict, default_context: int = 16384) -> ModelConfig:
@@ -424,7 +655,7 @@ def _parse_model(raw: dict, default_context: int = 16384) -> ModelConfig:
 _KNOWN_KEYS = {
     "models", "llm", "router", "bridges", "gateway", "workspace", "data",
     "logging", "max_tool_cycles", "parallel", "token_fuzz", "attachments", "permissions",
-    "tool_overrides", "context",  # "context" is the deprecated legacy top-level key
+    "tools", "context",  # "context" is the deprecated legacy top-level key
     "error_introspection", "command_introspection",
 }
 
@@ -541,18 +772,15 @@ def load(path="config.yaml") -> Config:
     )
 
     # ------------------------------------------------------------------ permissions
-    perm_raw = raw.get("permissions", {})
-    permissions = PermissionsConfig(
-        minimal_tokens=bool(perm_raw.get("minimal_tokens", False)),
-    )
+    permissions = _parse_permissions(raw.get("permissions", {}))
 
     # ------------------------------------------------------------------ parallel
     parallel = int(raw.get("parallel", 3))
     if parallel < 1:
         raise ValueError(f"parallel must be >= 1, got {parallel}")
 
-    # ------------------------------------------------------------------ tool_overrides
-    tool_overrides = _parse_tool_overrides(raw.get("tool_overrides", {}))
+    # ------------------------------------------------------------------ tools
+    tools = _parse_tools(raw.get("tools", {}))
 
     # ------------------------------------------------------------------ extra
     extra = {k: v for k, v in raw.items() if k not in _KNOWN_KEYS}
@@ -574,7 +802,7 @@ def load(path="config.yaml") -> Config:
         token_fuzz=float(raw.get("token_fuzz", 1.1)),
         attachments=attachments,
         permissions=permissions,
-        tool_overrides=tool_overrides,
+        tools=tools,
         error_introspection=bool(raw.get("error_introspection", False)),
         command_introspection=bool(raw.get("command_introspection", False)),
         extra=extra,

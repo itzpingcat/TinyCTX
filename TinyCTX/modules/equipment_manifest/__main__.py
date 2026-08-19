@@ -42,8 +42,9 @@ Available template variables (both templates):
   is_dm           — Opposite of is_group_chat. True for 1:1 DM lanes.
   platform        — Bridge platform string: "discord", "matrix", "cli",
                     "api", "cron", or "" for synthetic/unknown turns.
-  trusted         — True when the current user has permission_level >= trusted_threshold
-                    in the UserStore. True in both DMs and group chats.
+  trusted         — True when the current user holds Permission.EQUIPMENT_TRUSTED
+                    (docs/PERMISSIONS-PLAN.md §10.3 — a disclosure flag, not
+                    an authorisation bool). True in both DMs and group chats.
                     Read from ctx.state["session"]["author_id"] + ctx.state["session"]["platform"].
   time_since_last_message — human-readable elapsed time since the previous user
                     message (e.g. "42s", "5m", "1h 3m"). Empty string on the
@@ -76,6 +77,7 @@ from pathlib import Path
 from jinja2 import Environment, FileSystemLoader, TemplateNotFound, TemplateSyntaxError
 
 from TinyCTX.context import HOOK_PRE_ASSEMBLE_ASYNC
+from TinyCTX.permissions import Permission
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +95,7 @@ _DEFAULT_FOOTER_TEMPLATE = "<clock>{{ time }}</clock>"
 # Variable builder
 # ---------------------------------------------------------------------------
 
-def _build_variables(agent, ctx=None, trusted_threshold: int = 90, last_message_at: float | None = None) -> dict:
+def _build_variables(agent, ctx=None, last_message_at: float | None = None) -> dict:
     # UTC, not host-local time — see module docstring. datetime.now() with no
     # tz arg previously rendered naive local time with no timezone label
     # anywhere in the string, so nothing reading {{ time }} (including
@@ -120,7 +122,9 @@ def _build_variables(agent, ctx=None, trusted_threshold: int = 90, last_message_
         try:
             from TinyCTX.contracts import Platform
             user = _users.get_by_platform(Platform(platform), author_id)
-            trusted = user is not None and user.permission_level >= trusted_threshold
+            trusted = user is not None and user.has_permission(
+                Permission.EQUIPMENT_TRUSTED, agent.config.permissions,
+            )
         except Exception as exc:
             logger.debug("[equipment_manifest] trusted lookup failed: %s", exc)
 
@@ -153,7 +157,7 @@ def _build_variables(agent, ctx=None, trusted_threshold: int = 90, last_message_
     }
 
 
-def _build_static_variables(agent, ctx=None, trusted_threshold: int = 90) -> dict:
+def _build_static_variables(agent, ctx=None) -> dict:
     """Like _build_variables but omits `time` so the result is cache-stable."""
     workspace   = Path(agent.config.workspace.path).expanduser().resolve()
     source_root = Path.cwd().resolve()
@@ -176,7 +180,9 @@ def _build_static_variables(agent, ctx=None, trusted_threshold: int = 90) -> dic
         try:
             from TinyCTX.contracts import Platform
             user = _users.get_by_platform(Platform(platform), author_id)
-            trusted = user is not None and user.permission_level >= trusted_threshold
+            trusted = user is not None and user.has_permission(
+                Permission.EQUIPMENT_TRUSTED, agent.config.permissions,
+            )
         except Exception as exc:
             logger.debug("[equipment_manifest] trusted lookup failed: %s", exc)
 
@@ -241,7 +247,6 @@ def register_agent(agent) -> None:
     module_dir = Path(__file__).parent.resolve()
     em_path    = _resolve_em_path(str(cfg.get("em_path", "")), module_dir, workspace)
     priority   = int(cfg.get("prompt_priority", 5))
-    trusted_threshold = int(cfg.get("trusted_threshold", 90))
 
     if not em_path.exists():
         logger.debug("[equipment_manifest] EM.md not found at %s — module inactive", em_path)
@@ -286,7 +291,7 @@ def register_agent(agent) -> None:
             logger.warning("[equipment_manifest] syntax error in %s: %s", em_path, exc)
             return None
 
-        variables = _build_static_variables(agent, ctx, trusted_threshold)
+        variables = _build_static_variables(agent, ctx)
         try:
             rendered = template.render(**variables).strip()
         except Exception as exc:
@@ -321,7 +326,7 @@ def register_agent(agent) -> None:
     _builtin_footer_tmpl = jinja_env.from_string(_DEFAULT_FOOTER_TEMPLATE)
 
     def _em_prompt_footer(ctx) -> str | None:
-        variables = _build_variables(agent, ctx, trusted_threshold, _last_message_ts[0])
+        variables = _build_variables(agent, ctx, _last_message_ts[0])
 
         if has_footer_file:
             try:

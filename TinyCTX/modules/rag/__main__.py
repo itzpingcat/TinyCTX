@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from TinyCTX.context import HOOK_PRE_ASSEMBLE_ASYNC
+from TinyCTX.permissions import Permission
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +126,7 @@ async def _do_rag_search(
     query: str,
     top_k: int,
     bm25_weight: float,
+    rrf_k: int = 60,
 ) -> list[dict]:
     """Sync the indexer then dispatch to bank.rag_search. Returns [] on any error."""
     bank    = _state.databanks.get(name)
@@ -137,7 +139,7 @@ async def _do_rag_search(
     except Exception as exc:
         logger.warning("[rag] sync failed for '%s': %s", name, exc)
         return []
-    return await bank.rag_search(query, store, _state.embedder, top_k, bm25_weight)
+    return await bank.rag_search(query, store, _state.embedder, top_k, bm25_weight, rrf_k)
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +263,7 @@ def register_agent(cycle) -> None:
     cfg          = _state.cfg
     top_k        = int(cfg["top_k"])
     bm25_weight  = float(cfg["bm25_weight"])
+    rrf_k        = int(cfg.get("rrf_k", 60))
     budget_tokens = int(cfg["result_budget_tokens"])
     auto_priority = int(cfg["auto_inject_priority"])
     default_auto_targets = list(cfg.get("default_auto_targets", []))
@@ -328,7 +331,7 @@ def register_agent(cycle) -> None:
                     indexer = _state.indexers.get(name)
                     if indexer is not None:
                         await indexer.sync()  # keep the semantic side of auto_inject fresh
-                    results = await bank.auto_inject(query, store, _state.embedder, top_k, bm25_weight)
+                    results = await bank.auto_inject(query, store, _state.embedder, top_k, bm25_weight, rrf_k)
                 else:
                     results = await bank.auto_inject(query)  # keyword/regex-only, no embed() call
             except Exception as exc:
@@ -405,7 +408,7 @@ def register_agent(cycle) -> None:
 
         all_parts: list[str] = []
         for name in targets:
-            results = await _do_rag_search(name, query, k, bm25_weight)
+            results = await _do_rag_search(name, query, k, bm25_weight, rrf_k)
             block   = _format_results(results, budget_tokens, databank_name=name)
             if block:
                 all_parts.append(block)
@@ -414,7 +417,7 @@ def register_agent(cycle) -> None:
             return "No results found in the specified databank(s)"
         return "\n\n".join(all_parts)
 
-    cycle.tool_handler.register_tool(rag_search, always_on=True, min_permission=25)
+    cycle.tool_handler.register_tool(rag_search, always_on=True, required_permissions=None)
 
     # ------------------------------------------------------------------
     # Tool: set_auto_rag_databanks
@@ -457,7 +460,7 @@ def register_agent(cycle) -> None:
             return "Auto-rag cleared — no databanks will be injected automatically"
         return f"Auto-rag set to: {targets}"
 
-    cycle.tool_handler.register_tool(set_auto_rag_databanks, always_on=False, min_permission=25)
+    cycle.tool_handler.register_tool(set_auto_rag_databanks, always_on=False, required_permissions={Permission.MANAGE_CTX})
 
     # ------------------------------------------------------------------
     # Tool: rag_list_databanks
@@ -476,4 +479,4 @@ def register_agent(cycle) -> None:
             lines.append(f"  {name}  ({bank.kind})")
         return "\n".join(lines)
 
-    cycle.tool_handler.register_tool(rag_list_databanks, always_on=False, min_permission=25)
+    cycle.tool_handler.register_tool(rag_list_databanks, always_on=False, required_permissions=None)

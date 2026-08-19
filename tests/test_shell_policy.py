@@ -525,19 +525,6 @@ class TestPolicyLoading:
         policy = policy_mod.load_policy(child, WORKSPACE)
         assert validate.check("echo hi", policy, WORKSPACE).allowed
 
-    def test_shipped_example_extension_loads(self):
-        """The worked example next to allow.yaml must actually load."""
-        from TinyCTX.modules.shell.policy import ALLOW_PATH
-
-        example = ALLOW_PATH.parent / "example.instance-allow.yaml"
-        policy = policy_mod.load_policy(example, WORKSPACE)
-        assert validate.check("ps", policy, WORKSPACE).allowed
-        assert validate.check("ps -eo pid,comm,%cpu", policy, WORKSPACE).allowed
-        assert validate.check("echo hi", policy, WORKSPACE).allowed
-        # The column allow-list is the point: argv columns stay out.
-        for leaky in ("ps aux", "ps -ef", "ps -eo pid,args", "ps -eo cmd", "ps e"):
-            assert not validate.check(leaky, policy, WORKSPACE).allowed, leaky
-
     def test_policies_are_cached(self, tmp_path):
         path = self._write(tmp_path, (
             "default_action: allow\n"

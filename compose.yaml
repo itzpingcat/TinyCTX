@@ -49,6 +49,7 @@ services:
       TINYCTX_WORKSPACE_PATH: /home/tinyctx
       TINYCTX_DATA_PATH: /etc/tinyctx
       TINYCTX_CONFIG_DIR_PATH: /app/config
+      XDG_CACHE_HOME: /opt/camoufox-cache
       TINYCTX_INSTANCE: ${TINYCTX_INSTANCE:-tinyctx}
       OPENROUTER_API_KEY:
       ANTHROPIC_API_KEY:
@@ -69,6 +70,10 @@ services:
     tmpfs:
       - /tmp:size=256m,mode=1777
       - /app/__pycache__:size=64m
+    # Docker's default /dev/shm is 64m, which real (non-headless) Firefox
+    # under Camoufox can outgrow once Xvfb itself starts cleanly. Give it
+    # room so the browser doesn't crash/hang on shared-memory allocation.
+    shm_size: "1gb"
 
     deploy:
       resources:

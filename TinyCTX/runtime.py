@@ -11,6 +11,7 @@ from typing import Awaitable, Callable
 
 from TinyCTX.config import Config
 from TinyCTX.contracts import AgentError, InboundMessage, SessionEnvironment
+from TinyCTX.permissions import Permission
 from TinyCTX.users import UserStore
 from TinyCTX.utils.attachments import build_content_blocks as _build_content_blocks
 from TinyCTX.db import ConversationDB
@@ -66,7 +67,18 @@ class Runtime:
 
         self.commands = CommandRegistry()
         self.module_registry = ModuleRegistry()
-        self.users = UserStore(data_path)
+        self.users = UserStore(data_path, template=config.permissions.template)
+
+        # Tool discovery — one ToolVectorStore for the process lifetime,
+        # shared by every AgentCycle's ToolCallHandler (see agent.py). The
+        # tool registry itself is rebuilt fresh each turn, but embeddings are
+        # content-hash cached here across turns and restarts. Embedders are
+        # built lazily per model name (see get_tool_embedder below) since
+        # tools.passive and tools.search may name different embedding
+        # models, or neither — no sense connecting one that's never used.
+        from TinyCTX.tool_handling.vector_store import ToolVectorStore
+        self.tool_vector_store = ToolVectorStore(data_path / "tools_vector_cache.db")
+        self._tool_embedders: dict[str, object] = {}  # model name -> ai.Embedder
 
         # Concurrency Management
         max_workers = getattr(config, "max_workers", 8)
@@ -90,19 +102,66 @@ class Runtime:
     async def start(self) -> None:
         self._register_user_commands()
         self.module_registry.load_modules(self)
+        # Startup assertion (docs/PERMISSIONS-PLAN.md §9): every command
+        # registered by runtime.py itself or by any loaded module must have
+        # declared required_permissions. Runs once, after every module had
+        # its chance to register commands via runtime.commands.register().
+        self.commands.assert_permissions_declared()
         logger.info("Runtime started")
+
+    def get_tool_embedder(self, model_name: str):
+        """
+        Return a cached ai.Embedder for `model_name` (tools.passive.embedding_model
+        or tools.search.embedding_model), building it on first request. Returns
+        None for an empty model_name, or if the name doesn't resolve to a usable
+        'kind: embedding' models: entry — callers (agent.py) treat None as "fall
+        back to BM25-only", same graceful-degrade contract modules/rag uses.
+
+        Cached per model name rather than built once in __init__: tools.passive
+        and tools.search may name different models (or one/both may be unset),
+        so nothing is connected until something actually asks for it.
+        """
+        model_name = (model_name or "").strip()
+        if not model_name:
+            return None
+        if model_name in self._tool_embedders:
+            return self._tool_embedders[model_name]
+        try:
+            from TinyCTX.ai import Embedder
+            emb_cfg = self.config.get_embedding_model(model_name)
+            embedder = Embedder.from_config(emb_cfg)
+        except (KeyError, ValueError, AttributeError) as exc:
+            logger.warning(
+                "[runtime] tool embedding_model '%s' not usable (%s) — BM25 only",
+                model_name, exc,
+            )
+            embedder = None
+        self._tool_embedders[model_name] = embedder
+        return embedder
 
     def _register_user_commands(self) -> None:
         """
-        Register /user modify_permissions, /user info, and /user rename slash commands.
+        Register /user modify_permissions, /user info, and /user rename slash
+        commands — §9 path B of docs/PERMISSIONS-PLAN.md.
 
-        /user modify_permissions <username> <level>  — set a user's permission_level
-        /user info <username>                        — show a user's stored info
-        /user rename <username> <new>                — rename a TinyCTX username (requires caller level 100)
+        /user modify_permissions <username> <permission> <true|false>  — grant
+            or revoke a single permission bool on a user's permission_overrides
+            (see TinyCTX.config.PermissionsConfig; the single global template
+            configured under permissions.template). There are no named tiers
+            to assign a user to anymore — every user resolves against the
+            same template, and per-user variation is entirely this sparse
+            override dict.
+        /user info <username>                            — show a user's
+            stored identity, overrides, and effective permissions.
+        /user rename <username> <new>                    — rename a TinyCTX
+            username.
 
-        Permission rules match the agent tool:
-          - caller can only promote to at most (their level - 1)
-          - caller can only modify users whose current level is at most (their level - 1)
+        Gating is now via the CommandRegistry seam (required_permissions on
+        register(), enforced by dispatch()) instead of hand-rolled level
+        comparisons. ROOT is total (see permissions.py's docstring), so
+        there is no "may only grant up to caller's own level" ceiling to
+        enforce anymore — a ROOT holder may set any bool on any user,
+        including themselves.
         """
         users = self.users
 
@@ -117,47 +176,46 @@ class Runtime:
                     username=interaction.user.name,
                     display_name=interaction.user.display_name,
                 )
-            return None
+            return context.get("caller")
 
         from TinyCTX.users import UsernameConflictError
 
         async def _cmd_modify_permissions(args: list[str], context: dict) -> None:
             send = context["send"]
-            if len(args) < 2:
-                await send("Usage: /user modify_permissions <username> <level>")
+            valid = ", ".join(sorted(p.value for p in Permission))
+            if len(args) < 3:
+                await send(
+                    "Usage: /user modify_permissions <username> <permission> <true|false> "
+                    f"(known permissions: {valid})"
+                )
                 return
             caller = _caller_user(context)
             if caller is None:
                 await send("⛔ Cannot resolve your identity.")
                 return
-            target_username = args[0]
+            target_username, perm_name, value_str = args[0], args[1], args[2]
             try:
-                level = int(args[1])
+                perm = Permission(perm_name)
             except ValueError:
-                await send(f"Invalid level {args[1]!r} — must be an integer.")
+                await send(f"Unknown permission {perm_name!r}. Known permissions: {valid}")
                 return
-            if not (0 <= level <= 100):
-                await send("Level must be between 0 and 100.")
+            value_lower = value_str.strip().lower()
+            if value_lower not in ("true", "false"):
+                await send("Value must be 'true' or 'false'.")
                 return
-            max_grantable = caller.permission_level - 1
-            if level > max_grantable:
-                await send(f"⛔ Cannot set level {level} — you may only grant up to {max_grantable} (your level − 1).")
-                return
+            value = value_lower == "true"
             user = users.get_user(target_username)
             if user is None:
                 await send(f"User {target_username!r} not found.")
                 return
-            if user.permission_level >= caller.permission_level:
-                await send(f"⛔ {target_username!r} is at level {user.permission_level} — not below your level ({caller.permission_level}).")
-                return
-            old_level = user.permission_level
-            user.permission_level = level
+            old = user.permission_overrides.get(perm.value)
+            user.permission_overrides[perm.value] = value
             users.update_user(user)
             logger.info(
-                "[user] %s set level %d on %s (was %d)",
-                caller.username, level, target_username, old_level,
+                "[user] %s set %s=%s on %s (was %r)",
+                caller.username, perm.value, value, target_username, old,
             )
-            await send(f"✅ {target_username}: {old_level} → {level}")
+            await send(f"✅ {target_username}: {perm.value} → {value}")
 
         async def _cmd_info(args: list[str], context: dict) -> None:
             send = context["send"]
@@ -172,8 +230,13 @@ class Runtime:
                 f"{i.platform.value}:{i.user_id} ({i.username})"
                 for i in user.identities
             ) or "none"
+            overrides = ", ".join(
+                f"{k}={v}" for k, v in sorted(user.permission_overrides.items())
+            ) or "(none)"
+            effective = sorted(p.value for p in user.effective_permissions(self.config.permissions))
             await send(
-                f"**{user.username}** — level {user.permission_level}\n"
+                f"**{user.username}** — overrides: {overrides}\n"
+                f"Effective permissions: {', '.join(effective) or '(none)'}\n"
                 f"Identities: {identities}\n"
                 f"Created: {user.created_at:.0f}"
             )
@@ -182,10 +245,6 @@ class Runtime:
             send = context["send"]
             if len(args) < 2:
                 await send("Usage: /user rename <username> <new_username>")
-                return
-            caller = _caller_user(context)
-            if caller is None or caller.permission_level < 100:
-                await send("⛔ Permission denied. Requires level 100.")
                 return
             try:
                 updated = users.rename_user(args[0], args[1])
@@ -196,14 +255,70 @@ class Runtime:
                 await send(f"Username {args[1]!r} is already taken.")
 
         self.commands.register("user", "modify_permissions", _cmd_modify_permissions,
-            help="Set a user's permission level",
-            params=[("username", str, "TinyCTX username"), ("level", int, "Permission level (0-100)")])
+            help="Grant or revoke a single permission bool for a user",
+            params=[("username", str, "TinyCTX username"),
+                    ("permission", str, "Permission name (e.g. file_write, root)"),
+                    ("value", str, "'true' or 'false'")],
+            required_permissions={Permission.ROOT})
         self.commands.register("user", "info", _cmd_info,
-            help="Show a user's stored identity and level",
-            params=[("username", str, "TinyCTX username")])
+            help="Show a user's stored identity and permissions",
+            params=[("username", str, "TinyCTX username")],
+            required_permissions={Permission.USER_READ})
         self.commands.register("user", "rename", _cmd_rename,
             help="Rename a TinyCTX username (admin only)",
-            params=[("username", str, "Current username"), ("new_username", str, "New username")])
+            params=[("username", str, "Current username"), ("new_username", str, "New username")],
+            required_permissions={Permission.ROOT})
+
+    # ------------------------------------------------------------------
+    # Platform delivery — render events to a destination outside a live
+    # bridge-owned reply_queue drain loop (e.g. a cron job's output).
+    # ------------------------------------------------------------------
+
+    def register_platform_handler(
+        self,
+        platform: str,
+        handler: Callable[[str, object], Awaitable[None]],
+    ) -> None:
+        """
+        Register a renderer for `platform`: an async callable
+        `(destination, event) -> None` that renders one AgentEvent to
+        `destination` (a platform-specific address — e.g. a Discord
+        cursor_key or a Telegram chat_key).
+
+        Bridges call this once at startup with the same render_event
+        function their own turn-handling loop uses, so any caller that
+        isn't a live bridge turn (cron, and any future non-interactive
+        trigger source) can deliver output through the identical
+        rendering path a live user turn would use — same message
+        chunking, same file-upload handling, same error formatting.
+
+        Overwrites any previously registered handler for `platform`.
+        """
+        self._platform_handlers[platform] = handler
+        logger.info("[runtime] platform handler registered for %r", platform)
+
+    async def deliver(self, platform: str, destination: str, event: object) -> bool:
+        """
+        Render one AgentEvent to `destination` via the handler registered
+        for `platform`. Returns False (and logs) if no handler is
+        registered, or if the handler itself raises — a delivery failure
+        must never propagate up and abort the caller's larger loop (e.g.
+        a cron tick processing several due jobs).
+        """
+        handler = self._platform_handlers.get(platform)
+        if handler is None:
+            logger.warning(
+                "[runtime] deliver: no platform handler registered for %r — dropping event", platform
+            )
+            return False
+        try:
+            await handler(destination, event)
+            return True
+        except Exception:
+            logger.exception(
+                "[runtime] deliver: handler for %r raised while rendering to %r", platform, destination
+            )
+            return False
 
     # ------------------------------------------------------------------
     # Platform delivery — render events to a destination outside a live

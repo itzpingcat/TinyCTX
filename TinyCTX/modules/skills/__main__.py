@@ -605,7 +605,7 @@ def register_agent(cycle) -> None:
         agent.tool_handler.register_tool(
             use_skill,
             always_on=(_sk_vis != "deferred"),
-            min_permission=25,
+            required_permissions=None,
         )
 
     # ------------------------------------------------------------------
@@ -650,7 +650,7 @@ def register_agent(cycle) -> None:
     agent.tool_handler.register_tool(
         collapse_skill_categories,
         always_on=False,   # deferred
-        min_permission=25,
+        required_permissions=None,
     )
 
     # ------------------------------------------------------------------

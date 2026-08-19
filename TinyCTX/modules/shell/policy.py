@@ -42,26 +42,22 @@ Inheritance:
   cannot change the inherited `default_action` — allow-posture and
   deny-posture rules use different schemas.
 
-Which policies apply to whom:
-  Config, not code. Each policy carries the level at which a caller outgrows
-  it — that single number is the whole mechanism:
-
-      min_permission: 30
-      policies:
-        - {policy: builtin:allow, applies_below: 45}
-        - {policy: builtin:deny,  applies_below: 90}
-
-  Level 20 is subject to both, 50 to the deny-list only, 95 to nothing.
-  Omitting `applies_below` makes a policy unconditional. `min_permission` is
-  the level below which the tool isn't offered at all.
+Which policies apply to whom (HISTORICAL — retired):
+  Versions of this module before docs/PERMISSIONS-PLAN.md used to select
+  between policies by a numeric `min_permission` / `applies_below` tier
+  (level 20 got both an allow-list and a deny-list, level 50 got the
+  deny-list only, level 95 got nothing). That per-command allow/deny RULE
+  matching stood in for capability declarations, and is gone: which
+  commands a caller may run is now decided by modules/shell/perms.py's
+  per-command capability classification, checked once centrally by
+  tool_handling.handler.ToolCallHandler (§5, §5.2). What this module still
+  does is load a single Policy purely for its `constructs` map — the
+  structural/shape check (rejecting `$()`, unquoted globs used as commands,
+  unrecognized bash syntax) that's orthogonal to capability checking and
+  runs underneath it. See modules/shell/__main__.py's `shape_policy`.
 
   Nothing here knows what a "whitelist" or a "blacklist" is. Each file
-  declares its own posture via `default_action`, so the dispatcher just
-  filters a list by one comparison. That replaced first a hardcoded if-chain
-  with the constants use_whitelist / neutral / bypass_blacklist (three fixed
-  tiers, unextendable), and then a table of bands with nested policy lists
-  (extendable, but able to express a policy binding a HIGHER-privileged caller
-  and not a lower one — incoherent, and now unrepresentable).
+  declares its own posture via `default_action`.
 
 Policies are loaded once and cached by (path, workspace). The files are
 read-only by design (mounted read-only into the container) and are not meant to
@@ -151,26 +147,6 @@ class Policy:
     max_command_bytes: int
 
 
-@dataclass(frozen=True)
-class ScopedPolicy:
-    """A policy plus the level at which a caller stops being subject to it."""
-
-    policy: Policy
-    applies_below: int | None  # None = applies to everyone, no upper bound
-
-
-@dataclass(frozen=True)
-class PolicySet:
-    entries: tuple[ScopedPolicy, ...]
-
-    def for_level(self, level: int) -> tuple[Policy, ...]:
-        """Every policy this caller must satisfy. Empty tuple = unrestricted."""
-        return tuple(
-            e.policy for e in self.entries
-            if e.applies_below is None or level < e.applies_below
-        )
-
-
 # ---------------------------------------------------------------------------
 # Loading
 # ---------------------------------------------------------------------------
@@ -201,56 +177,6 @@ def load_policy(path: Path | str, workspace: Path | str) -> Policy:
 def clear_cache() -> None:
     """Drop the policy cache. Used by tests."""
     _cache.clear()
-
-
-def load_policy_set(raw, workspace: Path | str, config_dir: Path | str) -> PolicySet:
-    """Compile the `extra.shell.policies` list.
-
-    Each entry names a policy and the level at which a caller outgrows it:
-
-        policies:
-          - {policy: builtin:allow, applies_below: 45}
-          - {policy: builtin:deny,  applies_below: 90}
-
-    A caller is subject to every entry whose `applies_below` they are under, so
-    level 20 gets both, level 50 gets the deny-list only, and level 95 gets
-    nothing. Omit `applies_below` to make a policy unconditional.
-
-    Note what this cannot express: a policy that binds a HIGHER-privileged
-    caller but not a lower one. That's incoherent, and making it
-    unrepresentable is the reason this is a flat list of thresholds rather
-    than a table of tiers.
-
-    Raises PolicyError on a malformed list or an unloadable policy. Callers
-    must treat that as "block everything".
-    """
-    if not isinstance(raw, list):
-        raise PolicyError("shell.policies must be a list")
-
-    entries: list[ScopedPolicy] = []
-    for entry in raw:
-        if not isinstance(entry, dict):
-            raise PolicyError(f"shell.policies: each entry must be a mapping, got {entry!r}")
-        unknown = set(entry) - {"policy", "applies_below"}
-        if unknown:
-            raise PolicyError(f"shell.policies: unknown key(s): {sorted(unknown)}")
-        ref = entry.get("policy")
-        if not ref:
-            raise PolicyError(f"shell.policies: entry is missing 'policy': {entry!r}")
-
-        applies_below = entry.get("applies_below")
-        if applies_below is not None:
-            try:
-                applies_below = int(applies_below)
-            except (TypeError, ValueError) as exc:
-                raise PolicyError(
-                    f"shell.policies: applies_below must be an integer, got {entry['applies_below']!r}"
-                ) from exc
-
-        policy = load_policy(_resolve_ref(ref, config_dir=Path(config_dir)), workspace)
-        entries.append(ScopedPolicy(policy=policy, applies_below=applies_below))
-
-    return PolicySet(entries=tuple(entries))
 
 
 def _resolve_ref(value, relative_to: Path | None = None, config_dir: Path | None = None) -> Path:

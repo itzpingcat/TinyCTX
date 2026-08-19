@@ -7,7 +7,7 @@ command_introspection: false
 concurrency:
   roster_priority: 13
 cron:
-  store_file: CRON.json
+  store_file: cron.db
 ctx_tools:
   cot_keep_recent_turns: 10000
   same_call_dedup_after: 2
@@ -28,7 +28,6 @@ equipment_manifest:
   em_path: ''
   enabled: true
   prompt_priority: 5
-  trusted_threshold: 90
 error_introspection: false
 filesystem:
   cache_size: 128
@@ -39,17 +38,6 @@ gateway:
   enabled: false
   host: 127.0.0.1
   port: 8085
-heartbeat:
-  ack_max_chars: 300
-  active_hours: null
-  branch_from: root
-  continuation_prompt: <heartbeat_sentinel>Continue the task, or reply NO_REPLY when
-    you are done.</heartbeat_sentinel>
-  every_minutes: 30
-  max_continuations: 5
-  prompt: <heartbeat_sentinel>Read HEARTBEAT.md if it exists (workspace context).
-    Follow it strictly. Do not infer or repeat old tasks from prior chats. If nothing
-    needs attention, reply NO_REPLY.</heartbeat_sentinel>
 llm:
   fallback: []
   fallback_on:
@@ -138,6 +126,13 @@ models:
 parallel: 3
 permissions:
   minimal_tokens: false
+  # template: not shown here — omitting this key gets the built-in empty
+  # (fully closed) default documented in TinyCTX/config/__main__.py's
+  # _DEFAULT_TEMPLATE and docs/PERMISSIONS-PLAN.md §2. There is a single
+  # global template shared by every user; grant a specific user more via
+  # their permission_overrides (/user modify_permissions,
+  # onboard/fix_permissions.py, or the gateway's
+  # /v1/user/{username}/elevate endpoint for full admin).
 rag:
   auto_inject_priority: 25
   auto_inject_semantic: true
@@ -153,6 +148,7 @@ rag:
   - .rst
   rag_dir: rag
   result_budget_tokens: 2048
+  rrf_k: 60
   top_k: 5
 router:
   host: 127.0.0.1
@@ -160,14 +156,6 @@ router:
 shell:
   default_timeout: 120
   max_timeout: 1200
-  min_permission: 30
-  permissions:
-    access_backend: 80
-  policies:
-  - applies_below: 45
-    policy: builtin:allow
-  - applies_below: 90
-    policy: builtin:deny
   sandbox_url: null
 skills:
   dropped_footer_priority: 50
@@ -177,8 +165,6 @@ skills:
   skill_dirs:
   - skills
   tools: {}
-sysops:
-  model_min_permission: 75
 system_prompt:
   agents:
     file: AGENTS.md
@@ -190,22 +176,36 @@ system_prompt:
     file: TOOLS.md
     priority: 15
 token_fuzz: 1.1
-tool_overrides: {}
+tools:
+  overrides: {}
+  passive:
+    auto_bm25_enabled: true
+    auto_limit: 2
+    auto_min_score: 0.0
+    auto_vector_enabled: false
+    embedding_model: ''
+    rrf_k: 60
+  search:
+    embedding_model: ''
+    min_score: 0.0
+    rrf_k: 60
+    top_k: 5
+    vector_enabled: false
 web:
   browse_max_bytes: 2000000
   browse_max_chars: 20000
   browse_user_agent: TinyCTX/1.1
-  output_dir: outputs/browser   # screenshots land here; also returned inline
-  headless: virtual   # true | false | virtual (Xvfb-backed headful; needed for bot-checked sites)
+  headless: virtual
   ignore_tags:
   - script
   - style
   max_discovery_elements: 40
+  output_dir: outputs/browser
   prompt_priority: 12
+  screenshot_max_bytes: 1500000
   search_results: 5
+  settle_timeout_ms: 15000
   shift_enter_for_newline: true
-  screenshot_max_bytes: 1500000   # larger screenshots are saved but not shown inline
-  settle_timeout_ms: 15000   # extra wait for JS interstitials (Reddit, Cloudflare)
   timeout_ms: 30000
   tools: {}
   wait_until: domcontentloaded

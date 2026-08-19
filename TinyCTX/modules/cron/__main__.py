@@ -15,10 +15,12 @@ synthetic runner identity) had:
   2. Hardcoded permission: v1 ran every job as one synthetic "cron-system"
      user, so permission-gated tools were either open to all cron jobs or
      none. Jobs now store the *real* creating user's username, and at run
-     time the job executes with that user's *current* permission_level
-     (re-resolved via UserStore.get_user, not cached) — a promotion or
-     demotion since the job was created takes effect on the job's very
-     next run. The agent-facing tools never mention this: the agent isn't
+     time the job executes with that user's *current* effective_permissions()
+     (re-resolved via UserStore.get_user, not cached) — a grant or revocation
+     since the job was created takes effect on the job's very next run, and
+     tool calls made inside a firing job are checked against the creator's
+     current permissions by the normal ToolCallHandler seam, same as any
+     live turn. The agent-facing tools never mention this: the agent isn't
      "running the job as itself" in any permission sense — see add_cron's
      docstring, which is written entirely from the agent's point of view
      (schedule things, reminders/recurring checks, message goes to itself).
@@ -55,9 +57,9 @@ add_cron recovers "what channel is this turn happening in" without
 importing any bridge module. list_cron only returns jobs whose cursor_key
 matches the caller's current channel; remove_cron only acts on a job in
 the caller's channel, and additionally requires either being the job's
-creator or having permission_level >= admin_override_permission (config,
-default 90) — so Alice cannot see or delete Bob's job in Bob's channel, and
-a same-channel non-admin cannot delete another user's job either.
+creator or holding Permission.CRON_ADMIN (docs/PERMISSIONS-PLAN.md §8) —
+so Alice cannot see or delete Bob's job in Bob's channel, and a
+same-channel non-admin cannot delete another user's job either.
 
 Convention: register_agent(agent) — no imports from gateway or bridges
 (delivery goes through Runtime.deliver, which is bridge-agnostic).
@@ -71,7 +73,7 @@ import sqlite3
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from TinyCTX.contracts import (
@@ -79,6 +81,7 @@ from TinyCTX.contracts import (
     InboundMessage, SessionEnvironment, ContentType,
     Platform,
 )
+from TinyCTX.permissions import Permission
 
 logger = logging.getLogger(__name__)
 
@@ -243,6 +246,11 @@ class CronStore:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(_DDL)
+        cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(cron_jobs)")}
+        if "run_in" not in cols:
+            self._conn.execute(
+                "ALTER TABLE cron_jobs ADD COLUMN run_in TEXT NOT NULL DEFAULT 'main'"
+            )
         self._conn.commit()
         logger.info("[cron] store at %s", db_path)
 
@@ -362,21 +370,56 @@ class _CronRunner:
     Watches CronStore and triggers turns via the Runtime, delivering each
     job's output back to its origin channel via Runtime.deliver().
     """
-    def __init__(self, runtime, store: CronStore, min_run_permission: int) -> None:
+    def __init__(self, runtime, store: CronStore,
+                 poll_seconds: float = 20.0) -> None:
         self.runtime = runtime
         self._store = store
-        self._min_run_permission = min_run_permission
+        self._poll_seconds = max(1.0, float(poll_seconds))
         self._jobs: list[CronJob] = []
         self._timer_task: asyncio.Task | None = None
         self._running = False
         self._job_lock = asyncio.Lock()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._wake: asyncio.Event | None = None
 
     def start(self) -> None:
+        # The loop is captured here because start() runs on the loop the
+        # runner lives on, while add_cron/remove_cron are plain sync tool
+        # functions that the agent's tool dispatcher runs off-loop (see
+        # tool_handling/handler.py — non-coroutine tools go through
+        # loop.run_in_executor, i.e. a worker thread). notify_change()
+        # below needs this reference to hop back onto the loop safely.
+        self._loop = asyncio.get_running_loop()
+        self._wake = asyncio.Event()
         self._running = True
         self._reload()
         self._recompute_next_runs()
-        self._arm()
-        logger.info("[cron] runner started")
+        self._timer_task = asyncio.create_task(self._run_loop())
+        logger.info("[cron] runner started (poll every %.0fs)", self._poll_seconds)
+
+    def stop(self) -> None:
+        self._running = False
+        if self._timer_task and not self._timer_task.done():
+            self._timer_task.cancel()
+
+    def notify_change(self) -> None:
+        """
+        Tell the runner the job list changed, so it re-checks immediately
+        instead of waiting out its current sleep. Safe to call from any
+        thread — add_cron/remove_cron run in an executor thread.
+
+        This only makes the runner react *sooner*. Even if the wakeup never
+        lands, the poll loop re-reads the store every self._poll_seconds, so
+        a job is late by at most that interval rather than never firing.
+        """
+        loop, wake = self._loop, self._wake
+        if loop is None or wake is None:
+            return  # runner never started — the poll loop will pick it up
+        try:
+            loop.call_soon_threadsafe(wake.set)
+        except RuntimeError:
+            # Loop already closed (shutting down) — nothing to wake.
+            pass
 
     def _reload(self) -> None:
         self._jobs = self._store.all()
@@ -396,64 +439,95 @@ class _CronRunner:
         ]
         return min(enabled_jobs) if enabled_jobs else None
 
-    def _arm(self) -> None:
-        if self._timer_task and not self._timer_task.done():
-            self._timer_task.cancel()
+    async def _run_loop(self) -> None:
+        """
+        The scheduler: ONE long-lived task that polls the store, runs
+        whatever is due, then sleeps until the next due time (capped at
+        self._poll_seconds) or until notify_change() wakes it early.
 
-        wake = self._next_wake_ms()
-        if wake is None or not self._running:
-            return
+        This deliberately replaces the previous design of arming a fresh
+        one-shot asyncio task per wakeup and cancelling/re-arming it from
+        _tick's own `finally`. That design deadlocked itself: _arm()
+        cancels self._timer_task whenever it isn't done, but when called
+        from _tick's finally, self._timer_task IS the still-running tick —
+        and when called from add_cron it cancelled a sleeping tick whose
+        finally then immediately cancelled the *replacement* task and armed
+        another, whose finally cancelled that one, and so on. CancelledError
+        derives from BaseException, so `except Exception` never caught it
+        while `finally` still re-armed every time: an endless
+        cancel/re-arm cascade in which no timer ever survived long enough
+        to sleep to its deadline, so no job ever fired — silently, with
+        nothing logged.
 
-        delay = max(0, (wake - _now_ms()) / 1000)
-        self._timer_task = asyncio.create_task(self._tick(delay))
+        A single loop that is never cancelled has no such failure mode, and
+        the poll ceiling means a bug in the wakeup path can only ever make
+        a job late, never make it vanish.
+        """
+        assert self._wake is not None
+        while self._running:
+            delay = self._poll_seconds
+            try:
+                self._reload()
+                now = _now_ms()
+                due = [
+                    j for j in self._jobs
+                    if j.enabled and j.state.next_run_at_ms and now >= j.state.next_run_at_ms
+                ]
 
-    async def _tick(self, delay: float) -> None:
-        try:
-            await asyncio.sleep(delay)
-            if not self._running:
-                return
+                for job in due:
+                    async with self._job_lock:
+                        try:
+                            await self._run_job(job)
+                        except Exception:
+                            # One job's unexpected failure must never take
+                            # down the scheduler — at worst this run is
+                            # skipped and the job is rescheduled.
+                            logger.exception("[cron] job '%s' run raised unexpectedly", job.id)
+                            job.state.last_status = "error"
+                            job.state.last_error = "internal error — see server logs"
+                            job.state.last_run_at_ms = now
+                            if job.schedule.one_shot:
+                                job.enabled = False
+                            else:
+                                job.state.next_run_at_ms = _compute_next_run(job.schedule, _now_ms())
+                            await asyncio.to_thread(self._store.save_state, job)
 
-            self._reload()
-            now = _now_ms()
-            due = [j for j in self._jobs if j.enabled and j.state.next_run_at_ms and now >= j.state.next_run_at_ms]
+                wake = self._next_wake_ms()
+                if wake is not None:
+                    delay = max(0.1, min(self._poll_seconds, (wake - _now_ms()) / 1000))
+                if self._jobs:
+                    # Proof-of-life for the scheduler. If a job is sitting in
+                    # the store and never firing, this line is the first
+                    # thing to check: it shows whether the runner can see it
+                    # and what it thinks the job's due time is.
+                    logger.debug(
+                        "[cron] %d job(s) loaded, next due %s, sleeping %.1fs",
+                        len(self._jobs), _fmt_ts(wake), delay,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("[cron] scheduler iteration failed — continuing")
 
-            for job in due:
-                async with self._job_lock:
-                    try:
-                        await self._run_job(job)
-                    except Exception:
-                        # A single job's unexpected failure must never take
-                        # down the tick. v1's _tick had no such guard, so an
-                        # exception here (or in _reload / the due list
-                        # comprehension) killed the create_task coroutine
-                        # outright: no future tick was ever armed again, and
-                        # nothing logged that the scheduler had silently
-                        # died. Catch broadly so at worst one job's run is
-                        # skipped, never the scheduler itself.
-                        logger.exception("[cron] job '%s' run raised unexpectedly", job.id)
-                        job.state.last_status = "error"
-                        job.state.last_error = "internal error — see server logs"
-                        job.state.last_run_at_ms = now
-                        if job.schedule.one_shot:
-                            job.enabled = False
-                        else:
-                            job.state.next_run_at_ms = _compute_next_run(job.schedule, _now_ms())
-                        await asyncio.to_thread(self._store.save_state, job)
-        except Exception:
-            logger.exception("[cron] tick failed outside job execution — scheduler will still re-arm")
-        finally:
-            # Always re-arm, even if something above raised — this is the
-            # single most important line in the runner: v1 had no `finally`
-            # here, so any unhandled exception in this coroutine permanently
-            # stopped the scheduler with no error surfaced anywhere.
-            self._arm()
+            try:
+                await asyncio.wait_for(self._wake.wait(), timeout=delay)
+            except asyncio.TimeoutError:
+                pass
+            except asyncio.CancelledError:
+                raise
+            finally:
+                self._wake.clear()
+
+        logger.info("[cron] runner stopped")
 
     async def _run_job(self, job: CronJob) -> None:
         start_ms = _now_ms()
 
-        # 1. Re-resolve the job's *current* permission level from the real
-        # creator's user record — not a cached/synthetic value. A demotion
-        # since the job was created takes effect on this run.
+        # 1. Re-resolve the job's *current* permissions from the real
+        # creator's user record — not a cached/synthetic value. A grant or
+        # revocation since the job was created takes effect on this run
+        # (docs/PERMISSIONS-PLAN.md §8: a demoted creator's job is skipped
+        # wholesale, not partially executed).
         creator = self.runtime.users.get_user(job.creator_username)
         if creator is None:
             job.state.last_status = "error"
@@ -464,16 +538,15 @@ class _CronRunner:
             logger.warning("[cron] job '%s' skipped — creator user missing", job.id)
             return
 
-        if creator.permission_level < self._min_run_permission:
+        if not creator.has_permission(Permission.CRON_CREATE, self.runtime.config.permissions):
             job.state.last_status = "skipped"
             job.state.last_error = (
-                f"creator '{creator.username}' permission_level "
-                f"{creator.permission_level} < required {self._min_run_permission}"
+                f"creator '{creator.username}' no longer holds cron_create"
             )
             job.state.last_run_at_ms = start_ms
             job.state.next_run_at_ms = _compute_next_run(job.schedule, _now_ms())
             await asyncio.to_thread(self._store.save_state, job)
-            logger.info("[cron] job '%s' skipped — creator permission too low", job.id)
+            logger.info("[cron] job '%s' skipped — creator lacks cron_create", job.id)
             return
 
         logger.info("[cron] running job '%s' (creator=%s, run_in=%s, reset=%s)",
@@ -510,8 +583,8 @@ class _CronRunner:
             parent_id = self.runtime.db.get_root().id
 
         # 3. Prepare the turn — runs as the real creator, so permission-gated
-        # tools see this job's actual current permission_level, not a fixed
-        # system identity's.
+        # tools see this job's actual current effective_permissions(), not a
+        # fixed system identity's.
         #
         # job.message is wrapped, not sent verbatim, and suppress_attribution
         # is set so this ONE node gets no 【label】: prefix — not the whole
@@ -523,7 +596,7 @@ class _CronRunner:
         # NO_ATTRIBUTION_SENTINEL for how Runtime.push() and Context.assemble()
         # implement this per-node, not per-Context — author=creator below is
         # completely unaffected by suppress_attribution and still drives
-        # caller.permission_level normally.
+        # caller.effective_permissions() normally.
         #
         # Two complementary fixes for one root cause: without
         # suppress_attribution, the LLM would see what looks exactly like the
@@ -533,11 +606,12 @@ class _CronRunner:
         # cue; the wrapper text below makes the situation explicit in words
         # too, and tells the agent where its reply actually goes.
         wrapped_message = (
-            "[Scheduled trigger — not a message from a person waiting in this "
-            f"conversation. This fired automatically on the schedule you set up. "
-            f"Your instruction to yourself was:]\n{job.message}\n\n"
-            "[Carry it out now. Whatever you write in reply is what gets sent "
-            "to this channel — there is no one here to reply \"to\".]"
+            "<cron_sentinel>"
+            f"Your scheduled cron job has fired for this conversation. This fired automatically on the schedule you set up. "
+            f"Your instruction to yourself was:[\n{job.message}\n]\n"
+            "Carry it out now. Whatever you write in reply gets sent "
+            "to this channel. If you have nothing to say return NO_REPLY."
+            "</cron_sentinel>"
         )
         msg = InboundMessage(
             tail_node_id=parent_id,
@@ -627,6 +701,7 @@ class _CronRunner:
 # ---------------------------------------------------------------------------
 
 _STORE_CACHE: CronStore | None = None
+_RUNNER_CACHE: "_CronRunner | None" = None
 
 
 def _get_config() -> dict:
@@ -639,7 +714,7 @@ def register_runtime(runtime) -> None:
     Called once at boot. Opens the CronStore under config.data.path and
     starts the background runner that triggers due jobs.
     """
-    global _STORE_CACHE
+    global _STORE_CACHE, _RUNNER_CACHE
 
     cfg = _get_config()
     data_path = Path(runtime.config.data.path).expanduser().resolve()
@@ -647,9 +722,10 @@ def register_runtime(runtime) -> None:
     store = CronStore(data_path / store_file)
     _STORE_CACHE = store
 
-    min_run_permission = int(cfg.get("min_run_permission", 0))
-    runner = _CronRunner(runtime, store, min_run_permission)
+    poll_seconds = float(cfg.get("poll_seconds", 20))
+    runner = _CronRunner(runtime, store, poll_seconds)
     runner.start()
+    _RUNNER_CACHE = runner
 
     logger.info("[cron] background runner active via register_runtime")
 
@@ -660,13 +736,10 @@ def register_agent(agent) -> None:
     the calling turn's real user identity and channel (cursor_key).
     """
     store = _STORE_CACHE
-    if store is None:
+    runner = _RUNNER_CACHE
+    if store is None or runner is None:
         logger.error("[cron] register_agent called before register_runtime — cron tools unavailable this turn")
         return
-
-    cfg = _get_config()
-    min_create_permission = int(cfg.get("min_create_permission", 25))
-    admin_override_permission = int(cfg.get("admin_override_permission", 90))
 
     def _current_channel() -> tuple[str, str] | None:
         """
@@ -689,8 +762,9 @@ def register_agent(agent) -> None:
             return None
         return platform, cursor_key
 
-    def add_cron(cron_expr: str, message: str, one_shot: bool = False,
-                 tz: str = "", reset_after_run: bool = False, run_in: str = "main") -> str:
+    def add_cron(message: str, in_minutes: int = 0, cron_expr: str = "",
+                 one_shot: bool = False, tz: str = "",
+                 reset_after_run: bool = False, run_in: str = "main") -> str:
         """
         Schedule something to happen later, in this channel — a reminder,
         a recurring check-in, a daily/weekly report, anything you'd
@@ -710,21 +784,37 @@ def register_agent(agent) -> None:
         asked for a nudge at 3pm today." Whatever you say in response to
         that instruction is what the person in this channel actually sees.
 
-        Scheduling is expressed as a standard 5-field cron expression
-        (minute hour day-of-month month day-of-week), always in UTC
-        unless you set tz. Examples:
+        There are two ways to say when. Pick exactly one.
+
+        (1) in_minutes — for anything relative: "in 10 minutes", "in an
+        hour", "tomorrow morning", "in three days". Just pass how many
+        minutes from now, and it fires once, then stops. "remind me in 10
+        minutes" -> in_minutes=10. "in 2 hours" -> in_minutes=120.
+
+        PREFER THIS for every relative request. Do NOT do the clock
+        arithmetic yourself: the exact fire time is computed here, at the
+        moment the job is stored, from the server's own clock. If you
+        instead hand-write a cron expression for a time a few minutes out
+        and your idea of "now" is even slightly behind the server's, the
+        minute you picked is already in the past — and a cron expression
+        never fires in the past, it silently rolls forward to the next
+        matching time, which for a "HH MM * * *" pattern is 24 hours
+        later. The person gets nothing, and nothing looks broken.
+
+        (2) cron_expr — for genuinely repeating calendar schedules, as a
+        standard 5-field expression (minute hour day-of-month month
+        day-of-week), in UTC unless you set tz:
           "0 9 * * *"     — every day at 9:00 UTC
           "*/30 * * * *"  — every 30 minutes
           "0 9 * * 1"     — every Monday at 9:00 UTC
           "0 17 * * 1-5"  — weekdays at 17:00 UTC
+        Set one_shot=True if such a schedule should fire only its next
+        occurrence and then stop.
 
-        For a one-time reminder ("remind me in 20 minutes", "follow up
-        with them tomorrow at noon") rather than a recurring schedule:
-        compute the single future UTC minute/hour/day/month you want
-        (you have the current time in your context) and pass it as the
-        cron expression with day-of-week as "*", e.g. current time
-        14:10 UTC + 20 minutes -> "30 14 * * *", and set one_shot=True
-        so it fires exactly once and then stops.
+        Either way, the reply tells you the exact UTC time it will fire.
+        Read it back and sanity-check it against what the person asked
+        for — if it says tomorrow when they said ten minutes, say so
+        rather than confirming.
 
         By default the job fires right into this same conversation — when it
         goes off, it'll see everything that's happened here since (including
@@ -740,21 +830,20 @@ def register_agent(agent) -> None:
         sure, leave it as "main".
 
         Args:
-            cron_expr: 5-field cron expression — see examples above.
             message: The self-contained instruction you'll receive when this fires. Be detailed — you'll have no memory of this conversation.
-            one_shot: True for a single reminder/follow-up that fires once and never again. False (default) for something recurring.
+            in_minutes: How many minutes from now to fire, for a one-time reminder. Use this for ALL relative timing ("in 10 minutes" -> 10, "in 2 hours" -> 120, "tomorrow morning" -> minutes until then). Leave 0 if using cron_expr instead.
+            cron_expr: 5-field cron expression, for repeating calendar schedules only — see examples above. Leave empty if using in_minutes.
+            one_shot: With cron_expr, True fires only the next occurrence then stops. Ignored with in_minutes (always one-shot).
             tz: IANA timezone (e.g. "America/New_York") if the person means local time rather than UTC. Leave empty for UTC.
             reset_after_run: Only meaningful with run_in="isolated" — wipes that private scratch conversation after each run. No effect in the default "main" mode.
             run_in: "main" (default) to fire into this conversation, or "isolated" for a private one-off scratch conversation. Leave as "main" unless you have a specific reason not to.
         """
+        # Permission (CRON_CREATE) was already checked by
+        # ToolCallHandler.execute_tool_call before this function ever ran —
+        # see the required_permissions= passed to register_tool() below.
         caller = agent.caller
         if caller is None:
             return json.dumps({"status": "error", "error": "Cannot resolve your identity."})
-        if caller.permission_level < min_create_permission:
-            return json.dumps({
-                "status": "error",
-                "error": f"permission_level {caller.permission_level} < required {min_create_permission} to create cron jobs.",
-            })
 
         channel = _current_channel()
         if channel is None:
@@ -767,6 +856,35 @@ def register_agent(agent) -> None:
         message = (message or "").strip()
         if not message:
             return json.dumps({"status": "error", "error": "message must not be empty."})
+
+        cron_expr = (cron_expr or "").strip()
+        try:
+            in_minutes = int(in_minutes or 0)
+        except (TypeError, ValueError):
+            return json.dumps({"status": "error", "error": "in_minutes must be a whole number of minutes."})
+
+        if in_minutes > 0:
+            if cron_expr:
+                return json.dumps({
+                    "status": "error",
+                    "error": "Pass either in_minutes or cron_expr, not both.",
+                })
+            if in_minutes > 366 * 24 * 60:
+                return json.dumps({"status": "error", "error": "in_minutes must be under a year."})
+            # Pin the exact fire time from the SERVER's clock, then express it
+            # as a fully-qualified cron expression (minute hour day month *).
+            # This is the whole point of in_minutes: the caller never does
+            # wall-clock arithmetic, so it cannot land a minute in the past
+            # and get silently rolled forward a day by croniter.
+            target = datetime.now(timezone.utc) + timedelta(minutes=in_minutes)
+            cron_expr = f"{target.minute} {target.hour} {target.day} {target.month} *"
+            tz = ""            # target is already absolute UTC
+            one_shot = True
+        elif not cron_expr:
+            return json.dumps({
+                "status": "error",
+                "error": "Specify when: in_minutes for a relative reminder, or cron_expr for a repeating schedule.",
+            })
 
         err = _validate_schedule(cron_expr, tz or None)
         if err:
@@ -793,6 +911,16 @@ def register_agent(agent) -> None:
         )
         job.state.next_run_at_ms = _compute_next_run(job.schedule, now)
         store.add(job)
+        # The runner's sleep timer was armed for whatever was next due at
+        # the time it last woke up (or never armed at all, if this is the
+        # first job ever created — _next_wake_ms() had nothing to wake for).
+        # Without reloading + re-arming here, this new job's next_run_at_ms
+        # is correct in the DB and list_cron will show it fine, but nothing
+        # ever wakes the runner up to actually check it — it silently never
+        # fires until some other job's tick happens to reload the job list.
+        # notify_change() (not _reload()/_arm() directly) — this tool
+        # function runs off the runner's event loop thread.
+        runner.notify_change()
         logger.info("[cron] job '%s' created by %s in %s", job.id, caller.username, cursor_key)
         return json.dumps({"status": "ok", "job_id": job.id, "next_run": _fmt_ts(job.state.next_run_at_ms)})
 
@@ -845,18 +973,35 @@ def register_agent(agent) -> None:
             # that a job with this id exists in a different channel.
             return json.dumps({"status": "error", "error": f"No such job '{job_id}'."})
 
+        # Not statically decidable at the required_permissions seam: whether
+        # CRON_ADMIN is needed depends on whether job_id belongs to the
+        # caller, which requires a store lookup + comparing to caller
+        # identity — neither available to a required_permissions callable
+        # (it only ever sees the call's own coerced kwargs, docs/
+        # PERMISSIONS-PLAN.md §3). So remove_cron is registered ungated at
+        # the seam, and this ownership/CRON_ADMIN check happens here instead
+        # (§10.1: "CRON_ADMIN for others' jobs, ungated for own").
         is_creator = job.creator_username == caller.username
-        is_admin = caller.permission_level >= admin_override_permission
+        is_admin = caller.has_permission(Permission.CRON_ADMIN, agent.config.permissions)
         if not (is_creator or is_admin):
             return json.dumps({
                 "status": "error",
-                "error": "Only the job's creator, or a channel admin, may remove it.",
+                "error": "Only the job's creator, or someone holding cron_admin, may remove it.",
             })
 
         store.delete(job_id)
+        # Re-arm in case the removed job was the one the runner's timer was
+        # currently sleeping toward — otherwise the runner wakes for a job
+        # that no longer exists (harmless, just a wasted tick) but more
+        # importantly won't pick up an earlier next_run_at_ms among the
+        # remaining jobs until that stale wake happens. notify_change()
+        # (not _reload()/_arm() directly) — off-loop thread, same as add_cron.
+        runner.notify_change()
         logger.info("[cron] job '%s' removed by %s (creator=%s)", job_id, caller.username, job.creator_username)
         return json.dumps({"status": "ok"})
 
-    agent.tool_handler.register_tool(add_cron, min_permission=min_create_permission)
-    agent.tool_handler.register_tool(list_cron, always_on=True, min_permission=0)
-    agent.tool_handler.register_tool(remove_cron, min_permission=0)
+    agent.tool_handler.register_tool(add_cron, required_permissions={Permission.CRON_CREATE})
+    agent.tool_handler.register_tool(list_cron, always_on=True, required_permissions=None)
+    # remove_cron: ungated at the seam — see the ownership/CRON_ADMIN check
+    # inside the function body above for why.
+    agent.tool_handler.register_tool(remove_cron, required_permissions=None)

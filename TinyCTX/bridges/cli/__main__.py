@@ -462,7 +462,14 @@ class CLIBridge:
         """
         import aiohttp
 
-        payload: dict = {"node_id": self._cursor, "text": text, "permission_level": 100}
+        # NOTE: this payload used to carry a hardcoded "permission_level": 100,
+        # making the CLI implicitly omnipotent regardless of which real user
+        # was behind it. permission_level is retired (docs/PERMISSIONS-PLAN.md
+        # §10.4) — the CLI's actual authority now comes entirely from the real
+        # user identity resolved server-side via cli_username below (or, with
+        # no cli_username, the synthetic "api" user's own stored template,
+        # same as any other API caller — no more free elevation here).
+        payload: dict = {"node_id": self._cursor, "text": text}
         if self._cli_username:
             payload["cli_username"] = self._cli_username
         if self._cli_agent_name:

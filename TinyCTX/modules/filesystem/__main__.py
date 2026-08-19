@@ -21,6 +21,7 @@ import subprocess
 from pathlib import Path
 
 from TinyCTX.contracts import IMAGE_BLOCK_PREFIX
+from TinyCTX.permissions import Permission
 
 logger = logging.getLogger(__name__)
 
@@ -695,8 +696,12 @@ def register_agent(agent) -> None:
     # Register all tools
     # ------------------------------------------------------------------
 
-    agent.tool_handler.register_tool(view,        always_on=True, min_permission=25)
-    agent.tool_handler.register_tool(write_file,  always_on=True, min_permission=30)
-    agent.tool_handler.register_tool(edit_file,   always_on=True, min_permission=30)
-    agent.tool_handler.register_tool(grep,        always_on=True, min_permission=25)
-    agent.tool_handler.register_tool(glob_search, always_on=True, min_permission=25)
+    # docs/PERMISSIONS-PLAN.md §4 — reference case for static required_permissions.
+    # edit_file declares BOTH bools even though it used to sit at the same
+    # level as write_file: an edit reads existing content, so a caller who
+    # may write but not read shouldn't be able to launder a read through it.
+    agent.tool_handler.register_tool(view,        always_on=True, required_permissions={Permission.FILE_READ})
+    agent.tool_handler.register_tool(write_file,  always_on=True, required_permissions={Permission.FILE_WRITE})
+    agent.tool_handler.register_tool(edit_file,   always_on=True, required_permissions={Permission.FILE_READ, Permission.FILE_WRITE})
+    agent.tool_handler.register_tool(grep,        always_on=False, required_permissions={Permission.FILE_READ})
+    agent.tool_handler.register_tool(glob_search, always_on=False, required_permissions={Permission.FILE_READ})

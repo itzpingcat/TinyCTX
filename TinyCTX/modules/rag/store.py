@@ -10,7 +10,7 @@ Responsibilities:
   - Chunk insert / delete / query
   - BM25 full-text search via FTS5
   - Vector cosine similarity search
-  - Hybrid scoring (BM25 + vector)
+  - Hybrid scoring (BM25 + vector, fused via reciprocal-rank fusion)
 
 Embedding storage
 -----------------
@@ -59,6 +59,8 @@ import sqlite3
 import struct
 import time
 from pathlib import Path
+
+from TinyCTX.utils.rrf import rrf_fuse as _rrf_fuse
 
 _LN2 = math.log(2)
 
@@ -358,9 +360,12 @@ class DataStore:
         bm25_weight: float = 0.3,
         decay_halflife_days: float = 30.0,
         decay_weight: float = 0.0,
+        rrf_k: int = 60,
     ) -> list[dict]:
         """
-        Hybrid BM25 + cosine search with optional temporal decay.
+        Hybrid BM25 + cosine search, fused via reciprocal-rank fusion
+        (TinyCTX.utils.rrf.rrf_fuse — same fusion used by tool discovery and
+        memory search), with optional temporal decay.
         Falls back to BM25-only when query_vector is None.
         Returns list of {file, path, text, score, mtime} dicts, descending score.
 
@@ -428,25 +433,31 @@ class DataStore:
         if not candidates:
             return []
 
-        bm25_max = max(v["bm25"] for v in candidates.values()) or 1.0
-        vec_max  = max(v["vec"]  for v in candidates.values()) or 1.0
-        w_v      = 1.0 - bm25_weight
-
-        ranked = sorted(
-            [
-                {
-                    "file":  Path(info["fp"]).name,
-                    "path":  info["fp"],
-                    "text":  info["text"],
-                    "mtime": 0.0,  # filled by _apply_decay if needed
-                    "score": bm25_weight * (info["bm25"] / bm25_max)
-                             + w_v * (info["vec"] / vec_max),
-                }
-                for info in candidates.values()
-            ],
-            key=lambda x: x["score"],
-            reverse=True,
+        # Rank each retriever independently (1-based, best = 1), then fuse by
+        # rank position via RRF rather than min-max-normalized raw score.
+        bm25_ranked = sorted(
+            (cid for cid, info in candidates.items() if info["bm25"] > 0.0),
+            key=lambda cid: candidates[cid]["bm25"], reverse=True,
         )
+        vec_ranked = sorted(
+            (cid for cid, info in candidates.items() if info["vec"] > 0.0),
+            key=lambda cid: candidates[cid]["vec"], reverse=True,
+        )
+        bm25_ranks = {cid: rank for rank, cid in enumerate(bm25_ranked, start=1)}
+        vec_ranks  = {cid: rank for rank, cid in enumerate(vec_ranked, start=1)}
+
+        fused = _rrf_fuse(bm25_ranks, vec_ranks, bm25_w=bm25_weight, rrf_k=rrf_k)
+
+        ranked = [
+            {
+                "file":  Path(candidates[cid]["fp"]).name,
+                "path":  candidates[cid]["fp"],
+                "text":  candidates[cid]["text"],
+                "mtime": 0.0,  # filled by _apply_decay if needed
+                "score": score,
+            }
+            for cid, score in fused
+        ]
         results = ranked[:top_k]
         if decay_weight > 0:
             results = self._apply_decay(results, decay_halflife_days, decay_weight)

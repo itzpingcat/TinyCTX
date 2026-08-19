@@ -22,8 +22,13 @@ EXTENSION_META = {
         "enabled": True,
         # System prompt priority (lower = earlier in the prompt).
         "prompt_priority": 5,
-        # trusted template variable is True when the requesting user has
-        # permission_level >= trusted_threshold in the UserStore (DM only, never in group chats).
-        "trusted_threshold": 90,
+        # NOTE: trusted_threshold is GONE. The `trusted` template variable is
+        # now True when the requesting user holds Permission.EQUIPMENT_TRUSTED
+        # (DM only, never in group chats — see _build_variables below).
+        # docs/PERMISSIONS-PLAN.md §10.3: this bool is a *disclosure* flag —
+        # it decides whether the system prompt tells the agent about
+        # sensitive equipment, not whether an action is authorised. It's a
+        # category of one in TinyCTX.permissions.Permission; don't assume
+        # every Permission member gates an action just because most do.
     },
 }

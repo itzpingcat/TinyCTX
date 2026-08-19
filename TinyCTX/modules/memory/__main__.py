@@ -32,6 +32,7 @@ from pathlib import Path
 
 from TinyCTX.modules.memory import scopes as _scopes
 from TinyCTX.modules.memory.format import format_entity
+from TinyCTX.permissions import Permission
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +92,43 @@ class LibrarianRunner:
                        "dedup_running": False}
         self._active_tasks: set = set()
         self._review_queue = None  # lazy (needs data_path)
+
+        # Sentinel file recording last-run timestamps for each background
+        # process, so a restart doesn't cause every process to fire at once.
+        # Lives in the data dir (not the workspace) — it's runtime bookkeeping,
+        # not conversation/graph content.
+        self._sentinel_path = Path(self._data_path) / "librarian_state.json" if self._data_path else None
+        self._load_sentinel()
+
+    # -- sentinel (last-run timestamps, survives restarts) --
+    def _load_sentinel(self):
+        if self._sentinel_path is None or not self._sentinel_path.exists():
+            return
+        try:
+            saved = json.loads(self._sentinel_path.read_text(encoding="utf-8"))
+        except Exception:
+            logger.warning("[memory/librarian] sentinel unreadable, ignoring: %s", self._sentinel_path)
+            return
+        for key in ("last_poll_ts", "last_dedup_ts", "last_review_ts"):
+            val = saved.get(key)
+            if isinstance(val, (int, float)):
+                self._state[key] = float(val)
+        logger.info("[memory/librarian] loaded sentinel: %s", self._sentinel_path)
+
+    def _save_sentinel(self):
+        if self._sentinel_path is None:
+            return
+        try:
+            self._sentinel_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._sentinel_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps({
+                "last_poll_ts": self._state["last_poll_ts"],
+                "last_dedup_ts": self._state["last_dedup_ts"],
+                "last_review_ts": self._state["last_review_ts"],
+            }), encoding="utf-8")
+            tmp.replace(self._sentinel_path)
+        except Exception as exc:
+            logger.warning("[memory/librarian] cannot write sentinel file: %s", exc)
 
     # -- lifecycle --
     def start(self):
@@ -163,6 +201,7 @@ class LibrarianRunner:
         interval = float(librarian_cfg.get("trigger_interval_hours", 6)) * 3600
         if not self._user_cycles_active() and (now - self._state["last_poll_ts"]) >= interval:
             self._state["last_poll_ts"] = now
+            self._save_sentinel()
             async with self._write_lock:
                 tails = self._conv_db.get_tail_nodes()
             for tail in tails:
@@ -179,6 +218,7 @@ class LibrarianRunner:
                 and (now - self._state["last_review_ts"]) >= float(reviewer_cfg.get("interval_hours", 6)) * 3600
                 and len(self._active_tasks) < max_concurrent):
             self._state["last_review_ts"] = now
+            self._save_sentinel()
             t = asyncio.create_task(run_reviewer_cycle(
                 self._cfg, _graph_db, self._write_conn, self._write_lock, self._llm,
                 self._review_q(), self.agent_logger))
@@ -195,6 +235,7 @@ class LibrarianRunner:
                 and len(self._active_tasks) < max_concurrent):
             self._state["dedup_running"] = True
             self._state["last_dedup_ts"] = now
+            self._save_sentinel()
             t = asyncio.create_task(run_dedup_cycle(
                 self._cfg, self._data_path, self._write_conn, self._write_lock, self._llm,
                 self._embedder, _graph_db, self.agent_logger))
@@ -392,7 +433,8 @@ def register_runtime(runtime) -> None:
             await send(result)
 
     runtime.commands.register("memory", "librarian", _cmd_librarian,
-                              help="Trigger the memory librarian. Optional: a prompt for priority review.")
+                              help="Trigger the memory librarian. Optional: a prompt for priority review.",
+                              required_permissions={Permission.MEMORY_WRITE})
 
     async def _cmd_stats(args, context):
         # Diagnostics command: show full totals across every scope in the graph,
@@ -405,7 +447,8 @@ def register_runtime(runtime) -> None:
 
     runtime.commands.register("memory", "stats", _cmd_stats,
                               help="Show memory graph diagnostics: entity/edge counts, "
-                                   "pins, reviewer backlog, and live dedup progress.")
+                                   "pins, reviewer backlog, and live dedup progress.",
+                              required_permissions={Permission.MEMORY_READ})
     logger.info("[memory] ready — graph: %s | embedder: %s", graph_path, emb_model or "none")
 
 
@@ -560,10 +603,10 @@ def register_agent(cycle) -> None:
     assert _tools is not None
 
     cycle.tool_handler.register_tool(_scope_bound(_tools.search_memory, cycle),
-                                     always_on=True, min_permission=25)
+                                     always_on=True, required_permissions={Permission.MEMORY_READ})
     cycle.tool_handler.register_tool(_scope_bound(_tools.memory_stats, cycle),
-                                     always_on=False, min_permission=25)
-    cycle.tool_handler.register_tool(call_librarian, always_on=True, min_permission=35)
+                                     always_on=False, required_permissions={Permission.MEMORY_READ})
+    cycle.tool_handler.register_tool(call_librarian, always_on=True, required_permissions={Permission.MEMORY_WRITE})
 
     # pressure ingest
     librarian_cfg = _cfg.get("librarian", {})

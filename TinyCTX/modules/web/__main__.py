@@ -39,6 +39,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 import aiohttp
 
 from TinyCTX.contracts import IMAGE_BLOCK_PREFIX
+from TinyCTX.permissions import Permission
 
 
 # ---------------------------------------------------------------------------
@@ -674,7 +675,12 @@ async def _ensure_page(agent):
     # the container's cap_drop: ALL / no-new-privileges (see compose.yaml).
     # Note there is no --no-sandbox flag to pass here even if we wanted one:
     # that is a Chromium flag, and Firefox ignores it.
-    camoufox = AsyncCamoufox(headless=headless)
+    # debug=True: without it, camoufox's VirtualDisplay sends Xvfb's stdout/
+    # stderr to DEVNULL, so any Xvfb launch failure surfaces only as the
+    # generic "Xvfb did not report a display" with no explanation. Temporary
+    # while diagnosing that — flip back to False (or drop the kwarg) once
+    # browser tools are confirmed working again.
+    camoufox = AsyncCamoufox(headless=headless, debug=True)
     browser = await camoufox.__aenter__()
     page = await browser.new_page()
 
@@ -1277,17 +1283,23 @@ def register_agent(agent) -> None:
         "manage_browser": False,
     }
 
-    _WEB_PERMISSIONS: dict[str, int] = {
-        "web_search":         25,
-        "open_url":           25,
+    # docs/PERMISSIONS-PLAN.md §7. click/type_text are the interesting pair:
+    # a click on a nav link is a read, a click on a submit button is a
+    # write, and type_text puts locally-originated data into a remote form.
+    # Which one it is depends on the DOM, not the arguments — unlike shell's
+    # curl this isn't statically decidable, so it gets the conservative
+    # static answer (NETWORK_WRITE) rather than a per-call classifier.
+    _WEB_PERMISSIONS: dict[str, frozenset[Permission]] = {
+        "web_search":         frozenset({Permission.NETWORK_READ}),
+        "open_url":           frozenset({Permission.NETWORK_READ}),
         # http_request removed — deprecated.
-        "click":              30,
-        "type_text":          30,
-        "extract_text":       25,
-        "extract_html":       25,
-        "screenshot_browser": 25,
-        "wait_for":           25,
-        "manage_browser":     40,
+        "click":              frozenset({Permission.NETWORK_WRITE}),
+        "type_text":          frozenset({Permission.NETWORK_WRITE}),
+        "extract_text":       frozenset({Permission.NETWORK_READ}),
+        "extract_html":       frozenset({Permission.NETWORK_READ}),
+        "screenshot_browser": frozenset({Permission.NETWORK_READ, Permission.FILE_WRITE}),
+        "wait_for":           frozenset({Permission.NETWORK_READ}),
+        "manage_browser":     frozenset({Permission.NETWORK_WRITE}),
     }
 
     for fn in (
@@ -1305,4 +1317,6 @@ def register_agent(agent) -> None:
         if vis == "disabled":
             continue
         always_on = _WEB_DEFAULTS[fn.__name__] if vis == "" else vis == "always_on"
-        agent.tool_handler.register_tool(fn, always_on=always_on, min_permission=_WEB_PERMISSIONS[fn.__name__])
+        agent.tool_handler.register_tool(
+            fn, always_on=always_on, required_permissions=_WEB_PERMISSIONS[fn.__name__],
+        )

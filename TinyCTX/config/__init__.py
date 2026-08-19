@@ -17,6 +17,9 @@ from TinyCTX.config.__main__ import (
     AttachmentConfig,
     PermissionsConfig,
     ToolOverrideConfig,
+    ToolPassiveConfig,
+    ToolSearchConfig,
+    ToolsConfig,
 )
 
 __all__ = [
@@ -36,4 +39,7 @@ __all__ = [
     "AttachmentConfig",
     "PermissionsConfig",
     "ToolOverrideConfig",
+    "ToolPassiveConfig",
+    "ToolSearchConfig",
+    "ToolsConfig",
 ]

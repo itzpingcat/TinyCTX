@@ -58,6 +58,7 @@ from pathlib import Path
 from aiohttp import web
 
 from TinyCTX.config import GatewayConfig
+from TinyCTX.permissions import Permission
 from TinyCTX.contracts import (
     Platform, SessionEnvironment, content_type_for,
     InboundMessage, Attachment,
@@ -219,9 +220,6 @@ async def handle_lane_message(request: web.Request) -> web.StreamResponse:
                 mime_type=item.get("mime_type", "application/octet-stream"),
             ))
         attachments = tuple(parsed)
-
-    permission_level = int(body.get("permission_level", 25))
-    permission_level = max(0, min(100, permission_level))  # clamp to 0-100
 
     # If a cli_username is present, the request came from a CLI session.
     # Resolve the named user from users.db and author the message as them.
@@ -574,11 +572,18 @@ async def handle_commands_list(request: web.Request) -> web.Response:
 # GET /v1/user/{username}  &  POST /v1/user/{username}/elevate
 # ---------------------------------------------------------------------------
 
+def _is_admin(user) -> bool:
+    """True if this user's overrides grant every Permission bool — the
+    single-global-template equivalent of the old 'operator' tier. Surfaced
+    on the API so a caller sees what's actually in effect."""
+    return all(user.permission_overrides.get(p.value) is True for p in Permission)
+
+
 async def handle_user_get(request: web.Request) -> web.Response:
     """
     Return basic info about a user by username.
 
-    Response (200): { "username": "...", "permission_level": 25 }
+    Response (200): { "username": "...", "admin": false }
     Response (404): { "error": "user not found" }
     """
     runtime  = request.app["runtime"]
@@ -591,8 +596,7 @@ async def handle_user_get(request: web.Request) -> web.Response:
         )
     return web.Response(
         content_type="application/json",
-        body=json.dumps({"username": user.username,
-                         "permission_level": user.permission_level}),
+        body=json.dumps({"username": user.username, "admin": _is_admin(user)}),
     )
 
 
@@ -601,43 +605,45 @@ async def handle_user_create(request: web.Request) -> web.Response:
     Create a user with an exact username (no slugify/random fallback).
     Used by `tinyctx launch cli` when a typed-in username doesn't exist yet.
 
-    Body: { "permission_level": 25 }   (optional; defaults to 25)
-    Response (200): { "username": "...", "permission_level": 25 }
+    New users always start on the single configured permissions.template
+    (config.yaml) with empty overrides — there's nothing to select at
+    create time now that templates aren't named. Any request body is
+    ignored.
+
+    Response (200): { "username": "..." }
     Response (409): { "error": "username already taken" }
     """
     runtime  = request.app["runtime"]
     username = request.match_info["username"]
 
-    body = {}
     try:
-        body = await request.json()
-    except Exception:
-        pass
-    permission_level = max(0, min(100, int(body.get("permission_level", 25))))
-
-    try:
-        user = runtime.users.create_user(username, permission_level=permission_level)
+        user = runtime.users.create_user(username)
     except UsernameConflictError:
         raise web.HTTPConflict(
             content_type="application/json",
             body=json.dumps({"error": f"username {username!r} already taken"}),
         )
 
-    logger.info("gateway: created user %r (permission_level %d)", username, permission_level)
+    logger.info("gateway: created user %r", username)
     return web.Response(
         content_type="application/json",
-        body=json.dumps({"username": user.username,
-                         "permission_level": user.permission_level}),
+        body=json.dumps({"username": user.username}),
     )
 
 
 async def handle_user_elevate(request: web.Request) -> web.Response:
     """
-    Set a user's permission_level to the requested level (clamped 0-100).
-    Trusted endpoint — protected by the gateway api_key.
+    Grant (or revoke) full admin access for a user. Trusted endpoint —
+    protected by the gateway api_key. No named templates to choose between
+    now — this endpoint's only job is setting every Permission bool in
+    permission_overrides, the single-global-template equivalent of the old
+    'operator' tier. No compatibility shim for the old `template` body
+    field — see docs/PERMISSIONS-PLAN.md §10.4.
 
-    Body: { "permission_level": 100 }   (optional; defaults to 100)
-    Response (200): { "username": "...", "permission_level": 100 }
+    Body: { "reset": true }   (optional; clears overrides instead of
+    granting them, returning the user to whatever permissions.template
+    grants everyone by default — omitted/false means "grant everything")
+    Response (200): { "username": "...", "admin": true }
     Response (404): { "error": "user not found" }
     """
     runtime  = request.app["runtime"]
@@ -655,17 +661,18 @@ async def handle_user_elevate(request: web.Request) -> web.Response:
     except Exception:
         pass
 
-    new_level = int(body.get("permission_level", 100))
-    new_level = max(0, min(100, new_level))
-
-    user.permission_level = new_level
+    if bool(body.get("reset")):
+        user.permission_overrides = {}
+        action = "reset"
+    else:
+        user.permission_overrides = {p.value: True for p in Permission}
+        action = "elevated"
     runtime.users.update_user(user)
-    logger.info("gateway: elevated %r to permission_level %d", username, new_level)
+    logger.info("gateway: %s %r", action, username)
 
     return web.Response(
         content_type="application/json",
-        body=json.dumps({"username": user.username,
-                         "permission_level": user.permission_level}),
+        body=json.dumps({"username": user.username, "admin": _is_admin(user)}),
     )
 
 

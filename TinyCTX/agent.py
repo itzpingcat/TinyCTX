@@ -13,7 +13,7 @@ from TinyCTX.contracts import (
 )
 from TinyCTX.context import Context, HistoryEntry, HOOK_PRE_ASSEMBLE_ASYNC
 from TinyCTX.ai import LLM, TextDelta, ThinkingDelta, ToolCallAssembled, LLMError
-from TinyCTX.utils.tool_handler import ToolCallHandler
+from TinyCTX.tool_handling import ToolCallHandler
 
 logger = logging.getLogger(__name__)
 
@@ -102,8 +102,33 @@ class AgentCycle:
         }
 
         # Build Tools
-        self.tool_handler = ToolCallHandler()
-        self.tool_handler.register_tool(self.tool_handler.tools_search, always_on=True)
+        # vector_store/embedder come from Runtime (process-wide singletons —
+        # see runtime.py) so embeddings are cached across turns even though
+        # ToolCallHandler itself is rebuilt fresh every cycle. runtime is
+        # None in tests/bare usage, in which case tool discovery falls back
+        # to plain BM25 (ToolCallHandler's default when vector_store=None).
+        tool_vector_store = getattr(self._runtime, "tool_vector_store", None) if self._runtime else None
+        search_cfg = self.config.tools.search
+        passive_cfg = self.config.tools.passive
+        # Prefer search's embedding_model for the shared embedder if set,
+        # else passive's — either may be "" (unset). Both configs are read
+        # independently at call time in tools_search()/passive_search(), this
+        # only decides which single embedder instance backs both this turn.
+        embed_model_name = search_cfg.embedding_model or passive_cfg.embedding_model
+        tool_embedder = (
+            self._runtime.get_tool_embedder(embed_model_name)
+            if self._runtime and embed_model_name else None
+        )
+        self.tool_handler = ToolCallHandler(vector_store=tool_vector_store, embedder=tool_embedder)
+        self.tool_handler.search_config = search_cfg
+        self.tool_handler.permissions_config = self.config.permissions
+        # tools_search only toggles what's visible in this cycle's tool
+        # list — it doesn't itself touch files/network/memory/etc. Those
+        # effects are gated individually at the tools it enables, so gating
+        # tools_search too would be double-counting (docs/PERMISSIONS-PLAN.md §7.1).
+        self.tool_handler.register_tool(
+            self.tool_handler.tools_search, always_on=True, required_permissions=None,
+        )
         enabled_tools = state.get("enabled_tools")
         if enabled_tools:
             for t in enabled_tools:
@@ -123,10 +148,28 @@ class AgentCycle:
         # Wire modules into this cycle turn
         self.module_registry.register_agent(self)
 
-        # Config-driven per-tool overrides (always_on / min_permission) — applied
-        # last so they win over whatever each module's register_tool() call set.
-        if self.config.tool_overrides:
-            self.tool_handler.apply_overrides(self.config.tool_overrides)
+        # Config-driven per-tool overrides (always_on) — applied last so they
+        # win over whatever each module's register_tool() call set.
+        if self.config.tools.overrides:
+            self.tool_handler.apply_overrides(self.config.tools.overrides)
+
+        # Startup assertion (docs/PERMISSIONS-PLAN.md §3): every tool must
+        # have declared required_permissions, explicitly, even if that
+        # declaration is None. Runs once per cycle since the tool registry
+        # itself is rebuilt fresh every cycle (see this method's docstring).
+        self.tool_handler.assert_permissions_declared()
+
+        # Passive tool discovery — auto-enable up to tools.passive.auto_limit
+        # tools for THIS TURN ONLY, ranked against the incoming user message.
+        # Not persisted to session state (unlike enabled_tools above); reruns
+        # every turn against that turn's own message. No-ops (auto_enabled
+        # stays empty) when both tools.passive.auto_bm25_enabled and
+        # auto_vector_enabled are false, or when the incoming node has no
+        # text (e.g. a synthetic/system-originated turn).
+        incoming_node = self.db.get_node(node_id)
+        incoming_text = incoming_node.content if incoming_node else ""
+        if incoming_text:
+            await self.tool_handler.passive_search(incoming_text, self.config.tools.passive)
 
         # --- 2. Generation Loop ---
         # Tracker for metadata yielded in events
@@ -137,6 +180,18 @@ class AgentCycle:
         }
 
         max_cycles = self.config.max_tool_cycles
+        # A completion that returns neither text nor a tool call is always a
+        # malfunction, not a deliberate silence — the sanctioned way to say
+        # nothing is the NO_REPLY_TOKEN, which is non-empty. It usually means
+        # the model spent the whole completion in its reasoning channel and
+        # stopped without ever opening the content channel, so response_text
+        # comes back "" and the turn ends with an empty AgentTextFinal: the
+        # caller sees silence, with nothing logged as an error. Resend rather
+        # than let that through — a fresh sample almost always produces real
+        # content.
+        max_empty_retries = int(getattr(self.config, "max_empty_retries", 2))
+        empty_retries = 0
+
         final_text = ""
         streaming_active = False
         no_reply = False
@@ -160,7 +215,7 @@ class AgentCycle:
             logger.debug("[agent] running async hooks")
             await self.context.run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC)
             tools = self.tool_handler.get_tool_definitions(
-                caller_level=self.caller.permission_level,
+                caller=self.caller,
                 minimal_tokens=self.config.permissions.minimal_tokens,
             ) or None
             messages, _ = self.context.assemble(tools=tools)
@@ -168,12 +223,14 @@ class AgentCycle:
 
             # Inference with Fallback logic
             text_chunks, tool_calls_list, error = [], [], None
+            thinking_len = 0
             async for _ev in self._stream_inference(messages, tools, model_chain, abort_event, meta):
                 if isinstance(_ev, tuple):
                     # sentinel: (_chunks, _calls, _error)
                     text_chunks, tool_calls_list, error = _ev
                 elif isinstance(_ev, AgentThinkingChunk):
                     # logger.debug("[agent] thinking chunk (%d chars)", len(_ev.text))
+                    thinking_len += len(_ev.text)
                     yield AgentThinkingChunk(text=_ev.text, **meta)
                 elif isinstance(_ev, AgentTextChunk):
                     # logger.debug("[agent] text chunk (%d chars)", len(_ev.text))
@@ -187,8 +244,40 @@ class AgentCycle:
                 yield AgentError(message=f"[LLM error: {error}]", **meta)
                 return
 
-            # Record Assistant response in Context
             response_text = "".join(text_chunks)
+
+            # Empty completion (no content, no tool call) — resend.
+            #
+            # Deliberately BEFORE context.add(): an empty assistant node must
+            # not be written, or the retry re-assembles a history containing a
+            # blank assistant turn, which makes another blank one likelier and
+            # leaves a dead node in the tree for every attempt. Retries also
+            # don't advance cycle_num — this consumed no tool cycle — so the
+            # bound on total inferences is max_cycles * (1 + max_empty_retries),
+            # and empty_retries resets after any non-empty completion.
+            if not tool_calls_list and not response_text.strip():
+                if empty_retries < max_empty_retries:
+                    empty_retries += 1
+                    logger.warning(
+                        "[agent] empty completion (thinking=%d chars, no text, no tool calls) "
+                        "— resending, attempt %d/%d",
+                        thinking_len, empty_retries, max_empty_retries,
+                    )
+                    continue
+
+                logger.error(
+                    "[agent] model produced no output after %d attempts "
+                    "(last had %d chars of thinking) — giving up",
+                    max_empty_retries + 1, thinking_len,
+                )
+                self._record_error_introspection("[no output from model]")
+                meta["tail_node_id"] = self.context.tail_node_id
+                yield AgentError(message="[no output from model]", **meta)
+                return
+
+            empty_retries = 0
+
+            # Record Assistant response in Context
             self.context.add(HistoryEntry.assistant(
                 content=response_text,
                 tool_calls=tool_calls_list or None,

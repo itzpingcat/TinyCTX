@@ -1,0 +1,516 @@
+# ============================================================================
+# modules/shell/perms.yaml — per-command capability classification table.
+#
+# Loaded by modules/shell/perms.py at import time and compiled into the
+# lookup `classify()` uses to turn one resolved Command (validate.py) into
+# the TinyCTX.permissions.Permission bools it needs. See perms.py's module
+# docstring and docs/PERMISSIONS-PLAN.md §5 for the access-control model
+# this feeds into (checked once, centrally, by tool_handling.handler).
+#
+# Deliberately a MINIMAL table. Everything not named below falls through to
+# UNTRUSTED_EXEC — fail closed, expandable one command at a time as real
+# usage justifies it.
+#
+# Entry fields (all but `id`/`name` optional):
+#   id                required, stable across edits — used by extends:/disable:
+#   name              string or list of strings — executable basename(s)
+#   permissions       unconditional set for this command
+#   if_operands       added only when the command names at least one operand
+#                     (as opposed to reading stdin) — the filter commands'
+#                     "only FILE_READ when a file is actually named" rule
+#   operand_prefix    {prefix: [perms]} — added if any operand starts with
+#                     the given prefix (dd's if=/of=)
+#   subcommand        {name: [perms]} — matched against the first operand,
+#                     e.g. git's clone/fetch/pull/ls-remote/push
+#   subcommand_default  used when `subcommand` is set but nothing matched —
+#                       distinct from the table's overall unlisted-command
+#                       fallback, since the command itself IS recognized
+#   rules             list of {any_flag: [...], operand_in: [...], add: [...]}
+#                     — additive, evaluated independently; a rule fires when
+#                     EVERY condition it specifies holds (any_flag: caller's
+#                     flags intersect this set; operand_in: some operand's
+#                     upper() value is in this set). Conditions omitted from
+#                     a rule are not checked.
+#   known_flags       flags on THIS command that are known to have no effect
+#                     on its classification — anything the caller passes that
+#                     is neither here nor referenced by one of `rules:`'s
+#                     any_flag conditions adds UNTRUSTED_EXEC (see below).
+#                     Deliberately non-exhaustive: expand one flag at a time
+#                     as real usage hits the wall, same posture as the
+#                     command table itself. Omit anything with a real side
+#                     effect beyond what the entry already grants — e.g.
+#                     find's `-delete`/`-exec` and date's `-s`/`--set` are
+#                     intentionally absent so using them requires
+#                     UNTRUSTED_EXEC instead of riding along on FILE_READ /
+#                     nothing at all.
+#
+# Three behaviors are NOT expressed per-entry because they apply globally,
+# regardless of which (if any) entry matched — see perms.py's classify():
+#   - a redirect (`> file`) always adds FILE_WRITE, even to pure-compute or
+#     unlisted commands
+#   - a dynamic (unknowable-value) operand or redirect always adds
+#     UNTRUSTED_EXEC, plus whatever `worst_case:` below names for that
+#     command, ADDITIVELY on top of whatever was statically determined —
+#     never as a replacement (docs/PERMISSIONS-PLAN.md §5)
+#   - a flag not covered by `known_flags` or a `rules:` condition adds
+#     UNTRUSTED_EXEC — see perms.py's classify()/_flag_is_known() docstrings.
+#     `--help` is the one flag exempt everywhere; nothing else is assumed
+#     safe without being named somewhere.
+#
+# scp/rsync/sftp are deliberately NOT listed. Their real classification is
+# direction-dependent — upload vs download turns on which operand looks like
+# a remote host:path spec, a shape judgement this declarative table doesn't
+# express. Rather than hand that back to a bespoke Python classifier, they
+# fall through to the same UNTRUSTED_EXEC every other unrecognized command
+# gets — precision is traded for keeping the whole table auditable as data.
+# ============================================================================
+
+version: 1
+
+commands:
+  - id: pure-compute
+    # "true"/"false"/"yes" MUST be quoted — bare in YAML 1.1 (PyYAML's
+    # default resolver) they parse as booleans, not strings, and would
+    # silently vanish from the command-name table.
+    #
+    # date and seq are their OWN entries below, not folded in here, even
+    # though they're just as harmless in the cases this table already knows
+    # about — date's -s/--set sets the SYSTEM CLOCK, and seq happens to
+    # spell its (harmless) field-separator flag the same "-s". Sharing one
+    # known_flags list across this whole group would either register date's
+    # -s as safe (it isn't) or leave seq's -s unknown for no reason; giving
+    # each its own entry keeps every command's known_flags meaning exactly
+    # what it says for THAT command, not "safe on at least one command in
+    # this bucket".
+    name: [echo, printf, cal, expr, factor, basename, dirname, "true", "false", sleep, "yes"]
+    permissions: []
+    known_flags: ["-n", "-e", "-E"]
+
+  - id: date
+    name: date
+    permissions: []
+    # -s/--set (sets the system clock) is deliberately absent — everything
+    # else here is read-only formatting/display.
+    known_flags: ["-u", "-R", "-I", "-d", "-r", "--utc", "--rfc-3339", "--iso-8601"]
+
+  - id: seq
+    name: seq
+    permissions: []
+    known_flags: ["-s", "-w", "-f", "-t"]
+
+  # Introspection commands — report on the environment/process/machine
+  # rather than doing pure computation on their arguments. Kept separate
+  # from pure-compute since they're reads OF the system, not context-free
+  # transforms, even though none needs a permission bool today. Each has
+  # its own entry (not a shared known_flags list) for the same reason
+  # date/seq are split above: e.g. -a means "all" for uname but nothing
+  # for whoami/pwd, and sharing one list would falsely register it as
+  # known everywhere.
+  - id: whoami
+    name: whoami
+    permissions: []
+    known_flags: []
+
+  - id: pwd
+    name: pwd
+    permissions: []
+    known_flags: ["-L", "-P"]
+
+  - id: uname
+    name: uname
+    permissions: []
+    known_flags: ["-a", "-s", "-n", "-r", "-v", "-m", "-p", "-i", "-o"]
+
+  - id: file-read-cmds
+    name: [ls, find, stat, file, du, df, tree, readlink, realpath]
+    permissions: [file_read]
+    # Query/traversal/display flags only. find's action primaries that write
+    # or execute — -delete, -exec, -execdir, -ok, -okdir, -fprint(f)?, -ls
+    # writing to a file — are deliberately absent.
+    known_flags:
+      - "-l"
+      - "-a"
+      # Combined cluster spellings are listed explicitly, not derived by
+      # decomposing "-la" into "-l"+"-a" — see perms.py's _flag_is_known()
+      # docstring for why decomposition isn't safe (it can't be told apart
+      # from find's single-dash spelled-out options like -delete/-exec).
+      - "-la"
+      - "-al"
+      - "-lh"
+      - "-lah"
+      - "-alh"
+      - "-lart"
+      - "-latr"
+      - "-sh"
+      - "-hs"
+      - "-A"
+      - "-h"
+      - "-1"
+      - "-R"
+      - "-F"
+      - "-t"
+      - "-r"
+      - "-S"
+      - "-i"
+      - "-n"
+      - "-p"
+      - "-d"
+      - "-G"
+      - "-C"
+      - "-x"
+      - "-g"
+      - "-o"
+      - "-c"
+      - "-u"
+      - "-B"
+      - "-L"
+      - "-s"
+      - "-T"
+      - "-k"
+      - "-P"
+      - "-e"
+      - "-m"
+      - "-f"
+      - "-z"
+      - "-b"
+      - "--color"
+      - "-name"
+      - "-iname"
+      - "-path"
+      - "-ipath"
+      - "-type"
+      - "-maxdepth"
+      - "-mindepth"
+      - "-mtime"
+      - "-mmin"
+      - "-atime"
+      - "-amin"
+      - "-ctime"
+      - "-cmin"
+      - "-size"
+      - "-perm"
+      - "-user"
+      - "-group"
+      - "-newer"
+      - "-print"
+      - "-print0"
+      - "-empty"
+      - "-regex"
+      - "-iregex"
+      - "-depth"
+      - "-xdev"
+
+  - id: file-write-cmds
+    name: [rm, rmdir, mkdir, touch, truncate, chmod, chown, tee]
+    permissions: [file_write]
+    # chmod/chown's --reference (copies mode/ownership FROM another file, so
+    # it's really also a FILE_READ dependency this entry doesn't grant) is
+    # deliberately absent.
+    known_flags:
+      - "-r"
+      - "-R"
+      - "-f"
+      - "-i"
+      - "-v"
+      - "-d"
+      - "-p"
+      - "-m"
+      # Combined spellings, listed explicitly — see file-read-cmds' comment
+      # above on why (no cluster decomposition).
+      - "-rf"
+      - "-fr"
+      - "-a"
+      - "-c"
+      - "-t"
+      - "-s"
+      - "-o"
+      - "-n"
+
+  - id: file-rw-cmds
+    name: [cp, mv, ln, install]
+    permissions: [file_read, file_write]
+    known_flags:
+      - "-r"
+      - "-R"
+      - "-p"
+      - "-v"
+      - "-f"
+      - "-i"
+      - "-a"
+      - "-n"
+      - "-u"
+      - "-L"
+      - "-P"
+      - "-s"
+      - "-m"
+      - "-o"
+      - "-g"
+      - "-d"
+      - "-D"
+
+  - id: zip-cmds
+    name: [zip, unzip]
+    # Both directions read the source and write the archive/extracted files —
+    # zip reads the files it's compressing and writes the archive; unzip
+    # reads the archive and writes the extracted files. Not split by
+    # direction (unlike scp/rsync) since both permissions apply either way.
+    permissions: [file_read, file_write]
+    known_flags:
+      - "-r"
+      - "-v"
+      - "-q"
+      - "-j"
+      - "-x"
+      - "-d"
+      - "-o"
+      - "-n"
+      - "-l"
+      - "-t"
+      - "-p"
+      - "-9"
+      - "-1"
+      - "-6"
+
+  - id: network-read-cmds
+    name: [ping, dig, nslookup, host, http, httpie]
+    permissions: [network_read]
+    known_flags:
+      - "-c"
+      - "-c1"
+      - "-1"    # ping -c1 decomposes into flags {-c, -c1, -1} — see validate.py's _build
+      - "-i"
+      - "-W"
+      - "-w"
+      - "-q"
+      - "-v"
+      - "-4"
+      - "-6"
+      - "-x"
+      - "-t"
+      - "-a"
+      - "-h"
+    # http/httpie's --json/--form/--data-equivalent flags are deliberately
+    # absent — same reasoning as curl's rule-based NETWORK_WRITE: sending a
+    # body isn't a bare read, even though this entry (unlike curl) doesn't
+    # otherwise distinguish verbs.
+
+  - id: network-write-cmds
+    name: [nc, netcat, socat]
+    permissions: [network_write]
+    known_flags:
+      - "-l"
+      - "-v"
+      - "-w"
+      - "-p"
+      - "-u"
+      - "-d"
+      - "-z"
+      - "-4"
+      - "-6"
+
+  - id: ssh
+    name: ssh
+    # Both reaches the network AND runs arbitrary code on the far side — a
+    # bare NETWORK_WRITE tag would understate it. Since UNTRUSTED_EXEC is
+    # already unconditional here, an unregistered flag can't add anything a
+    # caller doesn't already need — known_flags is just for hygiene.
+    permissions: [network_write, untrusted_exec]
+    known_flags: ["-p", "-i", "-v", "-o", "-4", "-6", "-A", "-X", "-C"]
+
+  - id: filters-plain
+    name: [cat, tr, rev, tac, uniq, head, tail, cut, paste, nl, grep, awk,
+           cksum, md5sum, sha1sum, sha256sum]
+    permissions: []
+    if_operands: [file_read]
+    known_flags:
+      - "-n"
+      - "-b"
+      - "-s"
+      - "-A"
+      - "-E"
+      - "-c"
+      - "-w"
+      - "-l"
+      - "-i"
+      - "-v"
+      - "-r"
+      - "-R"
+      - "-x"
+      - "-o"
+      - "-f"
+      - "-d"
+      - "-C"
+      - "-B"
+      - "-t"
+      - "-e"
+      - "-m"
+      - "-u"
+      - "--color"
+
+  - id: filters-sort-shuf
+    name: [sort, shuf]
+    permissions: []
+    if_operands: [file_read]
+    rules:
+      - {any_flag: ["-o"], add: [file_write]}
+    known_flags: ["-n", "-r", "-u", "-k", "-t", "-f", "-b", "-c", "-e", "-i", "-z"]
+
+  - id: filters-sed
+    name: sed
+    permissions: []
+    if_operands: [file_read]
+    rules:
+      - {any_flag: ["-i"], add: [file_write]}
+    known_flags: ["-n", "-e", "-r", "-E", "-s", "-z", "--posix"]
+
+  - id: filters-wc
+    name: wc
+    permissions: []
+    if_operands: [file_read]
+    rules:
+      - {any_flag: ["--files0-from"], add: [file_read]}
+    known_flags: ["-l", "-w", "-c", "-m", "-L"]
+
+  - id: dd
+    name: dd
+    permissions: []
+    operand_prefix:
+      "of=": [file_write]
+      "if=": [file_read]
+
+  - id: git
+    name: git
+    permissions: []
+    subcommand:
+      # clone/fetch/pull don't just read from the network — they write the
+      # fetched objects (clone: a whole new working tree; fetch: into
+      # .git; pull: into .git AND the working tree) to disk. network_read
+      # alone would let a caller without FILE_WRITE write arbitrary files
+      # via `git clone <url> <target-dir>`.
+      clone: [network_read, file_write]
+      fetch: [network_read, file_write]
+      pull: [network_read, file_write]
+      ls-remote: [network_read]
+      push: [network_write]
+    # git can run hooks/aliases — anything else isn't silently treated as
+    # safe just because it's "git something local".
+    subcommand_default: [untrusted_exec]
+    # Flags that don't change the classification above (clone/fetch/pull's
+    # scope, or the read-only ls-remote/push cases) for the network
+    # subcommands above. Force-push (-f/--force/--force-with-lease) is
+    # deliberately absent.
+    known_flags:
+      - "--depth"
+      - "-b"
+      - "--branch"
+      - "-q"
+      - "--quiet"
+      - "-v"
+      - "--verbose"
+      - "--recurse-submodules"
+      - "--tags"
+      - "-u"
+      - "--set-upstream"
+      - "--single-branch"
+      - "--dry-run"
+
+  - id: package-managers
+    name: [pip, pip3, npm, apt, apt-get, cargo, gem]
+    permissions: []
+    subcommand:
+      # install/add is an EXEC, not just a fetch — install scripts run
+      # arbitrary code by design.
+      install: [network_read, file_write, untrusted_exec]
+      add: [network_read, file_write, untrusted_exec]
+    subcommand_default: [untrusted_exec]
+    known_flags: ["-y", "--yes", "-g", "--global", "--save", "--save-dev", "-q", "--quiet", "-v", "--verbose"]
+
+  - id: curl
+    name: curl
+    # network_write is granted unconditionally here "for now, just to be
+    # safe" — curl can always be used to exfiltrate data (POST/PUT/etc. are
+    # just one flag away, and even a plain GET's URL/headers can carry
+    # data out), so every invocation is treated as a potential write rather
+    # than trying to prove a given call is read-only. The rules below still
+    # run (data flags, -X <verb>) — they're now no-ops for the permission
+    # they used to conditionally add, but they're kept so those flags stay
+    # registered as "known" and don't trip the unregistered-flag fallback.
+    permissions: [network_read, network_write]
+    rules:
+      - any_flag: ["-d", "--data", "--data-ascii", "--data-binary", "--data-raw",
+                   "--data-urlencode", "-F", "--form", "-T", "--upload-file", "--json"]
+        add: [network_write]
+      - any_flag: ["-X", "--request"]
+        operand_in: [POST, PUT, PATCH, DELETE]
+        add: [network_write]
+      - any_flag: ["-o", "-O", "--output"]
+        add: [file_write]
+    known_flags:
+      - "-s"
+      - "--silent"
+      - "-v"
+      - "--verbose"
+      - "-i"
+      - "--include"
+      - "-L"
+      - "--location"
+      - "-H"
+      - "--header"
+      - "-A"
+      - "--user-agent"
+      - "-e"
+      - "--referer"
+      - "-k"
+      - "--insecure"
+      - "-m"
+      - "--max-time"
+      - "-h"
+
+  - id: wget
+    name: wget
+    # wget writes the downloaded content to disk by default (no -O needed) —
+    # network_read alone would let a caller without FILE_WRITE write
+    # arbitrary files via a bare `wget URL`.
+    permissions: [network_read, file_write]
+    rules:
+      - any_flag: ["--post-data", "--post-file"]
+        add: [network_write]
+      # The atom strips "=value", so the actual verb isn't recoverable here —
+      # presence of --method at all is treated as a write, conservatively.
+      - any_flag: ["--method"]
+        add: [network_write]
+      - any_flag: ["-o", "-O", "--output-document"]
+        add: [file_write]
+    known_flags:
+      - "-q"
+      - "--quiet"
+      - "-v"
+      - "--verbose"
+      - "-U"
+      - "--user-agent"
+      - "--header"
+      - "-T"
+      - "--timeout"
+      - "-t"
+      - "--tries"
+      - "-h"
+
+# Worst case a dynamic invocation of this command could ever need, added
+# ADDITIVELY (never replacing the statically-visible tags) when a resolved
+# Command's operand/redirect value isn't knowable ahead of time.
+worst_case:
+  curl: [network_write, file_write]
+  wget: [network_write, file_write]
+  git: [network_write]
+  pip: [network_read, file_write]
+  pip3: [network_read, file_write]
+  npm: [network_read, file_write]
+  apt: [network_read, file_write]
+  apt-get: [network_read, file_write]
+  cargo: [network_read, file_write]
+  gem: [network_read, file_write]
+  sort: [file_write]
+  shuf: [file_write]
+  sed: [file_write]
+  wc: [file_read]
+  dd: [file_read, file_write]
