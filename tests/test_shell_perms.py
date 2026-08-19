@@ -205,8 +205,13 @@ def test_curl_redirect_adds_file_write():
 # wget
 # ---------------------------------------------------------------------------
 
-def test_wget_plain_is_network_read_only():
-    assert _classify_str("wget https://example.com") == frozenset({Permission.NETWORK_READ})
+def test_wget_plain_is_network_read_and_file_write():
+    # wget writes the downloaded content to disk by default (no -O needed),
+    # so bare `wget URL` must carry FILE_WRITE too — see perms.yaml's wget
+    # entry and the "hotfix: git permissions" commit.
+    assert _classify_str("wget https://example.com") == frozenset(
+        {Permission.NETWORK_READ, Permission.FILE_WRITE}
+    )
 
 
 def test_wget_post_data_adds_network_write():
@@ -230,9 +235,21 @@ def test_wget_output_flag_adds_file_write():
 # git
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("sub", ["clone", "fetch", "pull", "ls-remote"])
-def test_git_network_read_subcommands(sub):
-    assert _classify_str(f"git {sub} https://example.com/x") == frozenset({Permission.NETWORK_READ})
+@pytest.mark.parametrize("sub", ["clone", "fetch", "pull"])
+def test_git_network_read_subcommands_also_write_files(sub):
+    # clone/fetch/pull write the fetched objects to disk (clone: a whole new
+    # working tree; fetch: into .git; pull: into .git AND the working tree),
+    # so FILE_WRITE is required alongside NETWORK_READ — see perms.yaml's
+    # git entry and the "hotfix: git permissions" commit.
+    assert _classify_str(f"git {sub} https://example.com/x") == frozenset(
+        {Permission.NETWORK_READ, Permission.FILE_WRITE}
+    )
+
+
+def test_git_ls_remote_is_network_read_only():
+    assert _classify_str("git ls-remote https://example.com/x") == frozenset(
+        {Permission.NETWORK_READ}
+    )
 
 
 def test_git_push_is_network_write():

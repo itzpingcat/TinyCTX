@@ -475,16 +475,20 @@ class TestLegacyMigrationFromPermissionLevel:
         store = UserStore(data_dir=tmp_path, template=frozenset(Permission))
         assert store.get_user("carol").permission_overrides == {}
 
-    def test_effective_permissions_unaffected_by_new_global_template(self, tmp_path):
-        """A migrated user's behaviour must not shift just because the
-        (now single) global template is configured differently than
-        whatever they used to resolve against."""
+    def test_effective_permissions_match_migration_time_template(self, tmp_path):
+        """A migrated user's behaviour must not shift relative to the
+        template UserStore was constructed with at migration time — the
+        overrides are diffed sparsely against THAT template (self._template),
+        not pinned against every possible future config. A later config
+        whose template grants something outside the legacy set (e.g. ROOT,
+        which isn't in "trusted") is expected to grant it, the same as any
+        other user resolving against that template."""
         self._make_legacy_db(tmp_path, [("alice", 50)])  # -> "trusted"
-        store = UserStore(data_dir=tmp_path)
+        store = UserStore(data_dir=tmp_path)  # template defaults to frozenset()
         alice = store.get_user("alice")
 
-        weird_cfg = PermissionsConfig(template=frozenset({Permission.ROOT}))
-        assert alice.effective_permissions(weird_cfg) == _LEGACY_TEMPLATES["trusted"]
+        migration_time_cfg = PermissionsConfig(template=frozenset())
+        assert alice.effective_permissions(migration_time_cfg) == _LEGACY_TEMPLATES["trusted"]
 
     def test_permission_level_column_dropped_or_left_harmless(self, tmp_path):
         self._make_legacy_db(tmp_path, [("alice", 50)])
@@ -559,13 +563,16 @@ class TestLegacyMigrationFromTemplateColumn:
             frozenset(bob_resolved), template
         )
 
-    def test_effective_permissions_unaffected_by_new_global_template(self, tmp_path):
+    def test_effective_permissions_match_migration_time_template(self, tmp_path):
+        """See the equivalent test in TestLegacyMigrationFromPermissionLevel
+        for why this checks against the migration-time template rather than
+        an arbitrary later one."""
         self._make_middle_db(tmp_path, [("alice", "trusted", {})])
-        store = UserStore(data_dir=tmp_path)
+        store = UserStore(data_dir=tmp_path)  # template defaults to frozenset()
         alice = store.get_user("alice")
 
-        weird_cfg = PermissionsConfig(template=frozenset({Permission.ROOT}))
-        assert alice.effective_permissions(weird_cfg) == _LEGACY_TEMPLATES["trusted"]
+        migration_time_cfg = PermissionsConfig(template=frozenset())
+        assert alice.effective_permissions(migration_time_cfg) == _LEGACY_TEMPLATES["trusted"]
 
     def test_permission_template_column_dropped_or_left_harmless(self, tmp_path):
         self._make_middle_db(tmp_path, [("alice", "guest", {})])
