@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tinyctx"
-version = "0.1.0"
+version = "0.2.0"
 requires-python = ">=3.14"
 # CLI-only deps: everything needed to run `tinyctx onboard/start/stop/restart/status/launch`
 # on the host. The full agent runtime (gateway, bridges, ai.py, etc.) runs inside Docker
