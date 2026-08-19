@@ -64,4 +64,10 @@ USER tinyctx
 
 # --- runtime ---------------------------------------------------------------
 EXPOSE 8085
-ENTRYPOINT ["python", "TinyCTX/main.py"]
+# /tmp is a fresh tmpfs mount every container start (see compose.yaml), so the
+# /tmp/.X11-unix dir Xvfb expects doesn't persist from the image layer. Xvfb
+# refuses to auto-create it when not running as root ("_XSERVTransmkdir:
+# ERROR: euid != 0"), which under some Docker mount configs makes Xvfb hang
+# past camoufox's virtual-display timeout instead of reporting a display.
+# Pre-create it ourselves (tinyctx can, since /tmp is mode 1777) before launch.
+ENTRYPOINT ["/bin/sh", "-c", "mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix && exec python TinyCTX/main.py"]

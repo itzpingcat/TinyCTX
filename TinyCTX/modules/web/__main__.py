@@ -675,7 +675,12 @@ async def _ensure_page(agent):
     # the container's cap_drop: ALL / no-new-privileges (see compose.yaml).
     # Note there is no --no-sandbox flag to pass here even if we wanted one:
     # that is a Chromium flag, and Firefox ignores it.
-    camoufox = AsyncCamoufox(headless=headless)
+    # debug=True: without it, camoufox's VirtualDisplay sends Xvfb's stdout/
+    # stderr to DEVNULL, so any Xvfb launch failure surfaces only as the
+    # generic "Xvfb did not report a display" with no explanation. Temporary
+    # while diagnosing that — flip back to False (or drop the kwarg) once
+    # browser tools are confirmed working again.
+    camoufox = AsyncCamoufox(headless=headless, debug=True)
     browser = await camoufox.__aenter__()
     page = await browser.new_page()
 

@@ -70,6 +70,10 @@ services:
     tmpfs:
       - /tmp:size=256m,mode=1777
       - /app/__pycache__:size=64m
+    # Docker's default /dev/shm is 64m, which real (non-headless) Firefox
+    # under Camoufox can outgrow once Xvfb itself starts cleanly. Give it
+    # room so the browser doesn't crash/hang on shared-memory allocation.
+    shm_size: "1gb"
 
     deploy:
       resources:
