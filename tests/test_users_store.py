@@ -30,7 +30,7 @@ from TinyCTX.users.store import (
     UserStore,
     UsernameConflictError,
     _LEGACY_TEMPLATES,
-    _explicit_overrides_for,
+    _sparse_overrides_for,
     _random_username,
     _slugify,
     _template_name_for_level,
@@ -375,9 +375,12 @@ class TestModels:
 #   2. Short-lived middle state: permission_template TEXT +
 #      permission_overrides TEXT (the multi-template system this file
 #      briefly implemented before being simplified to one global template).
-# Both must land on permission_overrides holding a FULL explicit dict (every
-# Permission name present) so a migrated user's effective permissions don't
-# shift no matter what permissions.template ends up being configured to.
+# Both must land on permission_overrides holding a SPARSE dict — only the
+# entries that differ from the live permissions.template passed into
+# UserStore(template=...) — so a migrated user's effective permissions don't
+# shift relative to what they had under the old system, while the row itself
+# stays a normal diff against the current template rather than a frozen
+# full-dict snapshot. See _sparse_overrides_for's docstring in users/store.py.
 # ---------------------------------------------------------------------------
 
 class TestTemplateNameForLevel:
@@ -395,20 +398,27 @@ class TestTemplateNameForLevel:
         assert _template_name_for_level(level) == expected_template
 
 
-class TestExplicitOverridesFor:
-    def test_every_permission_present(self):
-        overrides = _explicit_overrides_for(frozenset({Permission.FILE_READ}))
-        assert set(overrides) == {p.value for p in Permission}
+class TestSparseOverridesFor:
+    def test_no_entries_when_resolved_matches_template(self):
+        template = frozenset({Permission.FILE_READ})
+        overrides = _sparse_overrides_for(frozenset({Permission.FILE_READ}), template)
+        assert overrides == {}
 
-    def test_values_match_membership(self):
-        overrides = _explicit_overrides_for(frozenset({Permission.FILE_READ, Permission.ROOT}))
-        assert overrides[Permission.FILE_READ.value] is True
-        assert overrides[Permission.ROOT.value] is True
-        assert overrides[Permission.NETWORK_WRITE.value] is False
+    def test_only_differing_entries_present(self):
+        template = frozenset({Permission.FILE_READ})
+        overrides = _sparse_overrides_for(
+            frozenset({Permission.FILE_READ, Permission.ROOT}), template
+        )
+        assert overrides == {Permission.ROOT.value: True}
 
-    def test_empty_set_yields_all_false(self):
-        overrides = _explicit_overrides_for(frozenset())
-        assert all(v is False for v in overrides.values())
+    def test_revocation_relative_to_template_is_false(self):
+        template = frozenset({Permission.FILE_READ, Permission.ROOT})
+        overrides = _sparse_overrides_for(frozenset({Permission.ROOT}), template)
+        assert overrides == {Permission.FILE_READ.value: False}
+
+    def test_empty_template_and_empty_resolved_yields_empty(self):
+        overrides = _sparse_overrides_for(frozenset(), frozenset())
+        assert overrides == {}
 
 
 class TestLegacyMigrationFromPermissionLevel:
@@ -442,18 +452,28 @@ class TestLegacyMigrationFromPermissionLevel:
         conn.commit()
         conn.close()
 
-    def test_legacy_level_frozen_into_full_explicit_overrides(self, tmp_path):
+    def test_legacy_level_diffed_into_sparse_overrides(self, tmp_path):
         self._make_legacy_db(tmp_path, [("alice", 50), ("bob", 0), ("carol", 100)])
 
+        template = frozenset()  # default template used when none is passed
         store = UserStore(data_dir=tmp_path)
 
-        alice_expected = _explicit_overrides_for(_LEGACY_TEMPLATES["trusted"])
-        bob_expected   = _explicit_overrides_for(_LEGACY_TEMPLATES["guest"])
-        carol_expected = _explicit_overrides_for(_LEGACY_TEMPLATES["operator"])
+        alice_expected = _sparse_overrides_for(_LEGACY_TEMPLATES["trusted"], template)
+        bob_expected   = _sparse_overrides_for(_LEGACY_TEMPLATES["guest"], template)
+        carol_expected = _sparse_overrides_for(_LEGACY_TEMPLATES["operator"], template)
 
         assert store.get_user("alice").permission_overrides == alice_expected
         assert store.get_user("bob").permission_overrides == bob_expected
         assert store.get_user("carol").permission_overrides == carol_expected
+
+    def test_legacy_level_diffed_against_passed_template(self, tmp_path):
+        """When a template is passed at construction time, the migrated
+        overrides diff against IT, not against the empty default — so a
+        migrated user whose legacy grants happen to match the live template
+        exactly ends up with an EMPTY overrides dict, not a frozen snapshot."""
+        self._make_legacy_db(tmp_path, [("carol", 100)])  # -> "operator" = every permission
+        store = UserStore(data_dir=tmp_path, template=frozenset(Permission))
+        assert store.get_user("carol").permission_overrides == {}
 
     def test_effective_permissions_unaffected_by_new_global_template(self, tmp_path):
         """A migrated user's behaviour must not shift just because the
@@ -482,8 +502,8 @@ class TestLegacyMigrationFromPermissionLevel:
         self._make_legacy_db(tmp_path, [("alice", 25)])
         UserStore(data_dir=tmp_path)  # migrates
         store2 = UserStore(data_dir=tmp_path)  # reopen — must not raise
-        assert store2.get_user("alice").permission_overrides == _explicit_overrides_for(
-            _LEGACY_TEMPLATES["member"]
+        assert store2.get_user("alice").permission_overrides == _sparse_overrides_for(
+            _LEGACY_TEMPLATES["member"], frozenset()
         )
 
 
@@ -520,19 +540,24 @@ class TestLegacyMigrationFromTemplateColumn:
         conn.commit()
         conn.close()
 
-    def test_template_and_overrides_merged_into_full_explicit_overrides(self, tmp_path):
+    def test_template_and_overrides_merged_into_sparse_overrides(self, tmp_path):
         self._make_middle_db(tmp_path, [
             ("alice", "member", {"file_write": True}),   # member + an extra grant
             ("bob",   "trusted", {"model_swap": False}),  # trusted minus one bool
         ])
 
+        template = frozenset()  # default template used when none is passed
         store = UserStore(data_dir=tmp_path)
 
         alice_resolved = set(_LEGACY_TEMPLATES["member"]) | {Permission.FILE_WRITE}
         bob_resolved = set(_LEGACY_TEMPLATES["trusted"]) - {Permission.MODEL_SWAP}
 
-        assert store.get_user("alice").permission_overrides == _explicit_overrides_for(frozenset(alice_resolved))
-        assert store.get_user("bob").permission_overrides == _explicit_overrides_for(frozenset(bob_resolved))
+        assert store.get_user("alice").permission_overrides == _sparse_overrides_for(
+            frozenset(alice_resolved), template
+        )
+        assert store.get_user("bob").permission_overrides == _sparse_overrides_for(
+            frozenset(bob_resolved), template
+        )
 
     def test_effective_permissions_unaffected_by_new_global_template(self, tmp_path):
         self._make_middle_db(tmp_path, [("alice", "trusted", {})])
@@ -556,16 +581,25 @@ class TestLegacyMigrationFromTemplateColumn:
     def test_empty_template_name_falls_back_to_guest(self, tmp_path):
         self._make_middle_db(tmp_path, [("alice", "", {"root": True})])
         store = UserStore(data_dir=tmp_path)
-        expected = _explicit_overrides_for(frozenset({Permission.ROOT}))
+        expected = _sparse_overrides_for(frozenset({Permission.ROOT}), frozenset())
         assert store.get_user("alice").permission_overrides == expected
 
     def test_reopen_after_migration_is_a_no_op(self, tmp_path):
         self._make_middle_db(tmp_path, [("alice", "operator", {})])
         UserStore(data_dir=tmp_path)  # migrates
         store2 = UserStore(data_dir=tmp_path)  # reopen — must not raise
-        assert store2.get_user("alice").permission_overrides == _explicit_overrides_for(
-            _LEGACY_TEMPLATES["operator"]
+        assert store2.get_user("alice").permission_overrides == _sparse_overrides_for(
+            _LEGACY_TEMPLATES["operator"], frozenset()
         )
+
+    def test_migration_diffed_against_passed_template(self, tmp_path):
+        """Same guarantee as the permission_level path: passing a template
+        at construction time means the migrated row's overrides are a real
+        diff against it, not a frozen full-dict snapshot from whatever the
+        template happened to be at migration time."""
+        self._make_middle_db(tmp_path, [("alice", "operator", {})])  # -> every permission
+        store = UserStore(data_dir=tmp_path, template=frozenset(Permission))
+        assert store.get_user("alice").permission_overrides == {}
 
 
 # ---------------------------------------------------------------------------

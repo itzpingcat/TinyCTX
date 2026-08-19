@@ -182,18 +182,25 @@ def _template_name_for_level(level: int) -> str:
     return name
 
 
-def _explicit_overrides_for(perms: frozenset[Permission]) -> dict[str, bool]:
+def _sparse_overrides_for(
+    perms: frozenset[Permission], template: frozenset[Permission]
+) -> dict[str, bool]:
     """
-    Freeze a resolved permission set into a FULL explicit overrides dict —
-    every one of the enum's names, not just the ones that differ from
-    *something*. Used only when migrating a row off permission_template or
-    permission_level: at that point there is no live template to diff
-    against (UserStore doesn't import config — see this module's docstring),
-    so the only way to guarantee a migrated user's effective permissions
-    don't shift is to pin every bool explicitly. Freshly created users get
-    the normal sparse {} and diff cleanly against permissions.template.
+    Diff a resolved legacy permission set against the CURRENT global
+    permissions.template, keeping only the entries that differ — the same
+    sparse shape User.effective_permissions() expects everywhere else.
+
+    Used only when migrating a row off permission_template or
+    permission_level. `template` is the live PermissionsConfig.template,
+    passed into UserStore at construction time (see __init__'s `template`
+    param) — UserStore itself still doesn't import TinyCTX.config, it just
+    receives the already-resolved frozenset as plain data, same layering
+    rule as before. Diffing against the real template (instead of pinning
+    every bool explicitly) means a migrated user's overrides shrink to just
+    their actual deltas, and later template changes apply to them like any
+    other user instead of being masked by a frozen full-dict snapshot.
     """
-    return {p.value: (p in perms) for p in Permission}
+    return {p.value: (p in perms) for p in Permission if (p in perms) != (p in template)}
 
 
 # ---------------------------------------------------------------------------
@@ -201,7 +208,12 @@ def _explicit_overrides_for(perms: frozenset[Permission]) -> dict[str, bool]:
 # ---------------------------------------------------------------------------
 
 class UserStore:
-    def __init__(self, data_dir: Path | None = None) -> None:
+    def __init__(
+        self,
+        data_dir: Path | None = None,
+        *,
+        template: frozenset[Permission] = frozenset(),
+    ) -> None:
         """
         data_dir: directory to store users.db in. Should be the instance's
         internal data dir (Config.data.path), NOT the workspace — keeps
@@ -213,7 +225,19 @@ class UserStore:
         been updated yet). TINYCTX_DATA_PATH and the old TINYCTX_CONFIG_DIR
         point at the same directory now that config-dir and data-dir are the
         same concept — there is no separate config dir anymore.
+
+        template: the resolved permissions.template frozenset (from
+        Config.permissions.template), used ONLY by _migrate() to diff a
+        legacy user's resolved permissions down to a sparse overrides dict
+        instead of pinning every bool. Passed as plain data — UserStore
+        still does not import TinyCTX.config, preserving the layering
+        _sparse_overrides_for's docstring describes. Defaults to empty
+        (fail-closed) for callers that don't pass one; a legacy migration
+        run under the default will treat "no template" as the diff base,
+        which only matters for users.db files still carrying
+        permission_level/permission_template columns.
         """
+        self._template = template
         if data_dir is not None:
             config_dir = Path(data_dir)
         else:
@@ -245,15 +269,17 @@ class UserStore:
         Three things can be true of an existing users.db, in the order this
         codebase actually produced them:
           1. Oldest — only the original permission_level INTEGER column.
-             Freeze each user's resolved legacy-template permissions into
-             permission_overrides (via _explicit_overrides_for), then drop
-             permission_level.
+             Resolve each user's legacy-template permissions, diff against
+             the live permissions.template (self._template, via
+             _sparse_overrides_for) into a sparse permission_overrides dict,
+             then drop permission_level.
           2. Short-lived middle state — has permission_template AND
              permission_overrides (the multi-template system this file
              briefly implemented). Resolve template + overrides into one
-             full explicit set the same way User.effective_permissions()
-             used to, write that back as permission_overrides, then drop
-             permission_template.
+             set the same way User.effective_permissions() used to, diff
+             that against the live permissions.template the same way as
+             branch 1, write the sparse result back as permission_overrides,
+             then drop permission_template.
           3. Current — only permission_overrides. Nothing to do.
         These are checked as elif, not independently: by the time state 2
         existed, state 1 had already been fully migrated into it (see the
@@ -291,7 +317,10 @@ class UserStore:
                         resolved.discard(perm)
                 self._conn.execute(
                     "UPDATE users SET permission_overrides = ? WHERE username = ?",
-                    (json.dumps(_explicit_overrides_for(frozenset(resolved))), row["username"]),
+                    (
+                        json.dumps(_sparse_overrides_for(frozenset(resolved), self._template)),
+                        row["username"],
+                    ),
                 )
             self._conn.commit()
             try:
@@ -319,7 +348,10 @@ class UserStore:
                 resolved = _LEGACY_TEMPLATES.get(name, frozenset())
                 self._conn.execute(
                     "UPDATE users SET permission_overrides = ? WHERE username = ?",
-                    (json.dumps(_explicit_overrides_for(resolved)), row["username"]),
+                    (
+                        json.dumps(_sparse_overrides_for(frozenset(resolved), self._template)),
+                        row["username"],
+                    ),
                 )
             self._conn.commit()
             try:

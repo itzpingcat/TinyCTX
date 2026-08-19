@@ -67,7 +67,7 @@ class Runtime:
 
         self.commands = CommandRegistry()
         self.module_registry = ModuleRegistry()
-        self.users = UserStore(data_path)
+        self.users = UserStore(data_path, template=config.permissions.template)
 
         # Tool discovery — one ToolVectorStore for the process lifetime,
         # shared by every AgentCycle's ToolCallHandler (see agent.py). The
