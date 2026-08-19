@@ -321,6 +321,57 @@ class Runtime:
             return False
 
     # ------------------------------------------------------------------
+    # Platform delivery — render events to a destination outside a live
+    # bridge-owned reply_queue drain loop (e.g. a cron job's output).
+    # ------------------------------------------------------------------
+
+    def register_platform_handler(
+        self,
+        platform: str,
+        handler: Callable[[str, object], Awaitable[None]],
+    ) -> None:
+        """
+        Register a renderer for `platform`: an async callable
+        `(destination, event) -> None` that renders one AgentEvent to
+        `destination` (a platform-specific address — e.g. a Discord
+        cursor_key or a Telegram chat_key).
+
+        Bridges call this once at startup with the same render_event
+        function their own turn-handling loop uses, so any caller that
+        isn't a live bridge turn (cron, and any future non-interactive
+        trigger source) can deliver output through the identical
+        rendering path a live user turn would use — same message
+        chunking, same file-upload handling, same error formatting.
+
+        Overwrites any previously registered handler for `platform`.
+        """
+        self._platform_handlers[platform] = handler
+        logger.info("[runtime] platform handler registered for %r", platform)
+
+    async def deliver(self, platform: str, destination: str, event: object) -> bool:
+        """
+        Render one AgentEvent to `destination` via the handler registered
+        for `platform`. Returns False (and logs) if no handler is
+        registered, or if the handler itself raises — a delivery failure
+        must never propagate up and abort the caller's larger loop (e.g.
+        a cron tick processing several due jobs).
+        """
+        handler = self._platform_handlers.get(platform)
+        if handler is None:
+            logger.warning(
+                "[runtime] deliver: no platform handler registered for %r — dropping event", platform
+            )
+            return False
+        try:
+            await handler(destination, event)
+            return True
+        except Exception:
+            logger.exception(
+                "[runtime] deliver: handler for %r raised while rendering to %r", platform, destination
+            )
+            return False
+
+    # ------------------------------------------------------------------
     # Entry Point: push()
     # ------------------------------------------------------------------
 
