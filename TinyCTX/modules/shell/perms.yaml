@@ -382,16 +382,23 @@ commands:
     name: git
     permissions: []
     subcommand:
-      clone: [network_read]
-      fetch: [network_read]
-      pull: [network_read]
+      # clone/fetch/pull don't just read from the network — they write the
+      # fetched objects (clone: a whole new working tree; fetch: into
+      # .git; pull: into .git AND the working tree) to disk. network_read
+      # alone would let a caller without FILE_WRITE write arbitrary files
+      # via `git clone <url> <target-dir>`.
+      clone: [network_read, file_write]
+      fetch: [network_read, file_write]
+      pull: [network_read, file_write]
       ls-remote: [network_read]
       push: [network_write]
     # git can run hooks/aliases — anything else isn't silently treated as
     # safe just because it's "git something local".
     subcommand_default: [untrusted_exec]
-    # Read-only/query flags for the network subcommands above. Force-push
-    # (-f/--force/--force-with-lease) is deliberately absent.
+    # Flags that don't change the classification above (clone/fetch/pull's
+    # scope, or the read-only ls-remote/push cases) for the network
+    # subcommands above. Force-push (-f/--force/--force-with-lease) is
+    # deliberately absent.
     known_flags:
       - "--depth"
       - "-b"
@@ -461,7 +468,10 @@ commands:
 
   - id: wget
     name: wget
-    permissions: [network_read]
+    # wget writes the downloaded content to disk by default (no -O needed) —
+    # network_read alone would let a caller without FILE_WRITE write
+    # arbitrary files via a bare `wget URL`.
+    permissions: [network_read, file_write]
     rules:
       - any_flag: ["--post-data", "--post-file"]
         add: [network_write]
