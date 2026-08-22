@@ -8,9 +8,14 @@ Config (bridges.discord.options.cosmetics in config.yaml):
         options:
           cosmetics:
             status: online          # online | idle | dnd | invisible
-            activity_type: watching # playing | watching | listening | competing | streaming
-            activity_text: "the context window"
+            activity_type: custom   # playing | watching | listening | competing | streaming | custom
+            activity_text: "context window go brrr"
+            activity_emoji: "🧠"     # custom only — optional, shown before the text
             nickname: ""            # optional, applied per-guild in allowed_servers
+
+activity_type "custom" is the speech-bubble status Discord shows attached to
+a user/bot's avatar (an emoji + free text, no "Playing"/"Watching" verb
+prefix) — discord.py's CustomActivity / activity type 4.
 
 status/activity are applied via client.change_presence() — cheap, no rate
 limit, safe to re-apply on every reconnect. nickname is applied per-guild via
@@ -38,6 +43,7 @@ DEFAULTS = {
     "status": "",          # "" = leave default (online, no explicit call skipped below)
     "activity_type": "",   # "" = no activity set
     "activity_text": "",
+    "activity_emoji": "",  # custom only
     "nickname": "",
 }
 
@@ -68,6 +74,7 @@ async def _apply_presence(bridge: "DiscordBridge", cfg: dict) -> None:
     status_name = str(cfg["status"]).strip().lower()
     activity_type_name = str(cfg["activity_type"]).strip().lower()
     activity_text = str(cfg["activity_text"]).strip()
+    activity_emoji = str(cfg["activity_emoji"]).strip()
 
     if not status_name and not activity_type_name:
         return  # nothing configured — leave discord.py's default presence alone
@@ -82,7 +89,12 @@ async def _apply_presence(bridge: "DiscordBridge", cfg: dict) -> None:
             )
 
     activity = None
-    if activity_type_name == "streaming":
+    if activity_type_name == "custom":
+        if activity_text or activity_emoji:
+            activity = discord.CustomActivity(name=activity_text, emoji=activity_emoji or None)
+        else:
+            logger.warning("[cosmetics] activity_type 'custom' needs activity_text or activity_emoji — skipping")
+    elif activity_type_name == "streaming":
         if activity_text:
             # Streaming activities need a URL — reuse activity_text as the
             # display name and point at a placeholder Twitch URL, since
@@ -94,7 +106,7 @@ async def _apply_presence(bridge: "DiscordBridge", cfg: dict) -> None:
         activity_type = _ACTIVITY_TYPE_MAP.get(activity_type_name)
         if activity_type is None:
             logger.warning(
-                "[cosmetics] unknown activity_type %r — valid: %s, streaming",
+                "[cosmetics] unknown activity_type %r — valid: %s, streaming, custom",
                 activity_type_name, ", ".join(_ACTIVITY_TYPE_MAP),
             )
         elif activity_text:
