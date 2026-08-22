@@ -54,8 +54,8 @@ TinyCTX/
 │   └── workspace_setup.py
 │
 ├── custom_modules/     User-defined plugins, gitignored (same interface as modules/)
-│   └── anima/          generate_image_anima — deferred tool for Anima.json ComfyUI workflow (enable via tools_search or a skill's `tools:` field)
 └── modules/            Auto-discovered plugins (see Module System below)
+    ├── comfyui/        generate_image_comfyui — deferred tool; runs an admin-provided ComfyUI workflow (enable via tools_search or a skill's `tools:` field). See ComfyUI module below.
     ├── cron/           Cron scheduler
     ├── concurrency/    Concurrent Forks — running-peer roster + spawn_fork / nudge_fork
     ├── ctx_tools/      Context manipulation tools (edit, delete turns)
@@ -413,6 +413,16 @@ Superseded modules `decay.py` / `dedup_agents.py` / `librarian_agents.py` are in
 - Firefox's content sandbox is left **on**; it launches fine under `cap_drop: ALL`. (Firefox has no `--no-sandbox` — that is a Chromium flag and was previously being passed as a no-op.)
 - **Screenshots** go to `workspace/outputs/browser/` (config `web.output_dir`), matching the `outputs/<module>/` convention `anima` uses. By default they are *also* returned inline as `IMAGE_BLOCK:image/png;<b64>` (see `contracts.IMAGE_BLOCK_PREFIX`, same sentinel `filesystem.view()` uses), which `agent._execute_tool` unwraps into a real image block for vision models. The sentinel now takes an optional `\n<caption>` suffix (added to `contracts.py` / `agent.py`; base64 has no newline so the split is unambiguous and `filesystem.view()` is unaffected), which web uses to append `(also saved to <path>)`. Screenshots over `config.web.screenshot_max_bytes` (default 1.5 MB) are saved but not inlined — a full-page PNG of a long page costs a lot of context. `inline=False` returns the path as text.
 - `http_request` was removed.
+
+### `comfyui` — `generate_image_comfyui(workflow, positive_prompt, negative_prompt, dimensions="1024x1024", seed=0)`. Replaces the old `custom_modules/anima` plugin (that tool, `generate_image_anima`, was hardcoded to one bundled workflow; this is generic).
+
+- **Workflows are admin-owned data, not code.** They live in `<instance>/config/comfyui/<name>.json`, resolved via `utils/instance.py::runtime_config_dir()` — same read-only, host/Docker-path-agnostic mechanism the `shell` module uses for its policy YAML. The module itself ships no workflow files.
+- **Discovery is startup-time only.** `register_agent()` globs `config/comfyui/*.json` once and bakes the sorted list of workflow names (bare filename, no extension) into the tool's docstring, so the LLM sees valid options without a round trip. Adding a workflow file requires a restart to appear in the docstring; calling an existing name always re-reads current file content per-call (workflow JSON is not cached). If no workflow files are found at startup, the tool is not registered at all (logged as a warning) rather than exposing a tool that can never succeed.
+- **Marker convention**, unchanged from the old anima tool but extended: a workflow JSON string field containing `MARKER>>name<<MARKER` gets substituted at call time. Five names are supported: `positive-prompt`, `negative-prompt`, `seed`, `width`, `height`. `width`/`height` come from parsing the `dimensions` param (`"WIDTHxHEIGHT"`). When a marker is the *entire* string value (e.g. `"width": "MARKER>>width<<MARKER"`), the real typed value (int) is substituted in place of the string — this is what lets seed/width/height live in normally-numeric JSON fields; a marker embedded inside a longer string (prompts) still substitutes as text.
+- **No manifest, no hard validation** of which markers a workflow supports — but unlike silently ignoring it, if the agent passes a non-default value for a param (`negative_prompt` always counts as "supplied"; `seed`/`width`/`height` only count if they differ from their tool defaults) and the workflow never referenced that marker anywhere, the tool's return string carries an appended `[Warning: this workflow does not support <param> — it was ignored.]` line. Purely informational — the call still succeeds.
+- Path safety: `workflow` is validated against `[A-Za-z0-9_-]+` before being used to build a filesystem path (defense in depth against traversal, since `workflow` is LLM-controlled).
+- Everything else — the raw ComfyUI API v1 client (`/prompt`, `/history`, `/view`, `/free`), the NudeNet-based safety filter (`filter.py`, hard/soft blocked label sets, censor-in-place + withhold-or-notice), `Permission.IMAGE_GEN` gating, `config.yaml`'s `comfyui:` key (host/port/api_key/timeout/unload_after/safety_filter) — is carried over unchanged from the old anima module. The filter runs identically regardless of which workflow produced the image, by design: a per-workflow filter bypass would defeat the point of it.
+- `outputs/comfyui/` (was `outputs/anima/`) under the workspace holds downloaded images and, on a job with no image outputs, a `debug_history_<prompt_id>.json` dump.
 
 ### `concurrency` — Concurrent Forks. Replaces the deleted `subagents` module; see `docs/PLAN.md` for the design of record.
 
