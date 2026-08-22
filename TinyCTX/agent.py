@@ -11,7 +11,7 @@ from TinyCTX.contracts import (
     AgentThinkingChunk, AgentToolCall, AgentToolResult,
     ToolCall, ToolResult, IMAGE_BLOCK_PREFIX
 )
-from TinyCTX.context import Context, HistoryEntry, HOOK_PRE_ASSEMBLE_ASYNC
+from TinyCTX.context import Context, HistoryEntry, HOOK_PRE_ASSEMBLE_ASYNC, HOOK_POST_COMPLETION
 from TinyCTX.ai import LLM, TextDelta, ThinkingDelta, ToolCallAssembled, LLMError
 from TinyCTX.tool_handling import ToolCallHandler
 
@@ -246,6 +246,23 @@ class AgentCycle:
 
             response_text = "".join(text_chunks)
 
+            # HOOK_POST_COMPLETION — modules inspect the raw completion (text +
+            # any native tool calls) before it's written to history. Runs even
+            # on an empty/malformed completion, since that's exactly the case
+            # output_parser-style modules exist to catch (e.g. a model that
+            # emitted tool-call-shaped text instead of a native tool call, so
+            # tool_calls_list is empty but response_text is not). Queued
+            # follow-ups are appended AFTER the assistant entry below, so they
+            # never race the retry/finalize logic that follows.
+            pending_followups: list[str] = []
+            for action in self.context.run_sync_hooks(
+                HOOK_POST_COMPLETION, response_text, tool_calls_list
+            ):
+                if action.notify:
+                    logger.info("[agent] post_completion notify: %s", action.notify)
+                if action.followup_message:
+                    pending_followups.append(action.followup_message)
+
             # Empty completion (no content, no tool call) — resend.
             #
             # Deliberately BEFORE context.add(): an empty assistant node must
@@ -285,6 +302,17 @@ class AgentCycle:
             ))
             meta["tail_node_id"] = self.context.tail_node_id
             logger.debug("[agent] assistant node written, tail=%s", self.context.tail_node_id)
+
+            # Write any HOOK_POST_COMPLETION follow-ups queued above, now that
+            # the assistant entry they're reacting to is committed. Each is a
+            # normal user-role turn — the model sees it next cycle like any
+            # other nudge (matches _drain_inbox's HistoryEntry(role="user")
+            # shape). Written even when tool_calls_list is non-empty: a model
+            # can legitimately mix one real tool call with stray text-encoded
+            # ones in the same turn.
+            for msg in pending_followups:
+                self.context.add(HistoryEntry(role="user", content=msg))
+                meta["tail_node_id"] = self.context.tail_node_id
 
             if not tool_calls_list:
                 if response_text.strip() == NO_REPLY_TOKEN:

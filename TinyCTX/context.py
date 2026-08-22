@@ -102,6 +102,11 @@ HOOK_PRE_ASSEMBLE_ASYNC = "pre_assemble_async"  # async fn(ctx) -> None    — a
 HOOK_FILTER_TURN        = "filter_turn"          # fn(entry, age, ctx) -> bool   (False = drop)
 HOOK_TRANSFORM_TURN     = "transform_turn"       # fn(entry, age, ctx) -> HistoryEntry | None
 HOOK_POST_ASSEMBLE      = "post_assemble"        # fn(messages, ctx) -> list[dict] | None
+HOOK_POST_COMPLETION    = "post_completion"      # fn(response_text, tool_calls_list, ctx) -> PostCompletionAction | None
+                                                  #   — sync, runs in AgentCycle.run() right after a completion is
+                                                  #     received, BEFORE the empty-completion check and BEFORE the
+                                                  #     assistant HistoryEntry is written to context. See
+                                                  #     PostCompletionAction below and run_sync_hooks().
 
 # Execution order per turn:
 #   agent awaits run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC)
@@ -111,6 +116,10 @@ HOOK_POST_ASSEMBLE      = "post_assemble"        # fn(messages, ctx) -> list[dic
 #     → adjacent-message merge + token-budget trim   (still HistoryEntry — see below)
 #     → render to OpenAI-format dicts
 #     → HOOK_POST_ASSEMBLE (final reshape — genuinely final: runs after merge/trim/render)
+#   ... inference happens ...
+#   agent calls ctx.run_sync_hooks(HOOK_POST_COMPLETION, response_text, tool_calls_list)
+#     → e.g. modules/output_parser: detect tool calls the model emitted as text
+#       instead of a native tool call, and queue a corrective follow-up turn.
 #
 # NOTE: dialogue entries stay as HistoryEntry (carrying .tags) all the way through
 # filter_turn, transform_turn, the adjacent-message merge, AND the token-budget
@@ -148,6 +157,30 @@ class AssembleMeta:
     # used to decide whether to trim (that would reintroduce a circular
     # trim-depends-on-content-depends-on-trim dependency).
     invalidated_tags:  frozenset[str] = field(default_factory=frozenset)
+
+
+# ---------------------------------------------------------------------------
+# PostCompletionAction — what a HOOK_POST_COMPLETION hook may ask the agent
+# to do after inspecting a raw (pre-write) completion.
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PostCompletionAction:
+    """
+    Returned by a HOOK_POST_COMPLETION hook to steer AgentCycle.run() before
+    the assistant HistoryEntry is written. All fields optional; None/False
+    means "no opinion" — a hook can set only what it needs.
+
+    followup_message: if set, queued as a new user-role turn AFTER the
+        current assistant response is recorded, so the model gets a chance
+        to self-correct next cycle (e.g. output_parser nudging the model
+        back to native tool calls). Does not suppress the current response.
+    notify: if set, surfaced via whatever the runtime's diagnostic channel
+        is (bridge status line, log, etc.) — for operator-facing signals
+        that don't belong in the conversation itself.
+    """
+    followup_message: str | None = None
+    notify:            str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -308,6 +341,28 @@ class Context:
                 await fn(self)
             except Exception:
                 logger.exception("Async hook '%s' raised", fn.__name__)
+
+    def run_sync_hooks(self, stage: str, *args) -> list["PostCompletionAction"]:
+        """
+        Call all hooks registered for a sync stage in priority order, passing
+        *args followed by self (ctx). Collects and returns every non-None
+        PostCompletionAction a hook returns, in priority order. A raising
+        hook is logged and skipped — one misbehaving module must not break
+        the turn.
+
+        Currently used for HOOK_POST_COMPLETION; kept generic (not named
+        run_post_completion_hooks) so future sync stages can reuse it.
+        """
+        actions: list[PostCompletionAction] = []
+        for _, _, fn in self._hooks[stage]:
+            try:
+                result = fn(*args, self)
+            except Exception:
+                logger.exception("Sync hook '%s' raised on stage '%s'", getattr(fn, "__name__", fn), stage)
+                continue
+            if result is not None:
+                actions.append(result)
+        return actions
 
     # ------------------------------------------------------------------
     # Prompt provider registration
