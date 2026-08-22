@@ -24,7 +24,8 @@ EXTENSION_META = {
         "prompt_priority": 5,
         # NOTE: trusted_threshold is GONE. The `trusted` template variable is
         # now True when the requesting user holds Permission.EQUIPMENT_TRUSTED
-        # (DM only, never in group chats — see _build_variables below).
+        # (true in both DMs and group chats — see _build_variables below;
+        # this comment previously said "DM only", which was stale).
         # docs/PERMISSIONS-PLAN.md §10.3: this bool is a *disclosure* flag —
         # it decides whether the system prompt tells the agent about
         # sensitive equipment, not whether an action is authorised. It's a

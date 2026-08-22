@@ -45,7 +45,10 @@ Available template variables (both templates):
   trusted         — True when the current user holds Permission.EQUIPMENT_TRUSTED
                     (docs/PERMISSIONS-PLAN.md §10.3 — a disclosure flag, not
                     an authorisation bool). True in both DMs and group chats.
-                    Read from ctx.state["session"]["author_id"] + ctx.state["session"]["platform"].
+                    Read by looking up ctx.state["session"]["author_id"] (the
+                    TinyCTX username) via UserStore.get_user() — NOT
+                    get_by_platform(), which wants a platform-native user_id
+                    and would silently miss.
   time_since_last_message — human-readable elapsed time since the previous user
                     message (e.g. "42s", "5m", "1h 3m"). Empty string on the
                     first message in a session or if unavailable.
@@ -117,11 +120,17 @@ def _build_variables(agent, ctx=None, last_message_at: float | None = None) -> d
     platform = session.get("platform") or ""
     author_id = session.get("author_id") or ""
     # Trust check — applies in both DMs and group chats.
+    # NOTE: session["author_id"] is the TinyCTX *username* (see
+    # Runtime._compute_state_delta, which sets it from msg.author.username —
+    # msg.author is already a resolved TinyCTX.users.User), NOT the
+    # platform-native user_id. Look the user up by username via get_user(),
+    # not get_by_platform() (that lookup wants a platform snowflake and will
+    # silently miss, leaving `trusted` stuck at False even for a user who
+    # holds EQUIPMENT_TRUSTED).
     trusted = False
-    if _users is not None and platform and author_id:
+    if _users is not None and author_id:
         try:
-            from TinyCTX.contracts import Platform
-            user = _users.get_by_platform(Platform(platform), author_id)
+            user = _users.get_user(author_id)
             trusted = user is not None and user.has_permission(
                 Permission.EQUIPMENT_TRUSTED, agent.config.permissions,
             )
@@ -175,11 +184,12 @@ def _build_static_variables(agent, ctx=None) -> dict:
     is_group_chat = bool(session.get("server_name"))
     platform = session.get("platform") or ""
     author_id = session.get("author_id") or ""
+    # See the matching comment in _build_variables: author_id is a TinyCTX
+    # username, so look it up with get_user(), not get_by_platform().
     trusted = False
-    if _users is not None and platform and author_id:
+    if _users is not None and author_id:
         try:
-            from TinyCTX.contracts import Platform
-            user = _users.get_by_platform(Platform(platform), author_id)
+            user = _users.get_user(author_id)
             trusted = user is not None and user.has_permission(
                 Permission.EQUIPMENT_TRUSTED, agent.config.permissions,
             )
