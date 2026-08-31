@@ -45,8 +45,10 @@ def make_tool_handler():
     return handler
 
 
-def _render_node(conv_db, node_id: str, sanitize_brackets):
+def _render_node(conv_db, node_id: str):
     """Return (author, content) for a node, or None if not renderable."""
+    from TinyCTX.utils.sanitize import sanitize_brackets, sanitize_special_tokens
+
     node = conv_db.get_node(node_id)
     if node is None or node.role not in ("user", "assistant"):
         return None
@@ -61,7 +63,7 @@ def _render_node(conv_db, node_id: str, sanitize_brackets):
             )
         except Exception:
             pass
-    content = sanitize_brackets(content.strip())
+    content = sanitize_special_tokens(sanitize_brackets(content.strip()))
     if not content:
         return None
     return author, content, (node.role == "assistant" and node.author_id)
@@ -76,17 +78,17 @@ def nodes_to_text(conv_db, node_ids: list[str], batch_size: int,
     in an <already_extracted> block so the extractor has trailing context for
     small/fragmented new batches without re-extracting content from them.
     Content is passed through sanitize_brackets() so it cannot forge the
-    delimiter (injection defense). Returns (text, agent_name).
+    delimiter, and sanitize_special_tokens() so it cannot forge fake turn
+    boundaries with LLM special/control tokens (injection defense).
+    Returns (text, agent_name).
     """
-    from TinyCTX.utils.sanitize import sanitize_brackets
-
     agent_name = "assistant"
 
     def render(ids):
         nonlocal agent_name
         lines: list[str] = []
         for node_id in ids:
-            rendered = _render_node(conv_db, node_id, sanitize_brackets)
+            rendered = _render_node(conv_db, node_id)
             if rendered is None:
                 continue
             author, content, is_named_assistant = rendered

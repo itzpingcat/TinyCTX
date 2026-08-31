@@ -1,7 +1,6 @@
 from __future__ import annotations
 import json
 import re
-from pathlib import Path
 
 
 def register_runtime(runtime) -> None:
@@ -22,7 +21,6 @@ def register_agent(cycle) -> None:
     _register_cot_strip(cycle.context, config)
     _register_trim(cycle.context, config)
     _register_tokenade(cycle.context, config)
-    _register_token_sanitize(cycle.context, config)
 
 
 def _register_dedup(context, config):
@@ -82,113 +80,6 @@ def _register_dedup(context, config):
     context.register_hook("pre_assemble",   pre_assemble,   priority=0)
     context.register_hook("filter_turn",    filter_turn,    priority=0)
     context.register_hook("transform_turn", transform_turn, priority=0)
-
-
-# ---------------------------------------------------------------------------
-# Prompt-injection token sanitizer
-# ---------------------------------------------------------------------------
-
-_BLACKLIST_PATH = Path(__file__).parent / "token_blacklist.txt"
-
-
-def _load_token_blacklist(path: Path = _BLACKLIST_PATH) -> re.Pattern | None:
-    """Load token_blacklist.txt and compile all patterns into one combined regex.
-
-    File format (same convention as shell/blacklist.txt):
-      - One regex pattern per line
-      - Lines starting with # are comments
-      - Blank lines are ignored
-
-    Returns a compiled regex (OR of all patterns), or None if the file is
-    missing or contains no valid patterns.
-    """
-    import logging
-    _logger = logging.getLogger(__name__)
-
-    if not path.exists():
-        _logger.warning(
-            "[token_sanitize] blacklist not found at %s — sanitizer disabled", path
-        )
-        return None
-
-    patterns = []
-    for lineno, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        try:
-            re.compile(line, re.IGNORECASE)  # validate before adding
-            patterns.append(f"(?:{line})")
-        except re.error as exc:
-            _logger.warning(
-                "[token_sanitize] skipping invalid pattern on line %d: %s — %s",
-                lineno, line, exc,
-            )
-
-    if not patterns:
-        _logger.warning("[token_sanitize] blacklist is empty — sanitizer disabled")
-        return None
-
-    combined = re.compile('|'.join(patterns), re.IGNORECASE)
-    _logger.debug("[token_sanitize] loaded %d patterns from %s", len(patterns), path)
-    return combined
-
-
-def _sanitize_text(text: str, pattern: re.Pattern) -> str:
-    """Strip all blacklisted tokens, then collapse redundant horizontal whitespace."""
-    cleaned = pattern.sub('', text)
-    cleaned = re.sub(r'[ \t]{2,}', ' ', cleaned)
-    return cleaned
-
-
-def _register_token_sanitize(context, config):
-    """Transform hook: strip model-family special tokens from tool and user turns.
-
-    Patterns are loaded from ctx_tools/token_blacklist.txt at startup.
-    Edit that file to add/remove patterns — no code changes needed.
-
-    Config keys (all optional, under the "token_sanitize" sub-dict):
-        enabled        -- bool, default True
-        roles          -- list[str], default ["tool", "user"]
-        blacklist_path -- str, default ctx_tools/token_blacklist.txt
-    """
-    import logging
-    _logger = logging.getLogger(__name__)
-
-    sanitize_cfg = config.get("token_sanitize", {})
-
-    enabled = sanitize_cfg.get("enabled", True)
-    if not enabled:
-        return
-
-    blacklist_path = Path(sanitize_cfg.get("blacklist_path", str(_BLACKLIST_PATH)))
-    pattern = _load_token_blacklist(blacklist_path)
-    if pattern is None:
-        return
-
-    roles: set[str] = set(sanitize_cfg.get("roles", ["tool", "user"]))
-
-    def transform_turn(entry, age, ctx):
-        if entry.role not in roles:
-            return None
-
-        content = entry.content
-        if not content or not isinstance(content, str):
-            return None
-
-        cleaned = _sanitize_text(content, pattern)
-        if cleaned == content:
-            return None
-
-        removed = len(content) - len(cleaned)
-        _logger.debug(
-            "[token_sanitize] stripped %d chars of special tokens from %s turn (index=%d)",
-            removed, entry.role, entry.index,
-        )
-        return _copy(entry, content=cleaned)
-
-    # Priority 2 — runs after tokenade (1) but well before trim (8/10)
-    context.register_hook("transform_turn", transform_turn, priority=2)
 
 
 _COT_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)

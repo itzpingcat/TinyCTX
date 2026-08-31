@@ -57,6 +57,7 @@ import logging
 
 from TinyCTX.contracts import ToolCall, ToolResult
 from TinyCTX.utils.sanitize import sanitize_brackets as _sanitize_brackets
+from TinyCTX.utils.sanitize import sanitize_special_tokens as _sanitize_special_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -712,6 +713,14 @@ class Context:
                 if result is not None:
                     entry = result
                     seen_tags |= entry.tags
+
+            # Strip LLM special/control tokens (e.g. <|im_start|>, [INST]) from
+            # untrusted tool/user content so prompt injection can't forge fake
+            # turn boundaries in the assembled context.
+            if entry.role in (ROLE_TOOL, ROLE_USER) and isinstance(entry.content, str) and entry.content:
+                cleaned = _sanitize_special_tokens(entry.content)
+                if cleaned != entry.content:
+                    entry = replace(entry, content=cleaned)
 
             if entry.role == ROLE_USER and entry.author_id is None:
                 if entry.parent_id is not None:

@@ -11,9 +11,5 @@ EXTENSION_META = {
             "truncate_after": 10,
             "max_chars":      2000,
         },
-        "token_sanitize": {
-            "enabled": True,
-            "roles":   ["tool", "user"],
-        },
     },
 }
