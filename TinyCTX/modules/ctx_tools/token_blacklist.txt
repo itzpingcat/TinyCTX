@@ -25,7 +25,8 @@
 # <bos>, <eos>, <start_of_turn>, <end_of_turn>, <boi>, <eoi>, etc.
 # ============================================================
 <\s*(?:bos|eos|pad|unk|start_of_turn|end_of_turn|turn|boi|eoi)\s*>
-
+<\|(?:turn|channel|tool_call|tool_response|thought|analysis|commentary|final)\|?>
+<\|(?:turn|channel|tool_call|tool_response|thought|analysis|commentary|final)>
 
 # ============================================================
 # Mistral V3 / Tekken
