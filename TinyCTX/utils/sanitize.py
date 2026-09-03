@@ -147,9 +147,29 @@ def _build_token_regex(token_strings: list[str]) -> re.Pattern:
 _SPECIAL_TOKEN_RE = _build_token_regex(SPECIAL_TOKEN_STRINGS)
 
 
+# Hard cap on sanitization passes (see sanitize_special_tokens). Each pass
+# can only shrink the string (net char count strictly decreases whenever a
+# match is found — see the loop's own convergence check), so genuine nested
+# constructions bottom out in a handful of passes; this is purely a
+# worst-case backstop against a pathological input that somehow keeps
+# regenerating matches forever.
+_MAX_SANITIZE_PASSES = 20
+
+
 def sanitize_special_tokens(text: str, extra_patterns: list[str] | None = None) -> str:
     """Strip known LLM special/control tokens from text, then collapse
     redundant horizontal whitespace left behind.
+
+    Runs to a fixed point (re-applying the pattern until nothing more
+    changes, up to _MAX_SANITIZE_PASSES) rather than a single pass. A single
+    pass is bypassable: the wrapped-token pattern matches lazily up to the
+    first closing delimiter it finds, so an attacker can nest/interleave
+    delimiter characters (e.g. "<|channel<|channel>>...<<channel|>channel|>")
+    so the one match that fires consumes only a PREFIX of the payload,
+    leaving a well-formed forged token exposed in what's left behind — the
+    same "stripping one layer reveals the next" bypass class as classic
+    <script><script> filter evasion. Re-scanning after each pass catches
+    what the previous pass's removal exposed.
 
     extra_patterns, if given, is a list of additional raw regex patterns
     (e.g. loaded from a project-specific blacklist file) applied on top of
@@ -163,6 +183,12 @@ def sanitize_special_tokens(text: str, extra_patterns: list[str] | None = None) 
         combined = "|".join([_SPECIAL_TOKEN_RE.pattern] + [f"(?:{p})" for p in extra_patterns])
         pattern = re.compile(combined, re.IGNORECASE)
 
-    cleaned = pattern.sub("", text)
+    cleaned = text
+    for _ in range(_MAX_SANITIZE_PASSES):
+        next_cleaned = pattern.sub("", cleaned)
+        if next_cleaned == cleaned:
+            break
+        cleaned = next_cleaned
+
     cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
     return cleaned
