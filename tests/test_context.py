@@ -142,6 +142,74 @@ class TestAddAndAssemble:
 
 
 # ---------------------------------------------------------------------------
+# Thinking (<think>...</think>) → reasoning_content split at render time
+#
+# agent.py stores reasoning inline as a <think>...</think> prefix on the
+# assistant HistoryEntry's content (see agent.py's run() and
+# modules/ctx_tools' trim_thinking, which both operate on that stored text).
+# _render() peels it back off into its own "reasoning_content" key on the
+# OpenAI-compat dict, because that's the field the backend (llama-swap)
+# actually expects on replay — mirroring what it sends on the way IN (ai.py
+# parses delta["reasoning_content"] off the stream). Content stays whatever
+# followed the </think> tag.
+# ---------------------------------------------------------------------------
+
+class TestThinkingRender:
+    def test_leading_think_block_becomes_reasoning_content(self, ctx):
+        _assistant(ctx, "<think>secret reasoning</think>the actual reply")
+        messages, _ = ctx.assemble()
+        assistant_msg = next(m for m in messages if m["role"] == "assistant")
+        assert assistant_msg["reasoning_content"] == "secret reasoning"
+        assert assistant_msg["content"] == "the actual reply"
+        assert "<think>" not in assistant_msg["content"]
+
+    def test_no_think_block_has_no_reasoning_content_key(self, ctx):
+        _assistant(ctx, "plain reply, no thinking")
+        messages, _ = ctx.assemble()
+        assistant_msg = next(m for m in messages if m["role"] == "assistant")
+        assert "reasoning_content" not in assistant_msg
+        assert assistant_msg["content"] == "plain reply, no thinking"
+
+    def test_think_block_stripped_by_trim_still_has_no_reasoning_content(self, ctx):
+        # If an earlier transform_turn hook (e.g. ctx_tools' cot_strip in
+        # "all"/"auto" mode) has already stripped the <think> block out of
+        # content before render, there's nothing left to split — no
+        # reasoning_content key should appear.
+        from dataclasses import replace as _replace
+        _assistant(ctx, "<think>hidden</think>reply")
+
+        def strip_it(entry, age, c):
+            if entry.role == ROLE_ASSISTANT and "<think>" in (entry.content or ""):
+                return _replace(entry, content="reply")
+            return None
+
+        ctx.register_hook(HOOK_TRANSFORM_TURN, strip_it)
+        messages, _ = ctx.assemble()
+        assistant_msg = next(m for m in messages if m["role"] == "assistant")
+        assert "reasoning_content" not in assistant_msg
+        assert assistant_msg["content"] == "reply"
+
+    def test_reasoning_content_counted_in_token_budget(self, db):
+        # A long <think> block must still count against the token budget
+        # even though it's rendered into a separate field, not "content" —
+        # otherwise the trim loop would systematically undercount assistant
+        # turns that carry reasoning.
+        root = db.get_root()
+        ctx = Context(db, tail_node_id=root.id, token_limit=100_000)
+        _user(ctx, "hi")
+        _assistant(ctx, "<think>" + ("reasoning " * 2000) + "</think>short reply")
+        _, meta_with = ctx.assemble()
+
+        root2 = db.get_root()
+        ctx2 = Context(db, tail_node_id=root2.id, token_limit=100_000)
+        _user(ctx2, "hi")
+        _assistant(ctx2, "short reply")
+        _, meta_without = ctx2.assemble()
+
+        assert meta_with.tokens_used > meta_without.tokens_used + 1000
+
+
+# ---------------------------------------------------------------------------
 # filter_turn / transform_turn hooks
 # ---------------------------------------------------------------------------
 

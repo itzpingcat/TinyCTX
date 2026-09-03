@@ -47,6 +47,7 @@ calling assemble(). This keeps assemble() synchronous and simple.
 from __future__ import annotations
 
 import json
+import re
 import tiktoken
 import uuid
 from collections import defaultdict
@@ -609,9 +610,17 @@ class Context:
 
         tool_tokens = _tokenize(json.dumps(tools)) if tools else 0
 
+        def _reasoning_tokens(m: dict) -> int:
+            # reasoning_content (see _render) is a separate field on the
+            # wire, not part of "content" — must be counted explicitly or
+            # kept thinking silently doesn't count against the budget.
+            rc = m.get("reasoning_content")
+            return _tokenize(rc) if rc else 0
+
         raw = sum(
             _content_tokens(m.get("content", "")) +
-            _tokenize(json.dumps(m.get("tool_calls", [])))
+            _tokenize(json.dumps(m.get("tool_calls", []))) +
+            _reasoning_tokens(m)
             for m in messages
         ) + tool_tokens
 
@@ -864,6 +873,14 @@ class Context:
         """Render entries to dict form just for counting — doesn't mutate entries."""
         return self._count_tokens([self._render(e) for e in entries], tools)
 
+    # Matches a single leading <think>...</think> block — how thinking is
+    # stored inline on an assistant HistoryEntry's content (see agent.py's
+    # run() and modules/ctx_tools' cot_strip/trim_thinking, which both parse
+    # this same convention). Only stripped at render time, right before
+    # building the OpenAI-compat dict — everything upstream (trim_thinking,
+    # token counting, tags) keeps operating on the plain stored text.
+    _THINK_PREFIX_RE = re.compile(r"\A<think>(.*?)</think>", re.IGNORECASE | re.DOTALL)
+
     def _render(self, entry: HistoryEntry) -> dict:
         if entry.role == ROLE_TOOL:
             return {
@@ -872,7 +889,22 @@ class Context:
                 "tool_call_id": entry.tool_call_id,
             }
         if entry.role == ROLE_ASSISTANT:
-            msg: dict = {"role": ROLE_ASSISTANT, "content": entry.content}
+            content = entry.content
+            reasoning_content: str | None = None
+            if isinstance(content, str):
+                m = self._THINK_PREFIX_RE.match(content)
+                if m:
+                    reasoning_content = m.group(1)
+                    content = content[m.end():].lstrip("\n")
+            msg: dict = {"role": ROLE_ASSISTANT, "content": content}
+            if reasoning_content is not None:
+                # Sent back as its own field — not inline <think> text —
+                # because the backend's reasoning parser (llama-swap here)
+                # expects reasoning_content on replay, mirroring what it
+                # sends on the way IN (ai.py parses delta["reasoning_content"]
+                # off the stream). See project memory:
+                # project_thinking_persistence_and_footer_fix.md.
+                msg["reasoning_content"] = reasoning_content
             if entry.tool_calls:
                 msg["tool_calls"] = [
                     {

@@ -83,7 +83,7 @@ class TestExtensionMeta:
 
     def test_default_config_keys(self):
         cfg = ctx_tools.EXTENSION_META["default_config"]
-        for key in ("same_call_dedup_after", "cot_keep_recent_turns", "tokenade_threshold"):
+        for key in ("same_call_dedup_after", "trim_thinking", "tokenade_threshold"):
             assert key in cfg
         for key in ("trim_after", "truncate_after", "max_chars"):
             assert key in cfg["tool_output"]
@@ -181,12 +181,8 @@ class TestCotStrip:
         assert "multi" not in result
         assert "a" in result and "b" in result
 
-    def test_old_assistant_turn_has_cot_stripped(self, ctx):
-        # default cot_keep_recent_turns is 10000 in EXTENSION_META, so with
-        # the real default nothing would ever be stripped in a short test.
-        # Use an explicit small config via direct hook registration instead
-        # to exercise the underlying behavior deterministically.
-        ctx_tools_main._register_cot_strip(ctx, {"cot_keep_recent_turns": 0})
+    def test_trim_thinking_all_strips_every_turn(self, ctx):
+        ctx_tools_main._register_cot_strip(ctx, {"trim_thinking": "all"})
 
         _assistant(ctx, "old thought <think>hidden</think> visible")
         _user(ctx, "next")
@@ -196,6 +192,38 @@ class TestCotStrip:
         assistant_msgs = _msg_contents(messages, "assistant")
         assert not any("hidden" in c for c in assistant_msgs)
         assert any("visible" in c for c in assistant_msgs)
+
+    def test_trim_thinking_none_keeps_every_turn(self, ctx):
+        ctx_tools_main._register_cot_strip(ctx, {"trim_thinking": "none"})
+
+        _assistant(ctx, "old thought <think>hidden</think> visible")
+        _user(ctx, "next")
+        _assistant(ctx, "newer <think>also hidden</think> reply")
+
+        messages, _ = ctx.assemble()
+        assistant_msgs = _msg_contents(messages, "assistant")
+        assert any("hidden" in c for c in assistant_msgs)
+        assert any("also hidden" in c for c in assistant_msgs)
+
+    def test_trim_thinking_auto_keeps_only_current_agentcycle(self, ctx):
+        # "auto" (the default): thinking on assistant turns from a prior,
+        # already-finished agentcycle (i.e. at or before the most recent
+        # user turn) is stripped; thinking on assistant turns belonging to
+        # the still-in-progress cycle (after the most recent user turn) is
+        # kept — including across multiple assistant/tool-call turns within
+        # that same cycle.
+        ctx_tools_main._register_cot_strip(ctx, {"trim_thinking": "auto"})
+
+        _assistant(ctx, "old thought <think>hidden</think> visible")
+        _user(ctx, "next")
+        _assistant(ctx, "step one <think>kept one</think> a")
+        _assistant(ctx, "step two <think>kept two</think> b")
+
+        messages, _ = ctx.assemble()
+        assistant_msgs = _msg_contents(messages, "assistant")
+        assert not any("hidden" in c for c in assistant_msgs)
+        assert any("kept one" in c for c in assistant_msgs)
+        assert any("kept two" in c for c in assistant_msgs)
 
 
 # ---------------------------------------------------------------------------

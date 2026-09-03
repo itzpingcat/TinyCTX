@@ -223,6 +223,7 @@ class AgentCycle:
 
             # Inference with Fallback logic
             text_chunks, tool_calls_list, error = [], [], None
+            thinking_chunks: list[str] = []
             thinking_len = 0
             async for _ev in self._stream_inference(messages, tools, model_chain, abort_event, meta):
                 if isinstance(_ev, tuple):
@@ -230,6 +231,7 @@ class AgentCycle:
                     text_chunks, tool_calls_list, error = _ev
                 elif isinstance(_ev, AgentThinkingChunk):
                     # logger.debug("[agent] thinking chunk (%d chars)", len(_ev.text))
+                    thinking_chunks.append(_ev.text)
                     thinking_len += len(_ev.text)
                     yield AgentThinkingChunk(text=_ev.text, **meta)
                 elif isinstance(_ev, AgentTextChunk):
@@ -245,6 +247,7 @@ class AgentCycle:
                 return
 
             response_text = "".join(text_chunks)
+            thinking_text = "".join(thinking_chunks)
 
             # HOOK_POST_COMPLETION — modules inspect the raw completion (text +
             # any native tool calls) before it's written to history. Runs even
@@ -294,9 +297,23 @@ class AgentCycle:
 
             empty_retries = 0
 
-            # Record Assistant response in Context
+            # Record Assistant response in Context.
+            #
+            # Reasoning is persisted inline as a <think>...</think> prefix on
+            # the stored content — the established convention
+            # modules/ctx_tools' cot_strip already parses — so it can be
+            # replayed into context on a later turn (see trim_thinking).
+            # Applied here, AFTER the NO_REPLY/empty-completion checks above
+            # (which must see the model's real response_text only): wrapping
+            # earlier would make a thinking-only, content-free completion
+            # look non-empty to those checks and defeat both the resend
+            # retry and the NO_REPLY_TOKEN exact-match.
+            stored_content = (
+                f"<think>{thinking_text}</think>{response_text}"
+                if thinking_text else response_text
+            )
             self.context.add(HistoryEntry.assistant(
-                content=response_text,
+                content=stored_content,
                 tool_calls=tool_calls_list or None,
                 author_id=agent_name,
             ))

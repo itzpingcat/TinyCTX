@@ -92,27 +92,33 @@ def _strip_cot(text: str) -> str:
 
 
 def _register_cot_strip(context, config):
-    keep_recent = int(config.get("cot_keep_recent_turns", 0))
+    mode = config.get("trim_thinking", "auto")
 
-    assistant_age: dict[int, int] = {}
+    # In "auto" mode: the index of the most recent user entry — every
+    # assistant entry AFTER it belongs to the agentcycle still in progress
+    # (that cycle's own tool-call/assistant turns, all newer than the user
+    # message that started it) and keeps its thinking; every assistant
+    # entry at or before it is from a prior, finished cycle and gets
+    # stripped. -1 (nothing kept) when there's no user entry yet.
+    last_user_idx: list[int] = [-1]
 
     def pre_assemble(ctx):
-        assistant_age.clear()
-        rank = 0
-        for entry in reversed(ctx.dialogue):
-            if entry.role == "assistant":
-                assistant_age[entry.index] = rank
-                rank += 1
+        last_user_idx[0] = next(
+            (i for i in range(len(ctx.dialogue) - 1, -1, -1)
+             if ctx.dialogue[i].role == "user"),
+            -1,
+        )
 
     def transform_turn(entry, age, ctx):
+        if mode == "none":
+            return None
         if entry.role != "assistant":
             return None
         if not entry.content:
             return None
 
-        a_age = assistant_age.get(entry.index, 0)
-        if a_age < keep_recent:
-            return None
+        if mode == "auto" and entry.index > last_user_idx[0]:
+            return None  # still in this agentcycle — keep it
 
         new_content = _strip_cot(entry.content)
         if new_content == entry.content:
