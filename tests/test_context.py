@@ -463,3 +463,88 @@ class TestTags:
         ctx.register_hook(HOOK_TRANSFORM_TURN, destroy, priority=10)
         messages, meta = ctx.assemble()
         assert "late_tag" in meta.invalidated_tags
+
+
+# ---------------------------------------------------------------------------
+# Deferred (non-system) prompt placement — e.g. equipment_manifest's footer
+# ---------------------------------------------------------------------------
+
+class TestDeferredPromptPlacement:
+    """
+    A role="user" prompt provider (e.g. equipment_manifest's volatile footer)
+    must land BEFORE the entire trailing run of consecutive user turns, not
+    after them and not spliced in the middle of them — see
+    modules/equipment_manifest/__main__.py's module docstring. Because the
+    footer is role="user", the adjacent-merge (stage 4) folds it into that
+    run as plain text, so "inserted before the run" is what makes the footer
+    text land ahead of the user's own message(s) in the merged block.
+    """
+
+    def _register_footer(self, ctx, text="FOOTER", priority=99):
+        ctx.register_prompt("test_footer", lambda c: text, role=ROLE_USER, priority=priority)
+
+    def test_single_trailing_user_turn(self, ctx):
+        _user(ctx, "hello")
+        self._register_footer(ctx)
+        messages, _ = ctx.assemble()
+        user_msgs = [m["content"] for m in messages if m["role"] == ROLE_USER]
+        assert len(user_msgs) == 1
+        # Footer text precedes the user's own message in the merged block.
+        assert user_msgs[0].index("FOOTER") < user_msgs[0].index("hello")
+
+    def test_multiple_consecutive_trailing_user_turns(self, ctx):
+        # Simulates a group chat / passive-message batch: several user turns
+        # queued up with no assistant reply between them yet.
+        _user(ctx, "msg1")
+        _user(ctx, "msg2")
+        _user(ctx, "msg3")
+        self._register_footer(ctx)
+        messages, _ = ctx.assemble()
+        user_msgs = [m["content"] for m in messages if m["role"] == ROLE_USER]
+        assert len(user_msgs) == 1  # all merged into one block
+        content = user_msgs[0]
+        # Footer must precede ALL of the trailing run, not just the last one.
+        assert content.index("FOOTER") < content.index("msg1")
+        assert content.index("FOOTER") < content.index("msg2")
+        assert content.index("FOOTER") < content.index("msg3")
+
+    def test_lands_before_trailing_users_even_with_tool_calls_after_last_assistant(self, ctx):
+        # Regression: anchoring insertion on "the last assistant entry
+        # anywhere in history" (instead of "the trailing run of user
+        # entries") mis-fires when tool-call/tool-result entries sit between
+        # an earlier assistant turn and the true trailing user run — the
+        # footer would land right after that assistant turn, ahead of its
+        # own tool results, instead of ahead of the user turns that follow.
+        tc = ToolCall.make("foo", {})
+        _assistant(ctx, "", tool_calls=[tc])
+        _tool_result(ctx, tc.call_id, "tool output")
+        _user(ctx, "hello")
+        self._register_footer(ctx)
+
+        messages, _ = ctx.assemble()
+        roles = [m["role"] for m in messages]
+        # Tool result must stay directly after its assistant tool-call turn —
+        # the footer must not have been spliced between them.
+        assistant_i = roles.index(ROLE_ASSISTANT)
+        assert roles[assistant_i + 1] == ROLE_TOOL
+
+        user_msgs = [m["content"] for m in messages if m["role"] == ROLE_USER]
+        assert len(user_msgs) == 1
+        assert user_msgs[0].index("FOOTER") < user_msgs[0].index("hello")
+
+    def test_no_user_turn_yet_appends_after_system(self, ctx):
+        # Very first turn in a lane: no user entry at all (e.g. a synthetic
+        # trigger). Footer should land right after the system block, not
+        # get lost or crash.
+        self._register_footer(ctx)
+        messages, _ = ctx.assemble()
+        assert messages[-1]["role"] == ROLE_USER
+        assert "FOOTER" in messages[-1]["content"]
+
+    def test_priority_order_within_deferred_set(self, ctx):
+        _user(ctx, "hello")
+        ctx.register_prompt("footer_b", lambda c: "SECOND", role=ROLE_USER, priority=2)
+        ctx.register_prompt("footer_a", lambda c: "FIRST", role=ROLE_USER, priority=1)
+        messages, _ = ctx.assemble()
+        content = [m["content"] for m in messages if m["role"] == ROLE_USER][0]
+        assert content.index("FIRST") < content.index("SECOND") < content.index("hello")
