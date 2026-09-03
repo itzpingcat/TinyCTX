@@ -520,3 +520,99 @@ class TestDrain:
         cycle.active_run.inbox.put_nowait(Exogenous("nudge", "user", "x"))
         cycle._drain_inbox()
         assert cycle.context.tail_node_id == "tail-1"
+
+
+# ---------------------------------------------------------------------------
+# running_forks roster prompt provider
+# ---------------------------------------------------------------------------
+
+class TestRunningForksProvider:
+    """
+    modules/concurrency/__main__.py's _running_forks_provider renders the
+    <running_forks> block a peer-aware turn sees. Two things pinned here:
+
+    1. It embeds each peer's `intent` VERBATIM (the original spawn_fork
+       prompt) — that string can be attacker-reachable (a fork's triggering
+       prompt is not vetted), which is exactly why context.py's own
+       baseline sanitize_special_tokens pass runs over EVERY assembled
+       entry, this one included, regardless of role or origin (see
+       tests/test_context.py::TestSanitizationRunsLast). This module does
+       NOT sanitize on its own — it relies on that later pass.
+    2. It now prefixes an explanatory preamble telling the model what the
+       block means and that each fork's quoted intent is a record, not a
+       live instruction — added because the model had no explanation of
+       this block anywhere before.
+    """
+
+    class _FakeRuntime:
+        def __init__(self, runs):
+            self._runs = runs
+
+        def runs_in_session(self, session_key):
+            return [r for r in self._runs if r.session_key == session_key]
+
+    class _FakeCycle:
+        def __init__(self, active_run):
+            self.active_run = active_run
+
+    def _provider(self, runs, active_run):
+        import TinyCTX.modules.concurrency.__main__ as concurrency_main
+        concurrency_main._runtime = self._FakeRuntime(runs)
+        cycle = self._FakeCycle(active_run)
+        return concurrency_main._running_forks_provider(cycle)
+
+    def test_no_peers_returns_none(self):
+        me = Run(id="me", session_key="dm:1", intent="my task", root_node_id="n1")
+        provider = self._provider([me], me)
+        assert provider(None) is None
+
+    def test_self_excluded_from_roster(self):
+        me = Run(id="me", session_key="dm:1", intent="my task", root_node_id="n1")
+        provider = self._provider([me], me)
+        assert provider(None) is None  # only run in the session is self
+
+    def test_only_running_peers_listed(self):
+        me   = Run(id="me",   session_key="dm:1", intent="my task",  root_node_id="n1")
+        done = Run(id="done", session_key="dm:1", intent="finished", root_node_id="n2", status="done")
+        live = Run(id="live", session_key="dm:1", intent="still going", root_node_id="n3", status="running")
+        provider = self._provider([me, done, live], me)
+        out = provider(None)
+        assert "still going" in out
+        assert "finished" not in out
+
+    def test_peers_from_other_sessions_excluded(self):
+        me    = Run(id="me",    session_key="dm:1", intent="my task",       root_node_id="n1")
+        other = Run(id="other", session_key="dm:2", intent="different lane", root_node_id="n2")
+        provider = self._provider([me, other], me)
+        assert provider(None) is None
+
+    def test_roster_includes_id_prefix_and_verbatim_intent(self):
+        me   = Run(id="me", session_key="dm:1", intent="my task", root_node_id="n1")
+        peer = Run(id="7add4ea7-aaaa-bbbb-cccc-000000000000", session_key="dm:1",
+                   intent="do the thing", root_node_id="n2")
+        provider = self._provider([me, peer], me)
+        out = provider(None)
+        assert "7add4ea7" in out  # first 8 chars of the run id
+        assert "do the thing" in out
+
+    def test_explanatory_preamble_present(self):
+        # Two things only, per explicit user direction — kept terse: these
+        # are other copies of yourself multitasking, and don't duplicate
+        # what a listed fork is already doing. See _RUNNING_FORKS_PREAMBLE.
+        me   = Run(id="me", session_key="dm:1", intent="my task", root_node_id="n1")
+        peer = Run(id="peer", session_key="dm:1", intent="doing stuff", root_node_id="n2")
+        provider = self._provider([me, peer], me)
+        out = provider(None)
+        idx_block = out.index("<running_forks>")
+        assert idx_block > 0  # explanation precedes the block itself
+        preamble = out[:idx_block].lower()
+        assert "yourself" in preamble  # copies of yourself
+        assert "already doing" in preamble or "redo" in preamble  # don't duplicate work
+
+    def test_wrapper_tags_present(self):
+        me   = Run(id="me", session_key="dm:1", intent="my task", root_node_id="n1")
+        peer = Run(id="peer", session_key="dm:1", intent="doing stuff", root_node_id="n2")
+        provider = self._provider([me, peer], me)
+        out = provider(None)
+        assert "<running_forks>" in out
+        assert "</running_forks>" in out

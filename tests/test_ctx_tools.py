@@ -360,10 +360,18 @@ class TestTokenSanitize:
         assert not any("[INST]" in c for c in user_msgs)
         assert any("hello" in c and "world" in c for c in user_msgs)
 
-    def test_assistant_turns_not_sanitized_by_default(self, ctx):
-        # default token_sanitize_roles is ["tool", "user"] — assistant
-        # content should pass through untouched even if it contains a
-        # blacklisted-looking token.
+    def test_assistant_turns_also_sanitized_by_baseline_pass(self, ctx):
+        # context.py's own baseline sanitize_special_tokens pass (see
+        # assemble()'s step 4b) now runs over EVERY entry regardless of
+        # role, including assistant turns — not just tool/user. That's a
+        # deliberate, uniform default: a prompt-injection payload can end up
+        # in an assistant turn too (e.g. echoed back by a tool-call-shaped
+        # text completion before output_parser rewrites it), and there is no
+        # per-role opt-out for context.py's own pass. This module's
+        # (not-yet-implemented) token_sanitize_roles config would layer
+        # ADDITIONAL role-scoped sanitization with a configurable blacklist
+        # on top of that baseline — it does not, and cannot, exempt a role
+        # from the baseline pass.
         cycle = _FakeCycle(ctx)
         ctx_tools_main.register_agent(cycle)
 
@@ -371,7 +379,7 @@ class TestTokenSanitize:
 
         messages, _ = ctx.assemble()
         assistant_msgs = _msg_contents(messages, "assistant")
-        assert any("<|im_start|>" in c for c in assistant_msgs)
+        assert not any("<|im_start|>" in c for c in assistant_msgs)
 
     def test_disabled_via_config(self, ctx):
         ctx_tools_main._register_token_sanitize(ctx, {"token_sanitize": {"enabled": False}})

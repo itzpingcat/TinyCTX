@@ -723,14 +723,6 @@ class Context:
                     entry = result
                     seen_tags |= entry.tags
 
-            # Strip LLM special/control tokens (e.g. <|im_start|>, [INST]) from
-            # untrusted tool/user content so prompt injection can't forge fake
-            # turn boundaries in the assembled context.
-            if entry.role in (ROLE_TOOL, ROLE_USER) and isinstance(entry.content, str) and entry.content:
-                cleaned = _sanitize_special_tokens(entry.content)
-                if cleaned != entry.content:
-                    entry = replace(entry, content=cleaned)
-
             if entry.role == ROLE_USER and entry.author_id is None:
                 if entry.parent_id is not None:
                     logger.error(
@@ -804,6 +796,41 @@ class Context:
                 prev.tags = prev.tags | m.tags
             else:
                 merged.append(replace(m))
+
+        # 4b. Strip LLM special/control tokens (e.g. <|im_start|>, [INST]) so
+        # prompt injection can't forge fake turn boundaries in the assembled
+        # context. Deliberately the LAST content-mutating step before token
+        # counting/trim/render — everything that can still change an entry's
+        # text (filter_turn, transform_turn, the 【author】: label prefix, the
+        # adjacent-turn merge, and splicing in deferred prompt-provider
+        # entries like equipment_manifest's footer or concurrency's
+        # running_forks roster) has already run by this point, so nothing
+        # downstream can reintroduce unsanitized text without going back
+        # through this pass. Applied uniformly to EVERY entry regardless of
+        # role or origin — including role=system and the synthetic deferred
+        # entries — not just ROLE_USER/ROLE_TOOL dialogue turns, because a
+        # prompt provider can embed attacker-reachable text without it ever
+        # being a real dialogue turn (e.g. running_forks embeds a peer fork's
+        # spawn_fork(prompt) argument verbatim — see
+        # modules/concurrency/__main__.py's _format_run_line). Runs over the
+        # FULL rendered string, prefix included — the 【author】: delimiter
+        # itself is not exempted.
+        for i, e in enumerate(merged):
+            if isinstance(e.content, str) and e.content:
+                cleaned = _sanitize_special_tokens(e.content)
+                if cleaned != e.content:
+                    merged[i] = replace(e, content=cleaned)
+            elif isinstance(e.content, list):
+                new_blocks = None
+                for bi, b in enumerate(e.content):
+                    if isinstance(b, dict) and b.get("type") == "text" and b.get("text"):
+                        cleaned = _sanitize_special_tokens(b["text"])
+                        if cleaned != b["text"]:
+                            if new_blocks is None:
+                                new_blocks = list(e.content)
+                            new_blocks[bi] = {**b, "text": cleaned}
+                if new_blocks is not None:
+                    merged[i] = replace(e, content=new_blocks)
 
         # 5. Token budget enforcement (still HistoryEntry).
         tokens_pre_trim = self._count_tokens_entries(merged, tools)

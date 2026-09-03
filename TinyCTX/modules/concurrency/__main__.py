@@ -37,6 +37,16 @@ def register_runtime(runtime) -> None:
 # Roster prompt provider
 # ---------------------------------------------------------------------------
 
+# Preamble explaining <running_forks> to the model. Kept here (not in
+# AGENTS.md/SOUL.md) because the block is dynamic — only shown when peer
+# forks exist — so it only costs context budget on those turns. Two things
+# only, kept short: these are other copies of yourself multitasking, and
+# don't duplicate what a listed fork is already doing.
+_RUNNING_FORKS_PREAMBLE = (
+    "Other copies of yourself, multitasking. Don't redo what one's already doing:"
+)
+
+
 def _format_run_line(run) -> str:
     return f"- fork {run.id[:8]}: {run.intent!r}"
 
@@ -51,7 +61,11 @@ def _running_forks_provider(cycle):
         ]
         if not peers:
             return None
-        lines = ["<running_forks>"] + [_format_run_line(r) for r in peers] + ["</running_forks>"]
+        lines = (
+            [_RUNNING_FORKS_PREAMBLE, "<running_forks>"]
+            + [_format_run_line(r) for r in peers]
+            + ["</running_forks>"]
+        )
         return "\n".join(lines)
     return provider
 
