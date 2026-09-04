@@ -21,6 +21,7 @@ def register_agent(cycle) -> None:
     _register_cot_strip(cycle.context, config)
     _register_trim(cycle.context, config)
     _register_tokenade(cycle.context, config)
+    _register_label_prefix_strip(cycle, config)
 
 
 def _register_dedup(context, config):
@@ -259,3 +260,101 @@ def _copy(entry, **overrides):
         tool_call_id=entry.tool_call_id,
         tags=overrides.get("tags", entry.tags),
     )
+
+
+# ---------------------------------------------------------------------------
+# label_prefix_strip -- AgentCycle.stream_text_hooks (see agent.py __init__)
+# ---------------------------------------------------------------------------
+#
+# context.py's assemble() injects "【{author_id}】: " as a prefix on USER
+# turns only, to attribute speakers in multi-participant chats (see
+# context.py's assemble(), ~line 744: f"【{label}】: "). It must never
+# appear on an assistant turn. Models occasionally imitate the pattern
+# in-context and start echoing "【SomeName】: " at the head of their own
+# replies; once that lands in stored history it reinforces itself on every
+# later turn, since the model now sees its own past labeled replies as
+# precedent. This hook buffers the start of each streamed reply just long
+# enough to strip a leading label before any text reaches a client, so the
+# pattern never enters a live transcript and can't compound turn over turn.
+
+# _PREFIX_ONLY_RE: the buffer so far is exactly "【label】:" plus (maybe only
+# some of the) trailing whitespace, with no body text yet -- keep buffering
+# rather than resolving, since the separator space in context.py's
+# f"【{label}】: " can itself arrive split across TextDelta chunks.
+# _PREFIX_STRIP_RE: same shape, used once body text has arrived, to cut the
+# prefix off the front of the buffer.
+_LABEL_PREFIX_ONLY_RE  = re.compile(r"^【[^【】]{0,32}】:\s*$")
+_LABEL_PREFIX_STRIP_RE = re.compile(r"^【[^【】]{0,32}】:\s*")
+
+
+class _LabelPrefixStripHook:
+    """
+    Implements AgentCycle.stream_text_hooks' reset()/process()/flush()
+    protocol. Operates on accumulated text rather than raw provider chunks,
+    so it's correct regardless of how a delta stream happens to split the
+    brackets, colon, or separator space across tokens.
+    """
+
+    def __init__(self, max_buffer: int):
+        self._max_buffer = max_buffer
+        self._buf = ""
+        self._resolved = False
+
+    def reset(self) -> None:
+        self._buf = ""
+        self._resolved = False
+
+    def process(self, text: str) -> str:
+        if self._resolved:
+            return text
+
+        self._buf += text
+        if not self._buf.startswith("【"):
+            # Can never become a "【label】: " prefix -- no reason to
+            # hold ordinary replies back waiting for the cap or a newline.
+            self._resolved = True
+            out, self._buf = self._buf, ""
+            return out
+
+        if _LABEL_PREFIX_ONLY_RE.match(self._buf):
+            # Buffer is just "【label】:" (+ maybe partial trailing
+            # whitespace) with no body text yet -- keep waiting.
+            if len(self._buf) >= self._max_buffer:
+                self._resolved = True
+                out, self._buf = self._buf, ""
+                return out
+            return ""
+
+        stripped = _LABEL_PREFIX_STRIP_RE.sub("", self._buf, count=1)
+        if stripped != self._buf:
+            # Prefix matched with real body text after it -- drop the
+            # prefix, release the body.
+            self._resolved = True
+            self._buf = ""
+            return stripped
+
+        if len(self._buf) >= self._max_buffer or "\n" in self._buf:
+            # No match possible within the buffer budget (or the model
+            # moved past the first line without opening with 【) -- give up
+            # waiting, release as-is.
+            self._resolved = True
+            out, self._buf = self._buf, ""
+            return out
+
+        return ""  # keep buffering, nothing to release yet
+
+    def flush(self) -> str:
+        # Stream ended (or errored) before the buffer resolved -- e.g. a
+        # short reply that finished mid-buffer with no newline. Apply the
+        # same check once more before releasing whatever's left.
+        if self._resolved or not self._buf:
+            self._buf = ""
+            return ""
+        stripped = _LABEL_PREFIX_STRIP_RE.sub("", self._buf, count=1)
+        self._buf = ""
+        return stripped
+
+
+def _register_label_prefix_strip(cycle, config):
+    max_buffer = config.get("label_prefix_strip_max_chars", 40)
+    cycle.stream_text_hooks.append(_LabelPrefixStripHook(max_buffer))

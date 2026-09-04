@@ -15,6 +15,10 @@ EXTENSION_META = {
         #          normal token-budget trimming like any other content).
         "trim_thinking":         "auto",
         "tokenade_threshold":    20000,
+        # Max chars of a streamed reply's opening text to buffer while
+        # checking for a spoofed label prefix (see __main__.py's
+        # _LabelPrefixStripHook / agent.py's stream_text_hooks).
+        "label_prefix_strip_max_chars": 40,
         "tool_output": {
             "trim_after":     25,
             "truncate_after": 10,

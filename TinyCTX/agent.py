@@ -39,6 +39,33 @@ class AgentCycle:
         # Signature: async (tail_node_id: str) -> None
         self.post_turn_hooks: list = []
 
+        # Streaming-text hooks registered by modules via register_agent.
+        # Unlike context.py's hook stages (which all run before inference,
+        # or once on the full joined completion after it), these run
+        # per-TextDelta, live, as _stream_inference receives each chunk from
+        # the model -- the only stage that can rewrite or hold back text
+        # before it reaches a client. Each hook is a small stateful object
+        # (state lives on the hook instance, same closure-state convention
+        # as e.g. ctx_tools' dedup hook) implementing:
+        #   reset()        -> None   called once at the start of each model
+        #                             attempt in _stream_inference's
+        #                             `for model_name in model_chain` loop
+        #   process(text)  -> str    called with each TextDelta's new text;
+        #                             returns what to actually emit right
+        #                             now (may be "" to hold text back, may
+        #                             combine text buffered from earlier
+        #                             calls)
+        #   flush()        -> str    called once when the stream for this
+        #                             attempt ends (success, error, or
+        #                             abort); returns any text still held
+        #                             so it is never silently dropped
+        # Multiple hooks compose by piping text through each in registration
+        # order. A hook must not raise from process()/flush() -- unlike
+        # context.py's hooks, this stage has no try/except-and-skip wrapper
+        # (it runs in the hot per-token path), so a misbehaving hook here
+        # will break streaming for the whole cycle.
+        self.stream_text_hooks: list = []
+
         # Resources initialized during .run()
         self.db = None
         self.context = None
@@ -465,12 +492,35 @@ class AgentCycle:
         stream, then yields a single tuple sentinel at the end:
             (chunks: list[str], tool_calls: list[ToolCall], error: str | None)
         The caller unpacks the tuple to get the final result.
+
+        Every TextDelta's text is piped through self.stream_text_hooks (see
+        __init__) before being yielded/accumulated, letting a module rewrite
+        or hold back live text (e.g. ctx_tools' label-prefix strip). Hooks
+        are reset at the start of each model_name attempt and flushed once
+        the stream for that attempt ends (success, error, or abort) so any
+        text a hook is still holding is not silently lost.
         """
         for model_name in model_chain:
             llm = self.models[model_name]
             chunks: list[str] = []
             calls: list[ToolCall] = []
             error: str | None = None
+
+            for hook in self.stream_text_hooks:
+                hook.reset()
+
+            def _emit_text(text: str) -> AgentTextChunk | None:
+                # Pipe through every hook in registration order; each may
+                # rewrite, hold back (return ""), or pass through.
+                for hook in self.stream_text_hooks:
+                    text = hook.process(text)
+                if not text:
+                    return None
+                chunks.append(text)
+                return AgentTextChunk(text=text,
+                                      tail_node_id=meta["tail_node_id"],
+                                      trace_id=meta["trace_id"],
+                                      reply_to_message_id=meta["reply_to_message_id"])
 
             async for ev in llm.stream(messages, tools=tools, priority=0):
                 if abort_event.is_set():
@@ -483,16 +533,26 @@ class AgentCycle:
                                              trace_id=meta["trace_id"],
                                              reply_to_message_id=meta["reply_to_message_id"])
                 elif isinstance(ev, TextDelta):
-                    chunks.append(ev.text)
-                    yield AgentTextChunk(text=ev.text,
-                                         tail_node_id=meta["tail_node_id"],
-                                         trace_id=meta["trace_id"],
-                                         reply_to_message_id=meta["reply_to_message_id"])
+                    out = _emit_text(ev.text)
+                    if out is not None:
+                        yield out
                 elif isinstance(ev, ToolCallAssembled):
                     calls.append(ToolCall(ev.call_id, ev.tool_name, ev.args))
                 elif isinstance(ev, LLMError):
                     error = ev.message
                     break
+
+            # Flush: a hook may still be holding buffered text (e.g. a
+            # short reply that ended mid-buffer) -- give each one a last
+            # chance to release it before this attempt's chunks are final.
+            for hook in self.stream_text_hooks:
+                flushed = hook.flush()
+                if flushed:
+                    chunks.append(flushed)
+                    yield AgentTextChunk(text=flushed,
+                                         tail_node_id=meta["tail_node_id"],
+                                         trace_id=meta["trace_id"],
+                                         reply_to_message_id=meta["reply_to_message_id"])
 
             if not error:
                 yield (chunks, calls, None)

@@ -50,9 +50,11 @@ def ctx(db):
 
 
 class _FakeCycle:
-    """Minimal stand-in for AgentCycle — register_agent only touches .context."""
+    """Minimal stand-in for AgentCycle — register_agent touches .context and,
+    since the label-prefix-strip hook, appends to .stream_text_hooks too."""
     def __init__(self, context):
         self.context = context
+        self.stream_text_hooks: list = []
 
 
 def _user(ctx, text):
