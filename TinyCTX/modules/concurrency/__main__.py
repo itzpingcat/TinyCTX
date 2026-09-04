@@ -43,7 +43,7 @@ def register_runtime(runtime) -> None:
 # only, kept short: these are other copies of yourself multitasking, and
 # don't duplicate what a listed fork is already doing.
 _RUNNING_FORKS_PREAMBLE = (
-    "Other copies of yourself, multitasking. Don't redo what one's already doing:"
+    "Other copies of yourself, multitasking. Respond with NO_REPLY if you don't need to do anything. Don't redo what one's already doing:"
 )
 
 
