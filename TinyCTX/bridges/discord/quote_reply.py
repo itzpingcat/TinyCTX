@@ -81,8 +81,25 @@ class ReplySegment:
     target: "_HasContent | None"
 
 
+# Both mention spellings that can appear on either side of a match: raw
+# Discord snowflake mentions in real channel-history messages
+# ("<@123>"/"<@!123>"), and TinyCTX's humanized "@username" form the agent
+# sees and echoes back when quoting (bridge.py's on_message runs
+# humanize_mentions() on inbound text before the agent ever sees it, and
+# ChannelRenderer.flush() runs dehumanize_mentions() on outbound text before
+# quote-splitting -- so a quote block and the message it's quoting can
+# disagree on mention spelling even when they're "the same" message). Since
+# resolving @username back to the exact snowflake would need an async user
+# lookup this module doesn't have, mentions are stripped out of both sides
+# entirely before matching -- the mention itself is rarely what makes a
+# quote distinctive, the surrounding sentence is.
+_MENTION_RE = re.compile(r"<@!?\d+>|@[a-z0-9][a-z0-9_-]{1,31}", re.IGNORECASE)
+
+
 def _normalize(text: str) -> str:
-    """Lowercase + collapse whitespace, for loose substring matching."""
+    """Strip mention syntax, lowercase, collapse whitespace, for loose
+    substring matching that's insensitive to mention-spelling mismatches."""
+    text = _MENTION_RE.sub(" ", text)
     return " ".join(text.split()).lower()
 
 

@@ -178,3 +178,25 @@ def test_resolve_target_substring_either_direction():
 
 def test_no_candidates_never_matches():
     assert resolve_target("hello world how are you", []) is None
+
+
+def test_matches_across_humanized_vs_raw_mention_spelling():
+    # Real regression: the agent's context shows humanized "@username" for
+    # a mention (bridge.py humanizes inbound text before the agent sees
+    # it), so it echoes "@username" back when quoting -- but the actual
+    # channel-history message still has the raw Discord "<@snowflake>"
+    # mention. The mention spelling differs; the surrounding sentence
+    # should still match.
+    real_message = _FakeMessage(
+        content='hey <@1462978477119508530> try ">" quote replying to me. '
+                'you know what that is, right'
+    )
+    quote_content = ('hey @Yumeko try ">" quote replying to me. '
+                      'you know what that is, right')
+    assert resolve_target(quote_content, [real_message]) is real_message
+
+    text = f"> {quote_content}\n<@845336457153740830> oh, you mean like this?"
+    segments = split_into_reply_segments(text, [real_message])
+    assert len(segments) == 1
+    assert segments[0].target is real_message
+    assert segments[0].text == "<@845336457153740830> oh, you mean like this?"
