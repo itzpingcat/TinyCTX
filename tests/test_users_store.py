@@ -258,6 +258,30 @@ class TestRenameUser:
         assert fetched is not None
         assert fetched.username == "renamed"
 
+    def test_rename_invalidates_platform_cache(self, store):
+        """
+        Regression: get_by_platform() populates _cache_by_platform. If
+        rename_user() only invalidates _cache_by_username, the stale User
+        (old username) lingers in _cache_by_platform forever — every
+        subsequent get_by_platform() lookup for this identity (e.g. every
+        incoming bridge message resolving a command's permissions, see
+        utils/commands.py's runtime.users.get_by_platform() call) keeps
+        returning the pre-rename username until process restart.
+        """
+        user = store.resolve_user(Platform.DISCORD, "u1", "alice", "Alice")
+        # Prime _cache_by_platform BEFORE the rename — this is the
+        # steady-state case (a live bridge resolving identities on every
+        # message), unlike test_rename_updates_platform_index above which
+        # only ever queries get_by_platform() after the rename.
+        primed = store.get_by_platform(Platform.DISCORD, "u1")
+        assert primed is not None and primed.username == "alice"
+
+        store.rename_user(user.username, "renamed")
+
+        fetched = store.get_by_platform(Platform.DISCORD, "u1")
+        assert fetched is not None
+        assert fetched.username == "renamed"
+
 
 # ---------------------------------------------------------------------------
 # merge_users

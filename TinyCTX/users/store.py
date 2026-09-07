@@ -540,12 +540,36 @@ class UserStore:
                 (new_username, username),
             )
 
+        # _invalidate_by_username only clears _cache_by_username plus the
+        # platform-index entries for identities it still had cached under
+        # the OLD username's User object. That's the object we're about to
+        # replace anyway, so this also protects against a stale User with
+        # the old username lingering in _cache_by_platform if it was never
+        # loaded under _cache_by_username in the first place (e.g. only
+        # ever looked up via get_by_platform()).
         self._invalidate_by_username(username)
+        stale = self._cache_by_platform_entries_for(username)
+        for key in stale:
+            self._cache_by_platform.pop(key, None)
 
         user = self._load_user(new_username)
         assert user is not None
         self._populate_cache(user)
         return user
+
+    def _cache_by_platform_entries_for(self, username: str) -> list[tuple[str, str]]:
+        """Keys in _cache_by_platform whose cached User still has `username`.
+
+        Needed because a User can reach _cache_by_platform without ever
+        populating _cache_by_username (get_by_platform() populates both,
+        but only via _load_user under the OLD username at the time it was
+        cached) — so _invalidate_by_username's own cache pop can miss it
+        if get_user() was never called for this user under this process.
+        """
+        return [
+            key for key, cached in self._cache_by_platform.items()
+            if cached.username == username
+        ]
 
     # ------------------------------------------------------------------
     # Internal helpers
