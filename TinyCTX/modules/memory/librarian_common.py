@@ -45,8 +45,10 @@ def make_tool_handler():
     return handler
 
 
-def _render_node(conv_db, node_id: str, sanitize_brackets):
+def _render_node(conv_db, node_id: str):
     """Return (author, content) for a node, or None if not renderable."""
+    from TinyCTX.utils.sanitize import sanitize_brackets, sanitize_special_tokens
+
     node = conv_db.get_node(node_id)
     if node is None or node.role not in ("user", "assistant"):
         return None
@@ -61,7 +63,7 @@ def _render_node(conv_db, node_id: str, sanitize_brackets):
             )
         except Exception:
             pass
-    content = sanitize_brackets(content.strip())
+    content = sanitize_special_tokens(sanitize_brackets(content.strip()))
     if not content:
         return None
     return author, content, (node.role == "assistant" and node.author_id)
@@ -76,17 +78,17 @@ def nodes_to_text(conv_db, node_ids: list[str], batch_size: int,
     in an <already_extracted> block so the extractor has trailing context for
     small/fragmented new batches without re-extracting content from them.
     Content is passed through sanitize_brackets() so it cannot forge the
-    delimiter (injection defense). Returns (text, agent_name).
+    delimiter, and sanitize_special_tokens() so it cannot forge fake turn
+    boundaries with LLM special/control tokens (injection defense).
+    Returns (text, agent_name).
     """
-    from TinyCTX.utils.sanitize import sanitize_brackets
-
     agent_name = "assistant"
 
     def render(ids):
         nonlocal agent_name
         lines: list[str] = []
         for node_id in ids:
-            rendered = _render_node(conv_db, node_id, sanitize_brackets)
+            rendered = _render_node(conv_db, node_id)
             if rendered is None:
                 continue
             author, content, is_named_assistant = rendered
@@ -114,7 +116,7 @@ async def agent_loop(llm, system_prompt: str, user_prompt: str, handler, agent_l
                      max_cycles: int = 40) -> None:
     """Manual tool-calling loop. Caller is responsible for having bound the
     scope contextvar (tools.scope_context) before invoking this."""
-    from TinyCTX.ai import TextDelta, ToolCallAssembled, LLMError
+    from TinyCTX.ai import TextDelta, ThinkingDelta, ToolCallAssembled, LLMError
 
     class _InternalCaller:
         """Synthetic caller for the librarian subagent — not a real user, so
@@ -136,10 +138,13 @@ async def agent_loop(llm, system_prompt: str, user_prompt: str, handler, agent_l
 
     for cycle in range(max_cycles):
         text_chunks: list[str] = []
+        thinking_chunks: list[str] = []
         tool_calls: list[dict] = []
         async for event in llm.stream(messages, tools=tool_defs, priority=15):
             if isinstance(event, TextDelta):
                 text_chunks.append(event.text)
+            elif isinstance(event, ThinkingDelta):
+                thinking_chunks.append(event.text)
             elif isinstance(event, ToolCallAssembled):
                 tool_calls.append({"id": event.call_id, "name": event.tool_name, "args": event.args})
             elif isinstance(event, LLMError):
@@ -147,12 +152,13 @@ async def agent_loop(llm, system_prompt: str, user_prompt: str, handler, agent_l
                 return
 
         response_text = "".join(text_chunks)
+        thinking_text = "".join(thinking_chunks)
         if response_text:
             agent_logger.info("%s %s", "[final]" if not tool_calls else f"[cycle {cycle}]", response_text)
         if not tool_calls:
             return
 
-        messages.append({
+        assistant_msg: dict = {
             "role": "assistant",
             "content": response_text,
             "tool_calls": [
@@ -160,7 +166,14 @@ async def agent_loop(llm, system_prompt: str, user_prompt: str, handler, agent_l
                  "function": {"name": tc["name"], "arguments": json.dumps(tc["args"])}}
                 for tc in tool_calls
             ],
-        })
+        }
+        # Send reasoning_content back on the wire (see context.py's _render()
+        # split) so the model sees its own prior-cycle thinking on the next
+        # turn of this loop — same requirement agent.py fixed for the main
+        # AgentCycle, just never wired into this separate manual loop.
+        if thinking_text:
+            assistant_msg["reasoning_content"] = thinking_text
+        messages.append(assistant_msg)
         for tc in tool_calls:
             outcome = await handler.execute_tool_call(
                 {"id": tc["id"], "function": {"name": tc["name"], "arguments": tc["args"]}},

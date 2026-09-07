@@ -9,7 +9,7 @@ concurrency:
 cron:
   store_file: cron.db
 ctx_tools:
-  cot_keep_recent_turns: 10000
+  trim_thinking: auto
   same_call_dedup_after: 2
   token_sanitize:
     enabled: true

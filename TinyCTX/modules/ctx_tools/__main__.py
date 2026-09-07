@@ -1,7 +1,6 @@
 from __future__ import annotations
 import json
 import re
-from pathlib import Path
 
 
 def register_runtime(runtime) -> None:
@@ -22,7 +21,7 @@ def register_agent(cycle) -> None:
     _register_cot_strip(cycle.context, config)
     _register_trim(cycle.context, config)
     _register_tokenade(cycle.context, config)
-    _register_token_sanitize(cycle.context, config)
+    _register_label_prefix_strip(cycle, config)
 
 
 def _register_dedup(context, config):
@@ -84,113 +83,6 @@ def _register_dedup(context, config):
     context.register_hook("transform_turn", transform_turn, priority=0)
 
 
-# ---------------------------------------------------------------------------
-# Prompt-injection token sanitizer
-# ---------------------------------------------------------------------------
-
-_BLACKLIST_PATH = Path(__file__).parent / "token_blacklist.txt"
-
-
-def _load_token_blacklist(path: Path = _BLACKLIST_PATH) -> re.Pattern | None:
-    """Load token_blacklist.txt and compile all patterns into one combined regex.
-
-    File format (same convention as shell/blacklist.txt):
-      - One regex pattern per line
-      - Lines starting with # are comments
-      - Blank lines are ignored
-
-    Returns a compiled regex (OR of all patterns), or None if the file is
-    missing or contains no valid patterns.
-    """
-    import logging
-    _logger = logging.getLogger(__name__)
-
-    if not path.exists():
-        _logger.warning(
-            "[token_sanitize] blacklist not found at %s — sanitizer disabled", path
-        )
-        return None
-
-    patterns = []
-    for lineno, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        try:
-            re.compile(line, re.IGNORECASE)  # validate before adding
-            patterns.append(f"(?:{line})")
-        except re.error as exc:
-            _logger.warning(
-                "[token_sanitize] skipping invalid pattern on line %d: %s — %s",
-                lineno, line, exc,
-            )
-
-    if not patterns:
-        _logger.warning("[token_sanitize] blacklist is empty — sanitizer disabled")
-        return None
-
-    combined = re.compile('|'.join(patterns), re.IGNORECASE)
-    _logger.debug("[token_sanitize] loaded %d patterns from %s", len(patterns), path)
-    return combined
-
-
-def _sanitize_text(text: str, pattern: re.Pattern) -> str:
-    """Strip all blacklisted tokens, then collapse redundant horizontal whitespace."""
-    cleaned = pattern.sub('', text)
-    cleaned = re.sub(r'[ \t]{2,}', ' ', cleaned)
-    return cleaned
-
-
-def _register_token_sanitize(context, config):
-    """Transform hook: strip model-family special tokens from tool and user turns.
-
-    Patterns are loaded from ctx_tools/token_blacklist.txt at startup.
-    Edit that file to add/remove patterns — no code changes needed.
-
-    Config keys (all optional, under the "token_sanitize" sub-dict):
-        enabled        -- bool, default True
-        roles          -- list[str], default ["tool", "user"]
-        blacklist_path -- str, default ctx_tools/token_blacklist.txt
-    """
-    import logging
-    _logger = logging.getLogger(__name__)
-
-    sanitize_cfg = config.get("token_sanitize", {})
-
-    enabled = sanitize_cfg.get("enabled", True)
-    if not enabled:
-        return
-
-    blacklist_path = Path(sanitize_cfg.get("blacklist_path", str(_BLACKLIST_PATH)))
-    pattern = _load_token_blacklist(blacklist_path)
-    if pattern is None:
-        return
-
-    roles: set[str] = set(sanitize_cfg.get("roles", ["tool", "user"]))
-
-    def transform_turn(entry, age, ctx):
-        if entry.role not in roles:
-            return None
-
-        content = entry.content
-        if not content or not isinstance(content, str):
-            return None
-
-        cleaned = _sanitize_text(content, pattern)
-        if cleaned == content:
-            return None
-
-        removed = len(content) - len(cleaned)
-        _logger.debug(
-            "[token_sanitize] stripped %d chars of special tokens from %s turn (index=%d)",
-            removed, entry.role, entry.index,
-        )
-        return _copy(entry, content=cleaned)
-
-    # Priority 2 — runs after tokenade (1) but well before trim (8/10)
-    context.register_hook("transform_turn", transform_turn, priority=2)
-
-
 _COT_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
 
 
@@ -201,27 +93,33 @@ def _strip_cot(text: str) -> str:
 
 
 def _register_cot_strip(context, config):
-    keep_recent = int(config.get("cot_keep_recent_turns", 0))
+    mode = config.get("trim_thinking", "auto")
 
-    assistant_age: dict[int, int] = {}
+    # In "auto" mode: the index of the most recent user entry — every
+    # assistant entry AFTER it belongs to the agentcycle still in progress
+    # (that cycle's own tool-call/assistant turns, all newer than the user
+    # message that started it) and keeps its thinking; every assistant
+    # entry at or before it is from a prior, finished cycle and gets
+    # stripped. -1 (nothing kept) when there's no user entry yet.
+    last_user_idx: list[int] = [-1]
 
     def pre_assemble(ctx):
-        assistant_age.clear()
-        rank = 0
-        for entry in reversed(ctx.dialogue):
-            if entry.role == "assistant":
-                assistant_age[entry.index] = rank
-                rank += 1
+        last_user_idx[0] = next(
+            (i for i in range(len(ctx.dialogue) - 1, -1, -1)
+             if ctx.dialogue[i].role == "user"),
+            -1,
+        )
 
     def transform_turn(entry, age, ctx):
+        if mode == "none":
+            return None
         if entry.role != "assistant":
             return None
         if not entry.content:
             return None
 
-        a_age = assistant_age.get(entry.index, 0)
-        if a_age < keep_recent:
-            return None
+        if mode == "auto" and entry.index > last_user_idx[0]:
+            return None  # still in this agentcycle — keep it
 
         new_content = _strip_cot(entry.content)
         if new_content == entry.content:
@@ -362,3 +260,101 @@ def _copy(entry, **overrides):
         tool_call_id=entry.tool_call_id,
         tags=overrides.get("tags", entry.tags),
     )
+
+
+# ---------------------------------------------------------------------------
+# label_prefix_strip -- AgentCycle.stream_text_hooks (see agent.py __init__)
+# ---------------------------------------------------------------------------
+#
+# context.py's assemble() injects "【{author_id}】: " as a prefix on USER
+# turns only, to attribute speakers in multi-participant chats (see
+# context.py's assemble(), ~line 744: f"【{label}】: "). It must never
+# appear on an assistant turn. Models occasionally imitate the pattern
+# in-context and start echoing "【SomeName】: " at the head of their own
+# replies; once that lands in stored history it reinforces itself on every
+# later turn, since the model now sees its own past labeled replies as
+# precedent. This hook buffers the start of each streamed reply just long
+# enough to strip a leading label before any text reaches a client, so the
+# pattern never enters a live transcript and can't compound turn over turn.
+
+# _PREFIX_ONLY_RE: the buffer so far is exactly "【label】:" plus (maybe only
+# some of the) trailing whitespace, with no body text yet -- keep buffering
+# rather than resolving, since the separator space in context.py's
+# f"【{label}】: " can itself arrive split across TextDelta chunks.
+# _PREFIX_STRIP_RE: same shape, used once body text has arrived, to cut the
+# prefix off the front of the buffer.
+_LABEL_PREFIX_ONLY_RE  = re.compile(r"^【[^【】]{0,32}】:\s*$")
+_LABEL_PREFIX_STRIP_RE = re.compile(r"^【[^【】]{0,32}】:\s*")
+
+
+class _LabelPrefixStripHook:
+    """
+    Implements AgentCycle.stream_text_hooks' reset()/process()/flush()
+    protocol. Operates on accumulated text rather than raw provider chunks,
+    so it's correct regardless of how a delta stream happens to split the
+    brackets, colon, or separator space across tokens.
+    """
+
+    def __init__(self, max_buffer: int):
+        self._max_buffer = max_buffer
+        self._buf = ""
+        self._resolved = False
+
+    def reset(self) -> None:
+        self._buf = ""
+        self._resolved = False
+
+    def process(self, text: str) -> str:
+        if self._resolved:
+            return text
+
+        self._buf += text
+        if not self._buf.startswith("【"):
+            # Can never become a "【label】: " prefix -- no reason to
+            # hold ordinary replies back waiting for the cap or a newline.
+            self._resolved = True
+            out, self._buf = self._buf, ""
+            return out
+
+        if _LABEL_PREFIX_ONLY_RE.match(self._buf):
+            # Buffer is just "【label】:" (+ maybe partial trailing
+            # whitespace) with no body text yet -- keep waiting.
+            if len(self._buf) >= self._max_buffer:
+                self._resolved = True
+                out, self._buf = self._buf, ""
+                return out
+            return ""
+
+        stripped = _LABEL_PREFIX_STRIP_RE.sub("", self._buf, count=1)
+        if stripped != self._buf:
+            # Prefix matched with real body text after it -- drop the
+            # prefix, release the body.
+            self._resolved = True
+            self._buf = ""
+            return stripped
+
+        if len(self._buf) >= self._max_buffer or "\n" in self._buf:
+            # No match possible within the buffer budget (or the model
+            # moved past the first line without opening with 【) -- give up
+            # waiting, release as-is.
+            self._resolved = True
+            out, self._buf = self._buf, ""
+            return out
+
+        return ""  # keep buffering, nothing to release yet
+
+    def flush(self) -> str:
+        # Stream ended (or errored) before the buffer resolved -- e.g. a
+        # short reply that finished mid-buffer with no newline. Apply the
+        # same check once more before releasing whatever's left.
+        if self._resolved or not self._buf:
+            self._buf = ""
+            return ""
+        stripped = _LABEL_PREFIX_STRIP_RE.sub("", self._buf, count=1)
+        self._buf = ""
+        return stripped
+
+
+def _register_label_prefix_strip(cycle, config):
+    max_buffer = config.get("label_prefix_strip_max_chars", 40)
+    cycle.stream_text_hooks.append(_LabelPrefixStripHook(max_buffer))

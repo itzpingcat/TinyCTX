@@ -179,7 +179,14 @@ class _AgentEventBase:
 
 @dataclass(frozen=True)
 class AgentThinkingChunk(_AgentEventBase):
-    """One reasoning/thinking token (reasoning_content field). Never stored in context."""
+    """
+    One reasoning/thinking token (reasoning_content field). Streamed live to
+    bridges as it arrives; agent.py also accumulates these and persists the
+    full reasoning as a <think>...</think> prefix on the assistant node's
+    stored content once the completion finishes (see agent.py's run()).
+    Whether that stored reasoning survives into a LATER turn's assembled
+    context is controlled by modules/ctx_tools' trim_thinking setting.
+    """
     text: str
 
 

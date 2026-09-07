@@ -17,6 +17,7 @@ Decomposed sub-modules:
   cursors.py   — CursorStore, make_session_node
   turn.py      — handle_turn, typing_keepalive
   commands.py  — sync_app_commands, slash-command interaction handlers
+  cosmetics.py — cosmetic features
 """
 from __future__ import annotations
 
@@ -42,11 +43,12 @@ from TinyCTX.contracts import (
 )
 from TinyCTX.permissions import Permission
 
-from .compat   import CompatRules
-from .cursors  import CursorStore, make_session_node
-from .mentions import humanize_mentions, dehumanize_mentions
-from . import commands as _cmd_module
-from . import turn     as _turn_module
+from .compat     import CompatRules
+from .cursors    import CursorStore, make_session_node
+from .mentions   import humanize_mentions, dehumanize_mentions
+from . import commands  as _cmd_module
+from . import turn      as _turn_module
+from . import cosmetics as _cosmetics_module
 
 if TYPE_CHECKING:
     from TinyCTX.runtime import Runtime
@@ -79,6 +81,11 @@ DEFAULTS = {
     "typing_on_thinking": True,
     "typing_on_tools": True,
     "typing_on_reply": True,
+    "quote_reply_enabled": True,
+    "quote_reply_lookback": 50,
+    "quote_reply_min_len": 8,
+    # See cosmetics.py for the full key list and behavior.
+    "cosmetics": {},
 }
 
 # Message types Discord fires for thread creation / system events — these are
@@ -103,6 +110,9 @@ class DiscordBridge:
         self._typing_on_thinking: bool  = bool(self._opts["typing_on_thinking"])
         self._typing_on_tools:    bool  = bool(self._opts["typing_on_tools"])
         self._typing_on_reply:    bool  = bool(self._opts["typing_on_reply"])
+        self._quote_reply_enabled:  bool = bool(self._opts["quote_reply_enabled"])
+        self._quote_reply_lookback: int  = int(self._opts["quote_reply_lookback"])
+        self._quote_reply_min_len:  int  = int(self._opts["quote_reply_min_len"])
         self._reset_command:      str   = str(self._opts["reset_command"])
         self._shutdown_command:   str   = str(self._opts["shutdown_command"])
         self._dm_enabled:         bool  = bool(self._opts["dm_enabled"])
@@ -513,6 +523,7 @@ class DiscordBridge:
                 "in any server."
             )
         await _cmd_module.sync_app_commands(self)
+        await _cosmetics_module.apply(self, self._opts)
 
         # Let non-live callers (cron; any future background trigger) deliver
         # AgentEvents to a Discord cursor_key through the same rendering path

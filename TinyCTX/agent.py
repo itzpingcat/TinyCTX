@@ -11,7 +11,7 @@ from TinyCTX.contracts import (
     AgentThinkingChunk, AgentToolCall, AgentToolResult,
     ToolCall, ToolResult, IMAGE_BLOCK_PREFIX
 )
-from TinyCTX.context import Context, HistoryEntry, HOOK_PRE_ASSEMBLE_ASYNC
+from TinyCTX.context import Context, HistoryEntry, HOOK_PRE_ASSEMBLE_ASYNC, HOOK_POST_COMPLETION
 from TinyCTX.ai import LLM, TextDelta, ThinkingDelta, ToolCallAssembled, LLMError
 from TinyCTX.tool_handling import ToolCallHandler
 
@@ -38,6 +38,33 @@ class AgentCycle:
         # Called by runtime after run() completes, with the final tail_node_id.
         # Signature: async (tail_node_id: str) -> None
         self.post_turn_hooks: list = []
+
+        # Streaming-text hooks registered by modules via register_agent.
+        # Unlike context.py's hook stages (which all run before inference,
+        # or once on the full joined completion after it), these run
+        # per-TextDelta, live, as _stream_inference receives each chunk from
+        # the model -- the only stage that can rewrite or hold back text
+        # before it reaches a client. Each hook is a small stateful object
+        # (state lives on the hook instance, same closure-state convention
+        # as e.g. ctx_tools' dedup hook) implementing:
+        #   reset()        -> None   called once at the start of each model
+        #                             attempt in _stream_inference's
+        #                             `for model_name in model_chain` loop
+        #   process(text)  -> str    called with each TextDelta's new text;
+        #                             returns what to actually emit right
+        #                             now (may be "" to hold text back, may
+        #                             combine text buffered from earlier
+        #                             calls)
+        #   flush()        -> str    called once when the stream for this
+        #                             attempt ends (success, error, or
+        #                             abort); returns any text still held
+        #                             so it is never silently dropped
+        # Multiple hooks compose by piping text through each in registration
+        # order. A hook must not raise from process()/flush() -- unlike
+        # context.py's hooks, this stage has no try/except-and-skip wrapper
+        # (it runs in the hot per-token path), so a misbehaving hook here
+        # will break streaming for the whole cycle.
+        self.stream_text_hooks: list = []
 
         # Resources initialized during .run()
         self.db = None
@@ -223,6 +250,7 @@ class AgentCycle:
 
             # Inference with Fallback logic
             text_chunks, tool_calls_list, error = [], [], None
+            thinking_chunks: list[str] = []
             thinking_len = 0
             async for _ev in self._stream_inference(messages, tools, model_chain, abort_event, meta):
                 if isinstance(_ev, tuple):
@@ -230,6 +258,7 @@ class AgentCycle:
                     text_chunks, tool_calls_list, error = _ev
                 elif isinstance(_ev, AgentThinkingChunk):
                     # logger.debug("[agent] thinking chunk (%d chars)", len(_ev.text))
+                    thinking_chunks.append(_ev.text)
                     thinking_len += len(_ev.text)
                     yield AgentThinkingChunk(text=_ev.text, **meta)
                 elif isinstance(_ev, AgentTextChunk):
@@ -245,6 +274,24 @@ class AgentCycle:
                 return
 
             response_text = "".join(text_chunks)
+            thinking_text = "".join(thinking_chunks)
+
+            # HOOK_POST_COMPLETION — modules inspect the raw completion (text +
+            # any native tool calls) before it's written to history. Runs even
+            # on an empty/malformed completion, since that's exactly the case
+            # output_parser-style modules exist to catch (e.g. a model that
+            # emitted tool-call-shaped text instead of a native tool call, so
+            # tool_calls_list is empty but response_text is not). Queued
+            # follow-ups are appended AFTER the assistant entry below, so they
+            # never race the retry/finalize logic that follows.
+            pending_followups: list[str] = []
+            for action in self.context.run_sync_hooks(
+                HOOK_POST_COMPLETION, response_text, tool_calls_list
+            ):
+                if action.notify:
+                    logger.info("[agent] post_completion notify: %s", action.notify)
+                if action.followup_message:
+                    pending_followups.append(action.followup_message)
 
             # Empty completion (no content, no tool call) — resend.
             #
@@ -277,14 +324,39 @@ class AgentCycle:
 
             empty_retries = 0
 
-            # Record Assistant response in Context
+            # Record Assistant response in Context.
+            #
+            # Reasoning is persisted inline as a <think>...</think> prefix on
+            # the stored content — the established convention
+            # modules/ctx_tools' cot_strip already parses — so it can be
+            # replayed into context on a later turn (see trim_thinking).
+            # Applied here, AFTER the NO_REPLY/empty-completion checks above
+            # (which must see the model's real response_text only): wrapping
+            # earlier would make a thinking-only, content-free completion
+            # look non-empty to those checks and defeat both the resend
+            # retry and the NO_REPLY_TOKEN exact-match.
+            stored_content = (
+                f"<think>{thinking_text}</think>{response_text}"
+                if thinking_text else response_text
+            )
             self.context.add(HistoryEntry.assistant(
-                content=response_text,
+                content=stored_content,
                 tool_calls=tool_calls_list or None,
                 author_id=agent_name,
             ))
             meta["tail_node_id"] = self.context.tail_node_id
             logger.debug("[agent] assistant node written, tail=%s", self.context.tail_node_id)
+
+            # Write any HOOK_POST_COMPLETION follow-ups queued above, now that
+            # the assistant entry they're reacting to is committed. Each is a
+            # normal user-role turn — the model sees it next cycle like any
+            # other nudge (matches _drain_inbox's HistoryEntry(role="user")
+            # shape). Written even when tool_calls_list is non-empty: a model
+            # can legitimately mix one real tool call with stray text-encoded
+            # ones in the same turn.
+            for msg in pending_followups:
+                self.context.add(HistoryEntry(role="user", content=msg))
+                meta["tail_node_id"] = self.context.tail_node_id
 
             if not tool_calls_list:
                 if response_text.strip() == NO_REPLY_TOKEN:
@@ -420,12 +492,35 @@ class AgentCycle:
         stream, then yields a single tuple sentinel at the end:
             (chunks: list[str], tool_calls: list[ToolCall], error: str | None)
         The caller unpacks the tuple to get the final result.
+
+        Every TextDelta's text is piped through self.stream_text_hooks (see
+        __init__) before being yielded/accumulated, letting a module rewrite
+        or hold back live text (e.g. ctx_tools' label-prefix strip). Hooks
+        are reset at the start of each model_name attempt and flushed once
+        the stream for that attempt ends (success, error, or abort) so any
+        text a hook is still holding is not silently lost.
         """
         for model_name in model_chain:
             llm = self.models[model_name]
             chunks: list[str] = []
             calls: list[ToolCall] = []
             error: str | None = None
+
+            for hook in self.stream_text_hooks:
+                hook.reset()
+
+            def _emit_text(text: str) -> AgentTextChunk | None:
+                # Pipe through every hook in registration order; each may
+                # rewrite, hold back (return ""), or pass through.
+                for hook in self.stream_text_hooks:
+                    text = hook.process(text)
+                if not text:
+                    return None
+                chunks.append(text)
+                return AgentTextChunk(text=text,
+                                      tail_node_id=meta["tail_node_id"],
+                                      trace_id=meta["trace_id"],
+                                      reply_to_message_id=meta["reply_to_message_id"])
 
             async for ev in llm.stream(messages, tools=tools, priority=0):
                 if abort_event.is_set():
@@ -438,16 +533,26 @@ class AgentCycle:
                                              trace_id=meta["trace_id"],
                                              reply_to_message_id=meta["reply_to_message_id"])
                 elif isinstance(ev, TextDelta):
-                    chunks.append(ev.text)
-                    yield AgentTextChunk(text=ev.text,
-                                         tail_node_id=meta["tail_node_id"],
-                                         trace_id=meta["trace_id"],
-                                         reply_to_message_id=meta["reply_to_message_id"])
+                    out = _emit_text(ev.text)
+                    if out is not None:
+                        yield out
                 elif isinstance(ev, ToolCallAssembled):
                     calls.append(ToolCall(ev.call_id, ev.tool_name, ev.args))
                 elif isinstance(ev, LLMError):
                     error = ev.message
                     break
+
+            # Flush: a hook may still be holding buffered text (e.g. a
+            # short reply that ended mid-buffer) -- give each one a last
+            # chance to release it before this attempt's chunks are final.
+            for hook in self.stream_text_hooks:
+                flushed = hook.flush()
+                if flushed:
+                    chunks.append(flushed)
+                    yield AgentTextChunk(text=flushed,
+                                         tail_node_id=meta["tail_node_id"],
+                                         trace_id=meta["trace_id"],
+                                         reply_to_message_id=meta["reply_to_message_id"])
 
             if not error:
                 yield (chunks, calls, None)

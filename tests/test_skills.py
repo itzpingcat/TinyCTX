@@ -61,6 +61,7 @@ class _Agent:
             extra=extra or {},
         )
         self.tool_handler = _ToolHandler()
+        self.stream_text_hooks: list = []
 
 
 @pytest.fixture

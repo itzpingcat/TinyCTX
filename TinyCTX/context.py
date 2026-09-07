@@ -47,6 +47,7 @@ calling assemble(). This keeps assemble() synchronous and simple.
 from __future__ import annotations
 
 import json
+import re
 import tiktoken
 import uuid
 from collections import defaultdict
@@ -57,6 +58,7 @@ import logging
 
 from TinyCTX.contracts import ToolCall, ToolResult
 from TinyCTX.utils.sanitize import sanitize_brackets as _sanitize_brackets
+from TinyCTX.utils.sanitize import sanitize_special_tokens as _sanitize_special_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +104,11 @@ HOOK_PRE_ASSEMBLE_ASYNC = "pre_assemble_async"  # async fn(ctx) -> None    — a
 HOOK_FILTER_TURN        = "filter_turn"          # fn(entry, age, ctx) -> bool   (False = drop)
 HOOK_TRANSFORM_TURN     = "transform_turn"       # fn(entry, age, ctx) -> HistoryEntry | None
 HOOK_POST_ASSEMBLE      = "post_assemble"        # fn(messages, ctx) -> list[dict] | None
+HOOK_POST_COMPLETION    = "post_completion"      # fn(response_text, tool_calls_list, ctx) -> PostCompletionAction | None
+                                                  #   — sync, runs in AgentCycle.run() right after a completion is
+                                                  #     received, BEFORE the empty-completion check and BEFORE the
+                                                  #     assistant HistoryEntry is written to context. See
+                                                  #     PostCompletionAction below and run_sync_hooks().
 
 # Execution order per turn:
 #   agent awaits run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC)
@@ -111,6 +118,10 @@ HOOK_POST_ASSEMBLE      = "post_assemble"        # fn(messages, ctx) -> list[dic
 #     → adjacent-message merge + token-budget trim   (still HistoryEntry — see below)
 #     → render to OpenAI-format dicts
 #     → HOOK_POST_ASSEMBLE (final reshape — genuinely final: runs after merge/trim/render)
+#   ... inference happens ...
+#   agent calls ctx.run_sync_hooks(HOOK_POST_COMPLETION, response_text, tool_calls_list)
+#     → e.g. modules/output_parser: detect tool calls the model emitted as text
+#       instead of a native tool call, and queue a corrective follow-up turn.
 #
 # NOTE: dialogue entries stay as HistoryEntry (carrying .tags) all the way through
 # filter_turn, transform_turn, the adjacent-message merge, AND the token-budget
@@ -148,6 +159,30 @@ class AssembleMeta:
     # used to decide whether to trim (that would reintroduce a circular
     # trim-depends-on-content-depends-on-trim dependency).
     invalidated_tags:  frozenset[str] = field(default_factory=frozenset)
+
+
+# ---------------------------------------------------------------------------
+# PostCompletionAction — what a HOOK_POST_COMPLETION hook may ask the agent
+# to do after inspecting a raw (pre-write) completion.
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PostCompletionAction:
+    """
+    Returned by a HOOK_POST_COMPLETION hook to steer AgentCycle.run() before
+    the assistant HistoryEntry is written. All fields optional; None/False
+    means "no opinion" — a hook can set only what it needs.
+
+    followup_message: if set, queued as a new user-role turn AFTER the
+        current assistant response is recorded, so the model gets a chance
+        to self-correct next cycle (e.g. output_parser nudging the model
+        back to native tool calls). Does not suppress the current response.
+    notify: if set, surfaced via whatever the runtime's diagnostic channel
+        is (bridge status line, log, etc.) — for operator-facing signals
+        that don't belong in the conversation itself.
+    """
+    followup_message: str | None = None
+    notify:            str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -308,6 +343,28 @@ class Context:
                 await fn(self)
             except Exception:
                 logger.exception("Async hook '%s' raised", fn.__name__)
+
+    def run_sync_hooks(self, stage: str, *args) -> list["PostCompletionAction"]:
+        """
+        Call all hooks registered for a sync stage in priority order, passing
+        *args followed by self (ctx). Collects and returns every non-None
+        PostCompletionAction a hook returns, in priority order. A raising
+        hook is logged and skipped — one misbehaving module must not break
+        the turn.
+
+        Currently used for HOOK_POST_COMPLETION; kept generic (not named
+        run_post_completion_hooks) so future sync stages can reuse it.
+        """
+        actions: list[PostCompletionAction] = []
+        for _, _, fn in self._hooks[stage]:
+            try:
+                result = fn(*args, self)
+            except Exception:
+                logger.exception("Sync hook '%s' raised on stage '%s'", getattr(fn, "__name__", fn), stage)
+                continue
+            if result is not None:
+                actions.append(result)
+        return actions
 
     # ------------------------------------------------------------------
     # Prompt provider registration
@@ -553,9 +610,17 @@ class Context:
 
         tool_tokens = _tokenize(json.dumps(tools)) if tools else 0
 
+        def _reasoning_tokens(m: dict) -> int:
+            # reasoning_content (see _render) is a separate field on the
+            # wire, not part of "content" — must be counted explicitly or
+            # kept thinking silently doesn't count against the budget.
+            rc = m.get("reasoning_content")
+            return _tokenize(rc) if rc else 0
+
         raw = sum(
             _content_tokens(m.get("content", "")) +
-            _tokenize(json.dumps(m.get("tool_calls", [])))
+            _tokenize(json.dumps(m.get("tool_calls", []))) +
+            _reasoning_tokens(m)
             for m in messages
         ) + tool_tokens
 
@@ -696,20 +761,22 @@ class Context:
             entries.append(entry)
 
         # Insert deferred non-system prompts (e.g. footer) as synthetic entries
-        # BEFORE the last user entry so the merge produces: <footer>\n\n[user message].
-        # Priority is respected within the deferred set.
+        # BEFORE the trailing run of consecutive user entries (i.e. ahead of
+        # the entire unread batch, not spliced in the middle of it) so the
+        # merge produces: <footer>\n\n[msg1]\n\n[msg2]\n\n... . Found by
+        # walking back from the end of `entries` while the role is
+        # ROLE_USER — this lands before ALL trailing user turns, not just
+        # the last one, and (unlike anchoring on "the last assistant entry
+        # anywhere in history") isn't fooled by tool-call/tool-result
+        # entries that sit between an earlier assistant turn and this
+        # trailing user run. Priority is respected within the deferred set.
         if deferred_prompts:
             sorted_deferred = sorted(deferred_prompts, key=lambda x: x[0].priority)
-            last_user_idx = next(
-                (i for i in range(len(entries) - 1, -1, -1)
-                 if entries[i].role == ROLE_USER),
-                None,
-            )
+            insert_at = len(entries)
+            while insert_at > 0 and entries[insert_at - 1].role == ROLE_USER:
+                insert_at -= 1
             synthetic = [HistoryEntry(role=s.role, content=c) for s, c in sorted_deferred]
-            if last_user_idx is not None:
-                entries[last_user_idx:last_user_idx] = synthetic
-            else:
-                entries.extend(synthetic)
+            entries[insert_at:insert_at] = synthetic
 
         # 4. Merge adjacent same-role non-tool entries (still HistoryEntry — tags union).
         merged: list[HistoryEntry] = []
@@ -729,6 +796,41 @@ class Context:
                 prev.tags = prev.tags | m.tags
             else:
                 merged.append(replace(m))
+
+        # 4b. Strip LLM special/control tokens (e.g. <|im_start|>, [INST]) so
+        # prompt injection can't forge fake turn boundaries in the assembled
+        # context. Deliberately the LAST content-mutating step before token
+        # counting/trim/render — everything that can still change an entry's
+        # text (filter_turn, transform_turn, the 【author】: label prefix, the
+        # adjacent-turn merge, and splicing in deferred prompt-provider
+        # entries like equipment_manifest's footer or concurrency's
+        # running_forks roster) has already run by this point, so nothing
+        # downstream can reintroduce unsanitized text without going back
+        # through this pass. Applied uniformly to EVERY entry regardless of
+        # role or origin — including role=system and the synthetic deferred
+        # entries — not just ROLE_USER/ROLE_TOOL dialogue turns, because a
+        # prompt provider can embed attacker-reachable text without it ever
+        # being a real dialogue turn (e.g. running_forks embeds a peer fork's
+        # spawn_fork(prompt) argument verbatim — see
+        # modules/concurrency/__main__.py's _format_run_line). Runs over the
+        # FULL rendered string, prefix included — the 【author】: delimiter
+        # itself is not exempted.
+        for i, e in enumerate(merged):
+            if isinstance(e.content, str) and e.content:
+                cleaned = _sanitize_special_tokens(e.content)
+                if cleaned != e.content:
+                    merged[i] = replace(e, content=cleaned)
+            elif isinstance(e.content, list):
+                new_blocks = None
+                for bi, b in enumerate(e.content):
+                    if isinstance(b, dict) and b.get("type") == "text" and b.get("text"):
+                        cleaned = _sanitize_special_tokens(b["text"])
+                        if cleaned != b["text"]:
+                            if new_blocks is None:
+                                new_blocks = list(e.content)
+                            new_blocks[bi] = {**b, "text": cleaned}
+                if new_blocks is not None:
+                    merged[i] = replace(e, content=new_blocks)
 
         # 5. Token budget enforcement (still HistoryEntry).
         tokens_pre_trim = self._count_tokens_entries(merged, tools)
@@ -798,6 +900,14 @@ class Context:
         """Render entries to dict form just for counting — doesn't mutate entries."""
         return self._count_tokens([self._render(e) for e in entries], tools)
 
+    # Matches a single leading <think>...</think> block — how thinking is
+    # stored inline on an assistant HistoryEntry's content (see agent.py's
+    # run() and modules/ctx_tools' cot_strip/trim_thinking, which both parse
+    # this same convention). Only stripped at render time, right before
+    # building the OpenAI-compat dict — everything upstream (trim_thinking,
+    # token counting, tags) keeps operating on the plain stored text.
+    _THINK_PREFIX_RE = re.compile(r"\A<think>(.*?)</think>", re.IGNORECASE | re.DOTALL)
+
     def _render(self, entry: HistoryEntry) -> dict:
         if entry.role == ROLE_TOOL:
             return {
@@ -806,7 +916,22 @@ class Context:
                 "tool_call_id": entry.tool_call_id,
             }
         if entry.role == ROLE_ASSISTANT:
-            msg: dict = {"role": ROLE_ASSISTANT, "content": entry.content}
+            content = entry.content
+            reasoning_content: str | None = None
+            if isinstance(content, str):
+                m = self._THINK_PREFIX_RE.match(content)
+                if m:
+                    reasoning_content = m.group(1)
+                    content = content[m.end():].lstrip("\n")
+            msg: dict = {"role": ROLE_ASSISTANT, "content": content}
+            if reasoning_content is not None:
+                # Sent back as its own field — not inline <think> text —
+                # because the backend's reasoning parser (llama-swap here)
+                # expects reasoning_content on replay, mirroring what it
+                # sends on the way IN (ai.py parses delta["reasoning_content"]
+                # off the stream). See project memory:
+                # project_thinking_persistence_and_footer_fix.md.
+                msg["reasoning_content"] = reasoning_content
             if entry.tool_calls:
                 msg["tool_calls"] = [
                     {

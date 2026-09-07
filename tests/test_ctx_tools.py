@@ -10,8 +10,12 @@ register_agent(cycle) into cycle.context:
   - cot_strip:      strips <think>...</think> blocks from older assistant turns
   - trim:           trims/truncates old tool-result turns
   - tokenade:       blocks turns that look like a huge pasted-token flood
-  - token_sanitize: strips known LLM special/control tokens (from
-                    token_blacklist.txt) out of tool/user turn content
+
+Special/control-token stripping (e.g. <|im_start|>, [INST]) is NOT a
+ctx_tools hook — it's a baseline pass context.py's own assemble() runs
+unconditionally over every entry, regardless of role. TestTokenSanitize
+below exercises that baseline behavior through ctx_tools' register_agent
+wiring, not a ctx_tools-owned sanitizer.
 
 Uses a real ConversationDB(":memory:") + Context, following the pattern in
 tests/test_context.py, rather than a hand-rolled fake.
@@ -50,9 +54,11 @@ def ctx(db):
 
 
 class _FakeCycle:
-    """Minimal stand-in for AgentCycle — register_agent only touches .context."""
+    """Minimal stand-in for AgentCycle — register_agent touches .context and,
+    since the label-prefix-strip hook, appends to .stream_text_hooks too."""
     def __init__(self, context):
         self.context = context
+        self.stream_text_hooks: list = []
 
 
 def _user(ctx, text):
@@ -83,12 +89,10 @@ class TestExtensionMeta:
 
     def test_default_config_keys(self):
         cfg = ctx_tools.EXTENSION_META["default_config"]
-        for key in ("same_call_dedup_after", "cot_keep_recent_turns", "tokenade_threshold"):
+        for key in ("same_call_dedup_after", "trim_thinking", "tokenade_threshold"):
             assert key in cfg
         for key in ("trim_after", "truncate_after", "max_chars"):
             assert key in cfg["tool_output"]
-        for key in ("enabled", "roles"):
-            assert key in cfg["token_sanitize"]
 
 
 # ---------------------------------------------------------------------------
@@ -181,12 +185,8 @@ class TestCotStrip:
         assert "multi" not in result
         assert "a" in result and "b" in result
 
-    def test_old_assistant_turn_has_cot_stripped(self, ctx):
-        # default cot_keep_recent_turns is 10000 in EXTENSION_META, so with
-        # the real default nothing would ever be stripped in a short test.
-        # Use an explicit small config via direct hook registration instead
-        # to exercise the underlying behavior deterministically.
-        ctx_tools_main._register_cot_strip(ctx, {"cot_keep_recent_turns": 0})
+    def test_trim_thinking_all_strips_every_turn(self, ctx):
+        ctx_tools_main._register_cot_strip(ctx, {"trim_thinking": "all"})
 
         _assistant(ctx, "old thought <think>hidden</think> visible")
         _user(ctx, "next")
@@ -196,6 +196,38 @@ class TestCotStrip:
         assistant_msgs = _msg_contents(messages, "assistant")
         assert not any("hidden" in c for c in assistant_msgs)
         assert any("visible" in c for c in assistant_msgs)
+
+    def test_trim_thinking_none_keeps_every_turn(self, ctx):
+        ctx_tools_main._register_cot_strip(ctx, {"trim_thinking": "none"})
+
+        _assistant(ctx, "old thought <think>hidden</think> visible")
+        _user(ctx, "next")
+        _assistant(ctx, "newer <think>also hidden</think> reply")
+
+        messages, _ = ctx.assemble()
+        assistant_msgs = _msg_contents(messages, "assistant")
+        assert any("hidden" in c for c in assistant_msgs)
+        assert any("also hidden" in c for c in assistant_msgs)
+
+    def test_trim_thinking_auto_keeps_only_current_agentcycle(self, ctx):
+        # "auto" (the default): thinking on assistant turns from a prior,
+        # already-finished agentcycle (i.e. at or before the most recent
+        # user turn) is stripped; thinking on assistant turns belonging to
+        # the still-in-progress cycle (after the most recent user turn) is
+        # kept — including across multiple assistant/tool-call turns within
+        # that same cycle.
+        ctx_tools_main._register_cot_strip(ctx, {"trim_thinking": "auto"})
+
+        _assistant(ctx, "old thought <think>hidden</think> visible")
+        _user(ctx, "next")
+        _assistant(ctx, "step one <think>kept one</think> a")
+        _assistant(ctx, "step two <think>kept two</think> b")
+
+        messages, _ = ctx.assemble()
+        assistant_msgs = _msg_contents(messages, "assistant")
+        assert not any("hidden" in c for c in assistant_msgs)
+        assert any("kept one" in c for c in assistant_msgs)
+        assert any("kept two" in c for c in assistant_msgs)
 
 
 # ---------------------------------------------------------------------------
@@ -281,33 +313,6 @@ class TestTokenade:
 # ---------------------------------------------------------------------------
 
 class TestTokenSanitize:
-    def test_loads_real_blacklist_file(self):
-        pattern = ctx_tools_main._load_token_blacklist()
-        assert pattern is not None
-        assert pattern.search("<|im_start|>system") is not None
-
-    def test_missing_file_returns_none(self, tmp_path):
-        missing = tmp_path / "does_not_exist.txt"
-        assert ctx_tools_main._load_token_blacklist(missing) is None
-
-    def test_file_with_only_comments_returns_none(self, tmp_path):
-        f = tmp_path / "blacklist.txt"
-        f.write_text("# just a comment\n\n# another\n", encoding="utf-8")
-        assert ctx_tools_main._load_token_blacklist(f) is None
-
-    def test_invalid_pattern_line_is_skipped_not_fatal(self, tmp_path):
-        f = tmp_path / "blacklist.txt"
-        f.write_text("(unclosed\nvalid_token_[A-Z]+\n", encoding="utf-8")
-        pattern = ctx_tools_main._load_token_blacklist(f)
-        assert pattern is not None
-        assert pattern.search("valid_token_ABC") is not None
-
-    def test_sanitize_text_strips_and_collapses_whitespace(self):
-        pattern = re.compile(r"(?:XBADX)", re.IGNORECASE)
-        result = ctx_tools_main._sanitize_text("a  XBADX   b", pattern)
-        assert "XBADX" not in result
-        assert "a" in result and "b" in result
-
     def test_special_tokens_stripped_from_tool_turn(self, ctx):
         cycle = _FakeCycle(ctx)
         ctx_tools_main.register_agent(cycle)
@@ -332,10 +337,14 @@ class TestTokenSanitize:
         assert not any("[INST]" in c for c in user_msgs)
         assert any("hello" in c and "world" in c for c in user_msgs)
 
-    def test_assistant_turns_not_sanitized_by_default(self, ctx):
-        # default token_sanitize_roles is ["tool", "user"] — assistant
-        # content should pass through untouched even if it contains a
-        # blacklisted-looking token.
+    def test_assistant_turns_also_sanitized_by_baseline_pass(self, ctx):
+        # context.py's own baseline sanitize_special_tokens pass (see
+        # assemble()'s step 4b) now runs over EVERY entry regardless of
+        # role, including assistant turns — not just tool/user. That's a
+        # deliberate, uniform default: a prompt-injection payload can end up
+        # in an assistant turn too (e.g. echoed back by a tool-call-shaped
+        # text completion before output_parser rewrites it), and there is no
+        # per-role opt-out for context.py's own pass.
         cycle = _FakeCycle(ctx)
         ctx_tools_main.register_agent(cycle)
 
@@ -343,11 +352,5 @@ class TestTokenSanitize:
 
         messages, _ = ctx.assemble()
         assistant_msgs = _msg_contents(messages, "assistant")
-        assert any("<|im_start|>" in c for c in assistant_msgs)
+        assert not any("<|im_start|>" in c for c in assistant_msgs)
 
-    def test_disabled_via_config(self, ctx):
-        ctx_tools_main._register_token_sanitize(ctx, {"token_sanitize": {"enabled": False}})
-        _user(ctx, "keep <|im_start|> as-is")
-        messages, _ = ctx.assemble()
-        user_msgs = _msg_contents(messages, "user")
-        assert any("<|im_start|>" in c for c in user_msgs)

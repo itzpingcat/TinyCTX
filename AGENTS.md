@@ -1,4 +1,4 @@
-# CLAUDE.md (aka AGENTS.md)
+# AGENTS.md (aka AGENTS.md)
 
 This is the LLM entrypoint for the TinyCTX project. It lists behavioral rules for agents contributing to the project. If you are looking for the overview of the codebase, it is in `CODEBASE.md`.
 
@@ -94,3 +94,4 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
     - Every ~8 files you read, write to the CODEBASE.md file, and mark off items in the TODO as done.
 - Always update CODEBASE.md when you make changes to the code.
 - Read CODEBASE.md to find where things are, it's faster than manually searching.
+

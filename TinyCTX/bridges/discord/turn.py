@@ -24,6 +24,7 @@ from TinyCTX.contracts import (
     AgentToolResult,
     InboundMessage,
 )
+from .quote_reply import split_into_reply_segments
 
 if TYPE_CHECKING:
     from TinyCTX.bridges.discord.bridge import DiscordBridge
@@ -53,10 +54,16 @@ class ChannelRenderer:
         channel: discord.abc.Messageable,
         max_len: int,
         dehumanize: "Callable[[str], str] | None" = None,
+        quote_reply_enabled: bool = True,
+        quote_reply_lookback: int = 50,
+        quote_reply_min_len: int = 8,
     ) -> None:
         self._channel = channel
         self._max_len = max_len
         self._dehumanize = dehumanize or (lambda t: t)
+        self._quote_reply_enabled = quote_reply_enabled
+        self._quote_reply_lookback = quote_reply_lookback
+        self._quote_reply_min_len = quote_reply_min_len
         self._buf: list[str] = []
         self._suppressed = False
 
@@ -92,9 +99,51 @@ class ChannelRenderer:
     async def flush(self) -> None:
         text = "" if self._suppressed else self._dehumanize("".join(self._buf).strip())
         self._buf.clear()
-        if text:
-            for i in range(0, len(text), self._max_len):
-                await self._channel.send(text[i : i + self._max_len])
+        if not text:
+            return
+
+        if self._quote_reply_enabled and ">" in text:
+            candidates = await self._fetch_quote_candidates()
+            segments = split_into_reply_segments(
+                text, candidates, min_len=self._quote_reply_min_len
+            )
+            for segment in segments:
+                await self._send_chunked(segment.text, reference=segment.target)
+            return
+
+        await self._send_chunked(text)
+
+    async def _send_chunked(self, text: str, reference=None) -> None:
+        """Send text in <= max_len pieces. Only the first piece carries
+        `reference` (a Discord reply should not cascade across every
+        length-driven chunk of the same segment)."""
+        for i in range(0, len(text), self._max_len):
+            chunk = text[i : i + self._max_len]
+            ref = reference if i == 0 else None
+            try:
+                if ref is not None:
+                    await self._channel.send(chunk, reference=ref)
+                else:
+                    await self._channel.send(chunk)
+            except Exception as exc:
+                logger.warning(
+                    "Discord: failed to send as reply, falling back to plain send: %s", exc
+                )
+                await self._channel.send(chunk)
+
+    async def _fetch_quote_candidates(self) -> list:
+        """Recent messages in this channel, most-recent-first, for
+        quote_reply.resolve_target() to match against. Only called when the
+        buffered text actually contains a '>' -- most turns never pay for
+        this history() call."""
+        history = getattr(self._channel, "history", None)
+        if history is None:
+            return []
+        try:
+            return [msg async for msg in history(limit=self._quote_reply_lookback)]
+        except Exception as exc:
+            logger.warning("Discord: failed to fetch channel history for quote-reply: %s", exc)
+            return []
 
 
 def make_platform_handler(bridge: "DiscordBridge") -> "Callable[[str, object], Awaitable[None]]":
@@ -123,7 +172,12 @@ def make_platform_handler(bridge: "DiscordBridge") -> "Callable[[str, object], A
 
         renderer = renderers.get(cursor_key)
         if renderer is None:
-            renderer = ChannelRenderer(channel, bridge._max_len, bridge._dehumanize_mentions)
+            renderer = ChannelRenderer(
+                channel, bridge._max_len, bridge._dehumanize_mentions,
+                quote_reply_enabled=bridge._quote_reply_enabled,
+                quote_reply_lookback=bridge._quote_reply_lookback,
+                quote_reply_min_len=bridge._quote_reply_min_len,
+            )
             renderers[cursor_key] = renderer
 
         await renderer.feed(event)
@@ -205,7 +259,12 @@ async def handle_turn(
         turn_timeout: float | None = (
             float(bridge._opts.get("turn_timeout_s", 0)) or None
         )
-        renderer = ChannelRenderer(channel, bridge._max_len, bridge._dehumanize_mentions)
+        renderer = ChannelRenderer(
+            channel, bridge._max_len, bridge._dehumanize_mentions,
+            quote_reply_enabled=bridge._quote_reply_enabled,
+            quote_reply_lookback=bridge._quote_reply_lookback,
+            quote_reply_min_len=bridge._quote_reply_min_len,
+        )
 
         while True:
             try:
