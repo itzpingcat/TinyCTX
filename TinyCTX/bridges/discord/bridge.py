@@ -81,6 +81,9 @@ DEFAULTS = {
     "typing_on_thinking": True,
     "typing_on_tools": True,
     "typing_on_reply": True,
+    "quote_reply_enabled": True,
+    "quote_reply_lookback": 50,
+    "quote_reply_min_len": 8,
     # See cosmetics.py for the full key list and behavior.
     "cosmetics": {},
 }
@@ -107,6 +110,9 @@ class DiscordBridge:
         self._typing_on_thinking: bool  = bool(self._opts["typing_on_thinking"])
         self._typing_on_tools:    bool  = bool(self._opts["typing_on_tools"])
         self._typing_on_reply:    bool  = bool(self._opts["typing_on_reply"])
+        self._quote_reply_enabled:  bool = bool(self._opts["quote_reply_enabled"])
+        self._quote_reply_lookback: int  = int(self._opts["quote_reply_lookback"])
+        self._quote_reply_min_len:  int  = int(self._opts["quote_reply_min_len"])
         self._reset_command:      str   = str(self._opts["reset_command"])
         self._shutdown_command:   str   = str(self._opts["shutdown_command"])
         self._dm_enabled:         bool  = bool(self._opts["dm_enabled"])
