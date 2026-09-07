@@ -168,7 +168,7 @@ problem.
 One import, three decorators, no registration calls.
 
 ```python
-from TinyCTX import Module, tool, hook, command, HookType, Permission
+from TinyCTX import Module, tool, hook, command, HookType, Permission, ToolError
 
 
 class Notes(Module):
@@ -195,13 +195,13 @@ class Notes(Module):
             category: folder to file it under
         """
         if len(content) > self.config["max_note_chars"]:
-            return self.error("note too long")
+            raise ToolError("note too long")
         self.store.write(category, name, content)
-        return self.ok("note created")
+        return "note created"
 
     @command("notes", "list", permissions=None, help="List stored notes")
     async def cmd_list(self, args, ctx):
-        await ctx.reply("\n".join(self.store.categories()))
+        return "\n".join(self.store.categories())
 
     def _slug(self, name):          # untagged — framework never sees it
         return name.lower().strip()
@@ -273,7 +273,8 @@ Wraps `CommandRegistry.register` with its existing semantics intact.
 Commands are **not** tools and keep their own shape:
 
 - Handler signature is `(args: list[str], ctx)` — a token list and a
-  dispatch context — not typed keyword arguments.
+  dispatch context — not typed keyword arguments. It returns the string to
+  send, or `None`.
 - `namespace` / `sub` is the two-word grammar `/memory consolidate`
   parses against; `sub=""` handles bare `/namespace`.
 - `params` is a separate `list[(name, type, description)]` used by channels
@@ -286,11 +287,81 @@ Commands are **not** tools and keep their own shape:
 Registration is process-scope: commands are registered once at load, as
 they are today.
 
-One change to the handler's second argument. Today it is a raw dict the
+Two changes to the handler contract.
+
+**Handlers return their output instead of calling `send`.** Every command
+handler in the codebase today ends in `await send(...)` followed by
+`return` — `_cmd_info`, `_cmd_rename` and `_cmd_modify_permissions` in
+`runtime.py` do it in every branch, and none calls `send` twice or does
+work after it. That is a return value written as a side effect. Returning
+shortens each early exit from two lines to one, makes a handler testable
+without a mock `send`, and matches `@tool`, which already returns.
+
+It also closes a real failure mode: `dispatch()` wraps handlers in
+try/except and logs, so a handler that raises *after* calling `send` has
+already emitted output while one that raises before emits nothing, and the
+caller cannot tell which. With a return, "produced output" and "completed
+successfully" become the same event.
+
+`ctx.reply()` stays for the genuine streaming case — a long-running command
+that emits progress before it finishes. `return None` means handled with
+nothing to say. The permission-denial path in `dispatch()` resolves `send`
+itself and is unaffected.
+
+**The context argument becomes an object.** Today it is a raw dict the
 channel assembles, and handlers reach into it for `context["send"]`,
 `context["runtime"]`, `context["console"]`. It becomes a `CommandContext`
-object exposing `reply()`, `caller`, `env` and `app`, so a command handler
-gets the same facade guarantee as everything else.
+exposing `reply()`, `caller`, `env` and `app`, so a command handler gets the
+same facade guarantee as everything else.
+
+### Tool return values
+
+A tool returns whatever it wants the model to read, normally a plain
+string. There is no result envelope and no `self.ok()` / `self.error()`
+helper.
+
+An envelope was considered and rejected. `agent.py::_execute_tool` already
+wraps every return into a `ToolResult`, so a second `{"status": ...,
+"content": ...}` layer inside it is JSON noise around what is often three
+words, and it adds framework vocabulary an author must learn to write the
+most common line in any module.
+
+Expected failures — the ones the model should read and adapt to, not
+crashes — raise instead:
+
+```python
+raise ToolError("note already exists; read it and edit instead")
+```
+
+`_execute_tool` catches `ToolError` and renders it consistently, so error
+formatting is the framework's job rather than each author's. Unexpected
+exceptions keep their existing handling. The permission layer already
+produces its own `[PERMISSION DENIED] ...` strings and is unaffected.
+
+### Tool timeouts
+
+`@tool(timeout=...)` bounds one call, and the default is **deliberately
+generous: 600s**. Nothing bounds tool execution today, so a wedged
+`open_url` or MCP call blocks the cycle forever.
+
+The default is high because the two failure modes are not symmetric. A
+timeout that never fires leaves a visible hang — the turn stalls and the
+operator notices. A timeout that fires early presents as a bug in the tool
+itself, and costs real debugging time: `comfyui` once shipped a 10s
+timeout, far below what image generation takes, so every call failed and
+the symptom read as "ComfyUI is broken" rather than "TinyCTX gave up
+early". A too-low timeout is indistinguishable from a broken integration
+from the outside. The framework timeout exists to stop a hung call blocking
+the cycle indefinitely, not to enforce responsiveness.
+
+Per-tool overrides raise or lower it; `modules/shell` already implements
+this shape correctly (`default_timeout: 120`, `max_timeout: 1200`, per-call
+override clamped to the max) and keeps its own values.
+
+Module-level timeouts are separate and unaffected. A module's own timeout
+must be set to what its work actually takes, and the framework default must
+sit above the slowest tool it wraps, or the outer bound silently truncates
+the inner one.
 
 ### `settings`
 
@@ -334,13 +405,6 @@ Docker image; a container that pip-installs on boot drifts from its image
 and breaks reproducibility. Dependencies belong in `requirements.txt` and
 the image build. This field exists solely so a module whose optional dep is
 absent degrades to "not loaded" rather than "crashes the process".
-
-### `self.ok()` / `self.error()`
-
-Tools return a uniform envelope — `{"status": "success"|"error", "content": ...}` —
-so the model sees one shape across every module instead of each tool
-inventing its own error convention. Existing tools returning bare strings
-are wrapped during migration.
 
 ### Lifecycle
 
@@ -631,7 +695,8 @@ non-`HookType` raises and that `STREAM_TEXT` takes the no-wrapper path.
 ### P2 — Decorators and Module class, proven on three
 1. Add `TinyCTX/module.py` — `Module`, `AppContext`, `TurnContext`,
    `CommandContext`, `Scratch` namespacing, settings-schema merge.
-2. Add `TinyCTX/decorators.py` — `@tool`, `@hook`, `@command`.
+2. Add `TinyCTX/decorators.py` — `@tool`, `@hook`, `@command`, plus
+   `ToolError` and the 600s default tool timeout.
 3. The loader gains the class path alongside the function path. Temporary
    scaffolding for P2 only, not a compatibility interface.
 4. Migrate three modules chosen to stress different corners: `todo`
@@ -651,13 +716,17 @@ Verify: 886 green; `test_hook_order.py` identical.
 2. All hook registration moves to decoration. The registry becomes
    process-lifetime.
 3. Migrate the 6 `commands.register()` call sites (runtime.py:257/263/267,
-   memory:435/448, sysops:174) to `@command`, and convert the `context`
-   dict to `CommandContext`.
-4. Delete `register_runtime`/`register_agent` from the loader, and
+   memory:435/448, sysops:174) to `@command`; convert the `context` dict to
+   `CommandContext`, and convert each handler's `await send(x); return` to
+   `return x`.
+4. Add `ToolError` and the `_execute_tool` catch. Convert tools that
+   currently signal expected failure with an ad-hoc `"Error: ..."` string
+   prefix to raise it.
+5. Delete `register_runtime`/`register_agent` from the loader, and
    `EXTENSION_META` throughout.
-5. Delete `outbound_events`, `_memory_block`, `_file_read_state` from
+6. Delete `outbound_events`, `_memory_block`, `_file_read_state` from
    `AgentCycle`, and the `post_turn_hooks`/`stream_text_hooks` proxies.
-6. Rewrite `for-contributors/module_template/` as one annotated file.
+7. Rewrite `for-contributors/module_template/` as one annotated file.
 
 Verify: 886 green; `grep -rn "register_agent\|register_runtime\|EXTENSION_META" TinyCTX/`
 returns nothing outside docs. Add a test asserting the handler count for a
@@ -745,9 +814,10 @@ actually uses gets promoted to a named accessor as the migration finds it.
   Nicer at the call site, but a second set of names parallel to `HookType`
   that can drift. If wanted later, generate them from the enum so they
   cannot.
-- **A tool-call timeout.** Nothing bounds a tool's execution today; a hung
-  `open_url` or MCP call blocks the cycle indefinitely. Unrelated to this
-  refactor; worth its own issue.
+- **Background/long-running tools.** A tool that returns a job id
+  immediately and delivers its result later touches `Runtime`, `Run`,
+  `Exogenous` and a new job registry — not the module system. `@tool` would
+  gain a flag, but the machinery belongs in its own plan.
 - **`INBOUND` has no consumer.** Declared in P1 because it is obviously
   where a channel wants to normalise or drop a message before it becomes a
   node, but nothing uses it until something asks.
