@@ -10,8 +10,12 @@ register_agent(cycle) into cycle.context:
   - cot_strip:      strips <think>...</think> blocks from older assistant turns
   - trim:           trims/truncates old tool-result turns
   - tokenade:       blocks turns that look like a huge pasted-token flood
-  - token_sanitize: strips known LLM special/control tokens (from
-                    token_blacklist.txt) out of tool/user turn content
+
+Special/control-token stripping (e.g. <|im_start|>, [INST]) is NOT a
+ctx_tools hook — it's a baseline pass context.py's own assemble() runs
+unconditionally over every entry, regardless of role. TestTokenSanitize
+below exercises that baseline behavior through ctx_tools' register_agent
+wiring, not a ctx_tools-owned sanitizer.
 
 Uses a real ConversationDB(":memory:") + Context, following the pattern in
 tests/test_context.py, rather than a hand-rolled fake.
@@ -89,8 +93,6 @@ class TestExtensionMeta:
             assert key in cfg
         for key in ("trim_after", "truncate_after", "max_chars"):
             assert key in cfg["tool_output"]
-        for key in ("enabled", "roles"):
-            assert key in cfg["token_sanitize"]
 
 
 # ---------------------------------------------------------------------------
@@ -311,33 +313,6 @@ class TestTokenade:
 # ---------------------------------------------------------------------------
 
 class TestTokenSanitize:
-    def test_loads_real_blacklist_file(self):
-        pattern = ctx_tools_main._load_token_blacklist()
-        assert pattern is not None
-        assert pattern.search("<|im_start|>system") is not None
-
-    def test_missing_file_returns_none(self, tmp_path):
-        missing = tmp_path / "does_not_exist.txt"
-        assert ctx_tools_main._load_token_blacklist(missing) is None
-
-    def test_file_with_only_comments_returns_none(self, tmp_path):
-        f = tmp_path / "blacklist.txt"
-        f.write_text("# just a comment\n\n# another\n", encoding="utf-8")
-        assert ctx_tools_main._load_token_blacklist(f) is None
-
-    def test_invalid_pattern_line_is_skipped_not_fatal(self, tmp_path):
-        f = tmp_path / "blacklist.txt"
-        f.write_text("(unclosed\nvalid_token_[A-Z]+\n", encoding="utf-8")
-        pattern = ctx_tools_main._load_token_blacklist(f)
-        assert pattern is not None
-        assert pattern.search("valid_token_ABC") is not None
-
-    def test_sanitize_text_strips_and_collapses_whitespace(self):
-        pattern = re.compile(r"(?:XBADX)", re.IGNORECASE)
-        result = ctx_tools_main._sanitize_text("a  XBADX   b", pattern)
-        assert "XBADX" not in result
-        assert "a" in result and "b" in result
-
     def test_special_tokens_stripped_from_tool_turn(self, ctx):
         cycle = _FakeCycle(ctx)
         ctx_tools_main.register_agent(cycle)
@@ -369,11 +344,7 @@ class TestTokenSanitize:
         # deliberate, uniform default: a prompt-injection payload can end up
         # in an assistant turn too (e.g. echoed back by a tool-call-shaped
         # text completion before output_parser rewrites it), and there is no
-        # per-role opt-out for context.py's own pass. This module's
-        # (not-yet-implemented) token_sanitize_roles config would layer
-        # ADDITIONAL role-scoped sanitization with a configurable blacklist
-        # on top of that baseline — it does not, and cannot, exempt a role
-        # from the baseline pass.
+        # per-role opt-out for context.py's own pass.
         cycle = _FakeCycle(ctx)
         ctx_tools_main.register_agent(cycle)
 
@@ -383,9 +354,3 @@ class TestTokenSanitize:
         assistant_msgs = _msg_contents(messages, "assistant")
         assert not any("<|im_start|>" in c for c in assistant_msgs)
 
-    def test_disabled_via_config(self, ctx):
-        ctx_tools_main._register_token_sanitize(ctx, {"token_sanitize": {"enabled": False}})
-        _user(ctx, "keep <|im_start|> as-is")
-        messages, _ = ctx.assemble()
-        user_msgs = _msg_contents(messages, "user")
-        assert any("<|im_start|>" in c for c in user_msgs)
