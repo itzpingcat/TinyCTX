@@ -22,14 +22,14 @@ Settled decisions for this part:
 - Every framework attachment point is an **explicit decorator**. Nothing is
   wired by naming convention, method-name matching, or "public methods are
   tools". Untagged methods are plain helpers, invisible to the framework.
-- There are exactly **three decorators**: `@tool`, `@hook`, `@command`.
+- There are exactly **four decorators**: `@tool`, `@hook`, `@command`, `@prompt`.
 - Hooks live in **one flat `HookRegistry`**. No app/turn scope split.
 - A `HookType` is an enum member that **carries its own combine strategy**.
   The enum is closed.
 - Hooks are **stateless and registered once per process lifetime**.
   Per-pass working data lives in a scratch namespace supplied by `emit`.
 - Modules migrate in **one hard pass**, no compatibility shim.
-- **Hook and tool bodies still receive raw framework objects** —
+- **Hook, tool, and prompt bodies still receive raw framework objects** —
   `cycle`, `runtime`, `context`, `agent` — exactly as they do today.
   Nothing in this part restricts what a module can reach at call time.
   Only *registration* changes: how a handler gets attached, not what
@@ -146,8 +146,8 @@ attached*. Modules migrated under this part keep reaching into `cycle`/
 
 ## The module interface
 
-One import, three decorators, no registration calls — but hook and tool
-bodies still take the raw framework objects they take today.
+One import, four decorators, no registration calls — but hook, tool, and
+prompt bodies still take the raw framework objects they take today.
 
 ```python
 from TinyCTX import Module, tool, hook, command, HookType, Permission, ToolError
@@ -314,6 +314,172 @@ a `CommandContext` object is Part 2's job (it's the same facade decision as
 `AppContext`/`TurnContext`); doing it here would mix a registration-shape
 fix with an access-scope fix in one commit.
 
+### `@prompt`
+
+```python
+def prompt(*, role: str = "system", priority: int = 0, name: str = None): ...
+```
+
+Wraps `Context.register_prompt(pid, provider, *, role, priority)` with its
+existing semantics intact. A prompt provider is **not** a hook and does not
+become one — it is its own decorator for the same reason `@command` is its
+own decorator rather than a variant of `@tool`: different registry
+(`Context._prompts`, a dict keyed by `pid`, not `Context._hooks[stage]`, a
+list), different "no output" meaning (`None` means *skip this slot
+entirely*, not *pass the value through unchanged* the way `Combine.CHAIN`
+works for `TRANSFORM_TURN`), and different placement semantics (a
+`role="system"` prompt is joined into one synthetic system entry at the
+front of assembly; a non-system prompt is *deferred* and spliced back in
+at a computed insertion point — ahead of the trailing run of unread user
+entries — which has nothing to do with per-entry transformation).
+
+- `pid` defaults to `<module_name>.<method_name>`, same default-naming
+  pattern as `@tool`.
+- `role` and `priority` are exactly `PromptSlot`'s fields today — this
+  decorator does not add or remove anything from what `register_prompt`
+  already does, it just moves the call from inside a `TURN_START`/
+  `STARTUP` hook body to the line above the method.
+- The provider body still takes `ctx` (the raw assembly `Context`), same
+  as `register_prompt`'s `Callable[[Context], str | None]` contract today.
+
+```python
+class SystemPrompt(Module):
+    @prompt(role="system", priority=0)
+    async def identity(self, ctx):
+        return "You are TinyCTX, running as..."
+
+    @prompt(role="user", priority=10)
+    async def current_time(self, ctx):
+        return f"The time is now {ctx.now()}."
+```
+
+**A `@prompt` provider is frequently paired with a `@hook` that feeds it
+via scratch, and this is the normal case, not a special one.** Two
+providers already in the codebase need this and neither can be expressed
+as `@prompt` alone:
+
+- `modules/equipment_manifest`'s footer needs
+  `_last_message_ts`, computed by a separate `HOOK_PRE_ASSEMBLE_ASYNC`
+  hook (`_fetch_last_message_time`, reading `agent.db.get_ancestors`) that
+  is not itself a prompt — it returns nothing renderable, it just does a
+  DB lookup once per assemble pass and stashes the result for the footer
+  prompt to read.
+- `modules/memory`'s `memory_block` prompt (`register_prompt("memory_block",
+  lambda _ctx: cycle._memory_block, ...)`) needs the result of a BM25 +
+  vector-search + RRF-fusion pass that is too expensive to run inline
+  inside the prompt call on every assemble.
+
+Under this part, both become a `@hook(HookType.PRE_ASSEMBLE)` (or, for
+memory's case, `@hook(HookType.POST_TURN)` — see the worked comparison
+below) writing into `scratch`, paired with a `@prompt` that reads the same
+`scratch` key back out. `@prompt` alone covers only providers cheap enough
+to compute correctly, synchronously, on every call — `equipment_manifest`'s
+*top* block (a Jinja2 render off `ctx` and static variables, no DB call) is
+the case where `@prompt` needs nothing else at all.
+
+#### Worked comparison: `equipment_manifest` footer vs. `memory` block — one correct, one racy
+
+`equipment_manifest`'s footer does this correctly today. `PRE_ASSEMBLE`
+fires once per assemble pass, before any prompt is resolved, and writes
+into a slot only the footer reads:
+
+```python
+_last_message_ts: list[float | None] = [None]   # closure cell, pre-Scratch
+
+async def _fetch_last_message_time(ctx) -> None:
+    ancestors = agent.db.get_ancestors(ctx.tail_node_id)
+    for node in reversed(ancestors[:-1]):
+        if node.role == "user":
+            _last_message_ts[0] = node.created_at
+            return
+    _last_message_ts[0] = None
+
+agent.context.register_hook(HOOK_PRE_ASSEMBLE_ASYNC, _fetch_last_message_time)
+
+def _em_prompt_footer(ctx) -> str | None:
+    ...  # reads _last_message_ts[0]
+
+agent.context.register_prompt("equipment_manifest_footer", _em_prompt_footer,
+                              role="user", priority=priority)
+```
+
+Under this part: the closure cell becomes a `Scratch` key, computed and
+consumed within the same assembly pass, synchronously, every time:
+
+```python
+class EquipmentManifest(Module):
+    @hook(HookType.PRE_ASSEMBLE)
+    async def fetch_last_message_time(self, ctx, scratch):
+        ancestors = ctx.db.get_ancestors(ctx.tail_node_id)
+        scratch.last_message_ts = next(
+            (n.created_at for n in reversed(ancestors[:-1]) if n.role == "user"),
+            None,
+        )
+
+    @prompt(role="user", priority=5, name="equipment_manifest_footer")
+    async def footer(self, ctx, scratch):
+        ...  # reads scratch.last_message_ts
+```
+
+Nothing here caches across passes — `scratch` is created at the top of
+`Context.assemble()` and dropped at the bottom (Part 1's `Scratch`
+section), so `fetch_last_message_time` reruns every single assemble, same
+as it does today. This is the *correct* shape for a prompt that needs
+precomputed state: recompute every pass, synchronously, within the pass
+that will consume it.
+
+`modules/memory`'s `memory_block` does the same conceptual thing —
+precompute, then have the prompt read the result — but breaks the "within
+the pass that will consume it" part, and this is a real bug worth fixing
+in the same migration, not carrying forward:
+
+```python
+cycle._memory_block = None
+asyncio.get_event_loop().create_task(_refresh_block(list(cycle.context.dialogue)))
+# ^ fire-and-forget, no await, no ordering guarantee vs. assemble()
+
+async def _block_refresh_hook(final_tail: str):
+    await _refresh_block(list(cycle.context.dialogue))
+cycle.post_turn_hooks.append(_block_refresh_hook)
+# ^ recomputes for whatever the *next* AgentCycle/Context turns out to be —
+#   not guaranteed to be the same request if there's any concurrency
+
+cycle.context.register_prompt("memory_block", lambda _ctx: cycle._memory_block, ...)
+# ^ reads whatever's there *right now* — could be None from the initializer,
+#   a stale prior value, or the correct freshly-computed value, with no way
+#   for assemble() to tell which
+```
+
+The failure mode: `_build_memory_block` does a BM25 scan, an embedder call,
+and RRF fusion — genuinely too slow to run inline inside a prompt call on
+every assemble (unlike `equipment_manifest`'s DB-ancestor walk). But
+firing it detached with no join point means `assemble()` can run before it
+finishes, silently shipping a turn with **no memory context** — not
+"correctly decided nothing was relevant," just "the query hadn't returned
+yet" — with no signal distinguishing the two cases anywhere in the logs.
+
+This does **not** mean memory's block should become synchronous-inline
+like `equipment_manifest`'s footer — the computation is too expensive for
+that. It means the precompute-ahead pattern needs an actual synchronization
+contract instead of a bare module attribute:
+
+- Migrate `_memory_block` onto `turn.scratch` (Part 2), which at least
+  makes the sharing point discoverable instead of a private `cycle`
+  attribute — but scratch alone does not fix the ordering race, since
+  `turn.scratch` is still just a namespaced dict with the same "whatever's
+  there right now" read semantics.
+- The actual fix is a join point: either `assemble()`'s `PRE_ASSEMBLE`
+  phase awaits the in-flight refresh (bounded by a timeout, falling back to
+  the last-known-good block on timeout rather than `None`), or the
+  `POST_TURN` refresh explicitly signals completion (e.g. an `asyncio.Event`
+  stored alongside the block) that `@prompt` can check rather than
+  trusting the value is fresh. Either way, "cache the last computed value"
+  is fine as a strategy; "read whatever a detached task happened to have
+  written by now" is not — flag this explicitly during P3's migration of
+  `modules/memory`, since moving the attribute to `turn.scratch` without
+  also fixing the join point would just relocate the race under a nicer
+  name.
+
 ### Tool return values
 
 A tool returns whatever it wants the model to read, normally a plain
@@ -419,9 +585,13 @@ work are hook types like any other:
   and cancels it on shutdown. `cron`, `heartbeat` and memory's librarian
   loops each hand-roll `create_task` plus their own cancellation today.
 - `@hook(HookType.TURN_START)` — per-turn wiring: enabling a tool for this
-  turn, registering a prompt provider bound to this turn's data. Body still
-  receives `cycle` (the raw `AgentCycle`), same as `register_agent(cycle)`
-  does today.
+  turn. Body still receives `cycle` (the raw `AgentCycle`), same as
+  `register_agent(cycle)` does today. **Prompt providers no longer
+  register here** — a provider bound to "this turn's data" is not actually
+  a `TURN_START`-time concern once `@prompt` exists: the provider is a
+  process-lifetime decorated method like any other, and it reads whatever
+  turn-specific data it needs from `ctx`/`scratch` at call time, same
+  pattern as `Scratch` already gives `@hook`. See `@prompt` below.
 
 A module with only tools defines no hooks at all.
 
@@ -615,23 +785,31 @@ with tagged methods to register from.
 Verify: 886 green; `test_hook_order.py` byte-identical; new tests that a
 non-`HookType` raises and that `STREAM_TEXT` takes the no-wrapper path.
 
-### P2 — Decorators and Module class, proven on three
+### P2 — Decorators and Module class, proven on four
 1. Add `TinyCTX/module.py` — `Module`, `Scratch` namespacing, settings-
-   schema merge. **No `AppContext`/`TurnContext`/`CommandContext` — hook
-   and tool bodies keep taking `runtime`/`cycle`/`context`/raw `dict`.**
-2. Add `TinyCTX/decorators.py` — `@tool`, `@hook`, `@command`, plus
-   `ToolError` and the 600s default tool timeout.
+   schema merge. **No `AppContext`/`TurnContext`/`CommandContext` — hook,
+   tool, and prompt bodies keep taking `runtime`/`cycle`/`context`/raw
+   `dict`.**
+2. Add `TinyCTX/decorators.py` — `@tool`, `@hook`, `@command`, `@prompt`,
+   plus `ToolError` and the 600s default tool timeout.
 3. The loader gains the class path alongside the function path. Temporary
    scaffolding for P2 only, not a compatibility interface.
-4. Migrate three modules chosen to stress different corners: `todo`
+4. Migrate four modules chosen to stress different corners: `todo`
    (simplest, proves the shape), `ctx_tools` (heaviest hook user, proves
    scratch replaces closure state and that same-type-different-priority
    tagging works — see the worked comparison below), `shell` (proves
-   `@tool` carries a callable classifier and `listing_permissions` intact).
+   `@tool` carries a callable classifier and `listing_permissions` intact),
+   `equipment_manifest` (proves `@prompt` paired with a `@hook` writing
+   scratch — see the `@prompt` section's worked comparison above).
 
-`shell` is the one that decides whether `@tool` is sufficient. If its
-`required_permissions_for_shell` classifier survives decoration unchanged,
-every other tool will.
+`shell` is the one that decides whether `@tool` is sufficient.
+`equipment_manifest` is the one that decides whether `@prompt` +
+`@hook`-via-scratch is sufficient for a prompt provider that needs
+precomputed state — if its footer survives decoration with the
+`_last_message_ts` closure cell replaced by `scratch.last_message_ts` and
+no observable behavior change, the pattern is proven for `memory`'s
+harder (and currently racy) case in P3. If its `required_permissions_for_shell`
+classifier survives decoration unchanged, every other tool will.
 
 Verify: 886 green; `test_hook_order.py` identical.
 
@@ -703,7 +881,23 @@ reasons about; no facade object was introduced.
    this part alone they'd have nowhere else to go, so they stay exactly as
    they are, still reached into directly. Flagging here so P3 does not
    accidentally delete them without Part 2 having landed a replacement.
-7. Rewrite `for-contributors/module_template/` as one annotated file
+7. Migrate the remaining `register_prompt` call sites to `@prompt`
+   (`modules/skills`, `modules/rag`, `modules/system_prompt`,
+   `modules/concurrency`, `modules/memory`'s `memory_block`). Each prompt
+   that reads precomputed state gets its feeder hook converted to
+   `@hook(HookType.PRE_ASSEMBLE)` (or `POST_TURN`) writing `scratch`, per
+   the `equipment_manifest` pattern proven in P2. **`memory`'s
+   `memory_block` is the one that is not just a mechanical port**: fix the
+   ordering race described in the `@prompt` worked comparison above as
+   part of this migration, not after it — moving `_memory_block` onto a
+   `Scratch`/`turn.scratch` key without also adding a join point (the
+   `PRE_ASSEMBLE` phase awaiting the in-flight refresh, bounded by a
+   timeout with fallback to the last-known-good block) just relocates the
+   race under a nicer name. Add a test that asserts the memory block is
+   never silently `None` due to an unfinished refresh racing assembly —
+   distinguishing "nothing relevant" from "the query hadn't returned yet"
+   is the actual bug fix, not the decorator migration itself.
+8. Rewrite `for-contributors/module_template/` as one annotated file
    reflecting Part 1's shape (decorators + raw framework objects, no
    facade).
 
@@ -729,6 +923,23 @@ isolated path, throughput drops on every response. `isolate=False` needs a
 fast path with no wrapper allocation and its own test. **Add a throughput
 benchmark to P1's verify list, not just a correctness test** — this is the
 one place a naive generic implementation regresses perf silently.
+
+**`memory`'s `memory_block` prompt is a pre-existing race, not a new one
+introduced by this migration — but migrating it without fixing it would be
+a missed opportunity, not a neutral port.** Today, `_build_memory_block`
+runs as a detached background task with no ordering guarantee against
+`assemble()`; the prompt provider reads whatever `cycle._memory_block`
+happens to hold at call time, which can be `None` from initialization
+rather than a genuine "nothing relevant" result. `equipment_manifest`'s
+footer proves the correct pattern (`PRE_ASSEMBLE` hook writes `scratch`,
+synchronously, within the same pass a `@prompt` reads it), but `memory`'s
+case is harder because the computation is too expensive to run inline —
+it needs an explicit join point (bounded await, or a completion signal),
+not just a nicer place to park the same racy read. Track this as its own
+verify item in P3, separate from "did the decorator migration change
+behavior" — the intent here is for `@prompt` migration to also be the
+occasion this bug gets fixed, since touching this code path is otherwise
+rare.
 
 **Decorators run at class-definition time**, before any instance exists.
 They can only record metadata onto the function object; actual registration

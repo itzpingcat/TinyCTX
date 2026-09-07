@@ -115,7 +115,6 @@ Turn-scope facade; replaces the `cycle` argument. There is no `turn.cycle`.
 
 ```
 turn.tools      enable(name)  — registration is by decoration (Part 1)
-turn.prompts    register(name, provider, *, role, priority)
 turn.db         ConversationDB
 turn.caller     User
 turn.env        TurnEnv(platform, agent_name, server_name,
@@ -140,6 +139,21 @@ Four of these retire something:
   turn-scoped, distinct from Part 1's pass-scoped assembly and stream
   scratch.
 - `turn.emit` replaces `agent.outbound_events.append` (modules/present:148).
+
+**`turn.prompts` is gone from this facade — it doesn't exist here.**
+Part 1 already added `@prompt` as a fourth decorator alongside `@tool`/
+`@hook`/`@command`, registered once at load like everything else, so
+there's no runtime `.register(...)` call left for `TurnContext` to expose.
+This is a correction to how the original single-document plan described
+this facade (it had `turn.prompts.register(name, provider, *, role,
+priority)` as a method call inside a `TURN_START` hook body) — that shape
+predated `@prompt` and is superseded by it. A `@prompt`-decorated method's
+body takes `ctx` (the assembly `Context`, unchanged) and, when paired with
+a feeder hook, `scratch` — not `turn`. If a genuine need for *runtime*
+prompt registration turns up during F1/F2 (a provider whose existence, not
+just its content, must vary per turn), that would be new facade surface
+to design deliberately, not a leftover from the old shape to restore
+unexamined.
 
 ## `CommandContext`
 
@@ -174,10 +188,11 @@ the throughput benchmark, the 50-turn handler-count stability test).
 3. No module changes yet. Verify: 886 green, facade unit-tested in
    isolation against a fake `runtime`/`cycle`.
 
-### F1 — Migrate the same three proving modules
-1. `todo`, `ctx_tools`, `shell` — the same three Part 1 proved the
-   decorator shape on — now migrate their hook/tool bodies to take
-   `app`/`turn` instead of `runtime`/`cycle`/`context`.
+### F1 — Migrate the same four proving modules
+1. `todo`, `ctx_tools`, `shell`, `equipment_manifest` — the same four
+   Part 1 proved the decorator shape on — now migrate their hook/tool/
+   prompt bodies to take `app`/`turn` instead of `runtime`/`cycle`/
+   `context`.
 2. `ctx_tools` is again the load-bearing case: its `transform_turn` family
    only ever touched `ctx` (the assembly `Context`, unchanged by this
    part) and `Scratch` (Part 1), so it should need **no facade access at
@@ -186,6 +201,12 @@ the throughput benchmark, the 50-turn handler-count stability test).
 3. `shell`'s callable permission classifier must keep working: confirm it
    receives tool arguments the same way regardless of what the tool body's
    *other* parameters look like.
+4. `equipment_manifest`'s `@prompt`/`@hook`-via-scratch pairing (proven in
+   Part 1's P2) should also need **no facade access** — its footer's
+   `scratch.last_message_ts` read and its `@hook(HookType.PRE_ASSEMBLE)`
+   feeder both only touch `ctx`/`scratch`, same as `ctx_tools`. If it turns
+   out to need `turn.db` or similar, that's the same signal as #2: a
+   missing facade field, not a special case.
 
 Verify: 886 green; existing Part 1 tests unaffected (this part changes
 what handlers are *handed*, not how they're *registered* or *combined*).
