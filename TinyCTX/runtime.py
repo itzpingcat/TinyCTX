@@ -17,6 +17,7 @@ from TinyCTX.utils.attachments import build_content_blocks as _build_content_blo
 from TinyCTX.db import ConversationDB
 from TinyCTX.utils.commands import CommandRegistry
 from TinyCTX.module_registry import ModuleRegistry
+from TinyCTX.hooks import HookRegistry, HookType
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +98,15 @@ class Runtime:
         self._session_locks: dict[str, asyncio.Lock] = {}
 
         # Platform renderers — see register_platform_handler / deliver below.
-        self._platform_handlers: dict[str, Callable[[str, object], Awaitable[None]]] = {}
+        # Backed by HookType.DELIVER (Combine.DISPATCH) — MODULES-PLAN-P1.md
+        # P1 phase 1: "_platform_handlers becomes DELIVER." Storage moved
+        # onto the shared HookRegistry machinery; the public methods below
+        # keep their exact prior bodies/log messages/return semantics
+        # (register_platform_handler still overwrites, deliver() still
+        # distinguishes "no handler" from "handler raised" with its own
+        # specific logging) via HookRegistry.dispatch_handler_for()'s raw
+        # lookup rather than emit_dispatch()'s generic isolated-call path.
+        self._hooks = HookRegistry()
 
     async def start(self) -> None:
         self._register_user_commands()
@@ -294,7 +303,7 @@ class Runtime:
 
         Overwrites any previously registered handler for `platform`.
         """
-        self._platform_handlers[platform] = handler
+        self._hooks.register_dispatch(HookType.DELIVER, platform, handler)
         logger.info("[runtime] platform handler registered for %r", platform)
 
     async def deliver(self, platform: str, destination: str, event: object) -> bool:
@@ -305,7 +314,7 @@ class Runtime:
         must never propagate up and abort the caller's larger loop (e.g.
         a cron tick processing several due jobs).
         """
-        handler = self._platform_handlers.get(platform)
+        handler = self._hooks.dispatch_handler_for(HookType.DELIVER, platform)
         if handler is None:
             logger.warning(
                 "[runtime] deliver: no platform handler registered for %r — dropping event", platform

@@ -12,6 +12,7 @@ from TinyCTX.contracts import (
     ToolCall, ToolResult, IMAGE_BLOCK_PREFIX
 )
 from TinyCTX.context import Context, HistoryEntry, HOOK_PRE_ASSEMBLE_ASYNC, HOOK_POST_COMPLETION
+from TinyCTX.hooks import HookRegistry, HookListProxy, HookType
 from TinyCTX.ai import LLM, TextDelta, ThinkingDelta, ToolCallAssembled, LLMError
 from TinyCTX.tool_handling import ToolCallHandler
 
@@ -34,10 +35,22 @@ class AgentCycle:
         self.module_registry = module_registry
         self.trace_id = str(uuid.uuid4())
         
+        # Backing HookRegistry for this cycle (MODULES-PLAN-P1.md P1 phase 1:
+        # "post_turn_hooks and stream_text_hooks move onto it, with list-like
+        # proxies left on AgentCycle"). One instance per AgentCycle, matching
+        # today's per-turn registration lifetime (register_agent() is still
+        # called fresh per cycle — moving to process-lifetime registration is
+        # a P2 change, not this one).
+        self._hooks = HookRegistry()
+
         # Post-turn hooks registered by modules via register_agent.
         # Called by runtime after run() completes, with the final tail_node_id.
         # Signature: async (tail_node_id: str) -> None
-        self.post_turn_hooks: list = []
+        # Backed by HookType.POST_TURN via HookListProxy — modules still
+        # call cycle.post_turn_hooks.append(fn) and this loop still iterates
+        # it directly (see run()'s "Fire post-turn hooks" block below); only
+        # the storage moved, not the calling/isolation convention.
+        self.post_turn_hooks = HookListProxy(self._hooks, HookType.POST_TURN)
 
         # Streaming-text hooks registered by modules via register_agent.
         # Unlike context.py's hook stages (which all run before inference,
@@ -64,6 +77,18 @@ class AgentCycle:
         # context.py's hooks, this stage has no try/except-and-skip wrapper
         # (it runs in the hot per-token path), so a misbehaving hook here
         # will break streaming for the whole cycle.
+        # NOT yet moved onto HookRegistry, unlike post_turn_hooks above.
+        # These are object-protocol hooks (reset()/process()/flush()), not
+        # plain callables — HookType.STREAM_TEXT's fast path
+        # (emit_stream_text_sync) assumes fn(text) -> str, with no concept of
+        # a per-model-attempt reset or a final flush. Adapting this shape
+        # onto the registry means either extending HookRegistry with
+        # protocol-aware handling it doesn't have yet, or (per
+        # MODULES-PLAN-P1.md's P2/P3 phases) rewriting hooks like ctx_tools'
+        # _LabelPrefixStripHook as tagged methods over stream scratch — both
+        # are decorator/Module-class-era changes, not this wiring step's
+        # job. Left as a plain list for now; see hooks.py's HookListProxy
+        # docstring for the sibling case that DID fit cleanly.
         self.stream_text_hooks: list = []
 
         # Resources initialized during .run()

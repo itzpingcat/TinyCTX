@@ -267,3 +267,40 @@ class TestStreamTextFastPath:
         reg.register(HookType.STREAM_TEXT, bad)
         with pytest.raises(RuntimeError):
             reg.emit_stream_text_sync("hi")
+
+
+class TestHookListProxy:
+    def test_append_and_iterate_preserves_order(self):
+        reg = HookRegistry()
+        from TinyCTX.hooks import HookListProxy
+        proxy = HookListProxy(reg, HookType.POST_TURN)
+        proxy.append("a")
+        proxy.append("b")
+        proxy.append("c")
+        assert list(proxy) == ["a", "b", "c"]
+
+    def test_len_reflects_registered_count(self):
+        reg = HookRegistry()
+        from TinyCTX.hooks import HookListProxy
+        proxy = HookListProxy(reg, HookType.POST_TURN)
+        assert len(proxy) == 0
+        proxy.append(lambda: None)
+        assert len(proxy) == 1
+
+    def test_appended_handlers_are_visible_via_the_underlying_registry(self):
+        reg = HookRegistry()
+        from TinyCTX.hooks import HookListProxy
+        proxy = HookListProxy(reg, HookType.POST_TURN)
+        fn = lambda: None
+        proxy.append(fn)
+        assert reg.handlers_for(HookType.POST_TURN) == [fn]
+
+    def test_two_proxies_on_different_types_do_not_collide(self):
+        reg = HookRegistry()
+        from TinyCTX.hooks import HookListProxy
+        post_turn = HookListProxy(reg, HookType.POST_TURN)
+        startup = HookListProxy(reg, HookType.STARTUP)
+        post_turn.append("pt")
+        startup.append("su")
+        assert list(post_turn) == ["pt"]
+        assert list(startup) == ["su"]

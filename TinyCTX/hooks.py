@@ -157,6 +157,45 @@ class Scratch:
 Handler = Callable[..., Any]
 
 
+class HookListProxy:
+    """
+    List-like façade over one HookType bucket of a HookRegistry — lets
+    AgentCycle keep a plain-looking `self.post_turn_hooks` attribute that
+    modules `.append(fn)` to and agent.py iterates with `for hook in
+    self.post_turn_hooks:`, while registration actually files into the
+    shared HookRegistry underneath (see MODULES-PLAN-P1.md's P1 phase 1:
+    "post_turn_hooks and stream_text_hooks move onto it, with list-like
+    proxies left on AgentCycle").
+
+    Deliberately minimal: only append() and iteration are implemented,
+    because those are the only two operations any real call site uses today
+    (grep confirms no .remove()/indexing/clear() on either list in the
+    current codebase). Appending assigns an auto-incrementing priority so
+    insertion order is preserved exactly — this proxy does not expose
+    HookRegistry's priority parameter, since nothing appending today needs
+    it; a caller that does can reach the underlying registry directly via
+    .registry/.type.
+    """
+
+    def __init__(self, registry: "HookRegistry", type: "HookType") -> None:
+        self.registry = registry
+        self.type = type
+        self._next_priority = 0
+
+    def append(self, fn) -> None:
+        self.registry.register(self.type, fn, priority=self._next_priority)
+        self._next_priority += 1
+
+    def __iter__(self):
+        return iter(self.registry.handlers_for(self.type))
+
+    def __len__(self) -> int:
+        return len(self.registry.handlers_for(self.type))
+
+    def __repr__(self) -> str:
+        return f"HookListProxy({self.type}, {self.registry.handlers_for(self.type)!r})"
+
+
 class HookRegistry:
     """
     One registry for the process. register() files a handler under its
@@ -270,6 +309,19 @@ class HookRegistry:
             logger.warning("[hooks] emit_dispatch: no handler registered for %s key=%r", type, key)
             return None
         return await self._call(type, fn, args, scratch)
+
+    def dispatch_handler_for(self, type: HookType, key: str) -> Handler | None:
+        """
+        Raw lookup for a DISPATCH type's handler by key, or None — no call,
+        no logging, no isolation. Exists for callers (e.g. runtime.py's
+        deliver()) that need their own specific success/failure/logging
+        semantics around the call itself (distinguishing "no handler" from
+        "handler raised" with their own messages/return values) rather than
+        emit_dispatch()'s generic isolated-call behavior.
+        """
+        if type.combine != Combine.DISPATCH:
+            raise TypeError(f"{type} is not Combine.DISPATCH")
+        return getattr(self, "_dispatch_tables", {}).get(type, {}).get(key)
 
     def register_dispatch(self, type: HookType, key: str, fn: Handler) -> None:
         if type.combine != Combine.DISPATCH:
