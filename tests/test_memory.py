@@ -22,6 +22,9 @@ from TinyCTX.modules.memory import deduper
 from TinyCTX.modules.memory import migrate
 from TinyCTX.modules.memory import reviewer
 from TinyCTX.modules.memory.flaggers import decay_candidate, fuzzy_names
+from TinyCTX.modules.memory import Memory
+from TinyCTX.db import ConversationDB
+from TinyCTX.context import Context, HistoryEntry
 
 
 # ---------------------------------------------------------------------------
@@ -300,3 +303,96 @@ def test_search_memory_exact_match_respects_scope(monkeypatch):
             return await tools.search_memory("Carl secret", top_k=5)
 
     assert "not found" in asyncio.run(run()).lower() or "no matching" in asyncio.run(run()).lower()
+
+
+# ---------------------------------------------------------------------------
+# memory_block join point (MODULES-PLAN-P1.md P3) — a refresh that hasn't
+# returned yet must never be silently indistinguishable from "no memory
+# relevant this turn". Pre-Module version: a detached asyncio task raced
+# assemble() with no ordering guarantee at all.
+# ---------------------------------------------------------------------------
+
+def _memory_instance():
+    inst = Memory()
+    inst.config = inst.resolve_settings(None)
+    return inst
+
+
+def _ctx_with_one_user_turn():
+    db = ConversationDB(":memory:")
+    root = db.get_root()
+    ctx = Context(db, tail_node_id=root.id, token_limit=100_000)
+    ctx.add(HistoryEntry.user("hello"))
+    return ctx
+
+
+class TestMemoryBlockJoinPoint:
+    def test_timeout_leaves_no_stale_or_fabricated_block(self):
+        """A refresh that blows its timeout budget must not silently resolve
+        to None being indistinguishable from a real 'nothing relevant'
+        result — the timeout is logged, and ctx.state keeps whatever it had
+        (nothing, on the very first pass)."""
+        inst = _memory_instance()
+        inst.config["passive_rag"] = {**inst.config["passive_rag"], "block_timeout_seconds": 0.05}
+
+        async def never_returns(visible, text):
+            await asyncio.sleep(10)
+            return "<memory>should never appear</memory>"
+        inst._build_memory_block = never_returns
+
+        ctx = _ctx_with_one_user_turn()
+        asyncio.run(inst.refresh_memory_block(ctx))
+
+        assert ctx.state.get("memory_block") is None
+        assert inst.memory_block_prompt(ctx) is None
+
+    def test_successful_refresh_populates_the_block(self):
+        inst = _memory_instance()
+
+        async def fast(visible, text):
+            return "<memory>real result</memory>"
+        inst._build_memory_block = fast
+
+        ctx = _ctx_with_one_user_turn()
+        asyncio.run(inst.refresh_memory_block(ctx))
+
+        assert ctx.state["memory_block"] == "<memory>real result</memory>"
+        assert inst.memory_block_prompt(ctx) == "<memory>real result</memory>"
+
+    def test_later_pass_in_the_same_cycle_overwrites_an_earlier_one(self):
+        """Recomputing every assemble() pass (not once per cycle) means a
+        later pass in a multi-step tool-calling loop reflects tool calls
+        that already ran, not a block cached from before them."""
+        inst = _memory_instance()
+        ctx = _ctx_with_one_user_turn()
+
+        inst._build_memory_block = lambda visible, text: _const("<memory>first</memory>")
+        asyncio.run(inst.refresh_memory_block(ctx))
+        assert ctx.state["memory_block"] == "<memory>first</memory>"
+
+        inst._build_memory_block = lambda visible, text: _const("<memory>second</memory>")
+        asyncio.run(inst.refresh_memory_block(ctx))
+        assert ctx.state["memory_block"] == "<memory>second</memory>"
+
+    def test_timeout_after_a_successful_pass_keeps_the_last_known_good_block(self):
+        """A slow pass timing out must not erase a good block an earlier
+        pass in the same cycle already produced."""
+        inst = _memory_instance()
+        inst.config["passive_rag"] = {**inst.config["passive_rag"], "block_timeout_seconds": 0.05}
+        ctx = _ctx_with_one_user_turn()
+
+        inst._build_memory_block = lambda visible, text: _const("<memory>good</memory>")
+        asyncio.run(inst.refresh_memory_block(ctx))
+        assert ctx.state["memory_block"] == "<memory>good</memory>"
+
+        async def never_returns(visible, text):
+            await asyncio.sleep(10)
+            return "<memory>too slow</memory>"
+        inst._build_memory_block = never_returns
+        asyncio.run(inst.refresh_memory_block(ctx))
+
+        assert ctx.state["memory_block"] == "<memory>good</memory>"
+
+
+async def _const(value):
+    return value

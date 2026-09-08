@@ -21,9 +21,12 @@ Command syntax parsed here:
 
 `context` is whatever the bridge wants to pass through to handlers — typically
 a dict with keys like "console", "agent", "cursor", "gateway".  Handlers are
-async callables:
+async callables that return the string to send, or None if there's nothing
+to say (dispatch() delivers a non-None return via context["send"]/["console"]
+itself — a handler doesn't call either directly unless it's the genuine
+streaming case, emitting progress before it's done):
 
-    async def handler(args: list[str], context: dict) -> None: ...
+    async def handler(args: list[str], context: dict) -> str | None: ...
 """
 
 from __future__ import annotations
@@ -37,7 +40,7 @@ from TinyCTX.permissions import Permission
 
 logger = logging.getLogger(__name__)
 
-Handler = Callable[[list[str], dict], Awaitable[None]]
+Handler = Callable[[list[str], dict], Awaitable[str | None]]
 
 # Param spec: (name, python_type, description)
 ParamSpec = list[tuple[str, type, str]]
@@ -183,21 +186,36 @@ class CommandRegistry:
         denial = self._check_permission(entry, context)
         if denial is not None:
             logger.info("[commands] denied /%s %s: %s", namespace, sub, denial)
-            send = context.get("send")
-            if callable(send):
-                try:
-                    await send(denial)
-                except Exception:
-                    logger.exception("[commands] failed to deliver permission denial for /%s %s", namespace, sub)
+            try:
+                await self._deliver(context, denial)
+            except Exception:
+                logger.exception("[commands] failed to deliver permission denial for /%s %s", namespace, sub)
             return True  # handled (denied) — don't push to router
 
         try:
-            await entry.handler(args, context)
+            result = await entry.handler(args, context)
+            if result is not None:
+                await self._deliver(context, result)
         except Exception:
             logger.exception("[commands] handler for /%s %s raised", namespace, sub)
         else:
             self._record_command_introspection(namespace, sub, args, context)
         return True
+
+    @staticmethod
+    async def _deliver(context: dict, text: str) -> None:
+        """Send a handler's returned output (or a permission denial) through
+        whatever the bridge gave us — an async 'send' callable (Discord) or a
+        sync 'console' with .print() (gateway's _StringConsole). A handler
+        that still streams its own progress via context["send"] mid-call and
+        returns None is unaffected — this only fires for a non-None return."""
+        send = context.get("send")
+        if callable(send):
+            await send(text)
+            return
+        console = context.get("console")
+        if console is not None:
+            console.print(text)
 
     @staticmethod
     def _check_permission(entry: _Entry, context: dict) -> str | None:

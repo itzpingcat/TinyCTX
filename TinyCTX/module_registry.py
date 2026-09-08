@@ -1,21 +1,20 @@
 """
 module_registry.py — Module loading and per-cycle wiring.
 
-A module exposes either the function pair below or a single Module
-subclass (TinyCTX/module.py) with @tool/@hook/@command/@prompt-decorated
-methods (TinyCTX/decorators.py); both shapes may coexist in the codebase
-during the migration, and this registry runs whichever a module defines.
+A module directory (or single .py file) exports one Module subclass
+(TinyCTX/module.py) with @tool/@hook/@command/@prompt-decorated methods
+(TinyCTX/decorators.py). The loader instantiates it once, at load_modules()
+time, and walks its tagged methods to register them — see
+_register_module_class (runtime-scoped: STARTUP, @command) and
+_wire_module_instance (per-cycle-scoped: @tool, most @hook types, @prompt),
+called from register_agent() for every new AgentCycle.
 
-  def register_runtime(runtime: Runtime) -> None:
-      # Called once at startup.
-      # Build singletons, register commands, background hooks, etc.
-
-  def register_agent(cycle: AgentCycle) -> None:
-      # Called per AgentCycle after tool_handler and context are live.
-      # Register tools, prompt providers, pre-assemble hooks.
-
-Both are optional. A module with only register_agent does no startup work.
-A module with only register_runtime does no per-cycle wiring.
+MODULES-PLAN-P1.md's earlier phases supported a legacy function-pair shape
+(register_runtime(runtime)/register_agent(cycle)) alongside this one, for
+migrating modules one at a time without a flag-day cutover. That shape is
+gone now that every module in this repo is Module-class-based (P3) — a
+module lacking a Module subclass is skipped with a warning, not silently
+treated as function-based.
 """
 from __future__ import annotations
 
@@ -23,7 +22,7 @@ import importlib
 import importlib.util
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING
 
 from TinyCTX.decorators import CommandBinding, HookBinding, PromptBinding, ToolBinding, walk_bindings
 from TinyCTX.hooks import HookType
@@ -49,22 +48,17 @@ class ModuleRegistry:
     """
 
     def __init__(self) -> None:
-        self._agent_registrations: list[Callable] = []
         # Module-class instances found at load_modules() time, wired into
-        # each AgentCycle in register_agent() alongside the function-based
-        # queue above. A module may use either shape; both run.
+        # each AgentCycle in register_agent().
         self._module_instances: list[Module] = []
 
     def load_modules(self, runtime) -> None:
-        """Scan modules/ and custom_modules/ and call register_runtime on each."""
+        """Scan modules/ and custom_modules/ and instantiate each Module class found."""
         self._load_from_dir(MODULES_DIR, runtime, import_prefix="TinyCTX.modules")
         self._load_from_dir(CUSTOM_MODULES_DIR, runtime, import_prefix=None)
 
-        print(f"[module_registry] done — {len(self._agent_registrations)} register_agent hook(s) queued")
-        logger.info(
-            "[module_registry] done — %d register_agent hook(s) queued",
-            len(self._agent_registrations),
-        )
+        print(f"[module_registry] done — {len(self._module_instances)} module(s) loaded")
+        logger.info("[module_registry] done — %d module(s) loaded", len(self._module_instances))
 
     def _load_from_dir(self, modules_dir: Path, runtime, import_prefix: str | None) -> None:
         """Scan one modules directory and register all valid modules found."""
@@ -108,38 +102,28 @@ class ModuleRegistry:
                 spec = importlib.util.spec_from_file_location(fqn, fpath)
                 candidate = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(candidate)
-                has_rt = hasattr(candidate, "register_runtime")
-                has_ra = hasattr(candidate, "register_agent")
-                if has_rt or has_ra or self._find_module_class(candidate) is not None:
-                    logger.debug(
-                        "[module_registry] '%s' loaded from path (register_runtime=%s, register_agent=%s)",
-                        entry.name, has_rt, has_ra,
-                    )
+                if self._find_module_class(candidate) is not None:
+                    logger.debug("[module_registry] '%s' loaded from path", entry.name)
                     return candidate
             except Exception:
                 logger.exception("[module_registry] error loading '%s' from path", entry.name)
                 return None
-        logger.warning("[module_registry] '%s' has no register_runtime/register_agent/Module class — skipping", entry.name)
+        logger.warning("[module_registry] '%s' has no Module class — skipping", entry.name)
         return None
 
     def _find_module(self, module_name: str, entry_name: str):
-        """Import __main__ then package; return first with register_runtime or register_agent."""
+        """Import __main__ then package; return whichever defines a Module class."""
         for suffix in (".__main__", ""):
             fqn = module_name + suffix
             try:
                 candidate = importlib.import_module(fqn)
-                has_rt = hasattr(candidate, "register_runtime")
-                has_ra = hasattr(candidate, "register_agent")
-                if has_rt or has_ra or self._find_module_class(candidate) is not None:
-                    print(f"[module_registry] '{entry_name}' found in {fqn} (register_runtime={has_rt}, register_agent={has_ra})")
-                    logger.debug(
-                        "[module_registry] '%s' found in %s (register_runtime=%s, register_agent=%s)",
-                        entry_name, fqn, has_rt, has_ra,
-                    )
+                if self._find_module_class(candidate) is not None:
+                    print(f"[module_registry] '{entry_name}' found in {fqn}")
+                    logger.debug("[module_registry] '%s' found in %s", entry_name, fqn)
                     return candidate
                 else:
                     logger.debug(
-                        "[module_registry] '%s' imported from %s but has no register_*/Module class — trying next",
+                        "[module_registry] '%s' imported from %s but has no Module class — trying next",
                         entry_name, fqn,
                     )
             except ModuleNotFoundError as e:
@@ -151,28 +135,14 @@ class ModuleRegistry:
                 logger.exception("[module_registry] error importing '%s' as %s", entry_name, fqn)
                 return None
 
-        print(f"[module_registry] '{entry_name}' has no register_runtime/register_agent/Module class — skipping")
-        logger.warning("[module_registry] '%s' has no register_runtime/register_agent/Module class — skipping", entry_name)
+        print(f"[module_registry] '{entry_name}' has no Module class — skipping")
+        logger.warning("[module_registry] '%s' has no Module class — skipping", entry_name)
         return None
 
     def _register_one(self, mod, runtime, entry_name: str) -> None:
         module_class = self._find_module_class(mod)
         if module_class is not None:
             self._register_module_class(module_class, runtime, entry_name)
-            return
-        if hasattr(mod, "register_runtime"):
-            print(f"[module_registry] calling register_runtime for '{entry_name}'")
-            logger.info("[module_registry] calling register_runtime for '%s'", entry_name)
-            mod.register_runtime(runtime)
-            print(f"[module_registry] register_runtime done for '{entry_name}'")
-            logger.info("[module_registry] register_runtime done for '%s'", entry_name)
-            if hasattr(mod, "register_agent"):
-                self._agent_registrations.append(mod.register_agent)
-                logger.debug("[module_registry] queued register_agent for '%s'", entry_name)
-        elif hasattr(mod, "register_agent"):
-            self._agent_registrations.append(mod.register_agent)
-            print(f"[module_registry] queued register_agent (no runtime) for '{entry_name}'")
-            logger.info("[module_registry] queued register_agent (no runtime) for '%s'", entry_name)
 
     @staticmethod
     def _find_module_class(mod) -> type[Module] | None:
@@ -201,7 +171,7 @@ class ModuleRegistry:
         # CommandRegistry lives on the runtime, not the per-turn AgentCycle,
         # so CommandBinding registers here rather than in _wire_module_instance.
         # STARTUP is the other runtime-scoped type (replaces register_runtime()):
-        # called once, now, with `runtime` — same timing register_runtime had.
+        # called once, now, with `runtime`.
         for name, binding, bound in walk_bindings(instance):
             if isinstance(binding, CommandBinding) and hasattr(runtime, "commands"):
                 runtime.commands.register(
@@ -250,8 +220,7 @@ class ModuleRegistry:
                     elif binding.type is HookType.TURN_START:
                         # No emitter exists for this stage yet (MODULES-PLAN-P1.md
                         # notes it "replaces per-turn wiring"): run it now, once,
-                        # at the same per-cycle-construction point register_agent()
-                        # functions ran their own per-turn setup at today.
+                        # at this same per-cycle wiring point.
                         bound(cycle)
                     else:
                         logger.warning(
@@ -274,13 +243,5 @@ class ModuleRegistry:
 
     def register_agent(self, cycle: "AgentCycle") -> None:
         """Wire all modules into a newly constructed AgentCycle."""
-        logger.debug("[module_registry] register_agent called, %d hook(s)", len(self._agent_registrations))
-        for fn in self._agent_registrations:
-            try:
-                logger.debug("[module_registry] calling %s", getattr(fn, "__name__", fn))
-                fn(cycle)
-            except Exception:
-                logger.exception("[module_registry] register_agent raised (fn=%s)", getattr(fn, "__name__", fn))
-
         for instance in self._module_instances:
             self._wire_module_instance(instance, cycle)

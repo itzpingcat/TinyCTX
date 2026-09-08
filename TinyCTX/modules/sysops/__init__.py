@@ -1,24 +1,360 @@
-EXTENSION_META = {
-    "name":        "sysops",
-    "version":     "2.0",
-    "module_type": "per-cycle",
-    "description": (
-        "User and permission management tools for the agent, plus the /model "
-        "command and its set_active_model tool for switching the LLM used on "
-        "a conversation branch. Exposes user_list, user_info, "
-        "user_modify_permissions, user_rename, user_merge, and "
-        "set_active_model as agent-callable tools (always_on=False). "
-        "Gating is via named capabilities (TinyCTX.permissions.Permission), "
-        "enforced centrally by ToolCallHandler / CommandRegistry — see "
-        "docs/PERMISSIONS-PLAN.md. user_modify_permissions grants or revokes "
-        "a single permission bool on a user's permission_overrides — there "
-        "is one global permissions.template (config.yaml) shared by every "
-        "user; there is no more numeric ceiling logic since ROOT is total."
-    ),
-    "default_config": {
-        # NOTE: model_min_permission is GONE — /model and set_active_model
-        # are both gated on Permission.MODEL_SWAP (a bool granted by the
-        # global template or a per-user override), not a configurable
-        # numeric threshold. See docs/PERMISSIONS-PLAN.md §9's table.
-    },
-}
+"""
+modules/sysops
+
+System operation tools: user/permission management, plus the /model
+command and its set_active_model tool equivalent for switching the LLM
+used on a conversation branch.
+
+Tools registered (all always_on=False), gated per docs/PERMISSIONS-PLAN.md
+§10.1 at the ToolCallHandler seam (TinyCTX.permissions.Permission):
+  user_list                — list all users                    USER_READ
+  user_info                — show one user's details            USER_READ
+  user_modify_permissions  — grant/revoke one permission bool    ROOT
+  user_rename              — rename a TinyCTX username           ROOT
+  user_merge                — merge two users into one            ROOT
+  set_active_model          — override/clear the LLM for this branch  MODEL_SWAP
+
+They're registered imperatively from a @hook(HookType.TURN_START) body
+(which receives `cycle`), not via @tool: user_modify_permissions/
+user_rename/user_merge/set_active_model all log cycle.caller.username, and
+set_active_model additionally needs cycle.config/.db/.context.tail_node_id
+live at call time — none of that is available to a @tool method, whose only
+per-call inputs are its own declared (model-visible) arguments. See
+modules/present's docstring for the same constraint.
+
+/model is different: its handler only needs `runtime` (cached once at
+STARTUP) plus the per-call `context` dict CommandRegistry.dispatch() already
+passes every handler — no live cycle required — so it's a genuine @command.
+
+  /model              — show the current effective model
+  /model list         — list configured chat models
+  /model clear        — clear the override
+  /model <name>       — set the override
+  (MODEL_SWAP, same named bool as set_active_model — dispatch() checks it
+  centrally before cmd_model ever runs; see docs/PERMISSIONS-PLAN.md §9)
+
+There is no more numeric ceiling logic ("can only promote to at most your
+own level - 1"): ROOT is total (see permissions.py's docstring), and every
+tool/command above is gated by a bool the caller either holds or doesn't —
+by the time each function body below runs, the seam has already confirmed
+the caller holds what's required.
+
+How the model override takes effect
+-------------------------------------
+set_active_model / /model only WRITE state. AgentCycle.run() (agent.py)
+already reads it on every cycle:
+
+    state, _ = self.db.load_session_state(node_id)
+    primary_name = state.get("model") or self.config.llm.primary
+
+so as soon as the "model" key is written into the state_delta chain for a
+branch, it becomes the primary model for every subsequent turn on that
+branch, until cleared or overridden again. Writes go through
+db.set_state() (merge-write), not db.update_node_state_delta() (blind
+full-column replace) — see db.py's set_state()/get_state() docstrings and
+CODEBASE.md's Database section for why the raw primitive is a footgun for
+multi-writer nodes.
+"""
+from __future__ import annotations
+
+import logging
+
+from TinyCTX.decorators import command, hook
+from TinyCTX.hooks import HookType
+from TinyCTX.module import Module
+from TinyCTX.permissions import Permission
+
+logger = logging.getLogger(__name__)
+
+
+def _resolve_model_node_id(context: dict) -> str:
+    """Bridges disagree on the key name — gateway uses 'node_id', Discord uses 'cursor'."""
+    return (context.get("node_id") or context.get("cursor") or "").strip()
+
+
+def _chat_model_names(config) -> list[str]:
+    """Names of configured models usable as a primary/fallback LLM (excludes embedding models)."""
+    return sorted(name for name, mc in config.models.items() if not mc.is_embedding)
+
+
+def _model_status_text(db, config, node_id: str) -> str:
+    override = db.get_state(node_id, "model", "") or ""
+    default = config.llm.primary
+    if override:
+        return f"Current model: {override} (override — default is {default})"
+    return f"Current model: {default} (default, no override set)"
+
+
+def _model_list_text(db, config, node_id: str) -> str:
+    override = db.get_state(node_id, "model", "") or ""
+    default = config.llm.primary
+    names = _chat_model_names(config)
+    if not names:
+        return "No chat models configured."
+    lines = ["Available models:"]
+    for name in names:
+        tags = []
+        if name == default:
+            tags.append("default")
+        if name == override:
+            tags.append("current override")
+        suffix = f"  ({', '.join(tags)})" if tags else ""
+        lines.append(f"- {name}{suffix}")
+    return "\n".join(lines)
+
+
+class Sysops(Module):
+    """User/permission management tools, plus the /model command and its
+    set_active_model tool equivalent for switching the LLM on a branch."""
+
+    def __init__(self) -> None:
+        self._users = None
+        self._runtime = None
+
+    @hook(HookType.STARTUP)
+    def load(self, runtime) -> None:
+        self._users = runtime.users
+        self._runtime = runtime
+        logger.info("[sysops] registered — UserStore at %s", id(self._users))
+
+    # ------------------------------------------------------------------
+    # /model slash command
+    # ------------------------------------------------------------------
+    #
+    # Slash-command dispatch happens outside an AgentCycle, so there's no
+    # cycle.caller the way tools get one. The caller's identity is instead
+    # resolved from the conversation branch itself: the node_id/cursor the
+    # bridge puts in `context` already has platform + author_id somewhere in
+    # its session state (written by Runtime._compute_state_delta on the
+    # inbound user node), so CommandRegistry itself load_session_state()s on
+    # it and resolves the User via runtime.users.get_by_platform — the same
+    # approach modules/equipment_manifest/__init__.py uses for its own trust
+    # check.
+
+    @command("model", "", permissions={Permission.MODEL_SWAP},
+             help="Show/set/clear the LLM model for this conversation (requires model_swap)",
+             params=[("model_name", str, "Model name, or 'list' / 'clear' — leave blank to show current")])
+    async def cmd_model(self, args: list[str], context: dict) -> str | None:
+        runtime = self._runtime
+        node_id = _resolve_model_node_id(context)
+        if not node_id:
+            return "⛔ No conversation to attach the override to."
+
+        if not args:
+            return _model_status_text(runtime.db, runtime.config, node_id)
+
+        sub = args[0].lower()
+
+        if sub == "list":
+            return _model_list_text(runtime.db, runtime.config, node_id)
+
+        if sub == "clear":
+            runtime.db.set_state(node_id, "model", "")
+            return f"Model override cleared — back to default ({runtime.config.llm.primary})."
+
+        name = args[0]
+        valid = _chat_model_names(runtime.config)
+        if name not in valid:
+            return f"⛔ Unknown model '{name}'. Available: {', '.join(valid) or '(none configured)'}"
+
+        runtime.db.set_state(node_id, "model", name)
+        return f"Model override set: {name}"
+
+    # ------------------------------------------------------------------
+    # Per-cycle tools
+    # ------------------------------------------------------------------
+
+    @hook(HookType.TURN_START)
+    def wire_tools(self, cycle) -> None:
+        if self._users is None:
+            logger.warning("[sysops] UserStore not available — skipping tool registration")
+            return
+
+        users = self._users
+        permissions_config = cycle.config.permissions
+
+        def user_list(platform: str = "") -> str:
+            """List all TinyCTX users.
+
+            Args:
+                platform: Optional platform name to filter by (e.g. 'discord', 'cli').
+                          Leave blank to show all users.
+            """
+            rows = users._conn.execute(
+                "SELECT username, permission_overrides, identities, created_at "
+                "FROM users ORDER BY username ASC"
+            ).fetchall()
+
+            if not rows:
+                return "No users found."
+
+            import json as _json
+            lines = []
+            for row in rows:
+                identities = _json.loads(row["identities"])
+                id_strs = [
+                    f"{i['platform']}:{i['user_id']} ({i['username']})"
+                    for i in identities
+                    if not platform or i["platform"] == platform
+                ]
+                if platform and not id_strs:
+                    continue
+                overrides = _json.loads(row["permission_overrides"] or "{}")
+                override_str = f"{len(overrides)} override(s)" if overrides else "no overrides"
+                lines.append(
+                    f"{row['username']}  {override_str}  "
+                    + (", ".join(id_strs) if id_strs else "no identities")
+                )
+
+            if not lines:
+                return f"No users with platform '{platform}'."
+            return f"{len(lines)} user(s):\n" + "\n".join(lines)
+
+        def user_info(username: str) -> str:
+            """Show full details for a single TinyCTX user.
+
+            Args:
+                username: TinyCTX username to look up.
+            """
+            user = users.get_user(username)
+            if user is None:
+                return f"User '{username}' not found."
+
+            import json as _json, time as _time
+            identities = "\n".join(
+                f"  {i.platform.value}:{i.user_id}  username={i.username}  display={i.display_name}"
+                for i in user.identities
+            ) or "  (none)"
+            created = _time.strftime("%Y-%m-%d %H:%M UTC", _time.gmtime(user.created_at))
+            meta = _json.dumps(user.meta, indent=2) if user.meta else "{}"
+            overrides = ", ".join(
+                f"{k}={v}" for k, v in sorted(user.permission_overrides.items())
+            ) or "(none)"
+            effective = sorted(p.value for p in user.effective_permissions(permissions_config))
+            return (
+                f"username:    {user.username}\n"
+                f"overrides:   {overrides}\n"
+                f"effective:   {', '.join(effective) or '(none)'}\n"
+                f"created:     {created}\n"
+                f"identities:\n{identities}\n"
+                f"meta: {meta}"
+            )
+
+        def user_modify_permissions(username: str, permission: str, value: bool) -> str:
+            """Grant or revoke a single permission bool for a user.
+
+            There is a single global permissions.template in config.yaml now
+            (see TinyCTX.config.PermissionsConfig) shared by every user — this
+            is how a specific user gets more (or less) than everyone else,
+            via their sparse permission_overrides. There is no ceiling check —
+            ROOT is total, so a ROOT holder may grant or revoke any bool on
+            any user, including themselves.
+
+            Args:
+                username:   TinyCTX username to modify.
+                permission: Name of a Permission (e.g. 'file_write', 'root').
+                value:      True to grant, False to revoke.
+            """
+            try:
+                perm = Permission(permission)
+            except ValueError:
+                valid = ", ".join(sorted(p.value for p in Permission))
+                return f"Error: unknown permission {permission!r}. Valid names: {valid}"
+
+            user = users.get_user(username)
+            if user is None:
+                return f"User '{username}' not found."
+
+            old = user.permission_overrides.get(perm.value)
+            user.permission_overrides[perm.value] = bool(value)
+            users.update_user(user)
+            logger.info(
+                "[sysops] user_modify_permissions: '%s' %s %r → %r (caller=%s)",
+                username, perm.value, old, bool(value), cycle.caller.username,
+            )
+            return f"'{username}': {perm.value} {old!r} → {bool(value)!r}."
+
+        def user_rename(username: str, new_username: str) -> str:
+            """Rename a TinyCTX username. Requires the root capability.
+
+            Updates both the users table and the platform index atomically.
+            The user's identities, permission overrides, and meta are unchanged.
+
+            Args:
+                username:     Current TinyCTX username.
+                new_username: New TinyCTX username (must not already be taken).
+            """
+            from TinyCTX.users import UsernameConflictError
+            try:
+                updated = users.rename_user(username, new_username)
+                logger.info(
+                    "[sysops] user_rename: '%s' → '%s' (caller=%s)",
+                    username, updated.username, cycle.caller.username,
+                )
+                return f"Renamed '{username}' → '{updated.username}'."
+            except ValueError as exc:
+                return f"Error: {exc}"
+            except UsernameConflictError:
+                return f"Error: username '{new_username}' is already taken."
+
+        def user_merge(primary_username: str, secondary_username: str) -> str:
+            """Merge two users: move all platform identities from secondary into primary,
+            then delete the secondary user. Requires the root capability.
+
+            Use this when the same human has two separate TinyCTX user records
+            (e.g. created separately on Discord and Matrix before being linked).
+            After merging, all of secondary's identities are accessible via primary.
+
+            Args:
+                primary_username:   The user to keep. Receives all identities.
+                secondary_username: The user to delete after merging.
+            """
+            try:
+                merged = users.merge_users(primary_username, secondary_username)
+                id_count = len(merged.identities)
+                logger.info(
+                    "[sysops] user_merge: '%s' absorbed '%s', now %d identities (caller=%s)",
+                    primary_username, secondary_username, id_count, cycle.caller.username,
+                )
+                return (
+                    f"Merged '{secondary_username}' into '{primary_username}'. "
+                    f"'{primary_username}' now has {id_count} platform identity(s)."
+                )
+            except ValueError as exc:
+                return f"Error: {exc}"
+
+        def set_active_model(name: str) -> str:
+            """Set (or clear) the LLM model override for this conversation branch.
+
+            Same effect as the /model slash command: writes to session state,
+            which agent.py reads on every subsequent cycle on this branch
+            (state.get("model") or config default). Must be a chat model
+            defined under models: in config.yaml — embedding models are
+            rejected. Pass "" or "default" to clear the override and revert to
+            the configured default (config.llm.primary).
+
+            Args:
+                name: Model name from config.yaml's models: block, or "" / "default" to clear.
+            """
+            default = cycle.config.llm.primary
+            if name in ("", "default"):
+                cycle.db.set_state(cycle.context.tail_node_id, "model", "")
+                logger.info("[sysops] set_active_model: cleared (caller=%s)", cycle.caller.username)
+                return f"Model override cleared — back to default ({default})."
+
+            valid = _chat_model_names(cycle.config)
+            if name not in valid:
+                return f"Error: unknown model '{name}'. Available: {', '.join(valid) or '(none configured)'}"
+
+            cycle.db.set_state(cycle.context.tail_node_id, "model", name)
+            logger.info("[sysops] set_active_model: '%s' (caller=%s)", name, cycle.caller.username)
+            return f"Model override set: {name}"
+
+        cycle.tool_handler.register_tool(user_list,   always_on=False, required_permissions={Permission.USER_READ})
+        cycle.tool_handler.register_tool(user_info,   always_on=False, required_permissions={Permission.USER_READ})
+        cycle.tool_handler.register_tool(user_modify_permissions, always_on=False, required_permissions={Permission.ROOT})
+        cycle.tool_handler.register_tool(user_rename, always_on=False, required_permissions={Permission.ROOT})
+        cycle.tool_handler.register_tool(user_merge,  always_on=False, required_permissions={Permission.ROOT})
+        cycle.tool_handler.register_tool(set_active_model, always_on=False, required_permissions={Permission.MODEL_SWAP})
+
+        logger.debug("[sysops] registered 6 tools for caller=%s", cycle.caller.username)

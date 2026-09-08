@@ -3,11 +3,13 @@ module.py — Module base class.
 
 Deliberately minimal at this stage: no AppContext/TurnContext/CommandContext
 facade — hook/tool/prompt/command bodies still take raw framework objects
-(runtime, cycle, context, a plain dict) exactly as register_runtime()/
-register_agent() hand them over today. This file only gives a module author
-one class to subclass and four decorators (in decorators.py) to tag methods
-with, replacing the current "two loose functions plus a boilerplate config
-merge, copy-pasted into ten modules" shape.
+(runtime, cycle, context, a plain dict), the same objects the pre-Module
+register_runtime()/register_agent() function pair used to hand them (that
+convention is gone as of MODULES-PLAN-P1.md's P3 — every module is a Module
+subclass now). This file gives a module author one class to subclass and
+four decorators (in decorators.py) to tag methods with, replacing that old
+"two loose functions plus a boilerplate config merge, copy-pasted into ten
+modules" shape.
 """
 from __future__ import annotations
 

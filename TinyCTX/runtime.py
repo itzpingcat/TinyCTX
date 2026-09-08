@@ -189,34 +189,28 @@ class Runtime:
 
         from TinyCTX.users import UsernameConflictError
 
-        async def _cmd_modify_permissions(args: list[str], context: dict) -> None:
-            send = context["send"]
+        async def _cmd_modify_permissions(args: list[str], context: dict) -> str | None:
             valid = ", ".join(sorted(p.value for p in Permission))
             if len(args) < 3:
-                await send(
+                return (
                     "Usage: /user modify_permissions <username> <permission> <true|false> "
                     f"(known permissions: {valid})"
                 )
-                return
             caller = _caller_user(context)
             if caller is None:
-                await send("⛔ Cannot resolve your identity.")
-                return
+                return "⛔ Cannot resolve your identity."
             target_username, perm_name, value_str = args[0], args[1], args[2]
             try:
                 perm = Permission(perm_name)
             except ValueError:
-                await send(f"Unknown permission {perm_name!r}. Known permissions: {valid}")
-                return
+                return f"Unknown permission {perm_name!r}. Known permissions: {valid}"
             value_lower = value_str.strip().lower()
             if value_lower not in ("true", "false"):
-                await send("Value must be 'true' or 'false'.")
-                return
+                return "Value must be 'true' or 'false'."
             value = value_lower == "true"
             user = users.get_user(target_username)
             if user is None:
-                await send(f"User {target_username!r} not found.")
-                return
+                return f"User {target_username!r} not found."
             old = user.permission_overrides.get(perm.value)
             user.permission_overrides[perm.value] = value
             users.update_user(user)
@@ -224,17 +218,14 @@ class Runtime:
                 "[user] %s set %s=%s on %s (was %r)",
                 caller.username, perm.value, value, target_username, old,
             )
-            await send(f"✅ {target_username}: {perm.value} → {value}")
+            return f"✅ {target_username}: {perm.value} → {value}"
 
-        async def _cmd_info(args: list[str], context: dict) -> None:
-            send = context["send"]
+        async def _cmd_info(args: list[str], context: dict) -> str | None:
             if not args:
-                await send("Usage: /user info <username>")
-                return
+                return "Usage: /user info <username>"
             user = users.get_user(args[0])
             if user is None:
-                await send(f"User {args[0]!r} not found.")
-                return
+                return f"User {args[0]!r} not found."
             identities = ", ".join(
                 f"{i.platform.value}:{i.user_id} ({i.username})"
                 for i in user.identities
@@ -243,25 +234,23 @@ class Runtime:
                 f"{k}={v}" for k, v in sorted(user.permission_overrides.items())
             ) or "(none)"
             effective = sorted(p.value for p in user.effective_permissions(self.config.permissions))
-            await send(
+            return (
                 f"**{user.username}** — overrides: {overrides}\n"
                 f"Effective permissions: {', '.join(effective) or '(none)'}\n"
                 f"Identities: {identities}\n"
                 f"Created: {user.created_at:.0f}"
             )
 
-        async def _cmd_rename(args: list[str], context: dict) -> None:
-            send = context["send"]
+        async def _cmd_rename(args: list[str], context: dict) -> str | None:
             if len(args) < 2:
-                await send("Usage: /user rename <username> <new_username>")
-                return
+                return "Usage: /user rename <username> <new_username>"
             try:
                 updated = users.rename_user(args[0], args[1])
-                await send(f"✅ Renamed {args[0]!r} → {updated.username!r}")
+                return f"✅ Renamed {args[0]!r} → {updated.username!r}"
             except ValueError as e:
-                await send(f"Error: {e}")
+                return f"Error: {e}"
             except UsernameConflictError:
-                await send(f"Username {args[1]!r} is already taken.")
+                return f"Username {args[1]!r} is already taken."
 
         self.commands.register("user", "modify_permissions", _cmd_modify_permissions,
             help="Grant or revoke a single permission bool for a user",

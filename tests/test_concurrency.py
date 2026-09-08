@@ -528,7 +528,7 @@ class TestDrain:
 
 class TestRunningForksProvider:
     """
-    modules/concurrency/__main__.py's _running_forks_provider renders the
+    modules/concurrency/__init__.py's _running_forks_provider renders the
     <running_forks> block a peer-aware turn sees. Two things pinned here:
 
     1. It embeds each peer's `intent` VERBATIM (the original spawn_fork
@@ -556,10 +556,10 @@ class TestRunningForksProvider:
             self.active_run = active_run
 
     def _provider(self, runs, active_run):
-        import TinyCTX.modules.concurrency.__main__ as concurrency_main
-        concurrency_main._runtime = self._FakeRuntime(runs)
+        import TinyCTX.modules.concurrency as concurrency_mod
+        runtime = self._FakeRuntime(runs)
         cycle = self._FakeCycle(active_run)
-        return concurrency_main._running_forks_provider(cycle)
+        return concurrency_mod._running_forks_provider(runtime, cycle)
 
     def test_no_peers_returns_none(self):
         me = Run(id="me", session_key="dm:1", intent="my task", root_node_id="n1")

@@ -31,7 +31,8 @@ from TinyCTX.config import PermissionsConfig
 from TinyCTX.config.__main__ import LLMRoutingConfig, ModelConfig
 from TinyCTX.contracts import Platform
 from TinyCTX.db import ConversationDB
-from TinyCTX.modules.sysops import __main__ as sysops
+from TinyCTX.module_registry import ModuleRegistry
+from TinyCTX.modules import sysops
 from TinyCTX.permissions import Permission
 from TinyCTX.tool_handling import ToolCallHandler
 from TinyCTX.users.store import UserStore
@@ -132,11 +133,14 @@ def _node(db):
 def _register(users, db, config, caller_template="operator", uid="caller"):
     """Sets up runtime + agent with sysops registered, returns (agent, tool_handler, node_id)."""
     runtime = _FakeRuntime(users, db, config)
-    sysops.register_runtime(runtime)
+    registry = ModuleRegistry()
+    registry._register_module_class(sysops.Sysops, runtime, "sysops")  # STARTUP + /model @command
+    instance = registry._module_instances[-1]
+
     caller = _make_user(users, caller_template, uid=uid, username_hint=f"caller{uid}")
     node_id = _node(db)
     agent = _FakeAgent(caller, db, config, node_id)
-    sysops.register_agent(agent)
+    registry._wire_module_instance(instance, agent)  # TURN_START — registers the 6 tools
     # sysops registers tools deferred (always_on=False) — enable them all so
     # execute_tool_call can reach the closures under test.
     for name in list(agent.tool_handler.tools):
@@ -384,10 +388,20 @@ class TestSetActiveModel:
 # seam (docs/PERMISSIONS-PLAN.md §9's whole point: two entry points, one bool)
 # ---------------------------------------------------------------------------
 
+def _async_sink(store: list):
+    """context["send"] must be an async callable (dispatch() awaits it) —
+    list.append is sync, so a bare `sent.append` silently breaks delivery
+    (and, since it appends before the resulting TypeError is raised, used to
+    pass anyway by accident whenever dispatch() swallowed that error)."""
+    async def send(text: str) -> None:
+        store.append(text)
+    return send
+
+
 class TestModelCommand:
     def _setup(self, users, db, config, caller_template="trusted", uid="modelcaller"):
         runtime = _FakeRuntime(users, db, config)
-        sysops.register_runtime(runtime)
+        ModuleRegistry()._register_module_class(sysops.Sysops, runtime, "sysops")
         caller = _make_user(users, caller_template, uid=uid, username_hint=f"mcaller{uid}")
         node_id = _node(db)
         return runtime, caller, node_id
@@ -396,7 +410,7 @@ class TestModelCommand:
     async def test_no_args_shows_status_default(self, users, db, config):
         runtime, caller, node_id = self._setup(users, db, config)
         sent = []
-        context = {"runtime": runtime, "node_id": node_id, "caller": caller, "send": sent.append}
+        context = {"runtime": runtime, "node_id": node_id, "caller": caller, "send": _async_sink(sent)}
         handled = await runtime.commands.dispatch("/model", context)
         assert handled is True
         assert "default" in sent[0]
@@ -406,7 +420,7 @@ class TestModelCommand:
     async def test_list_shows_chat_models_only(self, users, db, config):
         runtime, caller, node_id = self._setup(users, db, config)
         sent = []
-        context = {"runtime": runtime, "node_id": node_id, "caller": caller, "send": sent.append}
+        context = {"runtime": runtime, "node_id": node_id, "caller": caller, "send": _async_sink(sent)}
         await runtime.commands.dispatch("/model list", context)
         text = sent[0]
         assert "main" in text
@@ -417,7 +431,7 @@ class TestModelCommand:
     async def test_set_valid_model_writes_override(self, users, db, config):
         runtime, caller, node_id = self._setup(users, db, config)
         sent = []
-        context = {"runtime": runtime, "node_id": node_id, "caller": caller, "send": sent.append}
+        context = {"runtime": runtime, "node_id": node_id, "caller": caller, "send": _async_sink(sent)}
         await runtime.commands.dispatch("/model alt", context)
         assert "Model override set: alt" in sent[0]
         assert db.get_state(node_id, "model", "") == "alt"
@@ -426,7 +440,7 @@ class TestModelCommand:
     async def test_set_unknown_model_rejected(self, users, db, config):
         runtime, caller, node_id = self._setup(users, db, config)
         sent = []
-        context = {"runtime": runtime, "node_id": node_id, "caller": caller, "send": sent.append}
+        context = {"runtime": runtime, "node_id": node_id, "caller": caller, "send": _async_sink(sent)}
         await runtime.commands.dispatch("/model bogus", context)
         assert "Unknown model" in sent[0]
         assert db.get_state(node_id, "model", "") == ""
@@ -436,7 +450,7 @@ class TestModelCommand:
         runtime, caller, node_id = self._setup(users, db, config)
         db.set_state(node_id, "model", "alt")
         sent = []
-        context = {"runtime": runtime, "node_id": node_id, "caller": caller, "send": sent.append}
+        context = {"runtime": runtime, "node_id": node_id, "caller": caller, "send": _async_sink(sent)}
         await runtime.commands.dispatch("/model clear", context)
         assert "cleared" in sent[0]
         assert db.get_state(node_id, "model", "") == ""
@@ -446,7 +460,7 @@ class TestModelCommand:
         runtime, caller, node_id = self._setup(users, db, config)
         db.set_state(node_id, "model", "alt")
         sent = []
-        context = {"runtime": runtime, "node_id": node_id, "caller": caller, "send": sent.append}
+        context = {"runtime": runtime, "node_id": node_id, "caller": caller, "send": _async_sink(sent)}
         await runtime.commands.dispatch("/model", context)
         assert "override" in sent[0]
         assert "alt" in sent[0]
@@ -455,7 +469,7 @@ class TestModelCommand:
     async def test_denied_without_model_swap(self, users, db, config):
         runtime, caller, node_id = self._setup(users, db, config, caller_template="member")  # lacks MODEL_SWAP
         sent = []
-        context = {"runtime": runtime, "node_id": node_id, "caller": caller, "send": sent.append}
+        context = {"runtime": runtime, "node_id": node_id, "caller": caller, "send": _async_sink(sent)}
         handled = await runtime.commands.dispatch("/model alt", context)
         assert handled is True
         assert "PERMISSION DENIED" in sent[0]
@@ -485,10 +499,10 @@ class TestModelCommand:
         CommandRegistry seam denies before _cmd_model ever runs (it no
         longer has its own caller-resolution fallback)."""
         runtime = _FakeRuntime(users, db, config)
-        sysops.register_runtime(runtime)
+        ModuleRegistry()._register_module_class(sysops.Sysops, runtime, "sysops")
         node_id = _node(db)
         sent = []
-        context = {"runtime": runtime, "node_id": node_id, "send": sent.append}
+        context = {"runtime": runtime, "node_id": node_id, "send": _async_sink(sent)}
         handled = await runtime.commands.dispatch("/model", context)
         assert handled is True
         assert "PERMISSION DENIED" in sent[0]
@@ -500,7 +514,7 @@ class TestModelCommand:
         """Discord-style context: caller_platform + caller_user_id instead of
         an already-resolved caller object."""
         runtime = _FakeRuntime(users, db, config)
-        sysops.register_runtime(runtime)
+        ModuleRegistry()._register_module_class(sysops.Sysops, runtime, "sysops")
         _make_user(users, "trusted", uid="plat1", username_hint="platcaller")
         node_id = _node(db)
         sent = []
@@ -509,7 +523,7 @@ class TestModelCommand:
             "node_id": node_id,
             "caller_platform": "discord",
             "caller_user_id": "plat1",
-            "send": sent.append,
+            "send": _async_sink(sent),
         }
         await runtime.commands.dispatch("/model", context)
         assert "default" in sent[0]
@@ -519,7 +533,7 @@ class TestModelCommand:
         """Discord bridge uses 'cursor' instead of 'node_id'."""
         runtime, caller, node_id = self._setup(users, db, config)
         sent = []
-        context = {"runtime": runtime, "cursor": node_id, "caller": caller, "send": sent.append}
+        context = {"runtime": runtime, "cursor": node_id, "caller": caller, "send": _async_sink(sent)}
         await runtime.commands.dispatch("/model", context)
         assert "default" in sent[0]
 
@@ -527,5 +541,5 @@ class TestModelCommand:
         """assert_permissions_declared() must not trip on /model — it
         declares required_permissions={MODEL_SWAP} explicitly."""
         runtime = _FakeRuntime(users, db, config)
-        sysops.register_runtime(runtime)
+        ModuleRegistry()._register_module_class(sysops.Sysops, runtime, "sysops")
         runtime.commands.assert_permissions_declared()  # must not raise

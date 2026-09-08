@@ -26,8 +26,8 @@ from TinyCTX.context import Context, ROLE_USER, ROLE_ASSISTANT, ROLE_TOOL
 from TinyCTX.contracts import ToolCall, ToolResult
 from TinyCTX.module_registry import ModuleRegistry
 from TinyCTX.modules.ctx_tools import CtxTools
-from TinyCTX.modules.skills import __main__ as skills_mod
-from TinyCTX.modules.skills.__main__ import (
+from TinyCTX.modules import skills as skills_mod
+from TinyCTX.modules.skills import (
     _parse_frontmatter,
     _skill_body,
     _discover,
@@ -97,6 +97,19 @@ def wire_ctx_tools(agent):
     instance = CtxTools()
     instance.config = instance.resolve_settings(None)
     ModuleRegistry()._wire_module_instance(instance, agent)
+
+
+def wire_skills(agent):
+    """Same wiring register_agent(cycle) used to do — skills needs both the
+    STARTUP hook (workspace-relative skill_dirs) and the TURN_START hook
+    (use_skill/collapse_skill_categories need live cycle.tool_handler/
+    cycle.context); `agent` here doubles as both roles, same as elsewhere in
+    this file."""
+    instance = skills_mod.Skills()
+    instance.config = instance.resolve_settings(getattr(agent.config, "extra", None))
+    instance.load(agent)
+    ModuleRegistry()._wire_module_instance(instance, agent)
+    return instance
 
 
 def write_skill(dir_path, name=None, description="", body="Do the thing."):
@@ -269,7 +282,7 @@ class TestUseSkillTool:
     def test_loads_skill_body(self, db, tmp_path, isolate_home):
         write_skill(tmp_path / "skills" / "foo", name="foo", description="d", body="Foo instructions.")
         agent = make_agent(db, tmp_path)
-        skills_mod.register_agent(agent)
+        wire_skills(agent)
         result = agent.tool_handler.tools["use_skill"]("foo")
         assert "Foo instructions." in result
         assert result.startswith("# Skill: foo")
@@ -278,21 +291,21 @@ class TestUseSkillTool:
         write_category(tmp_path / "skills" / "cat1", description="a category")
         write_skill(tmp_path / "skills" / "cat1" / "inner", name="inner", description="d")
         agent = make_agent(db, tmp_path)
-        skills_mod.register_agent(agent)
+        wire_skills(agent)
         result = agent.tool_handler.tools["use_skill"]("cat1")
         assert "inner" in result
 
     def test_case_insensitive_match(self, db, tmp_path, isolate_home):
         write_skill(tmp_path / "skills" / "Foo", name="Foo", description="d", body="body")
         agent = make_agent(db, tmp_path)
-        skills_mod.register_agent(agent)
+        wire_skills(agent)
         result = agent.tool_handler.tools["use_skill"]("foo")
         assert "body" in result
 
     def test_not_found_returns_error_listing(self, db, tmp_path, isolate_home):
         write_skill(tmp_path / "skills" / "known", name="known", description="d")
         agent = make_agent(db, tmp_path)
-        skills_mod.register_agent(agent)
+        wire_skills(agent)
         result = agent.tool_handler.tools["use_skill"]("nonexistent")
         assert "not found" in result
         assert "known" in result
@@ -300,7 +313,7 @@ class TestUseSkillTool:
     def test_skill_index_injected_into_system_prompt(self, db, tmp_path, isolate_home):
         write_skill(tmp_path / "skills" / "foo", name="foo", description="does foo")
         agent = make_agent(db, tmp_path)
-        skills_mod.register_agent(agent)
+        wire_skills(agent)
         messages, _ = agent.context.assemble()
         system_msg = next(m for m in messages if m["role"] == "system")
         assert "foo" in system_msg["content"]
@@ -316,7 +329,7 @@ class TestCategoryExpansionPersistence:
         write_category(tmp_path / "skills" / "cat1", description="d")
         write_skill(tmp_path / "skills" / "cat1" / "inner", name="inner", description="d")
         agent = make_agent(db, tmp_path)
-        skills_mod.register_agent(agent)
+        wire_skills(agent)
 
         agent.tool_handler.tools["use_skill"]("cat1")  # expand once
         messages, _ = agent.context.assemble()
@@ -328,7 +341,7 @@ class TestCategoryExpansionPersistence:
         write_category(tmp_path / "skills" / "cat1", description="d")
         write_skill(tmp_path / "skills" / "cat1" / "inner", name="inner", description="d")
         agent = make_agent(db, tmp_path, extra={"skills": {"ephemeral_categories": False}})
-        skills_mod.register_agent(agent)
+        wire_skills(agent)
 
         agent.tool_handler.tools["use_skill"]("cat1")
         messages, _ = agent.context.assemble()
@@ -339,7 +352,7 @@ class TestCategoryExpansionPersistence:
         write_category(tmp_path / "skills" / "cat1", description="d")
         write_skill(tmp_path / "skills" / "cat1" / "inner", name="inner", description="d")
         agent = make_agent(db, tmp_path, extra={"skills": {"ephemeral_categories": False}})
-        skills_mod.register_agent(agent)
+        wire_skills(agent)
 
         agent.tool_handler.tools["use_skill"]("cat1")
         result = agent.tool_handler.tools["collapse_skill_categories"](["cat1"])
@@ -352,7 +365,7 @@ class TestCategoryExpansionPersistence:
     def test_collapse_no_op_when_ephemeral(self, db, tmp_path, isolate_home):
         write_category(tmp_path / "skills" / "cat1", description="d")
         agent = make_agent(db, tmp_path)  # ephemeral=True (default)
-        skills_mod.register_agent(agent)
+        wire_skills(agent)
         result = agent.tool_handler.tools["collapse_skill_categories"](["cat1"])
         assert "ephemeral" in result.lower()
 
@@ -360,7 +373,7 @@ class TestCategoryExpansionPersistence:
         write_category(tmp_path / "skills" / "cat1", description="d")
         write_category(tmp_path / "skills" / "cat2", description="d")
         agent = make_agent(db, tmp_path, extra={"skills": {"ephemeral_categories": False}})
-        skills_mod.register_agent(agent)
+        wire_skills(agent)
         agent.tool_handler.tools["use_skill"]("cat1")
         agent.tool_handler.tools["use_skill"]("cat2")
         result = agent.tool_handler.tools["collapse_skill_categories"](["*"])
@@ -388,7 +401,7 @@ class TestSkillDroppedReminder:
         write_skill(tmp_path / "skills" / "foo", name="foo", description="d", body="body")
         agent = make_agent(db, tmp_path)
         wire_ctx_tools(agent)
-        skills_mod.register_agent(agent)
+        wire_skills(agent)
 
         tc = ToolCall.make("use_skill", {"name": "foo"})
         ctx = agent.context
@@ -402,7 +415,7 @@ class TestSkillDroppedReminder:
         write_skill(tmp_path / "skills" / "foo", name="foo", description="d", body="body")
         agent = make_agent(db, tmp_path)
         wire_ctx_tools(agent)
-        skills_mod.register_agent(agent)
+        wire_skills(agent)
         ctx = agent.context
 
         tc = ToolCall.make("use_skill", {"name": "foo"})

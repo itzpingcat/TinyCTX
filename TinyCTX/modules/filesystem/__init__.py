@@ -1,14 +1,710 @@
-EXTENSION_META = {
-    "name":    "filesystem",
-    "version": "3.1",
-    "description": (
-        "Core filesystem tools: view, write_file, edit_file, grep, glob_search. "
-        "grep wraps ripgrep (with Python fallback). glob_search finds files by pattern. "
-        "view renders images as vision blocks. "
-        "Shell execution has moved to the shell module."
-    ),
-    "default_config": {
-        "page_size":  2000,   # lines per view_range chunk
-        "cache_size": 128,    # max cached file conversions
-    },
+"""
+modules/filesystem
+
+Registers filesystem tools (view, write_file, edit_file, grep, glob_search)
+into each cycle's tool_handler.
+
+Shell execution moved to modules/shell.
+
+file_read_state (read-before-write + staleness + unchanged detection) is
+scoped to one AgentCycle's lifetime, matching today's actual behavior — a
+fresh AgentCycle is constructed per turn (runtime.py never reuses one across
+turns), so this dict never actually survives across turns despite reading
+like session-lifetime state. Preserved exactly as-is rather than "fixed" —
+that's a separate, bigger behavior change this migration doesn't make.
+Because it's per-cycle, view/write_file/edit_file are wired imperatively
+from @hook(HookType.TURN_START) (same reason as modules/present) rather than
+@tool; grep/glob_search don't touch it and are also wired there purely for
+symmetry with the other three (all five share `resolve()`/workspace/
+read_only_paths from the same closure).
+"""
+from __future__ import annotations
+
+import base64
+import fnmatch
+import logging
+import mimetypes
+import os
+import re
+import shutil
+import subprocess
+from pathlib import Path
+
+from TinyCTX.contracts import IMAGE_BLOCK_PREFIX
+from TinyCTX.decorators import hook
+from TinyCTX.hooks import HookType
+from TinyCTX.module import Module
+from TinyCTX.permissions import Permission
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Quote normalization — LLMs output straight quotes but files may have curly
+# ones. Normalizing lets edit_file match even when quote styles differ.
+# ---------------------------------------------------------------------------
+
+_CURLY_QUOTE_MAP = str.maketrans({
+    "‘": "'",   # left single curly  → straight
+    "’": "'",   # right single curly → straight
+    "“": '"',   # left double curly  → straight
+    "”": '"',   # right double curly → straight
+})
+
+
+def _normalize_quotes(s: str) -> str:
+    """Convert curly quotes to straight quotes."""
+    return s.translate(_CURLY_QUOTE_MAP)
+
+
+def _find_actual_string(file_content: str, search_string: str) -> str | None:
+    """Find the actual string in the file that matches search_string,
+    accounting for curly-vs-straight quote differences.
+
+    Returns the actual substring from file_content, or None if not found.
+    """
+    # Fast path — exact match
+    if search_string in file_content:
+        return search_string
+
+    # Try with normalized quotes
+    norm_search = _normalize_quotes(search_string)
+    norm_file = _normalize_quotes(file_content)
+    idx = norm_file.find(norm_search)
+    if idx != -1:
+        # Return the original (curly-quoted) slice from the file
+        return file_content[idx : idx + len(search_string)]
+
+    return None
+
+
+def _strip_trailing_ws(s: str) -> str:
+    """Strip trailing whitespace from each line. Prevents phantom diffs from
+    LLMs that add/drop trailing spaces."""
+    return "\n".join(line.rstrip() for line in s.split("\n"))
+
+
+# Image MIME types we can pass to a vision model as an image_url block.
+_VISION_MIMES: frozenset[str] = frozenset({
+    "image/jpeg", "image/png", "image/gif", "image/webp",
+})
+
+# Extension fallback map for cases where mimetypes guesses wrong.
+_EXT_TO_MIME: dict[str, str] = {
+    ".jpg":  "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png":  "image/png",
+    ".gif":  "image/gif",
+    ".webp": "image/webp",
 }
+
+
+def _image_mime(path: Path) -> str | None:
+    """Return the vision-compatible MIME type for a file, or None if not an image."""
+    ext = path.suffix.lower()
+    if ext in _EXT_TO_MIME:
+        return _EXT_TO_MIME[ext]
+    mime, _ = mimetypes.guess_type(str(path))
+    if mime and mime in _VISION_MIMES:
+        return mime
+    return None
+
+
+# Extensions whose raw bytes need text extraction before they can be viewed
+# as text. Maps extension -> attachments.py function name (looked up via
+# getattr so pdfplumber/python-docx/rapidocr stay fully optional -- view()
+# only imports TinyCTX.utils.attachments lazily, inside the branch that needs it).
+_DOC_EXTRACTORS: dict[str, str] = {
+    ".pdf":  "extract_pdf_text",
+    ".docx": "extract_docx_text",
+}
+
+# Directories always excluded from grep/glob results (VCS metadata).
+_VCS_DIRS = {".git", ".svn", ".hg", ".bzr", ".jj", ".sl"}
+
+_GREP_DEFAULT_LIMIT = 200
+_GLOB_DEFAULT_LIMIT = 100
+
+
+def _run_rg(
+    pattern: str,
+    search_path: Path,
+    *,
+    case_insensitive: bool,
+    include_glob: str | None,
+    file_type: str | None,
+    context_lines: int,
+    output_mode: str,
+    limit: int,
+) -> str:
+    """Run ripgrep and return raw stdout."""
+    args = ["rg", "--hidden", "--max-columns", "500"]
+    for d in _VCS_DIRS:
+        args += ["--glob", f"!{d}"]
+    if case_insensitive:
+        args.append("-i")
+    if include_glob:
+        for g in include_glob.split(","):
+            g = g.strip()
+            if g:
+                args += ["--glob", g]
+    if file_type:
+        args += ["--type", file_type]
+    if output_mode == "files":
+        args.append("-l")
+    elif output_mode == "count":
+        args.append("-c")
+    else:
+        args.append("-n")
+        if context_lines > 0:
+            args += ["-C", str(context_lines)]
+    if pattern.startswith("-"):
+        args += ["-e", pattern]
+    else:
+        args.append(pattern)
+    args.append(str(search_path))
+    try:
+        result = subprocess.run(
+            args, capture_output=True, text=True, timeout=30,
+            encoding="utf-8", errors="replace",
+        )
+        return result.stdout.rstrip()
+    except FileNotFoundError:
+        return "Error: ripgrep not found"
+    except subprocess.TimeoutExpired:
+        return "Error: grep timed out after 30s"
+
+
+def _run_py_grep(
+    pattern: str,
+    search_path: Path,
+    *,
+    case_insensitive: bool,
+    include_glob: str | None,
+    context_lines: int,
+    output_mode: str,
+    limit: int,
+) -> str:
+    """Pure-Python fallback when rg is not installed."""
+    flags = re.IGNORECASE if case_insensitive else 0
+    try:
+        regex = re.compile(pattern, flags)
+    except re.error as exc:
+        return f"Error: invalid regex — {exc}"
+
+    globs = []
+    if include_glob:
+        globs = [g.strip() for g in include_glob.split(",") if g.strip()]
+
+    matches: list[str] = []
+    file_hits: list[str] = []
+    count_map: dict[str, int] = {}
+
+    for root, dirs, files in os.walk(search_path):
+        # Prune VCS dirs
+        dirs[:] = [d for d in dirs if d not in _VCS_DIRS]
+        for fname in files:
+            if globs and not any(fnmatch.fnmatch(fname, g) for g in globs):
+                continue
+            fpath = Path(root) / fname
+            try:
+                text = fpath.read_text(encoding="utf-8", errors="replace")
+            except (OSError, UnicodeDecodeError):
+                continue
+            lines = text.splitlines()
+            hit_indices = [i for i, ln in enumerate(lines) if regex.search(ln)]
+            if not hit_indices:
+                continue
+            rel = fpath.relative_to(search_path)
+            if output_mode == "files":
+                file_hits.append(str(rel))
+                if len(file_hits) >= limit:
+                    break
+            elif output_mode == "count":
+                count_map[str(rel)] = len(hit_indices)
+            else:
+                for idx in hit_indices:
+                    start = max(0, idx - context_lines)
+                    end = min(len(lines), idx + context_lines + 1)
+                    for li in range(start, end):
+                        matches.append(f"{rel}:{li + 1}:{lines[li]}")
+                    if len(matches) >= limit:
+                        break
+                if len(matches) >= limit:
+                    break
+        else:
+            continue
+        break  # double-break on limit
+
+    if output_mode == "files":
+        return "\n".join(file_hits) if file_hits else ""
+    elif output_mode == "count":
+        return "\n".join(f"{f}:{c}" for f, c in count_map.items()) if count_map else ""
+    return "\n".join(matches) if matches else ""
+
+
+class Filesystem(Module):
+    """Core filesystem tools: view, write_file, edit_file, grep, glob_search."""
+
+    settings = {
+        "page_size":  {"default": 2000, "type": "int", "description": "Lines per view_range chunk."},
+        "cache_size": {"default": 128, "type": "int", "description": "Max cached file conversions."},
+        "read_only_paths": {
+            "default": [],
+            "type": "list",
+            "description": "Additional directories filesystem tools may VIEW (view/grep/glob_search) "
+                            "but never write to (write_file/edit_file). Nothing outside workspace/ is "
+                            "reachable at all unless listed here.",
+        },
+    }
+
+    @hook(HookType.STARTUP)
+    def load(self, runtime) -> None:
+        workspace = Path(runtime.config.workspace.path).expanduser().resolve()
+        workspace.mkdir(parents=True, exist_ok=True)
+        self._workspace = workspace
+        self._read_only_paths: list[Path] = [
+            Path(p).expanduser().resolve() for p in self.config["read_only_paths"]
+        ]
+        self._has_rg = shutil.which("rg") is not None
+
+    @hook(HookType.TURN_START)
+    def wire_tools(self, cycle) -> None:
+        workspace = self._workspace
+        read_only_paths = self._read_only_paths
+        has_rg = self._has_rg
+
+        # ------------------------------------------------------------------
+        # File-state tracking (read-before-write + staleness + unchanged detection)
+        # ------------------------------------------------------------------
+        # Maps absolute file path → dict with:
+        #   mtime:      float — mtime at last read/write
+        #   view_range: tuple | None — (start, end) from last view(), None = full file
+        #   line_count: int — total lines at last full read
+        # Fresh per AgentCycle (see this module's docstring).
+        file_read_state: dict[str, dict] = {}
+
+        def _record_read(p: Path, *, view_range: tuple | None = None, line_count: int = 0) -> None:
+            """Record that we just read a file — store its current mtime and read params."""
+            try:
+                file_read_state[str(p)] = {
+                    "mtime": p.stat().st_mtime,
+                    "view_range": view_range,
+                    "line_count": line_count,
+                }
+            except OSError:
+                pass
+
+        def _check_staleness(p: Path) -> str | None:
+            """Check file is safe to write. Returns an error string or None if OK."""
+            abs_key = str(p)
+            if not p.exists():
+                # New file — no prior read needed.
+                return None
+            if abs_key not in file_read_state:
+                return (
+                    f"Error: {p.name} has not been read yet. "
+                    "Use view() to read the file before writing to it."
+                )
+            try:
+                current_mtime = p.stat().st_mtime
+            except OSError:
+                return None  # file vanished — let the write handle it
+            recorded_mtime = file_read_state[abs_key]["mtime"]
+            if current_mtime > recorded_mtime:
+                return (
+                    f"Error: {p.name} has been modified since it was last read "
+                    "(possibly by a linter, formatter, or the user). "
+                    "Read it again with view() before editing."
+                )
+            return None
+
+        _WRITTEN_SENTINEL = object()  # distinguishes "written" from "read with no range"
+
+        def _update_after_write(p: Path) -> None:
+            """Update tracked mtime after a successful write. Uses a sentinel
+            view_range so a subsequent view() won't return the unchanged stub."""
+            try:
+                file_read_state[str(p)] = {
+                    "mtime": p.stat().st_mtime,
+                    "view_range": _WRITTEN_SENTINEL,  # never matches a real read
+                    "line_count": 0,
+                }
+            except OSError:
+                pass
+
+        def _read_only_root_for(candidate: Path) -> Path | None:
+            """Return the read_only_paths entry containing candidate, or None."""
+            for ro in read_only_paths:
+                try:
+                    candidate.relative_to(ro)
+                    return ro
+                except ValueError:
+                    continue
+            return None
+
+        def resolve(raw: str, *, for_write: bool = False) -> Path:
+            p = Path(raw)
+            # Resolve to an absolute path, then enforce containment.
+            # workspace is always read+write. read_only_paths entries are
+            # readable (view/grep/glob) but never writable (write_file/edit_file).
+            # Nothing else is reachable.
+            candidate = (workspace / p).resolve() if not p.is_absolute() else p.resolve()
+            try:
+                candidate.relative_to(workspace)
+                return candidate
+            except ValueError:
+                pass
+            ro_root = _read_only_root_for(candidate)
+            if ro_root is not None:
+                if for_write:
+                    raise ValueError(
+                        f"Path is read-only: {raw} (under {ro_root} — listed in "
+                        "filesystem.read_only_paths, which grants view access only)"
+                    )
+                return candidate
+            raise ValueError(f"Path escapes allowed directories: {raw}")
+
+        def view(path: str, view_range: list | None = None) -> str:
+            """Read a file with line numbers, list a directory, or display an image.
+
+            For image files (jpg, png, gif, webp) the raw image bytes are returned
+            as a vision content block so the model can see the image directly.
+            For PDF/DOCX files, extracted text is returned (paginated like any
+            other text file). For all other binary files an error is returned.
+
+            Args:
+                path: File or directory path.
+                view_range: [start_line, end_line]. Use -1 for end_line to read to EOF.
+            """
+            p = resolve(path)
+            if not p.exists():
+                return f"Error: not found: {p}"
+            if p.is_dir():
+                entries = sorted(p.iterdir(), key=lambda e: (e.is_file(), e.name))
+                if not entries:
+                    return f"Empty directory: {p}"
+                return f"{p}\n" + "\n".join(f"  {e.name}{'/' if e.is_dir() else ''}" for e in entries)
+
+            # --- image handling ---
+            mime = _image_mime(p)
+            if mime:
+                try:
+                    raw = p.read_bytes()
+                except OSError as exc:
+                    return f"Error: could not read {p}: {exc}"
+                b64 = base64.b64encode(raw).decode()
+                # Return a sentinel that agent._execute_tool knows how to unwrap.
+                return f"{IMAGE_BLOCK_PREFIX}{mime};{b64}"
+
+            # Normalize view_range early so both the document and text paths can use it.
+            parsed_range: tuple | None = None
+            if view_range:
+                try:
+                    if isinstance(view_range, str):
+                        range_parts = []
+                        for chunk in view_range.split(','):
+                            chunk = chunk.strip()
+                            if '-' in chunk:
+                                s, e = chunk.split('-', 1)
+                                range_parts.extend([s.strip(), e.strip()])
+                            else:
+                                range_parts.append(chunk)
+                        view_range = range_parts
+                    parsed_range = (int(view_range[0]), int(view_range[1]))
+                except (ValueError, IndexError):
+                    return "Error: view_range must be [start, end] or 'start,end' integers"
+
+            # --- document handling (PDF / DOCX text extraction) ---
+            ext = p.suffix.lower()
+            if ext in _DOC_EXTRACTORS:
+                try:
+                    raw_doc = p.read_bytes()
+                except OSError as exc:
+                    return f"Error: could not read {p}: {exc}"
+                from TinyCTX.utils import attachments
+                extracted = getattr(attachments, _DOC_EXTRACTORS[ext])(raw_doc)
+                if extracted is None:
+                    return (
+                        f"Error: could not extract text from {p.name} -- "
+                        "pdfplumber/python-docx not installed, or extraction failed"
+                    )
+                lines = extracted.splitlines()
+                total = len(lines)
+                if parsed_range:
+                    start = parsed_range[0] - 1
+                    end = parsed_range[1] if parsed_range[1] != -1 else total
+                    lines = lines[start:end]
+                return f"{p} | {total} lines, extracted text\n" + "\n".join(
+                    f"{i:>6}\t{l}" for i, l in enumerate(lines, 1)
+                )
+
+            # --- text handling ---
+            try:
+                fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW)
+                try:
+                    text = os.fdopen(fd, "r", encoding="utf-8").read()
+                except UnicodeDecodeError:
+                    os.close(fd)
+                    return "Error: binary file, cannot read as text"
+            except OSError as exc:
+                if exc.errno == 40:  # ELOOP — final component is a symlink
+                    return f"Error: {p.name} is a symlink — not followed"
+                return f"Error: could not open {p}: {exc}"
+
+            lines = text.splitlines()
+            total = len(lines)
+
+            # Track that we read this file (for staleness detection).
+            _record_read(p, view_range=parsed_range, line_count=total)
+
+            if parsed_range:
+                start = parsed_range[0] - 1
+                end = parsed_range[1] if parsed_range[1] != -1 else total
+                lines = lines[start:end]
+
+            return f"{p} | {total} lines\n" + "\n".join(
+                f"{i:>6}\t{l}" for i, l in enumerate(lines, 1)
+            )
+
+        def write_file(path: str, content: str = "", mode: str = "overwrite") -> str:
+            """Write content to a file. Creates the file and any missing parent directories if they don't exist.
+            Existing files must be read with view() first (prevents blind overwrites).
+
+            Args:
+                path: Path to the file.
+                content: Content to write. Omit or pass empty string to create/truncate to empty.
+                mode: How to write the content.
+                      'append'    — add content after existing content.
+                      'prepend'   — insert content before existing content.
+                      'overwrite' — replace the entire file with content (default).
+            """
+            p = resolve(path, for_write=True)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            existed = p.exists()
+
+            # Staleness check — skip for new files.
+            if existed:
+                err = _check_staleness(p)
+                if err:
+                    return err
+
+            if mode == "overwrite" or not existed:
+                fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o666)
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(content)
+                action = "truncated" if existed and content == "" else ("overwrote" if existed else "created")
+            elif mode == "prepend":
+                fd = os.open(p, os.O_RDWR | os.O_NOFOLLOW)
+                with os.fdopen(fd, "r+", encoding="utf-8") as f:
+                    existing = f.read()
+                    f.seek(0)
+                    f.write(content + existing)
+                    f.truncate()
+                action = "prepended"
+            else:  # append
+                fd = os.open(p, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW)
+                with os.fdopen(fd, "a", encoding="utf-8") as f:
+                    f.write(content)
+                action = "appended"
+
+            _update_after_write(p)
+            return f"{action.capitalize()} {p} ({len(content)} chars)"
+
+        def edit_file(path: str, old_str: str, new_str: str = "", replace_all: bool = False) -> str:
+            """Replace a string in an existing file. By default old_str must appear exactly once.
+            The file must have been read with view() first.
+
+            Args:
+                path: Path to the file.
+                old_str: Exact string to replace. Must be unique unless replace_all is true.
+                new_str: Replacement string. Leave empty to delete old_str.
+                replace_all: If true, replace every occurrence instead of requiring uniqueness.
+            """
+            p = resolve(path, for_write=True)
+            if not p.exists():
+                return f"Error: file not found: {p}"
+
+            # Staleness check — edit_file always targets existing files.
+            err = _check_staleness(p)
+            if err:
+                return err
+
+            fd = os.open(p, os.O_RDWR | os.O_NOFOLLOW)
+            try:
+                with os.fdopen(fd, "r+", encoding="utf-8") as f:
+                    original = f.read()
+            except OSError as exc:
+                if exc.errno == 40:
+                    return f"Error: {p.name} is a symlink — not followed"
+                return f"Error: could not open {p}: {exc}"
+
+            # Quote normalization — match even if file uses curly quotes and
+            # the LLM sent straight quotes (or vice versa).
+            actual_old = _find_actual_string(original, old_str)
+            if actual_old is None:
+                return f"Error: old_str not found in {p}"
+
+            # Strip trailing whitespace from new_str to prevent phantom diffs.
+            clean_new = _strip_trailing_ws(new_str)
+
+            count = original.count(actual_old)
+            if count > 1 and not replace_all:
+                return f"Error: old_str appears {count} times — add more context to make it unique, or set replace_all=true"
+            if replace_all:
+                fd = os.open(p, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(original.replace(actual_old, clean_new))
+                _update_after_write(p)
+                return f"Replaced {count} occurrences in {p}"
+            fd = os.open(p, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(original.replace(actual_old, clean_new, 1))
+            _update_after_write(p)
+            return f"Replaced 1 occurrence in {p}"
+
+        def grep(
+            pattern: str,
+            path: str = "",
+            include: str = "",
+            file_type: str = "",
+            case_insensitive: bool = False,
+            context_lines: int = 0,
+            output_mode: str = "files",
+            limit: int = 0,
+        ) -> str:
+            """Search file contents using regex. Uses ripgrep when available, falls back to Python.
+
+            Args:
+                pattern: Regular expression to search for.
+                path: File or directory to search in. Defaults to workspace root.
+                include: Glob pattern to filter files (e.g. '*.py', '*.{ts,tsx}'). Comma-separated for multiple.
+                file_type: Ripgrep file type filter (e.g. 'py', 'js', 'rust'). Ignored in Python fallback.
+                case_insensitive: If true, ignore case when matching.
+                context_lines: Number of lines to show before and after each match (content mode only).
+                output_mode: 'files' returns matching file paths, 'content' returns matching lines with context, 'count' returns match counts per file.
+                limit: Max results to return. 0 uses the default (200).
+            """
+            search_path = resolve(path) if path else workspace
+            if not search_path.exists():
+                return f"Error: path not found: {search_path}"
+            effective_limit = limit if limit > 0 else _GREP_DEFAULT_LIMIT
+
+            if has_rg:
+                raw = _run_rg(
+                    pattern, search_path,
+                    case_insensitive=case_insensitive,
+                    include_glob=include or None,
+                    file_type=file_type or None,
+                    context_lines=context_lines,
+                    output_mode=output_mode,
+                    limit=effective_limit,
+                )
+            else:
+                raw = _run_py_grep(
+                    pattern, search_path,
+                    case_insensitive=case_insensitive,
+                    include_glob=include or None,
+                    context_lines=context_lines,
+                    output_mode=output_mode,
+                    limit=effective_limit,
+                )
+
+            if not raw:
+                return "No matches"
+
+            # Apply limit (rg doesn't have a built-in result cap)
+            lines = raw.splitlines()
+            truncated = len(lines) > effective_limit
+            lines = lines[:effective_limit]
+
+            # Relativize absolute paths to save tokens
+            ws_str = str(workspace)
+            rel_lines = []
+            for line in lines:
+                if line.startswith(ws_str):
+                    line = line[len(ws_str):].lstrip(os.sep).lstrip("/")
+                rel_lines.append(line)
+
+            result = "\n".join(rel_lines)
+            if output_mode == "files":
+                n = len(rel_lines)
+                header = f"{n} file{'s' if n != 1 else ''} matched"
+                if truncated:
+                    header += f" (truncated to {effective_limit}, use limit= for more)"
+                return f"{header}\n{result}"
+            elif output_mode == "count":
+                total = 0
+                for line in rel_lines:
+                    parts = line.rsplit(":", 1)
+                    if len(parts) == 2 and parts[1].isdigit():
+                        total += int(parts[1])
+                return f"{total} matches across {len(rel_lines)} files\n{result}"
+            else:
+                if truncated:
+                    result += f"\nTruncated to {effective_limit} lines"
+                return result
+
+        def glob_search(
+            pattern: str,
+            path: str = "",
+            limit: int = 0,
+        ) -> str:
+            """Find files by name using glob patterns. Returns paths sorted by modification time (newest first).
+
+            Args:
+                pattern: Glob pattern to match (e.g. '**/*.py', 'src/**/*.ts', '*.md').
+                path: Directory to search in. Defaults to workspace root.
+                limit: Max files to return. 0 uses the default (100).
+            """
+            search_path = resolve(path) if path else workspace
+            if not search_path.exists():
+                return f"Error: path not found: {search_path}"
+            effective_limit = limit if limit > 0 else _GLOB_DEFAULT_LIMIT
+
+            try:
+                matches = list(search_path.glob(pattern))
+            except ValueError as exc:
+                return f"Error: invalid glob pattern — {exc}"
+
+            # Filter out VCS directories
+            matches = [
+                m for m in matches
+                if not any(part in _VCS_DIRS for part in m.parts)
+            ]
+
+            # Sort by modification time (newest first), with name as tiebreaker
+            def _sort_key(p: Path):
+                try:
+                    return (-p.stat().st_mtime, str(p))
+                except OSError:
+                    return (0, str(p))
+            matches.sort(key=_sort_key)
+
+            truncated = len(matches) > effective_limit
+            matches = matches[:effective_limit]
+
+            if not matches:
+                return "No files found"
+
+            # Relativize paths
+            rel_paths = []
+            for m in matches:
+                try:
+                    rel_paths.append(str(m.relative_to(workspace)))
+                except ValueError:
+                    rel_paths.append(str(m))
+
+            header = f"{len(rel_paths)} file{'s' if len(rel_paths) != 1 else ''} found"
+            if truncated:
+                header += f" (truncated to {effective_limit}, use limit= for more)"
+            return f"{header}\n" + "\n".join(rel_paths)
+
+        # docs/PERMISSIONS-PLAN.md §4 — reference case for static required_permissions.
+        # edit_file declares BOTH bools even though it used to sit at the same
+        # level as write_file: an edit reads existing content, so a caller who
+        # may write but not read shouldn't be able to launder a read through it.
+        cycle.tool_handler.register_tool(view,        always_on=True, required_permissions={Permission.FILE_READ})
+        cycle.tool_handler.register_tool(write_file,  always_on=True, required_permissions={Permission.FILE_WRITE})
+        cycle.tool_handler.register_tool(edit_file,   always_on=True, required_permissions={Permission.FILE_READ, Permission.FILE_WRITE})
+        cycle.tool_handler.register_tool(grep,        always_on=False, required_permissions={Permission.FILE_READ})
+        cycle.tool_handler.register_tool(glob_search, always_on=False, required_permissions={Permission.FILE_READ})

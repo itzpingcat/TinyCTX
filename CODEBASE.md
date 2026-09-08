@@ -194,13 +194,14 @@ Permission levels 0–100. `_python_type_to_json_schema` (schema generation from
 
 ## Module System (`module_registry.py`)
 
-Modules live under `TinyCTX/modules/<name>/`. Auto-discovered if they have `__main__.py` or `__init__.py`. A module exposes either shape (per-module exclusive — `_register_one` picks whichever it finds):
+Modules live under `TinyCTX/modules/<name>/`. Auto-discovered if they have `__main__.py` or `__init__.py`. Every module is a `Module` subclass now (`TinyCTX/module.py` + `TinyCTX/decorators.py`, MODULES-PLAN-P1.md — **P3 complete**): one class with `@tool`/`@hook`/`@command`/`@prompt`-tagged methods, instantiated once (process lifetime) and walked by the loader — no registration calls in module code. `settings` is a declarative schema merged via `resolve_settings()` onto `self.config`, replacing the old per-module `EXTENSION_META` + eight-line config-merge boilerplate. The legacy function-pair shape (`register_runtime(runtime)`/`register_agent(cycle)`) is gone — a module lacking a `Module` subclass is skipped with a warning, not treated as function-based. `for-contributors/module_template/__init__.py` is the one annotated reference file for writing a new module.
 
-- **Function-based (legacy):** `register_runtime(runtime)` — called once at startup; `register_agent(cycle)` — called per `AgentCycle`.
-- **`Module`-class-based (MODULES-PLAN-P1.md P2; `TinyCTX/module.py` + `TinyCTX/decorators.py`):** one `Module` subclass with `@tool`/`@hook`/`@command`/`@prompt`-tagged methods. `settings` is a declarative schema merged via `resolve_settings()` onto `self.config` — no more per-module `EXTENSION_META`/config-merge boilerplate. `ctx_tools`, `equipment_manifest`, and `shell` are migrated (P2's three proving targets — plan called for a fourth, `todo`, but no such module exists in this codebase); the remaining ~17 are still function-based (P3, not started).
-  - `@hook` types actually wired today: `PRE_ASSEMBLE`/`PRE_ASSEMBLE_ASYNC`/`FILTER_TURN`/`TRANSFORM_TURN`/`POST_ASSEMBLE`/`POST_COMPLETION` → `cycle.context.register_hook`; `POST_TURN` → `cycle.post_turn_hooks.append`; `STARTUP` → called once with `runtime` at module-class load time (`_register_module_class`); `TURN_START` → called once with `cycle` at per-cycle wiring time (`_wire_module_instance`) — no dedicated emitter exists yet, this is the closest per-cycle hook point. `STREAM_TEXT`/`STREAM_START`/`STREAM_END` (need stream-pass `Scratch`, not built) and `SHUTDOWN`/`BACKGROUND`/`DELIVER`/`INBOUND` (runtime-scoped or no consumer yet) log a warning and register nowhere if `@hook`'d — see `module_registry.py::_wire_module_instance`.
-  - `Context.assemble()` creates one `hooks.Scratch()` per call, passed to any `PRE_ASSEMBLE`/`FILTER_TURN`/`TRANSFORM_TURN`/`POST_ASSEMBLE`/prompt-provider handler that declares a trailing `scratch` parameter (`hooks.handler_wants_scratch`); dropped when `assemble()` returns. This is how a module shares data across its own hook stages without closures (see `ctx_tools`' dedup/trim, `equipment_manifest`'s footer).
-  - `Context.db` is a public property (`ConversationDB`) so a `ctx`-only hook/prompt body can walk ancestors without needing `agent`/`cycle`.
+- `@hook` types actually wired: `PRE_ASSEMBLE`/`PRE_ASSEMBLE_ASYNC`/`FILTER_TURN`/`TRANSFORM_TURN`/`POST_ASSEMBLE`/`POST_COMPLETION` → `cycle.context.register_hook`; `POST_TURN` → `cycle.post_turn_hooks.append`; `STARTUP` → called once with `runtime` at module-class load time (`_register_module_class`); `TURN_START` → called once with `cycle` at per-cycle wiring time (`_wire_module_instance`) — no dedicated emitter exists yet, this is the closest per-cycle hook point, and it's also where a `@tool`/hook needing *live* cycle state (`cycle.caller`, `cycle.outbound_events`, `cycle.tool_handler.enable()`, ...) gets registered imperatively, since a `@tool` method itself receives only its own declared arguments — see `modules/present`'s docstring. `STREAM_TEXT`/`STREAM_START`/`STREAM_END` (need stream-pass `Scratch`, not built) and `SHUTDOWN`/`BACKGROUND`/`DELIVER`/`INBOUND` (runtime-scoped or no consumer yet) log a warning and register nowhere if `@hook`'d.
+- `Context.assemble()` creates one `hooks.Scratch()` per call, passed to any `PRE_ASSEMBLE`/`FILTER_TURN`/`TRANSFORM_TURN`/`POST_ASSEMBLE`/prompt-provider handler that declares a trailing `scratch` parameter (`hooks.handler_wants_scratch`); dropped when `assemble()` returns — this is how a module shares data across its own hook stages within one assemble pass without closures (see `ctx_tools`' dedup/trim). `ctx.state` is the coarser, longer-lived sibling — persists across every `assemble()` call within one `AgentCycle` (used by `output_parser`'s nudge budget, `memory`'s `memory_block` cache).
+- `Context.db` is a public property (`ConversationDB`) so a `ctx`-only hook/prompt body can walk ancestors without needing `agent`/`cycle` (e.g. `equipment_manifest`, `skills`).
+- `ToolError` (`TinyCTX.module.ToolError`) is caught by `ToolCallHandler.execute_tool_call` and rendered as a normal successful call (`success: True`, the message as the result text) — what a `@tool` raises for an expected failure instead of hand-writing `return "Error: ..."`. Not yet retrofitted onto every existing tool's ad-hoc error string (mechanical, deferred).
+- `CommandRegistry.dispatch()` delivers a handler's non-None return value itself via `context["send"]`/`["console"]` (`_deliver`) — a `@command`/inline handler returns its output instead of calling `send()` directly. Converted: `sysops`'s `/model`, `memory`'s `/memory librarian`+`/memory stats`, and `runtime.py`'s inline `/user info`/`/user rename`/`/user modify_permissions` (not `@command`-able since `Runtime` isn't a `Module`, but same return-value convention).
+- `memory`'s `memory_block` prompt race (a detached background task with no ordering guarantee against `assemble()`) is fixed, not just ported — see the `memory` entry below.
 
 ---
 
@@ -260,18 +261,29 @@ aiohttp HTTP server: `/v1/chat` (OpenAI-compat SSE), `/v1/health`, `api_key` aut
 
 ## Notable Modules
 
-### `system_prompt`
-Injects SOUL.md, AGENTS.md, TOOLS.md into the system prompt via `register_prompt` providers.
+### `system_prompt` (migrated to `Module`/decorators — MODULES-PLAN-P1.md P3)
+`SystemPrompt(Module)` — injects SOUL.md, AGENTS.md, TOOLS.md via three `@prompt` methods, backed by providers built once in `@hook(HookType.STARTUP)`. Overrides `resolve_settings()` to deep-merge each `{file, priority}` setting instead of the base's whole-value replace (a partial override, e.g. just `soul.priority`, must not drop `soul.file`).
 
-### `rag`
+### `output_parser` (migrated — MODULES-PLAN-P1.md P3)
+`OutputParser(Module)` — `@hook(HookType.POST_COMPLETION)`. Its nudge-budget state (`liquid_notified`/`nudge_count`) lives on `ctx.state["output_parser"]` (Context's own per-cycle state bag) rather than instance state, since the hook itself is process-lifetime/shared but the budget is genuinely per-AgentCycle.
+
+### `present` (migrated — MODULES-PLAN-P1.md P3)
+`present(paths)` tool. Emits `AgentOutboundFiles` events. Registered imperatively from `@hook(HookType.TURN_START)`, not `@tool` — it needs live `cycle.outbound_events`/`cycle.context.tail_node_id`/`cycle.trace_id` at call time, which a `@tool` method has no way to receive (its declared parameters are the model-visible schema). This "wire a closure from TURN_START" pattern repeats for any tool needing live per-cycle state until Part 2's facade exists.
+
+### `sysops` (migrated — MODULES-PLAN-P1.md P3)
+`Sysops(Module)` — `user_list`/`user_info`/`user_modify_permissions`/`user_rename`/`user_merge`/`set_active_model` tools wired from `@hook(HookType.TURN_START)` (same live-cycle-state reason as `present`). `/model` is a genuine `@command` — its handler only needs `runtime` (cached at `@hook(HookType.STARTUP)`) plus the per-call `context` dict `CommandRegistry.dispatch()` already passes every handler.
+
+### `rag` (migrated to `Module`/decorators — MODULES-PLAN-P1.md P3)
 Indexes named databank folders under `workspace/rag/` — BM25 or embedding search via `rag_search`/`set_auto_rag_databanks` tools.
 - `lorefile.py` — parses `*.md` YAML frontmatter (`name`, `mode`, `keys`, `secondary_keys`, `constant`, `selective`, `selective_logic`, `case_sensitive`, `whole_words`, `disabled`) for keyword-triggered lore entries; `convert_lorebook_json` migrates legacy SillyTavern JSON lorebooks
 - `databanks.py` — `FilesDataBank` (only databank kind), `_entry_cache` keyed by `(path, mtime)`
-- `__main__.py` — pre-assemble hook calling `auto_inject`; module state is one `_RagState` dataclass (`_state`)
+- `Rag(Module)` in `__init__.py` — former `_RagState` dataclass fields are now instance attributes, built once in `@hook(HookType.STARTUP)`. The auto-inject prefetch stays `@hook(HookType.PRE_ASSEMBLE_ASYNC)` (it does a real `embed()` network call, so it can't be the synchronous `PRE_ASSEMBLE` `Context.assemble()` calls inline) and caches results on `ctx.state["rag_auto_results"]` for a paired `@prompt` to read (`Scratch` doesn't exist yet at that point — it's created inside `assemble()`, which hasn't started). `rag_search`/`rag_list_databanks` are plain `@tool`s (process-lifetime state only); `set_auto_rag_databanks` needs live `cycle.context`/`cycle.db`, so it's wired imperatively from `@hook(HookType.TURN_START)` like `modules/present`.
 - Config: `default_auto_targets` in `EXTENSION_META["default_config"]`
 
-### `memory` (v2)
+### `memory` (v2, migrated — MODULES-PLAN-P1.md P3, incl. the plan's flagged race fix)
 Scoped LadybugDB property-graph knowledge store at `<instance>/data/memory/memory.lbug`. Design doc: `modules/memory/PLAN.md`.
+- `Memory(Module)` in `__init__.py` — `LibrarianRunner`, `GraphDatabase`/`GraphDB` singletons built once in `@hook(HookType.STARTUP)`. `/memory librarian`/`/memory stats` are genuine `@command`s (only need `self.*` + the per-call `context` dict); `call_librarian` is a plain `@tool`; `search_memory`/`memory_stats` (scope-bound) and the pressure-ingest post_turn hook need live `cycle.context`/`.db`, wired from `@hook(HookType.TURN_START)`.
+- **The `memory_block` race is fixed, not just ported.** The old design fired a detached `asyncio.create_task` at cycle start with no ordering guarantee against `assemble()` — a later assemble() pass in a multi-step tool-calling loop could read a stale block, or `None` from initialization, indistinguishable from a real "nothing relevant" result. Now `@hook(HookType.PRE_ASSEMBLE_ASYNC)` (`refresh_memory_block`) directly `await`s the block computation, bounded by `passive_rag.block_timeout_seconds` (new setting, default 3.0s), caching the result on `ctx.state["memory_block"]` for a paired `@prompt` to read; a timeout logs a warning and keeps whatever `ctx.state` already had (persists across assemble() passes within one cycle, unlike `Scratch`) instead of silently resolving to `None`. Recomputing every pass (not once per cycle) also means a later pass reflects tool calls that already ran. Tests: `tests/test_memory.py::TestMemoryBlockJoinPoint`.
 - `graph.py` — `Entity`/`Relation` schema, `VectorIndex` (in-memory, dirty-set invalidated)
 - `scopes.py` — `resolve_scopes(env, active_users)`; scope grammar `global` | `kind:target`
 - `tools.py` — all tools in one file: `search_memory`, `memory_stats`, `call_librarian` (main agent); `memory_add_entity`, `memory_update_entity_description`, `memory_set_entity_pinned`, `memory_set_entity_scope`, `memory_delete_entity`, `memory_set_relationship`, `memory_delete_relationship`, `memory_merge_into` (librarian-only)
@@ -287,11 +299,11 @@ Scoped LadybugDB property-graph knowledge store at `<instance>/data/memory/memor
 ### `heartbeat`
 Fires periodic agent turns on a background DB branch. Slash command: `/heartbeat run`.
 
-### `cron`
-CRON.json-backed job scheduler; creates agent turns at specified times.
+### `cron` (v2, SQLite-backed; migrated — MODULES-PLAN-P1.md P3)
+`Cron(Module)` — `add_cron`/`list_cron`/`remove_cron` tools; jobs are rows in a SQLite store under `config.data.path/cron.db` (never `workspace/`, so the agent's own filesystem tools can't create/edit jobs — closes v1's indirect-prompt-injection path). `CronStore`/`_CronRunner` (the background scheduler) are built once in `@hook(HookType.STARTUP)`; the three tools need live `cycle.caller`/`.context`/`.db`/`.config.permissions`, so they're wired imperatively from `@hook(HookType.TURN_START)` like `modules/present`.
 
-### `filesystem`
-`view`, `write_file`, `edit_file`, `grep`, `glob_search` tools. Write tools sandboxed to `workspace/`; read tools can also reach `filesystem.read_only_paths` from config.yaml. `view()` returns images via `IMAGE_BLOCK_PREFIX`, unwrapped by `agent._execute_tool`.
+### `filesystem` (migrated — MODULES-PLAN-P1.md P3)
+`Filesystem(Module)` — `view`, `write_file`, `edit_file`, `grep`, `glob_search` tools. Write tools sandboxed to `workspace/`; read tools can also reach `filesystem.read_only_paths` from config.yaml. `view()` returns images via `IMAGE_BLOCK_PREFIX`, unwrapped by `agent._execute_tool`. All five wired imperatively from `@hook(HookType.TURN_START)` (same reason as `present`) since `file_read_state` (the read-before-write staleness tracker) must be fresh per `AgentCycle` — which, since `runtime.py` constructs a new `AgentCycle` per turn rather than reusing one per session, means it never actually survives across turns despite the docstring reading like session-lifetime state; preserved exactly as-is, not "fixed."
 
 ### `shell` (migrated to `Module`/decorators — MODULES-PLAN-P1.md P2)
 `Shell(Module)` in `__init__.py` — `shell` tool, runs in workspace directory, Linux only. Proves `@tool` carries a callable permission classifier (`shell_perms.required_permissions_for_shell`, an imported function, not a method) and `listing_permissions` intact.
@@ -309,7 +321,8 @@ CRON.json-backed job scheduler; creates agent turns at specified times.
 - Interstitial handling: `_settle_navigation()`, `_CHALLENGE_SELECTORS`, `_wait_for_dom_stable()`; budget `config.web.settle_timeout_ms`
 - Screenshots → `workspace/outputs/browser/` (`config.web.output_dir`), inlined via `IMAGE_BLOCK_PREFIX` unless over `config.web.screenshot_max_bytes`
 
-### `comfyui`
+### `comfyui` (migrated — MODULES-PLAN-P1.md P3)
+`ComfyUI(Module)` — a plain `@tool` (all setup is process-lifetime, done once in `@hook(HookType.STARTUP)`; unlike `present`/`sysops` it needs no live per-cycle state). If no workflows are configured the tool stays registered (decorators tag unconditionally) and returns a clear error on call, instead of the old "don't register the tool at all". Also fixed in passing: the old `EXTENSION_META` default for `api_key` was the literal string `"null"`, not `None` — truthy, so an unconfigured instance sent a literal `Authorization: Bearer null` header; the settings default is now real `None`.
 `generate_image_comfyui(workflow, positive_prompt, negative_prompt, dimensions="1024x1024", seed=0)` tool.
 - Workflow JSON files live in `<instance>/config/comfyui/<name>.json`, resolved via `utils/instance.py::runtime_config_dir()`
 - `filter.py` — NudeNet-based safety filter (hard/soft blocked labels, censor-in-place)
@@ -335,8 +348,8 @@ CRON.json-backed job scheduler; creates agent turns at specified times.
 - `em_path` config key resolution: `""` → `EM.md` next to module; `"workspace:X"` → under workspace root
 - `@prompt`'s `priority` is fixed at class-definition time, so `prompt_priority` is no longer a live setting (was already unused in this repo's config)
 
-### `concurrency`
-Concurrent Forks. Design doc: `docs/PLAN.md`. Registers `running_forks` roster prompt provider (role=user) plus:
+### `concurrency` (migrated — MODULES-PLAN-P1.md P3)
+`Concurrency(Module)` — `@hook(HookType.STARTUP)` caches `runtime`; `@hook(HookType.TURN_START)` wires the roster prompt + `spawn_fork`/`nudge_fork` tools imperatively (same live-cycle-state reason as `present`/`sysops`). Design doc: `docs/PLAN.md`. Registers `running_forks` roster prompt provider (role=user) plus:
 - `spawn_fork(prompt)` → `run_id` — starts a run on a fresh branch off caller's head
 - `nudge_fork(run_id, message)` — advisory one-way message to a peer
 
@@ -348,17 +361,16 @@ Lifecycle lives in `runtime.py`:
 - Capacity capped by `Runtime._semaphore` (`max_workers`, default 8)
 - Tests: `tests/test_concurrency.py`
 
-### `skills`
-`use_skill(name)` tool. Loads `SKILL.md` from `workspace/skills/<name>/` (agentskills.io convention). Frontmatter `tools:` list enables deferred tools on load.
+### `skills` (migrated — MODULES-PLAN-P1.md P3)
+`Skills(Module)` — `use_skill(name)` tool. Loads `SKILL.md` from `workspace/skills/<name>/` (agentskills.io convention). Frontmatter `tools:` list enables deferred tools on load. Discovery/index/tag-tracking are plain `@hook`/`@prompt` (only ever touch `ctx`, via the now-public `ctx.db`); `use_skill`/`collapse_skill_categories` need live `cycle.tool_handler`/`cycle.context`, so they're wired from `@hook(HookType.TURN_START)` like `modules/present`.
 
-### `todo`
-`todo_read` / `todo_write`. Session-scoped task checklist.
+(No `todo` module exists in this codebase — a stale entry describing one was removed here; MODULES-PLAN-P1.md's own `todo` example module is illustrative, not a real module in this repo.)
 
 ### `present`
 `present(paths)` tool. Emits `AgentOutboundFiles` events.
 
-### `mcp`
-MCP server integration; loads configured MCP servers and registers their tools into the cycle.
+### `mcp` (migrated — MODULES-PLAN-P1.md P3)
+`MCP(Module)` — connects configured MCP servers once at `@hook(HookType.STARTUP)` (was per-cycle before migration, which reconnected — spawning subprocesses — on every single turn; that was waste the migration fixes, not a behavior this module relied on). `@hook(HookType.TURN_START)` cheaply re-registers already-discovered tools into each new cycle's `tool_handler`. The old `agent.reset()`-patching restart mechanism referenced a method that doesn't exist on `AgentCycle` (dead code, no test coverage) and was dropped rather than carried forward.
 
 ---
 

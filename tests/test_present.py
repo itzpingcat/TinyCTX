@@ -1,15 +1,16 @@
 """
 tests/test_present.py
 
-End-to-end test for modules/present/__main__.py's dynamic required_permissions
+End-to-end test for modules/present/__init__.py's dynamic required_permissions
 classifier (docs/PERMISSIONS-PLAN.md §7.1): present() always needs FILE_READ,
 plus Permission.ROOT when the call is a solo request for exactly one core
 system (blacklisted) file — the blacklist-override path.
 
 Unlike test_tool_handler.py's TestRequiredPermissionsCallable (which exercises
 the classifier-callable *mechanism* generically with a toy path.startswith
-example), this file drives the REAL present module — register_agent(agent),
-the real blacklist.txt loader, the real _present_perms/_is_system_file/
+example), this file drives the REAL present module — the Present Module
+class wired via ModuleRegistry, the real blacklist.txt loader, the real
+_present_perms/_is_system_file/
 _resolve_media_path helpers — through a real ToolCallHandler, to prove the
 classifier and the tool body agree with each other and with the actual
 on-disk blacklist.
@@ -24,10 +25,11 @@ from pathlib import Path
 
 import pytest
 
+from TinyCTX.module_registry import ModuleRegistry
 from TinyCTX.permissions import Permission
 from TinyCTX.tool_handling import ToolCallHandler
 
-present_mod = importlib.import_module("TinyCTX.modules.present.__main__")
+present_mod = importlib.import_module("TinyCTX.modules.present")
 
 
 class _FakeCaller:
@@ -90,9 +92,18 @@ def workspace(tmp_path):
 def _register(agent, monkeypatch, file_names=frozenset({"soul.md"}), dir_names=frozenset()):
     """Force _load_blacklist to return a known, deterministic blacklist
     regardless of whether modules/present/blacklist.txt exists on disk in
-    this checkout, so the test doesn't depend on that file's real contents."""
+    this checkout, so the test doesn't depend on that file's real contents.
+
+    `agent` doubles as both the STARTUP hook's `runtime` (.config.workspace)
+    and the TURN_START hook's `cycle` (.tool_handler/.outbound_events/
+    .context/.trace_id) — present() needs live per-cycle access to the
+    latter three, so it registers its tool imperatively from TURN_START
+    rather than via @tool (see modules/present/__init__.py's docstring)."""
     monkeypatch.setattr(present_mod, "_load_blacklist", lambda module_dir: (file_names, dir_names))
-    present_mod.register_agent(agent)
+    instance = present_mod.Present()
+    instance.config = instance.resolve_settings(None)
+    instance.load(agent)
+    ModuleRegistry()._wire_module_instance(instance, agent)
 
 
 class TestPresentClassifierEndToEnd:

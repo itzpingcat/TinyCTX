@@ -51,11 +51,9 @@ SKIP_MODULES: dict[str, str] = {
     "rag": "needs runtime vector store / embedder singletons",
     "web": "needs runtime browser singleton",
     "filesystem": "needs cycle.config.data.path",
-    "system_prompt": "needs cycle.config identity fields",
     "sysops": "command-only; no context hooks",
     "present": "tool-only; no context hooks",
     "shell": "tool-only; no context hooks",
-    "output_parser": "needs cycle.config.extra",
     "skills": "needs runtime skills store singleton",
     "equipment_manifest": "needs cycle.db / runtime singletons",
 }

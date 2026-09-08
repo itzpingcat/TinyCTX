@@ -176,7 +176,10 @@ class TestRegisterModuleClass:
 
         assert registry._module_instances[0].config == {"max_note_chars": 500}
 
-    def test_function_based_and_class_based_modules_coexist(self):
+    def test_function_based_module_is_skipped_not_registered(self):
+        """MODULES-PLAN-P1.md P3: the legacy register_runtime/register_agent
+        function-pair path is gone — a module exposing only that shape has
+        no Module class, so _register_one finds nothing to do with it."""
         calls = []
 
         def register_agent(cycle):
@@ -200,5 +203,5 @@ class TestRegisterModuleClass:
         cycle = _FakeCycle()
         registry.register_agent(cycle)
 
-        assert calls == ["function_based"]
-        assert len(cycle.tool_handler.registered) == 1
+        assert calls == []  # register_agent on func_mod was never called
+        assert len(cycle.tool_handler.registered) == 1  # only the class-based module wired

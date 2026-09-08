@@ -6,6 +6,7 @@ import logging
 from typing import Dict, Any, Callable, List, Optional, Iterable
 
 from TinyCTX import permissions as _permissions
+from TinyCTX.module import ToolError
 from TinyCTX.permissions import Permission
 
 logger = logging.getLogger(__name__)
@@ -643,6 +644,20 @@ class ToolCallHandler:
                 'tool_call_id': tool_call_id,
                 'function_name': function_name,
                 'result': result,
+                'success': True
+            }
+
+        except ToolError as e:
+            # Expected failure the model should read and adapt to, not a
+            # crash (MODULES-PLAN-P1.md's @tool section) — rendered the same
+            # shape as a normal successful call (success=True, the message as
+            # the result text) so a caller doesn't need special-casing. This
+            # is what a tool body raises instead of hand-writing its own
+            # "Error: ..." string prefix; the framework owns the rendering.
+            return {
+                'tool_call_id': tool_call_id,
+                'function_name': function_name if 'function_name' in locals() else 'unknown',
+                'result': str(e),
                 'success': True
             }
 

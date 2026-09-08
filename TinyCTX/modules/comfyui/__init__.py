@@ -1,9 +1,8 @@
 """
-modules/comfyui/__main__.py
+modules/comfyui
 
 generate_image_comfyui — runs an admin-provided ComfyUI workflow in-process
-(no subprocess). Delivers the generated image directly to the user via
-present().
+(no subprocess).
 
 Workflows are JSON files dropped by the admin into the instance's read-only
 extra-config directory, resolved via utils/instance.py::runtime_config_dir():
@@ -11,14 +10,15 @@ extra-config directory, resolved via utils/instance.py::runtime_config_dir():
     <instance>/config/comfyui/<name>.json
 
 The agent picks a workflow by name (bare filename, no extension). Available
-names are discovered once at startup and baked into the tool's docstring.
+names are discovered once at @hook(HookType.STARTUP) and baked into the
+tool's docstring.
 
 Uses the raw ComfyUI **API v1** surface (POST /prompt, GET /history/{id},
 GET /view). This talks directly to stock ComfyUI (default 127.0.0.1:8188) —
 no comfy-api-proxy or Comfy Cloud v2 job surface required.
 
 Config (read from the top-level `comfyui:` key in config.yaml, via
-agent.config.extra — same mechanism as the `mcp:` block):
+config.extra — same mechanism as the `mcp:` block):
 
   comfyui:
     host: 127.0.0.1        # ComfyUI host
@@ -44,154 +44,170 @@ positive-prompt, negative-prompt, seed, width, height. A workflow does not
 have to use all five; if the agent passes a non-default value for one the
 workflow doesn't reference, the tool call still succeeds but the returned
 text carries a warning that the value was ignored.
+
+Everything here is process-lifetime — workflow discovery, safety-filter
+config, and the ComfyUI HTTP client all come from config alone, nothing
+per-cycle — so, unlike modules/present or modules/sysops, this is a plain
+@tool with all setup done once in @hook(HookType.STARTUP). If no workflows
+are configured, the tool stays registered (decorators tag unconditionally)
+but returns a clear error on call instead of the pre-Module version's
+"don't register the tool at all" — a caller with IMAGE_GEN but no configured
+workflows now gets an informative error rather than "tool not found".
 """
 from __future__ import annotations
 
-EXTENSION_META = {
-    "name": "comfyui",
-    "version": "1.0",
-    "description": "generate_image_comfyui tool. Runs an admin-provided ComfyUI workflow from config/comfyui/.",
-    "default_config": {
-        "timeout": 300,
-        "host": "127.0.0.1",
-        "port": 8188,
-        "api_key": "null",
-        "unload_after": True,
-    },
-}
+import json
+import logging
+import re
+import time
+import uuid
+from pathlib import Path
 
-# The five marker names _inject knows how to substitute, and which tool
-# parameter each corresponds to (for the "ignored" warning).
-_MARKER_KEYS = ("positive-prompt", "negative-prompt", "seed", "width", "height")
+import requests
+
+from TinyCTX.decorators import hook, tool
+from TinyCTX.hooks import HookType
+from TinyCTX.module import Module
+from TinyCTX.permissions import Permission
+from TinyCTX.utils.instance import runtime_config_dir
+
+from .filter import apply_filter, resolve_blocked_ids
+
+logger = logging.getLogger(__name__)
+
+# Matches a JSON string value that is *exactly* one marker, e.g.
+# "MARKER>>width<<MARKER" — the whole field, not embedded in other text.
+# This lets a marker stand in for a non-string field (seed/width/height
+# are normally JSON ints); on an exact match we substitute the real
+# typed value instead of stringifying it. A marker embedded inside a
+# longer string (e.g. prompts) still substitutes as text via the
+# partial-match regex below.
+_EXACT_MARKER_RE   = re.compile(r'^MARKER>>([^<\n]+?)<<MARKER$')
+_PARTIAL_MARKER_RE = re.compile(r'MARKER>>([^<\n]+?)<<MARKER')
 
 
-def register_agent(agent) -> None:
-    import json
-    import logging
-    import re
-    import time
-    import uuid
-    from pathlib import Path
+def _inject(obj, params: dict, used: set[str]) -> object:
+    """
+    Recursively substitute MARKER>>name<<MARKER placeholders.
 
-    import requests
+    `used` is mutated in place to record every marker name actually
+    found in the workflow, so the caller can warn about params that had
+    nowhere to go.
+    """
+    if isinstance(obj, str):
+        exact = _EXACT_MARKER_RE.match(obj)
+        if exact:
+            name = exact.group(1).strip()
+            if name in params:
+                used.add(name)
+                return params[name]
+            return obj
+        def _sub(m: re.Match) -> str:
+            name = m.group(1).strip()
+            if name in params:
+                used.add(name)
+                return str(params[name])
+            return m.group(0)
+        return _PARTIAL_MARKER_RE.sub(_sub, obj)
+    if isinstance(obj, dict):
+        return {k: _inject(v, params, used) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_inject(v, params, used) for v in obj]
+    return obj
 
-    from TinyCTX.permissions import Permission
-    from TinyCTX.utils.instance import runtime_config_dir
 
-    logger = logging.getLogger(__name__)
+_GENERATE_DOC_TEMPLATE = """Generate an image using a ComfyUI workflow.
 
-    # ---------------------------------------------------------------------------
-    # Paths & config
-    # ---------------------------------------------------------------------------
-    _module_dir    = Path(__file__).parent
-    _workspace_path = Path(agent.config.workspace.path)
-    _workflow_dir  = runtime_config_dir(_workspace_path) / "comfyui"
-    _output_dir    = _workspace_path / "outputs" / "comfyui"
-
-    _cfg = EXTENSION_META["default_config"].copy()
-    _cfg.update(agent.config.extra.get("comfyui", {}))
-
-    _comfy_url    = f"http://{_cfg['host']}:{_cfg['port']}"
-    _timeout      = int(_cfg["timeout"])
-    _unload_after = bool(_cfg["unload_after"])
-    _api_key      = _cfg.get("api_key", None)
-    _client_id    = str(uuid.uuid4())
-
-    # ---------------------------------------------------------------------------
-    # Workflow discovery
-    # ---------------------------------------------------------------------------
-    if _workflow_dir.is_dir():
-        _workflow_names = sorted(p.stem for p in _workflow_dir.glob("*.json"))
-    else:
-        _workflow_names = []
-
-    if not _workflow_names:
-        logger.warning(
-            "comfyui: no workflows found in %s — generate_image_comfyui not registered",
-            _workflow_dir,
-        )
-        return
-
-    logger.info("comfyui: discovered workflows: %s", _workflow_names)
-
-    # ---------------------------------------------------------------------------
-    # Safety filter
-    # ---------------------------------------------------------------------------
-    from .filter import apply_filter, resolve_blocked_ids
-
-    _filter_cfg     = _cfg.get("safety_filter", {})
-    _filter_enabled = bool(_filter_cfg.get("enabled", False))
-    _filter_score   = float(_filter_cfg.get("min_score", 0.2))
-
-    _hard_blocked_ids = resolve_blocked_ids(_filter_cfg.get("hard_blocked_labels", []))
-    _soft_blocked_ids = resolve_blocked_ids(_filter_cfg.get("soft_blocked_labels", []))
-
-    if _filter_enabled:
-        logger.info(
-            "comfyui: safety filter enabled — hard-blocking %d label(s): %s | soft-blocking %d label(s): %s",
-            len(_hard_blocked_ids), list(_filter_cfg.get("hard_blocked_labels", [])),
-            len(_soft_blocked_ids), list(_filter_cfg.get("soft_blocked_labels", [])),
-        )
-    else:
-        logger.info("comfyui: safety filter disabled")
-
-    # ---------------------------------------------------------------------------
-    # Marker substitution
-    # ---------------------------------------------------------------------------
-    # Matches a JSON string value that is *exactly* one marker, e.g.
-    # "MARKER>>width<<MARKER" — the whole field, not embedded in other text.
-    # This lets a marker stand in for a non-string field (seed/width/height
-    # are normally JSON ints); on an exact match we substitute the real
-    # typed value instead of stringifying it. A marker embedded inside a
-    # longer string (e.g. prompts) still substitutes as text via the
-    # partial-match regex below.
-    _EXACT_MARKER_RE  = re.compile(r'^MARKER>>([^<\n]+?)<<MARKER$')
-    _PARTIAL_MARKER_RE = re.compile(r'MARKER>>([^<\n]+?)<<MARKER')
-
-    def _inject(obj, params: dict, used: set[str]) -> object:
+        workflow: name of the workflow to run, one of {workflow_names}.
+        dimensions: "WIDTHxHEIGHT", e.g. "1024x1024". A workflow that
+            doesn't support custom dimensions ignores this (see returned
+            warnings).
+        seed: default 0. A workflow that doesn't support seeding ignores
+            this (see returned warnings).
         """
-        Recursively substitute MARKER>>name<<MARKER placeholders.
 
-        `used` is mutated in place to record every marker name actually
-        found in the workflow, so the caller can warn about params that had
-        nowhere to go.
-        """
-        if isinstance(obj, str):
-            exact = _EXACT_MARKER_RE.match(obj)
-            if exact:
-                name = exact.group(1).strip()
-                if name in params:
-                    used.add(name)
-                    return params[name]
-                return obj
-            def _sub(m: re.Match) -> str:
-                name = m.group(1).strip()
-                if name in params:
-                    used.add(name)
-                    return str(params[name])
-                return m.group(0)
-            return _PARTIAL_MARKER_RE.sub(_sub, obj)
-        if isinstance(obj, dict):
-            return {k: _inject(v, params, used) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [_inject(v, params, used) for v in obj]
-        return obj
 
-    # ---------------------------------------------------------------------------
+class ComfyUI(Module):
+    """generate_image_comfyui tool. Runs an admin-provided ComfyUI workflow
+    from config/comfyui/."""
+
+    settings = {
+        "timeout":      {"default": 300, "type": "int", "description": "Seconds to wait for the job to finish."},
+        "host":         {"default": "127.0.0.1", "type": "str", "description": "ComfyUI host."},
+        "port":         {"default": 8188, "type": "int", "description": "ComfyUI port."},
+        "api_key":      {"default": None, "type": "str", "description": "Optional Bearer token (reverse-proxied setups)."},
+        "unload_after": {"default": True, "type": "bool", "description": "POST /free (unload models, free VRAM) when done."},
+        "safety_filter": {
+            "default": {"enabled": False, "min_score": 0.2, "hard_blocked_labels": [], "soft_blocked_labels": []},
+            "type": "dict",
+            "description": "enabled, min_score, hard_blocked_labels (withheld), soft_blocked_labels (censored, sent with a notice).",
+        },
+    }
+
+    @hook(HookType.STARTUP)
+    def load(self, runtime) -> None:
+        self._module_dir     = Path(__file__).parent
+        workspace_path        = Path(runtime.config.workspace.path)
+        self._workflow_dir    = runtime_config_dir(workspace_path) / "comfyui"
+        self._output_dir      = workspace_path / "outputs" / "comfyui"
+
+        self._comfy_url    = f"http://{self.config['host']}:{self.config['port']}"
+        self._timeout      = int(self.config["timeout"])
+        self._unload_after = bool(self.config["unload_after"])
+        self._api_key      = self.config.get("api_key")
+        self._client_id    = str(uuid.uuid4())
+
+        if self._workflow_dir.is_dir():
+            self._workflow_names = sorted(p.stem for p in self._workflow_dir.glob("*.json"))
+        else:
+            self._workflow_names = []
+
+        if not self._workflow_names:
+            logger.warning(
+                "comfyui: no workflows found in %s — generate_image_comfyui will return an error until configured",
+                self._workflow_dir,
+            )
+        else:
+            logger.info("comfyui: discovered workflows: %s", self._workflow_names)
+
+        filter_cfg = self.config["safety_filter"]
+        self._filter_enabled = bool(filter_cfg.get("enabled", False))
+        self._filter_score   = float(filter_cfg.get("min_score", 0.2))
+        self._hard_blocked_ids = resolve_blocked_ids(filter_cfg.get("hard_blocked_labels", []))
+        self._soft_blocked_ids = resolve_blocked_ids(filter_cfg.get("soft_blocked_labels", []))
+
+        if self._filter_enabled:
+            logger.info(
+                "comfyui: safety filter enabled — hard-blocking %d label(s): %s | soft-blocking %d label(s): %s",
+                len(self._hard_blocked_ids), list(filter_cfg.get("hard_blocked_labels", [])),
+                len(self._soft_blocked_ids), list(filter_cfg.get("soft_blocked_labels", [])),
+            )
+        else:
+            logger.info("comfyui: safety filter disabled")
+
+        # The tool's docstring feeds the model-visible schema description —
+        # see modules/shell's STARTUP hook for why this must be set here
+        # rather than as a static docstring.
+        type(self).generate_image_comfyui.__doc__ = _GENERATE_DOC_TEMPLATE.format(
+            workflow_names=self._workflow_names,
+        )
+
+    # ------------------------------------------------------------------
     # ComfyUI helpers (API v1: /prompt, /history, /view, /free)
-    # ---------------------------------------------------------------------------
-    def _headers() -> dict:
+    # ------------------------------------------------------------------
+
+    def _headers(self) -> dict:
         headers = {"Content-Type": "application/json", "Accept": "application/json"}
-        if _api_key:
-            headers["Authorization"] = f"Bearer {_api_key}"
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
         return headers
 
-    def _wait_for_comfy(timeout: int = 5) -> None:
+    def _wait_for_comfy(self, timeout: int = 5) -> None:
         deadline = time.time() + timeout
         last_err = None
         while time.time() < deadline:
             try:
-                if requests.get(f"{_comfy_url}/system_stats", headers=_headers(), timeout=2).ok:
+                if requests.get(f"{self._comfy_url}/system_stats", headers=self._headers(), timeout=2).ok:
                     return
             except Exception as e:
                 last_err = e
@@ -201,12 +217,12 @@ def register_agent(agent) -> None:
             + (f": {last_err}" if last_err else "")
         )
 
-    def _submit(workflow: dict) -> str:
+    def _submit(self, workflow: dict) -> str:
         """Submit a workflow to the ComfyUI API v1 (POST /prompt)."""
-        url = f"{_comfy_url}/prompt"
-        payload = {"prompt": workflow, "client_id": _client_id}
+        url = f"{self._comfy_url}/prompt"
+        payload = {"prompt": workflow, "client_id": self._client_id}
         try:
-            response = requests.post(url, json=payload, headers=_headers(), timeout=5)
+            response = requests.post(url, json=payload, headers=self._headers(), timeout=5)
             if response.status_code >= 400:
                 # ComfyUI returns 400 with {"error": ..., "node_errors": {...}} on
                 # invalid workflows — surface that instead of a bare HTTP error.
@@ -223,13 +239,13 @@ def register_agent(agent) -> None:
         except requests.exceptions.RequestException as e:
             raise RuntimeError(f"Failed to submit workflow: {e}")
 
-    def _poll(prompt_id: str, timeout: int = _timeout) -> dict:
+    def _poll(self, prompt_id: str, timeout: int) -> dict:
         """Poll GET /history/{id} until the job shows up as finished."""
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
                 response = requests.get(
-                    f"{_comfy_url}/history/{prompt_id}", headers=_headers(), timeout=2
+                    f"{self._comfy_url}/history/{prompt_id}", headers=self._headers(), timeout=2
                 )
                 response.raise_for_status()
                 data = response.json()
@@ -246,26 +262,26 @@ def register_agent(agent) -> None:
                 raise RuntimeError(f"Failed to poll job {prompt_id}: {e}")
         raise TimeoutError(f"Job {prompt_id} did not complete within {timeout}s")
 
-    def _download(filename: str, subfolder: str, img_type: str) -> Path:
+    def _download(self, filename: str, subfolder: str, img_type: str) -> Path:
         """Download an output image via GET /view."""
         response = requests.get(
-            f"{_comfy_url}/view",
+            f"{self._comfy_url}/view",
             params={"filename": filename, "subfolder": subfolder, "type": img_type},
-            headers=_headers(),
+            headers=self._headers(),
             timeout=10,
             stream=True,
         )
         response.raise_for_status()
-        _output_dir.mkdir(parents=True, exist_ok=True)
-        out_path = _output_dir / filename
+        self._output_dir.mkdir(parents=True, exist_ok=True)
+        out_path = self._output_dir / filename
         with open(out_path, "wb") as f:
             for chunk in response.iter_content(chunk_size=8192):
                 f.write(chunk)
         return out_path
 
-    def _load_workflow(name: str) -> dict:
-        """Load a workflow JSON by bare name from _workflow_dir."""
-        path = _workflow_dir / f"{name}.json"
+    def _load_workflow(self, name: str) -> dict:
+        """Load a workflow JSON by bare name from self._workflow_dir."""
+        path = self._workflow_dir / f"{name}.json"
         try:
             with open(path, "r") as f:
                 return json.load(f)
@@ -274,42 +290,42 @@ def register_agent(agent) -> None:
         except json.JSONDecodeError as e:
             raise ValueError(f"Invalid JSON in workflow file: {e}")
 
-    def _free_memory() -> None:
+    def _free_memory(self) -> None:
         """POST /free to unload models and free VRAM (v1 endpoint)."""
         try:
             requests.post(
-                f"{_comfy_url}/free",
+                f"{self._comfy_url}/free",
                 json={"unload_models": True, "free_memory": True},
-                headers=_headers(),
+                headers=self._headers(),
                 timeout=5,
             )
         except Exception as e:
             logger.debug("comfyui: /free request failed (non-fatal): %s", e)
 
+    # ------------------------------------------------------------------
+    # Tool
+    # ------------------------------------------------------------------
+
+    @tool(always_on=False, permissions={Permission.IMAGE_GEN})
     def generate_image_comfyui(
+        self,
         workflow: str,
         positive_prompt: str,
         negative_prompt: str,
         dimensions: str = "1024x1024",
         seed: int = 0,
     ) -> str:
-        f"""Generate an image using a ComfyUI workflow.
+        if not self._workflow_names:
+            return f"Error: no workflows configured — drop workflow JSON files into {self._workflow_dir}."
 
-        workflow: name of the workflow to run, one of {_workflow_names}.
-        dimensions: "WIDTHxHEIGHT", e.g. "1024x1024". A workflow that
-            doesn't support custom dimensions ignores this (see returned
-            warnings).
-        seed: default 0. A workflow that doesn't support seeding ignores
-            this (see returned warnings).
-        """
         # --- resolve workflow name -------------------------------------
         if not re.fullmatch(r"[A-Za-z0-9_-]+", workflow):
             return (
                 f"Error: invalid workflow name '{workflow}'. "
-                f"Available: {_workflow_names}"
+                f"Available: {self._workflow_names}"
             )
-        if workflow not in _workflow_names:
-            return f"Error: unknown workflow '{workflow}'. Available: {_workflow_names}"
+        if workflow not in self._workflow_names:
+            return f"Error: unknown workflow '{workflow}'. Available: {self._workflow_names}"
 
         # --- parse dimensions --------------------------------------------
         m = re.fullmatch(r"\s*(\d+)\s*x\s*(\d+)\s*", dimensions, re.IGNORECASE)
@@ -320,7 +336,7 @@ def register_agent(agent) -> None:
             return f"Error: invalid dimensions '{dimensions}' — width and height must be positive."
 
         try:
-            raw_workflow = _load_workflow(workflow)
+            raw_workflow = self._load_workflow(workflow)
         except Exception as e:
             return f"Error: failed to read workflow: {e}"
 
@@ -356,21 +372,21 @@ def register_agent(agent) -> None:
                 )
 
         try:
-            _wait_for_comfy(timeout=5)
+            self._wait_for_comfy(timeout=5)
         except RuntimeError as e:
             return f"Error: {e}"
 
-        logger.info("comfyui: submitting prompt (workflow=%s, timeout=%ds)", workflow, _timeout)
+        logger.info("comfyui: submitting prompt (workflow=%s, timeout=%ds)", workflow, self._timeout)
 
         try:
-            prompt_id = _submit(prepared_workflow)
+            prompt_id = self._submit(prepared_workflow)
         except Exception as e:
             return f"Error: failed to submit prompt: {e}"
 
         logger.info("comfyui: job submitted: %s", prompt_id)
 
         try:
-            history_entry = _poll(prompt_id, timeout=_timeout)
+            history_entry = self._poll(prompt_id, timeout=self._timeout)
         except TimeoutError as e:
             return f"Error: {e}"
         except Exception as e:
@@ -389,8 +405,8 @@ def register_agent(agent) -> None:
         if not image_refs:
             debug_path = None
             try:
-                _output_dir.mkdir(parents=True, exist_ok=True)
-                debug_path = _output_dir / f"debug_history_{prompt_id}.json"
+                self._output_dir.mkdir(parents=True, exist_ok=True)
+                debug_path = self._output_dir / f"debug_history_{prompt_id}.json"
                 debug_path.write_text(json.dumps(history_entry, indent=2, default=str))
             except Exception as e:
                 logger.warning("comfyui: failed to write history debug dump: %s", e)
@@ -420,22 +436,22 @@ def register_agent(agent) -> None:
             if not filename:
                 continue
             try:
-                path = _download(filename, subfolder, img_type)
+                path = self._download(filename, subfolder, img_type)
             except Exception as e:
                 logger.warning("comfyui: failed to download %s: %s", filename, e)
                 continue
 
-            if not _filter_enabled:
+            if not self._filter_enabled:
                 safe_files.append(str(path))
                 continue
 
             try:
                 result = apply_filter(
                     path,
-                    _module_dir,
-                    _hard_blocked_ids,
-                    _soft_blocked_ids,
-                    _filter_score,
+                    self._module_dir,
+                    self._hard_blocked_ids,
+                    self._soft_blocked_ids,
+                    self._filter_score,
                 )
             except Exception as fe:
                 logger.warning("comfyui: safety filter error on %s: %s", path.name, fe)
@@ -464,8 +480,8 @@ def register_agent(agent) -> None:
             else:
                 safe_files.append(str(path))
 
-        if _unload_after:
-            _free_memory()
+        if self._unload_after:
+            self._free_memory()
         lines = []
         all_passed_files = safe_files + soft_files
         if all_passed_files:
@@ -492,7 +508,3 @@ def register_agent(agent) -> None:
         lines.extend(warnings)
 
         return "\n".join(lines)
-
-    agent.tool_handler.register_tool(
-        generate_image_comfyui, always_on=False, required_permissions={Permission.IMAGE_GEN}
-    )

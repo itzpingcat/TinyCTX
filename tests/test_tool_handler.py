@@ -558,6 +558,67 @@ class TestExecuteToolAsync:
 
 
 # ---------------------------------------------------------------------------
+# ToolError — MODULES-PLAN-P1.md's @tool section: an expected failure the
+# model should read and adapt to, not a crash. Rendered as a normal
+# successful call (success=True, message as the result text) rather than
+# success=False+error, so a caller doesn't need to special-case it — this is
+# what a tool raises instead of hand-writing its own "Error: ..." string.
+# ---------------------------------------------------------------------------
+
+class TestToolError:
+    def setup_method(self):
+        self.handler = ToolCallHandler()
+
+    @pytest.mark.asyncio
+    async def test_sync_tool_error_renders_as_successful_call(self):
+        from TinyCTX.module import ToolError
+
+        def picky(name: str) -> str:
+            """Rejects a name."""
+            raise ToolError(f"'{name}' already exists; read it and edit instead")
+
+        self.handler.register_tool(picky, always_on=True)
+        result = await self.handler.execute_tool_call({
+            "id": "c1",
+            "function": {"name": "picky", "arguments": '{"name": "foo"}'}
+        }, _FakeCaller())
+        assert result["success"] is True
+        assert result["result"] == "'foo' already exists; read it and edit instead"
+
+    @pytest.mark.asyncio
+    async def test_async_tool_error_renders_as_successful_call(self):
+        from TinyCTX.module import ToolError
+
+        async def picky(name: str) -> str:
+            """Rejects a name."""
+            raise ToolError(f"'{name}' already exists; read it and edit instead")
+
+        self.handler.register_tool(picky, always_on=True)
+        result = await self.handler.execute_tool_call({
+            "id": "c1",
+            "function": {"name": "picky", "arguments": '{"name": "foo"}'}
+        }, _FakeCaller())
+        assert result["success"] is True
+        assert result["result"] == "'foo' already exists; read it and edit instead"
+
+    @pytest.mark.asyncio
+    async def test_unexpected_exception_still_fails_the_call(self):
+        """A ToolError catch must not swallow genuine bugs — those still
+        come back as success=False, distinct from an expected ToolError."""
+        def boom() -> str:
+            """Explodes for real."""
+            raise RuntimeError("genuinely broken")
+
+        self.handler.register_tool(boom, always_on=True)
+        result = await self.handler.execute_tool_call({
+            "id": "c1",
+            "function": {"name": "boom", "arguments": {}},
+        }, _FakeCaller())
+        assert result["success"] is False
+        assert "genuinely broken" in result["error"]
+
+
+# ---------------------------------------------------------------------------
 # required_permissions — static set (docs/PERMISSIONS-PLAN.md §3)
 # ---------------------------------------------------------------------------
 
