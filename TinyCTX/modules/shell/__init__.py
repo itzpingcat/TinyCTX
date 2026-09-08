@@ -1,35 +1,239 @@
-EXTENSION_META = {
-    "name":    "shell",
-    "version": "3.0",
-    "description": (
-        "Shell execution tool. "
-        "shell: always-on, runs in the sandbox container by default (no LAN/Tailscale). "
-        "Pass backend_access=True to run in the main TinyCTX container with full network access "
-        "and its own backend files (requires the backend_exec capability). "
-        "Commands are parsed with tree-sitter-bash. Each resolved command is classified "
-        "into the capability bools it needs (file_read, file_write, network_read, "
-        "network_write, untrusted_exec, ...) per a declarative table in "
-        "modules/shell/perms.yaml (compiled by perms.py), checked once, centrally, by "
-        "tool_handling.handler.ToolCallHandler — see docs/PERMISSIONS-PLAN.md §5. A "
-        "single always-applied shape policy (derived from allow.yaml's `constructs` map) "
-        "still runs underneath that, rejecting `$()`, unquoted globs used as commands, "
-        "and unrecognized bash syntax — structural injection defense, orthogonal to "
-        "capability checking (§5.2)."
-    ),
-    "default_config": {
-        # Timeout used when the agent does not pass an explicit timeout arg.
-        "default_timeout": 120,
+"""
+modules/shell/__init__.py
 
-        # Hard ceiling — agent-supplied timeout values are capped to this.
-        "max_timeout": 1200,
+Registers the `shell` tool into the agent's tool_handler.
 
-        # Default points at the sandbox container defined in compose.yaml.
-        # Actual host is computed at runtime from TINYCTX_INSTANCE (the
-        # per-instance hashed container name) + "_sandbox" — see
-        # modules/shell/__main__.py::register_agent. Override to null for
-        # bare-metal / dev (falls back to local). Linux only.
-        "sandbox_url": None,
+Execution modes:
+  SANDBOX (sandbox_url configured)
+    POSTs {"command": "..."} to the sandbox HTTP service over the internal
+    Docker network (agent_sandbox). The sandbox container has no route to
+    the host LAN or Tailscale — network isolation is enforced at the compose
+    level, not in code. No auth token needed: the sandbox port is only
+    reachable from the agent container by design.
 
+  LOCAL (sandbox_url not set)
+    Runs via `bash -c` in the main container. Used for backend_access=True and
+    for bare-metal installs. Linux only — PowerShell support was removed with
+    the container refactor.
+
+One gate runs before any dispatch, in both modes. The sandbox itself runs
+whatever it receives — it trusts the agent.
+
+  CAPABILITY — "is this caller permitted to do this at all", including
+  whether the invocation is even syntactically safe to run. Per-command
+  tagging, compiled from modules/shell/perms.yaml by perms.py, classifies
+  each resolved command into the TinyCTX.permissions.Permission bools it
+  needs (FILE_WRITE, NETWORK_WRITE, UNTRUSTED_EXEC, ...); shell's
+  `required_permissions` callable (registered below) is checked once,
+  centrally, by tool_handling.handler.ToolCallHandler — same seam every
+  other tool uses. See docs/PERMISSIONS-PLAN.md §5.
+
+  Construct/shape denial — unmapped bash syntax, `$()`, backgrounding, or
+  anything else allow.yaml's `constructs` map doesn't mark "allow" — is
+  folded into that same classification instead of living as a second check
+  run after the fact: any denied construct anywhere in the parsed tree
+  requires Permission.UNTRUSTED_EXEC, same as an unrecognized command or an
+  unaccounted flag. A caller who holds UNTRUSTED_EXEC is trusted to run
+  syntax that can't be statically verified safe; a caller who doesn't gets
+  the same "[PERMISSION DENIED] missing: UNTRUSTED_EXEC" every other
+  worst-cased command produces. See perms.py's module docstring and
+  required_permissions_for_shell(). `_dispatch` below still parses the
+  command once more, but only for runtime diagnostics that were never
+  permission decisions in the first place — empty command, over the byte
+  limit, unparseable syntax — not for construct denial, which never reaches
+  this function for a caller who was already turned away by ToolCallHandler.
+
+Command policy is AST-based: the command is parsed with tree-sitter-bash and
+each resolved command in it is checked separately (see validate.py). This
+replaced substring-glob blacklist.txt / whitelist.txt files, which could not
+tell a command from a quoted argument that happened to contain the same
+text.
+
+`backend_access=True` no longer compares against a scalar level — it adds
+Permission.BACKEND_EXEC to what the classifier requires (perms.py), enforced
+by the same central seam as everything else. See permissions.py's
+BACKEND_EXEC docstring for why this is a *location* permission (which
+container the command runs in), not a capability about what the command
+itself does.
+
+Two commands that used to have a bespoke Python classifier — scp/rsync/sftp,
+whose real classification is direction-dependent (upload vs download turns
+on which operand looks like a remote host:path) — are deliberately unlisted
+in perms.yaml now: that judgment isn't expressible in the table's matcher
+primitives, and rather than keep one-off Python for just those three, they
+fall through to the same UNTRUSTED_EXEC every unrecognized command gets. See
+perms.yaml's header.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import subprocess
+import urllib.error
+import urllib.request
+from collections.abc import Callable
+from pathlib import Path
+
+from TinyCTX.decorators import hook, tool
+from TinyCTX.hooks import HookType
+from TinyCTX.module import Module
+
+from . import perms as shell_perms
+from . import policy as policy_mod
+from . import validate
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Exit-code interpretation
+# ---------------------------------------------------------------------------
+
+_EXIT_SEMANTICS: dict[str, Callable[[int], tuple[bool, str | None]]] = {
+    "grep":  lambda c: (c >= 2, "no matches found" if c == 1 else None),
+    "rg":    lambda c: (c >= 2, "no matches found" if c == 1 else None),
+    "egrep": lambda c: (c >= 2, "no matches found" if c == 1 else None),
+    "fgrep": lambda c: (c >= 2, "no matches found" if c == 1 else None),
+    "diff":  lambda c: (c >= 2, "files differ" if c == 1 else None),
+    "test":  lambda c: (c >= 2, "condition is false" if c == 1 else None),
+    "[":     lambda c: (c >= 2, "condition is false" if c == 1 else None),
+    "find":  lambda c: (c >= 2, "some directories were inaccessible" if c == 1 else None),
+}
+
+
+def _annotate_exit(command: str, code: int) -> str:
+    if code == 0:
+        return ""
+    sem = _EXIT_SEMANTICS.get(validate.last_command_name(command))
+    if sem:
+        is_err, msg = sem(code)
+        if not is_err:
+            return f"({msg})" if msg else ""
+    return f"(exit {code})"
+
+
+# ---------------------------------------------------------------------------
+# Safe env for local subprocess
+# ---------------------------------------------------------------------------
+
+_SAFE_KEYS = (
+    "PATH", "HOME", "TMPDIR", "TEMP", "TMP", "LANG", "LC_ALL",
+    "TERM", "USER", "LOGNAME",
+)
+_LOCAL_ENV = {k: v for k, v in os.environ.items() if k in _SAFE_KEYS}
+
+
+# ---------------------------------------------------------------------------
+# Dispatch: sandbox HTTP
+# ---------------------------------------------------------------------------
+
+def _run_sandbox(command: str, sandbox_url: str, timeout: int) -> str:
+    endpoint = sandbox_url.rstrip("/") + "/exec"
+    payload = json.dumps({"command": command}).encode()
+    req = urllib.request.Request(
+        endpoint,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout + 5) as resp:
+            body = json.loads(resp.read().decode())
+            return body.get("output", "Error: sandbox returned no output field")
+    except urllib.error.URLError as exc:
+        return f"Error: cannot reach sandbox at {sandbox_url} — {exc.reason}"
+    except Exception as exc:
+        return f"Error: sandbox request failed — {exc}"
+
+
+# ---------------------------------------------------------------------------
+# Dispatch: local
+# ---------------------------------------------------------------------------
+
+def _run_local(command: str, cwd: Path, timeout: int) -> str:
+    try:
+        result = subprocess.run(
+            ["bash", "-c", command], cwd=cwd,
+            capture_output=True, text=True, timeout=timeout,
+            encoding="utf-8", errors="replace",
+            env=_LOCAL_ENV,
+        )
+        parts = []
+        if result.stdout:
+            parts.append(result.stdout.rstrip())
+        if result.stderr:
+            parts.append(f"stderr:\n{result.stderr.rstrip()}")
+        annotation = _annotate_exit(command, result.returncode)
+        if annotation:
+            parts.append(annotation)
+        return "\n".join(parts) if parts else "No output"
+    except subprocess.TimeoutExpired:
+        return f"Error: timed out after {timeout}s"
+    except FileNotFoundError as exc:
+        return f"Error: shell not found — {exc}"
+    except Exception as exc:
+        return f"Error: {exc}"
+
+
+_SHELL_DOC_TEMPLATE = """Run a shell command.
+
+        By default runs in the isolated sandbox container, which has outbound
+        internet access (HTTP/S, git, pip, npm, etc.) but is NETWORK-ISOLATED:
+        it cannot reach the local LAN, Tailscale peers, or internal services.
+        Use this for the vast majority of shell work.
+
+        Set backend_access=True to run in the main TinyCTX container instead,
+        which has full network access and its own backend files — use when
+        the command needs to reach a private or local address, e.g.:
+          - Tailscale IPs (100.x.x.x)
+          - LAN services (192.168.x.x, 10.x.x.x)
+          - Internal APIs (ComfyUI, local databases, self-hosted services)
+          - Docker host or sibling containers by hostname
+        Requires the backend_exec capability. Command policy still applies in
+        both modes.
+
+        The command is parsed as bash and each command in it is checked
+        separately, so chaining with ; && || and pipes is fine and quoted
+        arguments are treated as data. Blocked commands say which rule
+        objected. Which specific commands you may run depends on your
+        granted capabilities (file_read, file_write, network_read,
+        network_write, untrusted_exec, ...) — most everyday commands
+        (cat, ls, grep, curl, git clone, ...) need only a narrow one or two
+        of these; anything unrecognized requires untrusted_exec.
+
+        Args:
+            command: The shell command to run.
+            timeout: Optional per-call timeout in seconds. Capped at the
+                     configured maximum (default {max_timeout}s).
+            backend_access: If True, run in the main container with full
+                            network access and access to its own backend
+                            files (requires the backend_exec capability).
+        """
+
+
+class Shell(Module):
+    """Shell execution tool. Sandbox by default; backend_access=True runs in
+    the main container. See this module's own docstring for the full design."""
+
+    settings = {
+        "default_timeout": {
+            "default": 120,
+            "type": "int",
+            "description": "Timeout used when the agent does not pass an explicit timeout arg.",
+        },
+        "max_timeout": {
+            "default": 1200,
+            "type": "int",
+            "description": "Hard ceiling — agent-supplied timeout values are capped to this.",
+        },
+        "sandbox_url": {
+            "default": "auto",
+            "type": "str",
+            "description": "Sandbox HTTP endpoint. 'auto' computes it from TINYCTX_INSTANCE "
+                            "(see compose.yaml). Set to an explicit URL to override, or to an "
+                            "empty string to disable the sandbox and run in the main container.",
+        },
         # NOTE: min_permission, policies (applies_below tiers), and
         # permissions.access_backend are GONE — permission_level was fully
         # retired (see TinyCTX/permissions.py and docs/PERMISSIONS-PLAN.md).
@@ -38,5 +242,107 @@ EXTENSION_META = {
         # config.yaml, plus any per-user permission_overrides), via
         # modules/shell/perms.py's per-command classification. There is
         # nothing left to configure here for that axis.
-    },
-}
+    }
+
+    @hook(HookType.STARTUP)
+    def load(self, runtime) -> None:
+        self._workspace = Path(runtime.config.workspace.path).expanduser().resolve()
+
+        sandbox_cfg = self.config["sandbox_url"]
+        if sandbox_cfg == "auto":
+            # TINYCTX_INSTANCE is the per-instance hashed container name (see
+            # utils/instance.py::project_name_for); falls back to "tinyctx"
+            # to match compose.yaml's own default when unset.
+            self._sandbox_url = f"http://{os.environ.get('TINYCTX_INSTANCE', 'tinyctx')}_sandbox:8700"
+        else:
+            self._sandbox_url = sandbox_cfg or None
+
+        if self._sandbox_url:
+            logger.info("shell: dispatching via sandbox at %s", self._sandbox_url)
+        else:
+            logger.info("shell: dispatching locally (no sandbox configured)")
+
+        # SHAPE policy only — construct/redirect/glob-shape validation that runs
+        # regardless of who's calling (§5.2). Built from builtin:allow's
+        # `constructs` map (the strictest available — it's what makes injection
+        # structurally impossible, see validate.py) but with default_action
+        # forced to "allow" and no rules: the per-command allow/deny RULES that
+        # used to stand in for capability decisions are retired — perms.py's
+        # classify() + the central ToolCallHandler seam owns that now (§5, §5.2).
+        #
+        # Fail closed. A policy that won't load blocks every command — it must
+        # never degrade into an unrestricted shell, which is what the old
+        # blacklist.txt did when its file was missing.
+        self._policy_error: str | None = None
+        self._shape_policy: policy_mod.Policy | None = None
+        try:
+            base = policy_mod.load_policy(policy_mod.ALLOW_PATH, self._workspace)
+            self._shape_policy = policy_mod.Policy(
+                name="shape-only (derived from builtin:allow constructs)",
+                default_action="allow",
+                constructs=base.constructs,
+                rules=(),
+                max_command_bytes=base.max_command_bytes,
+            )
+        except policy_mod.PolicyError as exc:
+            self._policy_error = str(exc)
+            logger.error("shell: shape policy failed to load — all commands blocked: %s", exc)
+
+        # The tool's docstring feeds the model-visible schema description
+        # (ToolCallHandler reads func.__doc__ at register_tool() time, which
+        # happens after this STARTUP hook runs — see module_registry.py) and
+        # must show the ACTUAL configured max_timeout, not a hardcoded
+        # default baked in at import time.
+        type(self).shell.__doc__ = _SHELL_DOC_TEMPLATE.format(max_timeout=self.config["max_timeout"])
+
+    def _dispatch(self, command: str, local: bool = False, call_timeout: int | None = None) -> str:
+        """Shared pipeline: validate, then dispatch. Capability checking —
+        INCLUDING construct/shape denial, folded into
+        shell_perms.required_permissions_for_shell (see that module's
+        docstring) — already happened before this function is ever reached,
+        enforced once by ToolCallHandler. There is no second gate here: this
+        call to validate.check() only surfaces runtime diagnostics that
+        aren't permission decisions (empty command, over the byte limit,
+        unparseable syntax) — its construct check is dead weight against a
+        command that already cleared ToolCallHandler and would only ever
+        re-deny what UNTRUSTED_EXEC already covered, so it isn't consulted
+        here."""
+        if self._policy_error is not None:
+            return f"Blocked: shell policy could not be loaded — {self._policy_error}"
+
+        if not command.strip():
+            return "Blocked: empty command."
+        source = command.encode("utf-8", errors="surrogateescape")
+        if len(source) > self._shape_policy.max_command_bytes:
+            return (
+                f"Blocked: command is {len(source)} bytes, over the "
+                f"{self._shape_policy.max_command_bytes}-byte limit."
+            )
+        root = validate._get_parser().parse(source).root_node
+        if root.has_error:
+            return "Blocked: could not be parsed as bash (syntax error)."
+
+        max_timeout = self.config["max_timeout"]
+        default_timeout = self.config["default_timeout"]
+        effective_timeout = min(call_timeout, max_timeout) if call_timeout is not None else default_timeout
+        if local or not self._sandbox_url:
+            return _run_local(command, self._workspace, effective_timeout)
+        return _run_sandbox(command, self._sandbox_url, effective_timeout)
+
+    # docs/PERMISSIONS-PLAN.md §5 — dynamic classifier, third alongside
+    # `present` (§7.1). listing_permissions is deliberately left unset
+    # (empty) — under minimal_tokens, any caller might be permitted to run
+    # *some* command, so hiding the tool entirely would be wrong (§3.2).
+    # timeout=1200 matches max_timeout above — the framework's own @tool
+    # timeout isn't enforced anywhere yet (MODULES-PLAN-P1.md's P3), but
+    # when it is, this must already sit at or above shell's own ceiling or
+    # it would silently truncate calls this module already promises to allow.
+    @tool(always_on=True, timeout=1200, permissions=shell_perms.required_permissions_for_shell)
+    def shell(self, command: str, timeout: int | None = None, backend_access: bool = False) -> str:
+        # No hand-rolled backend_access gate here anymore — perms.py's
+        # required_permissions_for_shell adds Permission.BACKEND_EXEC to what
+        # this call needs, and ToolCallHandler.execute_tool_call already
+        # denied the call before shell() ever ran if the caller lacks it.
+        return self._dispatch(command, local=backend_access, call_timeout=timeout)
+
+    shell.__doc__ = _SHELL_DOC_TEMPLATE.format(max_timeout=1200)  # overwritten with the real config value in load()

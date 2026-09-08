@@ -37,8 +37,9 @@ from __future__ import annotations
 
 import pytest
 
-from TinyCTX.modules.shell import __main__ as shell_mod
+from TinyCTX.modules import shell as shell_mod
 from TinyCTX.modules.shell import policy as policy_mod
+from TinyCTX.module_registry import ModuleRegistry
 from TinyCTX.permissions import Permission
 from TinyCTX.tool_handling import ToolCallHandler
 
@@ -79,6 +80,12 @@ class _FakeAgent:
         self.tool_handler = tool_handler or ToolCallHandler()
 
 
+class _FakeRuntime:
+    """Shell.load()'s STARTUP hook only reads .config off of this."""
+    def __init__(self, config):
+        self.config = config
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -114,7 +121,11 @@ def _register(tmp_path, granted_permissions=None, extra_shell=None, sandbox_url=
     config = _FakeConfig(workspace, extra=extra)
     caller = _FakeCaller(granted_permissions)
     agent = _FakeAgent(caller, config)
-    shell_mod.register_agent(agent)
+
+    instance = shell_mod.Shell()
+    instance.config = instance.resolve_settings(extra)
+    instance.load(_FakeRuntime(config))
+    ModuleRegistry()._wire_module_instance(instance, agent)
     return agent
 
 

@@ -197,7 +197,7 @@ Permission levels 0–100. `_python_type_to_json_schema` (schema generation from
 Modules live under `TinyCTX/modules/<name>/`. Auto-discovered if they have `__main__.py` or `__init__.py`. A module exposes either shape (per-module exclusive — `_register_one` picks whichever it finds):
 
 - **Function-based (legacy):** `register_runtime(runtime)` — called once at startup; `register_agent(cycle)` — called per `AgentCycle`.
-- **`Module`-class-based (MODULES-PLAN-P1.md P2; `TinyCTX/module.py` + `TinyCTX/decorators.py`):** one `Module` subclass with `@tool`/`@hook`/`@command`/`@prompt`-tagged methods. `settings` is a declarative schema merged via `resolve_settings()` onto `self.config` — no more per-module `EXTENSION_META`/config-merge boilerplate. `ctx_tools` and `equipment_manifest` are migrated; the rest are still function-based.
+- **`Module`-class-based (MODULES-PLAN-P1.md P2; `TinyCTX/module.py` + `TinyCTX/decorators.py`):** one `Module` subclass with `@tool`/`@hook`/`@command`/`@prompt`-tagged methods. `settings` is a declarative schema merged via `resolve_settings()` onto `self.config` — no more per-module `EXTENSION_META`/config-merge boilerplate. `ctx_tools`, `equipment_manifest`, and `shell` are migrated (P2's three proving targets — plan called for a fourth, `todo`, but no such module exists in this codebase); the remaining ~17 are still function-based (P3, not started).
   - `@hook` types actually wired today: `PRE_ASSEMBLE`/`PRE_ASSEMBLE_ASYNC`/`FILTER_TURN`/`TRANSFORM_TURN`/`POST_ASSEMBLE`/`POST_COMPLETION` → `cycle.context.register_hook`; `POST_TURN` → `cycle.post_turn_hooks.append`; `STARTUP` → called once with `runtime` at module-class load time (`_register_module_class`); `TURN_START` → called once with `cycle` at per-cycle wiring time (`_wire_module_instance`) — no dedicated emitter exists yet, this is the closest per-cycle hook point. `STREAM_TEXT`/`STREAM_START`/`STREAM_END` (need stream-pass `Scratch`, not built) and `SHUTDOWN`/`BACKGROUND`/`DELIVER`/`INBOUND` (runtime-scoped or no consumer yet) log a warning and register nowhere if `@hook`'d — see `module_registry.py::_wire_module_instance`.
   - `Context.assemble()` creates one `hooks.Scratch()` per call, passed to any `PRE_ASSEMBLE`/`FILTER_TURN`/`TRANSFORM_TURN`/`POST_ASSEMBLE`/prompt-provider handler that declares a trailing `scratch` parameter (`hooks.handler_wants_scratch`); dropped when `assemble()` returns. This is how a module shares data across its own hook stages without closures (see `ctx_tools`' dedup/trim, `equipment_manifest`'s footer).
   - `Context.db` is a public property (`ConversationDB`) so a `ctx`-only hook/prompt body can walk ancestors without needing `agent`/`cycle`.
@@ -293,14 +293,15 @@ CRON.json-backed job scheduler; creates agent turns at specified times.
 ### `filesystem`
 `view`, `write_file`, `edit_file`, `grep`, `glob_search` tools. Write tools sandboxed to `workspace/`; read tools can also reach `filesystem.read_only_paths` from config.yaml. `view()` returns images via `IMAGE_BLOCK_PREFIX`, unwrapped by `agent._execute_tool`.
 
-### `shell`
-`shell` tool, runs in workspace directory, Linux only.
+### `shell` (migrated to `Module`/decorators — MODULES-PLAN-P1.md P2)
+`Shell(Module)` in `__init__.py` — `shell` tool, runs in workspace directory, Linux only. Proves `@tool` carries a callable permission classifier (`shell_perms.required_permissions_for_shell`, an imported function, not a method) and `listing_permissions` intact.
+- `@hook(HookType.STARTUP)` resolves the shape policy and sandbox URL once (was per-cycle in `register_agent`); also rewrites `Shell.shell.__doc__` with the real configured `max_timeout`, since a `@tool` method's docstring — read by `register_tool()` for the model-visible schema — is otherwise fixed at import time
+- Which commands a caller may run is decided entirely by granted capabilities (the single `permissions.template` in `config.yaml`, plus any per-user `permission_overrides`) via `perms.py`'s per-command classification — `min_permission`/tiered `policies`/`permissions.access_backend` are gone, permission_level was fully retired (see `TinyCTX/permissions.py`, `docs/PERMISSIONS-PLAN.md`)
 - `validate.py` — AST-based command validation via `tree-sitter-bash`
-- `policy.py` — compiles rules from YAML
-- Two policy files: `deny.yaml` (default_action: allow, for callers ≥ neutral) and `allow.yaml` (default_action: deny, for callers below neutral), both overridable via `extra.shell.policy.{deny,allow}`; compose via `extends:` (`builtin:allow`, `builtin:deny`, or a relative path)
-- `extra.shell.min_permission` (default 30), `extra.shell.policies` (tiered policy list), `extra.shell.permissions.access_backend` (default 80, sandbox vs main container)
-- Design doc: `modules/shell/PLAN.md`; example: `modules/shell/example.instance-allow.yaml`
-- Tests: `tests/test_shell_policy.py` (shipped-YAML corpus), `tests/test_shell.py` (tier routing, fail-closed)
+- `policy.py` — compiles a shape-only policy (construct/redirect/glob shape, not capability rules) from `allow.yaml`'s `constructs` map
+- `settings`: `default_timeout` (120), `max_timeout` (1200), `sandbox_url` (`"auto"` computes from `TINYCTX_INSTANCE`; empty string disables the sandbox and runs in the main container)
+- Design doc: `modules/shell/PLAN.md`
+- Tests: `tests/test_shell_policy.py` (shipped-YAML corpus), `tests/test_shell.py` (capability gating, fail-closed), `tests/test_shell_perms.py`/`tests/test_shell_perms_yaml.py` (per-command tag table)
 
 ### `web`
 `web_search` (DuckDuckGo via `ddgs`) and `open_url` (Camoufox — anti-detect Firefox), plus `click`/`type_text`/`extract_text`/`extract_html`/`screenshot_browser`/`wait_for` acting on the last-loaded page.
