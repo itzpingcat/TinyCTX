@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
 from TinyCTX.decorators import CommandBinding, HookBinding, PromptBinding, ToolBinding, walk_bindings
+from TinyCTX.hooks import HookType
 from TinyCTX.module import Module
 
 if TYPE_CHECKING:
@@ -109,7 +110,7 @@ class ModuleRegistry:
                 spec.loader.exec_module(candidate)
                 has_rt = hasattr(candidate, "register_runtime")
                 has_ra = hasattr(candidate, "register_agent")
-                if has_rt or has_ra:
+                if has_rt or has_ra or self._find_module_class(candidate) is not None:
                     logger.debug(
                         "[module_registry] '%s' loaded from path (register_runtime=%s, register_agent=%s)",
                         entry.name, has_rt, has_ra,
@@ -118,7 +119,7 @@ class ModuleRegistry:
             except Exception:
                 logger.exception("[module_registry] error loading '%s' from path", entry.name)
                 return None
-        logger.warning("[module_registry] '%s' has no register_runtime/register_agent — skipping", entry.name)
+        logger.warning("[module_registry] '%s' has no register_runtime/register_agent/Module class — skipping", entry.name)
         return None
 
     def _find_module(self, module_name: str, entry_name: str):
@@ -129,7 +130,7 @@ class ModuleRegistry:
                 candidate = importlib.import_module(fqn)
                 has_rt = hasattr(candidate, "register_runtime")
                 has_ra = hasattr(candidate, "register_agent")
-                if has_rt or has_ra:
+                if has_rt or has_ra or self._find_module_class(candidate) is not None:
                     print(f"[module_registry] '{entry_name}' found in {fqn} (register_runtime={has_rt}, register_agent={has_ra})")
                     logger.debug(
                         "[module_registry] '%s' found in %s (register_runtime=%s, register_agent=%s)",
@@ -138,7 +139,7 @@ class ModuleRegistry:
                     return candidate
                 else:
                     logger.debug(
-                        "[module_registry] '%s' imported from %s but has no register_* — trying next",
+                        "[module_registry] '%s' imported from %s but has no register_*/Module class — trying next",
                         entry_name, fqn,
                     )
             except ModuleNotFoundError as e:
@@ -150,8 +151,8 @@ class ModuleRegistry:
                 logger.exception("[module_registry] error importing '%s' as %s", entry_name, fqn)
                 return None
 
-        print(f"[module_registry] '{entry_name}' has no register_runtime/register_agent — skipping")
-        logger.warning("[module_registry] '%s' has no register_runtime/register_agent — skipping", entry_name)
+        print(f"[module_registry] '{entry_name}' has no register_runtime/register_agent/Module class — skipping")
+        logger.warning("[module_registry] '%s' has no register_runtime/register_agent/Module class — skipping", entry_name)
         return None
 
     def _register_one(self, mod, runtime, entry_name: str) -> None:
@@ -199,6 +200,8 @@ class ModuleRegistry:
 
         # CommandRegistry lives on the runtime, not the per-turn AgentCycle,
         # so CommandBinding registers here rather than in _wire_module_instance.
+        # STARTUP is the other runtime-scoped type (replaces register_runtime()):
+        # called once, now, with `runtime` — same timing register_runtime had.
         for name, binding, bound in walk_bindings(instance):
             if isinstance(binding, CommandBinding) and hasattr(runtime, "commands"):
                 runtime.commands.register(
@@ -206,10 +209,27 @@ class ModuleRegistry:
                     help=binding.help, params=binding.params,
                     required_permissions=binding.permissions,
                 )
+            elif isinstance(binding, HookBinding) and binding.type is HookType.STARTUP:
+                try:
+                    bound(runtime)
+                except Exception:
+                    logger.exception(
+                        "[module_registry] STARTUP hook '%s' raised for module '%s'",
+                        name, instance.name,
+                    )
 
         self._module_instances.append(instance)
         print(f"[module_registry] '{entry_name}' loaded as Module class '{module_class.__name__}'")
         logger.info("[module_registry] '%s' loaded as Module class '%s'", entry_name, module_class.__name__)
+
+    # HookType members Context.assemble() actually reads out of its own
+    # _hooks dict; every other type needs its own home (see below) rather
+    # than landing in that dict, where nothing would ever call it.
+    _CONTEXT_HOOK_TYPES = frozenset({
+        HookType.PRE_ASSEMBLE, HookType.PRE_ASSEMBLE_ASYNC,
+        HookType.FILTER_TURN, HookType.TRANSFORM_TURN,
+        HookType.POST_ASSEMBLE, HookType.POST_COMPLETION,
+    })
 
     def _wire_module_instance(self, instance: Module, cycle: "AgentCycle") -> None:
         for name, binding, bound in walk_bindings(instance):
@@ -223,7 +243,24 @@ class ModuleRegistry:
                         listing_permissions=binding.listing_permissions,
                     )
                 elif isinstance(binding, HookBinding):
-                    cycle.context.register_hook(binding.type.wire_name, bound, priority=binding.priority)
+                    if binding.type in self._CONTEXT_HOOK_TYPES:
+                        cycle.context.register_hook(binding.type.wire_name, bound, priority=binding.priority)
+                    elif binding.type is HookType.POST_TURN:
+                        cycle.post_turn_hooks.append(bound)
+                    elif binding.type is HookType.TURN_START:
+                        # No emitter exists for this stage yet (MODULES-PLAN-P1.md
+                        # notes it "replaces per-turn wiring"): run it now, once,
+                        # at the same per-cycle-construction point register_agent()
+                        # functions ran their own per-turn setup at today.
+                        bound(cycle)
+                    else:
+                        logger.warning(
+                            "[module_registry] '%s' declares @hook(%s) from module '%s', "
+                            "which has no per-cycle wiring yet (STREAM_TEXT/START/END need "
+                            "stream-pass Scratch, not built; STARTUP/SHUTDOWN/BACKGROUND/DELIVER "
+                            "are runtime-scoped, not cycle-scoped) — not registered anywhere.",
+                            name, binding.type, instance.name,
+                        )
                 elif isinstance(binding, PromptBinding):
                     pid = binding.name or f"{instance.name}.{name}"
                     cycle.context.register_prompt(pid, bound, role=binding.role, priority=binding.priority)

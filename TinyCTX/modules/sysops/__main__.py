@@ -83,7 +83,7 @@ def register_runtime(runtime) -> None:
 # its session state (written by Runtime._compute_state_delta on the inbound
 # user node), so we load_session_state() on it and resolve the User via
 # runtime.users.get_by_platform — the same approach
-# modules/equipment_manifest/__main__.py uses for its own trust check.
+# modules/equipment_manifest/__init__.py uses for its own trust check.
 
 async def _model_reply(context: dict, text: str) -> None:
     """Works whether the bridge gives an async 'send' callable (Discord) or

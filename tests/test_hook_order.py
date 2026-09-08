@@ -35,6 +35,7 @@ import pytest
 
 from TinyCTX.db import ConversationDB
 from TinyCTX.context import Context
+from TinyCTX.module_registry import ModuleRegistry
 
 # Modules whose register_agent() needs more scaffolding (real config, a live
 # tool_handler, runtime singletons) than this characterization test builds.
@@ -101,6 +102,7 @@ def _load_all_modules_into_context() -> tuple[Context, list[str], list[str]]:
 
     loaded: list[str] = []
     skipped: list[str] = []
+    registry = ModuleRegistry()
 
     for import_path in MODULE_IMPORT_PATHS:
         name = import_path.rsplit(".", 1)[-1]
@@ -111,6 +113,18 @@ def _load_all_modules_into_context() -> tuple[Context, list[str], list[str]]:
             mod = importlib.import_module(f"{import_path}.__main__")
         except ModuleNotFoundError:
             mod = importlib.import_module(import_path)
+
+        module_class = registry._find_module_class(mod)
+        if module_class is not None:
+            try:
+                instance = module_class()
+                instance.config = instance.resolve_settings(None)
+                registry._wire_module_instance(instance, cycle)
+                loaded.append(name)
+            except Exception as e:  # pragma: no cover - diagnostic path
+                pytest.fail(f"wiring Module class for '{name}' raised unexpectedly: {e!r}")
+            continue
+
         register_agent = getattr(mod, "register_agent", None)
         if register_agent is None:
             skipped.append(name)

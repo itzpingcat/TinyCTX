@@ -57,6 +57,7 @@ from typing import Any, Callable
 import logging
 
 from TinyCTX.contracts import ToolCall, ToolResult
+from TinyCTX.hooks import Scratch, handler_wants_scratch
 from TinyCTX.utils.sanitize import sanitize_brackets as _sanitize_brackets
 from TinyCTX.utils.sanitize import sanitize_special_tokens as _sanitize_special_tokens
 
@@ -308,6 +309,9 @@ class Context:
         # ctx.state["session"] IS still written by assemble() for hook compat.
         self.state: dict[str, Any] = {}
 
+        # Set for the duration of assemble() only; see assemble()'s own comment.
+        self.scratch: Scratch | None = None
+
     # ------------------------------------------------------------------
     # Cursor advance (only setter that exists post-construction)
     # ------------------------------------------------------------------
@@ -323,6 +327,13 @@ class Context:
     @property
     def tail_node_id(self) -> str:
         return self._tail_node_id
+
+    @property
+    def db(self) -> "ConversationDB":
+        """Exposed so a hook/prompt tagged against `ctx` alone (no `agent`
+        reference) can still walk ancestors — e.g. equipment_manifest's
+        last-message-time lookup (MODULES-PLAN-P1.md's @prompt section)."""
+        return self._db
 
     # ------------------------------------------------------------------
     # Hook registration
@@ -685,9 +696,18 @@ class Context:
         # "was present this turn" or it can never show up as invalidated.
         seen_tags: set[str] = set()
 
+        # One Scratch per assemble() call, for hooks/prompts that need to
+        # pass derived data between stages of THIS pass without closing over
+        # per-turn state (see hooks.py's Scratch and MODULES-PLAN-P1.md).
+        # Dropped at the bottom of this method.
+        self.scratch = Scratch()
+
         # 1. pre_assemble (sync)
         for _, _, fn in self._hooks[HOOK_PRE_ASSEMBLE]:
-            fn(self)
+            if handler_wants_scratch(fn):
+                fn(self, self.scratch)
+            else:
+                fn(self)
 
         # Resolve prompt providers
         resolved: list[tuple[PromptSlot, str]] = []
@@ -695,7 +715,7 @@ class Context:
             self._prompts.values(), key=lambda x: x[0].priority
         ):
             try:
-                content = provider(self)
+                content = provider(self, self.scratch) if handler_wants_scratch(provider) else provider(self)
             except Exception:
                 content = None
                 logger.exception("Prompt provider '%s' raised", slot.pid)
@@ -719,14 +739,16 @@ class Context:
 
             drop = False
             for _, _, fn in self._hooks[HOOK_FILTER_TURN]:
-                if fn(entry, age, self) is False:
+                args = (entry, age, self, self.scratch) if handler_wants_scratch(fn) else (entry, age, self)
+                if fn(*args) is False:
                     drop = True
                     break
             if drop:
                 continue
 
             for _, _, fn in self._hooks[HOOK_TRANSFORM_TURN]:
-                result = fn(entry, age, self)
+                args = (entry, age, self, self.scratch) if handler_wants_scratch(fn) else (entry, age, self)
+                result = fn(*args)
                 if result is not None:
                     entry = result
                     seen_tags |= entry.tags
@@ -892,7 +914,8 @@ class Context:
 
         # 7. post_assemble — genuinely final now: runs after merge + trim + render.
         for _, _, fn in self._hooks[HOOK_POST_ASSEMBLE]:
-            result = fn(messages, self)
+            args = (messages, self, self.scratch) if handler_wants_scratch(fn) else (messages, self)
+            result = fn(*args)
             if result is not None:
                 messages = result
 
@@ -902,6 +925,7 @@ class Context:
             was_trimmed=was_trimmed,
             invalidated_tags=invalidated_tags,
         )
+        self.scratch = None
         return messages, meta
 
     def _count_tokens_entries(self, entries: list[HistoryEntry], tools: list[dict] | None) -> int:

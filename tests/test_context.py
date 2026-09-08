@@ -542,7 +542,7 @@ class TestDeferredPromptPlacement:
     A role="user" prompt provider (e.g. equipment_manifest's volatile footer)
     must land BEFORE the entire trailing run of consecutive user turns, not
     after them and not spliced in the middle of them — see
-    modules/equipment_manifest/__main__.py's module docstring. Because the
+    modules/equipment_manifest/__init__.py's module docstring. Because the
     footer is role="user", the adjacent-merge (stage 4) folds it into that
     run as plain text, so "inserted before the run" is what makes the footer
     text land ahead of the user's own message(s) in the merged block.
@@ -729,3 +729,68 @@ class TestRegisterHookValidatesStageName:
         from TinyCTX.context import HOOK_PRE_ASSEMBLE_ASYNC
         ctx.register_hook(HOOK_PRE_ASSEMBLE_ASYNC, lambda c: None)
         assert len(ctx._hooks[HOOK_PRE_ASSEMBLE_ASYNC]) == 1
+
+
+class TestScratch:
+    """MODULES-PLAN-P1.md's Scratch section: one Scratch per assemble() call,
+    passed to any hook/prompt handler that declares a trailing `scratch`
+    parameter, dropped once assemble() returns. A handler without that
+    parameter keeps being called exactly as before (test_context's other
+    classes cover that path)."""
+
+    def test_pre_assemble_writes_scratch_transform_turn_reads_it(self, ctx):
+        _user(ctx, "hello")
+
+        def stash(c, scratch):
+            scratch.greeting = "HELLO"
+
+        def apply(entry, age, c, scratch):
+            if entry.role == ROLE_USER:
+                from dataclasses import replace
+                return replace(entry, content=scratch.greeting)
+            return None
+
+        ctx.register_hook(HOOK_PRE_ASSEMBLE, stash)
+        ctx.register_hook(HOOK_TRANSFORM_TURN, apply)
+        messages, _ = ctx.assemble()
+        assert "HELLO" in next(m["content"] for m in messages if m["role"] == ROLE_USER)
+
+    def test_filter_turn_and_post_assemble_receive_scratch(self, ctx):
+        _user(ctx, "keep")
+        seen = {}
+
+        def stash(c, scratch):
+            scratch.marker = "set"
+
+        def check_filter(entry, age, c, scratch):
+            seen["filter"] = scratch.marker
+            return None
+
+        def check_post(messages, c, scratch):
+            seen["post"] = scratch.marker
+            return None
+
+        ctx.register_hook(HOOK_PRE_ASSEMBLE, stash)
+        ctx.register_hook(HOOK_FILTER_TURN, check_filter)
+        ctx.register_hook(HOOK_POST_ASSEMBLE, check_post)
+        ctx.assemble()
+        assert seen == {"filter": "set", "post": "set"}
+
+    def test_scratch_does_not_persist_across_assemble_calls(self, ctx):
+        _user(ctx, "x")
+        seen = []
+
+        def stash_and_read(c, scratch):
+            seen.append(getattr(scratch, "value", None))
+            scratch.value = "written"
+
+        ctx.register_hook(HOOK_PRE_ASSEMBLE, stash_and_read)
+        ctx.assemble()
+        ctx.assemble()
+        assert seen == [None, None]  # a fresh Scratch every pass, not a leftover
+
+    def test_handler_without_scratch_parameter_still_works(self, ctx):
+        _user(ctx, "unchanged")
+        ctx.register_hook(HOOK_TRANSFORM_TURN, lambda entry, age, c: None)
+        messages, _ = ctx.assemble()
+        assert "unchanged" in next(m["content"] for m in messages if m["role"] == ROLE_USER)

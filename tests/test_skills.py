@@ -24,7 +24,8 @@ import pytest
 from TinyCTX.db import ConversationDB
 from TinyCTX.context import Context, ROLE_USER, ROLE_ASSISTANT, ROLE_TOOL
 from TinyCTX.contracts import ToolCall, ToolResult
-from TinyCTX.modules.ctx_tools import __main__ as ctx_tools_mod
+from TinyCTX.module_registry import ModuleRegistry
+from TinyCTX.modules.ctx_tools import CtxTools
 from TinyCTX.modules.skills import __main__ as skills_mod
 from TinyCTX.modules.skills.__main__ import (
     _parse_frontmatter,
@@ -88,6 +89,14 @@ def make_agent(db, workspace, extra=None):
     root = db.get_root()
     ctx = Context(db, tail_node_id=root.id, token_limit=100_000)
     return _Agent(db, ctx, workspace, extra=extra)
+
+
+def wire_ctx_tools(agent):
+    """Same wiring register_agent(cycle) used to do, via the real
+    Module-class loader path (module_registry.py) ctx_tools migrated to."""
+    instance = CtxTools()
+    instance.config = instance.resolve_settings(None)
+    ModuleRegistry()._wire_module_instance(instance, agent)
 
 
 def write_skill(dir_path, name=None, description="", body="Do the thing."):
@@ -378,7 +387,7 @@ class TestSkillDroppedReminder:
     def test_fresh_skill_load_not_flagged(self, db, tmp_path, isolate_home):
         write_skill(tmp_path / "skills" / "foo", name="foo", description="d", body="body")
         agent = make_agent(db, tmp_path)
-        ctx_tools_mod.register_agent(agent)
+        wire_ctx_tools(agent)
         skills_mod.register_agent(agent)
 
         tc = ToolCall.make("use_skill", {"name": "foo"})
@@ -392,7 +401,7 @@ class TestSkillDroppedReminder:
     def test_reminder_fires_once_then_stops(self, db, tmp_path, isolate_home):
         write_skill(tmp_path / "skills" / "foo", name="foo", description="d", body="body")
         agent = make_agent(db, tmp_path)
-        ctx_tools_mod.register_agent(agent)
+        wire_ctx_tools(agent)
         skills_mod.register_agent(agent)
         ctx = agent.context
 

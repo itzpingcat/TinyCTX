@@ -26,7 +26,7 @@ import pytest
 from TinyCTX.agent import AgentCycle
 from TinyCTX.ai import TextDelta, LLMError
 from TinyCTX.contracts import AgentTextChunk
-from TinyCTX.modules.ctx_tools.__main__ import _LabelPrefixStripHook
+from TinyCTX.modules.ctx_tools import _LabelPrefixStripHook
 
 
 CASES = [

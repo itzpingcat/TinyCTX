@@ -149,6 +149,17 @@ class Scratch:
 Handler = Callable[..., Any]
 
 
+def handler_wants_scratch(fn: Handler) -> bool:
+    """True if fn declares a trailing `scratch` parameter — shared by
+    HookRegistry._call and by Context.assemble()'s own hook loops, which
+    predate HookRegistry backing them and so inspect this directly."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return "scratch" in params
+
+
 class HookListProxy:
     """
     List-like façade over one HookType bucket of a HookRegistry — lets
@@ -366,8 +377,4 @@ class HookRegistry:
 
     @staticmethod
     def _wants_scratch(fn: Handler) -> bool:
-        try:
-            params = inspect.signature(fn).parameters
-        except (TypeError, ValueError):
-            return False
-        return "scratch" in params
+        return handler_wants_scratch(fn)

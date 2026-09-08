@@ -194,11 +194,13 @@ Permission levels 0–100. `_python_type_to_json_schema` (schema generation from
 
 ## Module System (`module_registry.py`)
 
-Modules live under `TinyCTX/modules/<name>/`. Auto-discovered if they have `__main__.py` or `__init__.py`.
+Modules live under `TinyCTX/modules/<name>/`. Auto-discovered if they have `__main__.py` or `__init__.py`. A module exposes either shape (per-module exclusive — `_register_one` picks whichever it finds):
 
-Each module may expose:
-- `register_runtime(runtime)` — called once at startup
-- `register_agent(cycle)` — called per `AgentCycle`
+- **Function-based (legacy):** `register_runtime(runtime)` — called once at startup; `register_agent(cycle)` — called per `AgentCycle`.
+- **`Module`-class-based (MODULES-PLAN-P1.md P2; `TinyCTX/module.py` + `TinyCTX/decorators.py`):** one `Module` subclass with `@tool`/`@hook`/`@command`/`@prompt`-tagged methods. `settings` is a declarative schema merged via `resolve_settings()` onto `self.config` — no more per-module `EXTENSION_META`/config-merge boilerplate. `ctx_tools` and `equipment_manifest` are migrated; the rest are still function-based.
+  - `@hook` types actually wired today: `PRE_ASSEMBLE`/`PRE_ASSEMBLE_ASYNC`/`FILTER_TURN`/`TRANSFORM_TURN`/`POST_ASSEMBLE`/`POST_COMPLETION` → `cycle.context.register_hook`; `POST_TURN` → `cycle.post_turn_hooks.append`; `STARTUP` → called once with `runtime` at module-class load time (`_register_module_class`); `TURN_START` → called once with `cycle` at per-cycle wiring time (`_wire_module_instance`) — no dedicated emitter exists yet, this is the closest per-cycle hook point. `STREAM_TEXT`/`STREAM_START`/`STREAM_END` (need stream-pass `Scratch`, not built) and `SHUTDOWN`/`BACKGROUND`/`DELIVER`/`INBOUND` (runtime-scoped or no consumer yet) log a warning and register nowhere if `@hook`'d — see `module_registry.py::_wire_module_instance`.
+  - `Context.assemble()` creates one `hooks.Scratch()` per call, passed to any `PRE_ASSEMBLE`/`FILTER_TURN`/`TRANSFORM_TURN`/`POST_ASSEMBLE`/prompt-provider handler that declares a trailing `scratch` parameter (`hooks.handler_wants_scratch`); dropped when `assemble()` returns. This is how a module shares data across its own hook stages without closures (see `ctx_tools`' dedup/trim, `equipment_manifest`'s footer).
+  - `Context.db` is a public property (`ConversationDB`) so a `ctx`-only hook/prompt body can walk ancestors without needing `agent`/`cycle`.
 
 ---
 
@@ -314,20 +316,23 @@ CRON.json-backed job scheduler; creates agent turns at specified times.
 - `Permission.IMAGE_GEN` gating; config under `comfyui:` (host/port/api_key/timeout/unload_after/safety_filter)
 - Outputs: `workspace/outputs/comfyui/`
 
-### `ctx_tools`
-Context-assembly hooks only — registers **no tools**. Wired via `register_agent(cycle)`. Config in `EXTENSION_META["default_config"]`.
+### `ctx_tools` (migrated to `Module`/decorators — MODULES-PLAN-P1.md P2)
+`CtxTools(Module)` in `__init__.py` — context-assembly hooks only, registers **no tools**. Settings schema replaces `EXTENSION_META`. Per-pass state (`suppressed_tool`, `last_user_idx`, `trimmed_calls`) lives on `scratch`, not closures.
 - **dedup** — suppresses repeated identical tool call+result (`same_call_dedup_after`, default 2)
 - **cot_strip** — strips `<think>` blocks per `trim_thinking` (`"all" | "auto" | "none"`, default `"auto"`)
 - **trim** — replaces/truncates old tool-result turns (`tool_output.trim_after`/`truncate_after`/`max_chars`)
 - **tokenade** — blocks turns over `tokenade_threshold` (default 20000) tokens
-- **`token_sanitize`** — referenced by `tests/test_ctx_tools.py` but not implemented in `__main__.py`; tests fail, known incomplete
+- **label_prefix_strip** (`_LabelPrefixStripHook`) — wired into `cycle.stream_text_hooks` from a `@hook(HookType.TURN_START)` method, since `STREAM_TEXT`'s object-protocol (reset/process/flush) has no decorator path yet
+- Special-token sanitizing (`<|im_start|>`, `[INST]`) is a baseline pass in `context.py`'s own `assemble()`, not a ctx_tools hook
 
-### `equipment_manifest`
-Renders `EM.md` (Jinja2) as a system prompt every turn.
-- `equipment_manifest` (role=system, static vars) — cache-stable
-- `equipment_manifest_footer` (role=user, volatile vars: `time`, `time_since_last_message`) — from `EM_FOOTER.md` or a built-in default
+### `equipment_manifest` (migrated to `Module`/decorators — MODULES-PLAN-P1.md P2)
+`EquipmentManifest(Module)` in `__init__.py` — renders `EM.md` (Jinja2) as a system prompt every turn.
+- `@hook(HookType.STARTUP)` does the one-time EM.md/Jinja2-Environment setup (replaces `register_runtime`+`register_agent`'s per-cycle-repeated setup)
+- `equipment_manifest` (role=system, static vars, `@prompt`) — cache-stable
+- `equipment_manifest_footer` (role=user, volatile vars: `time`, `time_since_last_message`, `@prompt`) — from `EM_FOOTER.md` or a built-in default; `time_since_last_message` is precomputed by a paired `@hook(HookType.PRE_ASSEMBLE)` into `scratch.last_message_ts` (the plan's worked example for `@prompt` + scratch-feeding `@hook`)
 - `trusted` resolved via `UserStore.get_user(author_id)` (username lookup, not `get_by_platform`)
 - `em_path` config key resolution: `""` → `EM.md` next to module; `"workspace:X"` → under workspace root
+- `@prompt`'s `priority` is fixed at class-definition time, so `prompt_priority` is no longer a live setting (was already unused in this repo's config)
 
 ### `concurrency`
 Concurrent Forks. Design doc: `docs/PLAN.md`. Registers `running_forks` roster prompt provider (role=user) plus:
