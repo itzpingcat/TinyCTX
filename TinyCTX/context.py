@@ -329,6 +329,16 @@ class Context:
     # ------------------------------------------------------------------
 
     def register_hook(self, stage: str, fn: Callable, *, priority: int = 0) -> None:
+        # Validate against HookType's known wire names (TinyCTX/hooks.py) —
+        # see docs/MODULES-PLAN-P1.md's "Stage names are unvalidated strings"
+        # defect. A misspelled stage used to register silently into a
+        # defaultdict bucket nothing drains; it is a hard error now. This is
+        # the P1-phase-1 wiring step ONLY: storage, ordering, and combine
+        # behavior below are completely unchanged — HookRegistry itself is
+        # not yet backing this dict (see hooks.py's PRE_ASSEMBLE_ASYNC
+        # comment for why that swap is deferred).
+        from TinyCTX.hooks import HookType
+        HookType.from_wire_name(stage)
         self._hook_counter += 1
         self._hooks[stage].append((priority, self._hook_counter, fn))
         self._hooks[stage].sort(key=lambda x: (x[0], x[1]))

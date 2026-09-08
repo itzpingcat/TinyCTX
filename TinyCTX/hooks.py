@@ -76,6 +76,21 @@ class HookType(Enum):
 
     TURN_START      = ("turn_start",      Combine.FANOUT)
     PRE_ASSEMBLE    = ("pre_assemble",    Combine.FANOUT)
+    # PRE_ASSEMBLE_ASYNC is kept as its own member for now, diverging from
+    # MODULES-PLAN-P1.md's target end-state ("PRE_ASSEMBLE_ASYNC is gone as a
+    # separate type: emit awaiting coroutines makes sync-vs-async a property
+    # of the handler, not of the stage"). In THIS codebase the two are not
+    # just sync/async of one call site: HOOK_PRE_ASSEMBLE_ASYNC handlers are
+    # awaited by AgentCycle.run() via run_async_hooks() BEFORE assemble() is
+    # called at all, while HOOK_PRE_ASSEMBLE handlers run synchronously
+    # *inside* assemble()'s own step 1, after dialogue is loaded from the DB.
+    # Collapsing them into one HookType bucket right now would either
+    # double-fire every pre-assemble hook (if both call sites emit the same
+    # type) or silently change *when* one of the two groups runs relative to
+    # DB-loaded dialogue being available. That is a real behavior change the
+    # plan doesn't call out against this specific codebase's split — so it's
+    # deliberately deferred rather than folded in during this wiring step.
+    PRE_ASSEMBLE_ASYNC = ("pre_assemble_async", Combine.FANOUT)
     FILTER_TURN     = ("filter_turn",     Combine.VETO)
     TRANSFORM_TURN  = ("transform_turn",  Combine.CHAIN)
     POST_ASSEMBLE   = ("post_assemble",   Combine.CHAIN)

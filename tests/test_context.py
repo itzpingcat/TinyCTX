@@ -701,3 +701,31 @@ class TestSanitizationRunsLast:
         content = next(m["content"] for m in messages if m["role"] == ROLE_USER)
         assert "channel" not in content.lower()
         assert "part one" in content and "part two" in content
+
+
+class TestRegisterHookValidatesStageName:
+    """docs/MODULES-PLAN-P1.md P0/P1: register_hook() used to accept any
+    string and silently register into a defaultdict bucket nothing drains —
+    a misspelled stage (e.g. "pre_assemble_asycn") registered successfully
+    and the hook then never fired, forever, with no error anywhere. This is
+    the P1-phase-1 fix: register_hook validates against TinyCTX.hooks.HookType's
+    known wire names and raises immediately on an unknown one."""
+
+    def test_known_stage_still_registers(self, ctx):
+        ctx.register_hook(HOOK_PRE_ASSEMBLE, lambda c: None)
+        assert len(ctx._hooks[HOOK_PRE_ASSEMBLE]) == 1
+
+    def test_misspelled_stage_raises_instead_of_silently_registering(self, ctx):
+        with pytest.raises(ValueError):
+            ctx.register_hook("pre_assemble_asycn", lambda c: None)  # typo, on purpose
+        # And critically: nothing was silently filed away under the typo'd key.
+        assert "pre_assemble_asycn" not in ctx._hooks
+
+    def test_pre_assemble_async_is_still_a_recognized_stage(self, ctx):
+        # Confirms the deliberate divergence documented in hooks.py: this
+        # stage stays distinct from HOOK_PRE_ASSEMBLE rather than being
+        # folded away, because the two run at genuinely different times
+        # (see hooks.py's PRE_ASSEMBLE_ASYNC comment).
+        from TinyCTX.context import HOOK_PRE_ASSEMBLE_ASYNC
+        ctx.register_hook(HOOK_PRE_ASSEMBLE_ASYNC, lambda c: None)
+        assert len(ctx._hooks[HOOK_PRE_ASSEMBLE_ASYNC]) == 1
