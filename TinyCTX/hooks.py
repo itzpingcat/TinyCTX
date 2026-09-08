@@ -1,8 +1,6 @@
 """
 hooks.py — HookRegistry, HookType, Combine, Scratch.
 
-See docs/MODULES-PLAN-P1.md for the design rationale. Summary:
-
   - One registry for the process: dict[HookType, list[Handler]] that a
     caller looks up and runs inline, on its own stack. Not a bus — no
     queue, no decoupling, no deferred delivery.
@@ -14,10 +12,9 @@ See docs/MODULES-PLAN-P1.md for the design rationale. Summary:
     registered once per process lifetime and cannot close over per-turn
     data.
 
-This module is intentionally self-contained: it does not import from
-context.py, agent.py, or runtime.py, so it can be adopted incrementally
-(Context can delegate to it without every hook stage changing shape at
-once — see MODULES-PLAN-P1.md's phased rollout).
+This module does not import from context.py, agent.py, or runtime.py, so
+each of those can start delegating to it independently, one stage at a
+time, without a single flag-day cutover.
 """
 from __future__ import annotations
 
@@ -58,9 +55,9 @@ class HookType(Enum):
 
     wire_name is the legacy string stage name (e.g. "transform_turn") used by
     Context.register_hook()'s back-compat shim so existing string-literal
-    call sites keep working unchanged (see MODULES-PLAN-P1.md's "Stage names
-    are unvalidated strings" defect — this is what fixes it: an unknown wire
-    name raises instead of silently registering into a dead bucket).
+    call sites keep working unchanged. Looking it up here means a typo'd
+    stage name raises instead of silently registering into a dead bucket
+    that never gets emitted.
 
     isolate=False means emit() does NOT wrap each handler call in its own
     try/except — used only for STREAM_TEXT, which runs once per streamed
@@ -76,20 +73,16 @@ class HookType(Enum):
 
     TURN_START      = ("turn_start",      Combine.FANOUT)
     PRE_ASSEMBLE    = ("pre_assemble",    Combine.FANOUT)
-    # PRE_ASSEMBLE_ASYNC is kept as its own member for now, diverging from
-    # MODULES-PLAN-P1.md's target end-state ("PRE_ASSEMBLE_ASYNC is gone as a
-    # separate type: emit awaiting coroutines makes sync-vs-async a property
-    # of the handler, not of the stage"). In THIS codebase the two are not
-    # just sync/async of one call site: HOOK_PRE_ASSEMBLE_ASYNC handlers are
-    # awaited by AgentCycle.run() via run_async_hooks() BEFORE assemble() is
-    # called at all, while HOOK_PRE_ASSEMBLE handlers run synchronously
-    # *inside* assemble()'s own step 1, after dialogue is loaded from the DB.
-    # Collapsing them into one HookType bucket right now would either
-    # double-fire every pre-assemble hook (if both call sites emit the same
-    # type) or silently change *when* one of the two groups runs relative to
-    # DB-loaded dialogue being available. That is a real behavior change the
-    # plan doesn't call out against this specific codebase's split — so it's
-    # deliberately deferred rather than folded in during this wiring step.
+    # PRE_ASSEMBLE_ASYNC stays a separate member: HOOK_PRE_ASSEMBLE_ASYNC
+    # handlers are awaited by AgentCycle.run() via run_async_hooks() BEFORE
+    # assemble() is called at all, while HOOK_PRE_ASSEMBLE handlers run
+    # synchronously *inside* assemble()'s own step 1, after dialogue is
+    # loaded from the DB. Merging them into one HookType would either
+    # double-fire every pre-assemble hook (if both call sites emitted the
+    # same type) or silently move one group's timing relative to when
+    # DB-loaded dialogue becomes available — a real behavior change, not a
+    # cleanup, so it stays deferred until assemble()'s two call sites are
+    # unified on purpose.
     PRE_ASSEMBLE_ASYNC = ("pre_assemble_async", Combine.FANOUT)
     FILTER_TURN     = ("filter_turn",     Combine.VETO)
     TRANSFORM_TURN  = ("transform_turn",  Combine.CHAIN)
@@ -139,11 +132,10 @@ class Scratch:
 
     Namespacing is per-caller's own discipline, not enforced structurally:
     two modules using the same attribute name on the same Scratch instance
-    will collide. The convention (see MODULES-PLAN-P1.md) is one Scratch
-    instance per pass, with each module picking distinct key names — this
-    class does not attempt to auto-namespace by module, since attribute
-    access needs to stay ergonomic (`scratch.suppressed_tool`, not
-    `scratch["ctx_tools"]["suppressed_tool"]`).
+    will collide. One Scratch instance per pass, with each module picking
+    distinct key names, keeps attribute access ergonomic
+    (`scratch.suppressed_tool`, not `scratch["ctx_tools"]["suppressed_tool"]`)
+    at the cost of not auto-namespacing by module.
     """
 
     def __repr__(self) -> str:
@@ -163,9 +155,7 @@ class HookListProxy:
     AgentCycle keep a plain-looking `self.post_turn_hooks` attribute that
     modules `.append(fn)` to and agent.py iterates with `for hook in
     self.post_turn_hooks:`, while registration actually files into the
-    shared HookRegistry underneath (see MODULES-PLAN-P1.md's P1 phase 1:
-    "post_turn_hooks and stream_text_hooks move onto it, with list-like
-    proxies left on AgentCycle").
+    shared HookRegistry underneath — existing call sites don't change shape.
 
     Deliberately minimal: only append() and iteration are implemented,
     because those are the only two operations any real call site uses today
@@ -217,8 +207,9 @@ class HookRegistry:
         if not isinstance(type, HookType):
             raise TypeError(
                 f"HookRegistry.register() requires a HookType member, got {type!r}. "
-                f"The enum is closed by design — see MODULES-PLAN-P1.md's "
-                f"'Module-defined hook types' deferral."
+                f"The enum is closed by design: every stage's Combine strategy is "
+                f"fixed at definition time so two callers can never disagree about "
+                f"how return values for that stage combine."
             )
         self._seq += 1
         self._handlers[type].append((priority, self._seq, fn))
@@ -240,8 +231,7 @@ class HookRegistry:
         Run every handler registered for `type` and combine their return
         values per type.combine. Coroutine handlers are awaited; sync
         handlers are called directly — sync-vs-async is a property of the
-        handler, not of the stage (see MODULES-PLAN-P1.md: PRE_ASSEMBLE_ASYNC
-        is gone as a separate type for exactly this reason).
+        handler, not of the stage.
 
         `scratch`, if given, is appended as a final keyword-ish positional:
         handlers that want it declare a trailing `scratch` parameter; a

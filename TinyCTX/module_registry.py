@@ -1,7 +1,10 @@
 """
 module_registry.py — Module loading and per-cycle wiring.
 
-Modules expose two functions:
+A module exposes either the function pair below or a single Module
+subclass (TinyCTX/module.py) with @tool/@hook/@command/@prompt-decorated
+methods (TinyCTX/decorators.py); both shapes may coexist in the codebase
+during the migration, and this registry runs whichever a module defines.
 
   def register_runtime(runtime: Runtime) -> None:
       # Called once at startup.
@@ -21,6 +24,9 @@ import importlib.util
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
+
+from TinyCTX.decorators import CommandBinding, HookBinding, PromptBinding, ToolBinding, walk_bindings
+from TinyCTX.module import Module
 
 if TYPE_CHECKING:
     from TinyCTX.agent import AgentCycle
@@ -43,6 +49,10 @@ class ModuleRegistry:
 
     def __init__(self) -> None:
         self._agent_registrations: list[Callable] = []
+        # Module-class instances found at load_modules() time, wired into
+        # each AgentCycle in register_agent() alongside the function-based
+        # queue above. A module may use either shape; both run.
+        self._module_instances: list[Module] = []
 
     def load_modules(self, runtime) -> None:
         """Scan modules/ and custom_modules/ and call register_runtime on each."""
@@ -145,6 +155,10 @@ class ModuleRegistry:
         return None
 
     def _register_one(self, mod, runtime, entry_name: str) -> None:
+        module_class = self._find_module_class(mod)
+        if module_class is not None:
+            self._register_module_class(module_class, runtime, entry_name)
+            return
         if hasattr(mod, "register_runtime"):
             print(f"[module_registry] calling register_runtime for '{entry_name}'")
             logger.info("[module_registry] calling register_runtime for '%s'", entry_name)
@@ -159,6 +173,68 @@ class ModuleRegistry:
             print(f"[module_registry] queued register_agent (no runtime) for '{entry_name}'")
             logger.info("[module_registry] queued register_agent (no runtime) for '%s'", entry_name)
 
+    @staticmethod
+    def _find_module_class(mod) -> type[Module] | None:
+        """First Module subclass defined in `mod`, or None. `attr.__module__
+        == mod.__name__` excludes Module itself and any Module subclass the
+        file merely imported rather than defined."""
+        for attr in vars(mod).values():
+            if (
+                isinstance(attr, type)
+                and issubclass(attr, Module)
+                and attr is not Module
+                and attr.__module__ == mod.__name__
+            ):
+                return attr
+        return None
+
+    def _register_module_class(self, module_class: type[Module], runtime, entry_name: str) -> None:
+        instance = module_class()
+        ok, missing = instance.dependencies_satisfied()
+        if not ok:
+            print(f"[module_registry] '{entry_name}' skipped — missing dependency '{missing}'")
+            logger.warning("[module_registry] '%s' skipped — missing dependency '%s'", entry_name, missing)
+            return
+        instance.config = instance.resolve_settings(getattr(getattr(runtime, "config", None), "extra", None))
+
+        # CommandRegistry lives on the runtime, not the per-turn AgentCycle,
+        # so CommandBinding registers here rather than in _wire_module_instance.
+        for name, binding, bound in walk_bindings(instance):
+            if isinstance(binding, CommandBinding) and hasattr(runtime, "commands"):
+                runtime.commands.register(
+                    binding.namespace, binding.sub, bound,
+                    help=binding.help, params=binding.params,
+                    required_permissions=binding.permissions,
+                )
+
+        self._module_instances.append(instance)
+        print(f"[module_registry] '{entry_name}' loaded as Module class '{module_class.__name__}'")
+        logger.info("[module_registry] '%s' loaded as Module class '%s'", entry_name, module_class.__name__)
+
+    def _wire_module_instance(self, instance: Module, cycle: "AgentCycle") -> None:
+        for name, binding, bound in walk_bindings(instance):
+            try:
+                if isinstance(binding, ToolBinding):
+                    cycle.tool_handler.register_tool(
+                        bound,
+                        name=binding.name,
+                        always_on=binding.always_on,
+                        required_permissions=binding.permissions,
+                        listing_permissions=binding.listing_permissions,
+                    )
+                elif isinstance(binding, HookBinding):
+                    cycle.context.register_hook(binding.type.wire_name, bound, priority=binding.priority)
+                elif isinstance(binding, PromptBinding):
+                    pid = binding.name or f"{instance.name}.{name}"
+                    cycle.context.register_prompt(pid, bound, role=binding.role, priority=binding.priority)
+                elif isinstance(binding, CommandBinding):
+                    pass  # registered in _register_module_class, once per runtime
+            except Exception:
+                logger.exception(
+                    "[module_registry] failed wiring binding '%s' (%s) from module '%s'",
+                    name, type(binding).__name__, instance.name,
+                )
+
     def register_agent(self, cycle: "AgentCycle") -> None:
         """Wire all modules into a newly constructed AgentCycle."""
         logger.debug("[module_registry] register_agent called, %d hook(s)", len(self._agent_registrations))
@@ -168,3 +244,6 @@ class ModuleRegistry:
                 fn(cycle)
             except Exception:
                 logger.exception("[module_registry] register_agent raised (fn=%s)", getattr(fn, "__name__", fn))
+
+        for instance in self._module_instances:
+            self._wire_module_instance(instance, cycle)

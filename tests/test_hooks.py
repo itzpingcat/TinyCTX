@@ -1,9 +1,9 @@
 """
 tests/test_hooks.py — unit tests for TinyCTX/hooks.py (HookRegistry, HookType,
-Combine, Scratch). See docs/MODULES-PLAN-P1.md.
+Combine, Scratch).
 
 These test the registry in isolation, not wired into Context/AgentCycle yet
-(that wiring is a separate, later step — see MODULES-PLAN-P1.md's P1 phase 2).
+(that wiring is a separate, later step).
 """
 from __future__ import annotations
 
