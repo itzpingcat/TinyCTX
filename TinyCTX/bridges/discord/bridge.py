@@ -84,6 +84,10 @@ DEFAULTS = {
     "quote_reply_enabled": True,
     "quote_reply_lookback": 50,
     "quote_reply_min_len": 8,
+    # When True (and no quote-reply blocks matched -- see quote_reply.py's
+    # split_into_paragraphs), a reply with blank-line-separated paragraphs
+    # is sent as one Discord message per paragraph instead of one message.
+    "paragraph_split_enabled": True,
     # See cosmetics.py for the full key list and behavior.
     "cosmetics": {},
 }
@@ -113,6 +117,7 @@ class DiscordBridge:
         self._quote_reply_enabled:  bool = bool(self._opts["quote_reply_enabled"])
         self._quote_reply_lookback: int  = int(self._opts["quote_reply_lookback"])
         self._quote_reply_min_len:  int  = int(self._opts["quote_reply_min_len"])
+        self._paragraph_split_enabled: bool = bool(self._opts["paragraph_split_enabled"])
         self._reset_command:      str   = str(self._opts["reset_command"])
         self._shutdown_command:   str   = str(self._opts["shutdown_command"])
         self._dm_enabled:         bool  = bool(self._opts["dm_enabled"])

@@ -16,6 +16,7 @@ from dataclasses import dataclass
 
 from TinyCTX.bridges.discord.quote_reply import (
     resolve_target,
+    split_into_paragraphs,
     split_into_reply_segments,
 )
 
@@ -200,3 +201,40 @@ def test_matches_across_humanized_vs_raw_mention_spelling():
     assert len(segments) == 1
     assert segments[0].target is real_message
     assert segments[0].text == "<@845336457153740830> oh, you mean like this?"
+
+
+# ---------------------------------------------------------------------------
+# split_into_paragraphs — used by ChannelRenderer.flush() only when
+# quote-reply splitting doesn't trigger (no '>' block present); see turn.py.
+# ---------------------------------------------------------------------------
+
+class TestParagraphSplit:
+    def test_single_paragraph_returns_one_item(self):
+        assert split_into_paragraphs("just one paragraph, no blank lines") == [
+            "just one paragraph, no blank lines"
+        ]
+
+    def test_blank_line_splits_into_two(self):
+        assert split_into_paragraphs("first part\n\nsecond part") == [
+            "first part",
+            "second part",
+        ]
+
+    def test_multiple_blank_lines_collapse_to_one_boundary(self):
+        # "a\n\n\n\nb" must not produce an empty paragraph in between.
+        assert split_into_paragraphs("a\n\n\n\nb") == ["a", "b"]
+
+    def test_single_newline_does_not_split(self):
+        # A single '\n' is just a line break within one paragraph/message,
+        # not a paragraph boundary.
+        assert split_into_paragraphs("line one\nline two") == ["line one\nline two"]
+
+    def test_blank_only_text_returns_empty_list(self):
+        assert split_into_paragraphs("   \n\n   ") == []
+
+    def test_leading_trailing_whitespace_stripped_per_paragraph(self):
+        assert split_into_paragraphs("  first  \n\n  second  ") == ["first", "second"]
+
+    def test_three_or_more_paragraphs(self):
+        text = "one\n\ntwo\n\nthree"
+        assert split_into_paragraphs(text) == ["one", "two", "three"]

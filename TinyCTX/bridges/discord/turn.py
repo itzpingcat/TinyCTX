@@ -24,7 +24,7 @@ from TinyCTX.contracts import (
     AgentToolResult,
     InboundMessage,
 )
-from .quote_reply import split_into_reply_segments
+from .quote_reply import split_into_paragraphs, split_into_reply_segments
 
 if TYPE_CHECKING:
     from TinyCTX.bridges.discord.bridge import DiscordBridge
@@ -57,6 +57,7 @@ class ChannelRenderer:
         quote_reply_enabled: bool = True,
         quote_reply_lookback: int = 50,
         quote_reply_min_len: int = 8,
+        paragraph_split_enabled: bool = True,
     ) -> None:
         self._channel = channel
         self._max_len = max_len
@@ -64,6 +65,7 @@ class ChannelRenderer:
         self._quote_reply_enabled = quote_reply_enabled
         self._quote_reply_lookback = quote_reply_lookback
         self._quote_reply_min_len = quote_reply_min_len
+        self._paragraph_split_enabled = paragraph_split_enabled
         self._buf: list[str] = []
         self._suppressed = False
 
@@ -110,6 +112,18 @@ class ChannelRenderer:
             for segment in segments:
                 await self._send_chunked(segment.text, reference=segment.target)
             return
+
+        if self._paragraph_split_enabled:
+            # No quote blocks -- if the model separated the reply into
+            # blank-line-delimited paragraphs, send each as its own Discord
+            # message instead of one long blob. Only reached when the
+            # quote-reply branch above didn't trigger at all (see
+            # split_into_paragraphs' docstring for why the two don't mix).
+            paragraphs = split_into_paragraphs(text)
+            if len(paragraphs) > 1:
+                for paragraph in paragraphs:
+                    await self._send_chunked(paragraph)
+                return
 
         await self._send_chunked(text)
 
@@ -177,6 +191,7 @@ def make_platform_handler(bridge: "DiscordBridge") -> "Callable[[str, object], A
                 quote_reply_enabled=bridge._quote_reply_enabled,
                 quote_reply_lookback=bridge._quote_reply_lookback,
                 quote_reply_min_len=bridge._quote_reply_min_len,
+                paragraph_split_enabled=bridge._paragraph_split_enabled,
             )
             renderers[cursor_key] = renderer
 
@@ -264,6 +279,7 @@ async def handle_turn(
             quote_reply_enabled=bridge._quote_reply_enabled,
             quote_reply_lookback=bridge._quote_reply_lookback,
             quote_reply_min_len=bridge._quote_reply_min_len,
+            paragraph_split_enabled=bridge._paragraph_split_enabled,
         )
 
         while True:

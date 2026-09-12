@@ -147,6 +147,30 @@ def resolve_target(
     return None
 
 
+def split_into_paragraphs(text: str) -> list[str]:
+    """
+    Split `text` on blank lines (one or more consecutive "\\n\\n"-style
+    gaps) into separate messages, each sent standalone (no reply target).
+
+    Used by ChannelRenderer.flush() only when quote-reply splitting does
+    NOT trigger (no '>' block in the text) -- see that call site. This is
+    a much simpler rule than split_into_reply_segments: no history lookup,
+    no back-reference resolution, just "the model separated these with a
+    blank line, so send them as separate Discord messages" (e.g. a model
+    that free-forms a multi-part reply without any quote markers).
+
+    Runs of 2+ consecutive newlines are treated as one paragraph boundary
+    (so "a\\n\\n\\nb" is two paragraphs, not one empty one in between).
+    Leading/trailing whitespace on each paragraph is stripped; empty
+    paragraphs (e.g. from "a\\n\\n\\n\\nb") are dropped.
+    """
+    parts = _PARAGRAPH_SPLIT_RE.split(text.strip())
+    return [p.strip() for p in parts if p.strip()]
+
+
+_PARAGRAPH_SPLIT_RE = re.compile(r"\n{2,}")
+
+
 def split_into_reply_segments(
     text: str,
     candidates: list,
