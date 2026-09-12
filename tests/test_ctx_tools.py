@@ -33,7 +33,7 @@ from TinyCTX.db import ConversationDB
 from TinyCTX.context import Context, HistoryEntry
 from TinyCTX.contracts import ToolCall, ToolResult
 from TinyCTX.module_registry import ModuleRegistry
-from TinyCTX.modules.ctx_tools import CtxTools, _strip_cot
+from TinyCTX.modules.ctx_tools import CtxTools, _strip_cot, _LabelPrefixStripHook
 
 
 # ---------------------------------------------------------------------------
@@ -361,3 +361,75 @@ class TestTokenSanitize:
         messages, _ = ctx.assemble()
         assistant_msgs = _msg_contents(messages, "assistant")
         assert not any("<|im_start|>" in c for c in assistant_msgs)
+
+
+# ---------------------------------------------------------------------------
+# label_prefix_strip hook (stream_text_hooks protocol)
+# ---------------------------------------------------------------------------
+
+def _run_stream(hook, chunks):
+    """Drive a stream_text_hooks-style hook the way agent.py's
+    _stream_inference does: reset() once, process() per chunk, flush() at
+    the end -- and concatenate everything the hook actually released."""
+    hook.reset()
+    out = "".join(hook.process(c) for c in chunks)
+    out += hook.flush()
+    return out
+
+
+class TestLabelPrefixStripHook:
+    def test_strips_prefix_on_first_line(self):
+        hook = _LabelPrefixStripHook(40)
+        assert _run_stream(hook, ["【Bob】: hello there"]) == "hello there"
+
+    def test_strips_prefix_repeated_on_later_lines(self):
+        # The bug this hook now fixes: a model that opens more than one
+        # line in the same reply with "【label】: " (e.g. simulating a
+        # multi-speaker exchange) must have every occurrence stripped, not
+        # just the one at the very start of the stream.
+        hook = _LabelPrefixStripHook(40)
+        out = _run_stream(hook, ["【Bob】: hello\n【Alice】: hi back\n【Bob】: cool"])
+        assert out == "hello\nhi back\ncool"
+
+    def test_strips_prefix_split_across_many_small_chunks(self):
+        hook = _LabelPrefixStripHook(40)
+        chunks = ["【", "Bob", "】", ":", " ", "hi\n", "【Bob】", ": ", "there\n", "plain"]
+        assert _run_stream(hook, chunks) == "hi\nthere\nplain"
+
+    def test_ordinary_reply_untouched(self):
+        hook = _LabelPrefixStripHook(40)
+        text = "just a normal\nmulti-line reply\nwith no labels at all"
+        assert _run_stream(hook, [text]) == text
+
+    def test_only_first_line_labeled_rest_untouched(self):
+        hook = _LabelPrefixStripHook(40)
+        out = _run_stream(hook, ["【Bob】: hi\nno label on this line\nor this one"])
+        assert out == "hi\nno label on this line\nor this one"
+
+    def test_non_label_bracket_text_not_eaten(self):
+        # Starts with 【 but never actually forms "【label】: " -- must be
+        # released untouched, not dropped, and later lines still checked.
+        hook = _LabelPrefixStripHook(40)
+        out = _run_stream(hook, ["【just brackets, no closing colon\nsecond line"])
+        assert out == "【just brackets, no closing colon\nsecond line"
+
+    def test_oversized_label_gives_up_but_still_rearms_next_line(self):
+        # A prefix candidate that blows the buffer cap on line one must not
+        # prevent detection on a later line in the same reply.
+        hook = _LabelPrefixStripHook(20)
+        out = _run_stream(hook, ["【" + "x" * 30 + "】: body\n【Bob】: third"])
+        assert out.endswith("\nthird")
+        assert "【Bob】" not in out
+
+    def test_flush_releases_buffered_prefix_only_line(self):
+        # Stream ends right after "【label】:" with no body text yet.
+        hook = _LabelPrefixStripHook(40)
+        assert _run_stream(hook, ["【Bob】:"]) == ""
+
+    def test_reset_clears_state_between_stream_attempts(self):
+        hook = _LabelPrefixStripHook(40)
+        _run_stream(hook, ["【Bob】: first attempt"])
+        # A fresh attempt (e.g. retry after a model_chain fallback) must not
+        # be affected by whatever state the previous attempt left behind.
+        out = _run_stream(hook, ["【Alice】: second attempt"])
+        assert out == "second attempt"

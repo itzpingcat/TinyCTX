@@ -273,19 +273,27 @@ def _strip_cot(text: str) -> str:
 # turns only, to attribute speakers in multi-participant chats (see
 # context.py's assemble(), ~line 744: f"【{label}】: "). It must never
 # appear on an assistant turn. Models occasionally imitate the pattern
-# in-context and start echoing "【SomeName】: " at the head of their own
-# replies; once that lands in stored history it reinforces itself on every
-# later turn, since the model now sees its own past labeled replies as
-# precedent. This hook buffers the start of each streamed reply just long
-# enough to strip a leading label before any text reaches a client, so the
-# pattern never enters a live transcript and can't compound turn over turn.
+# in-context and start echoing "【SomeName】: " at the head of a line in
+# their own replies -- not only at the very start of the reply, but at the
+# start of later lines too (e.g. one label per paragraph, or per "turn" in
+# a simulated multi-speaker exchange). Once that lands in stored history it
+# reinforces itself on every later turn, since the model now sees its own
+# past labeled replies as precedent. This hook buffers the start of each
+# line of a streamed reply just long enough to strip a leading label
+# before any text reaches a client, so the pattern never enters a live
+# transcript and can't compound turn over turn.
+#
+# State is tracked per-line rather than per-stream: after any line resolves
+# (matched-and-stripped, or given up on), the hook re-arms and watches the
+# start of the next line for the same pattern, all the way to flush().
 
-# _PREFIX_ONLY_RE: the buffer so far is exactly "【label】:" plus (maybe only
-# some of the) trailing whitespace, with no body text yet -- keep buffering
-# rather than resolving, since the separator space in context.py's
-# f"【{label}】: " can itself arrive split across TextDelta chunks.
+# _PREFIX_ONLY_RE: the line-start buffer so far is exactly "【label】:" plus
+# (maybe only some of the) trailing whitespace, with no body text yet --
+# keep buffering rather than resolving, since the separator space in
+# context.py's f"【{label}】: " can itself arrive split across TextDelta
+# chunks.
 # _PREFIX_STRIP_RE: same shape, used once body text has arrived, to cut the
-# prefix off the front of the buffer.
+# prefix off the front of the line-start buffer.
 _LABEL_PREFIX_ONLY_RE = re.compile(r"^【[^【】]{0,32}】:\s*$")
 _LABEL_PREFIX_STRIP_RE = re.compile(r"^【[^【】]{0,32}】:\s*")
 
@@ -295,64 +303,97 @@ class _LabelPrefixStripHook:
     Implements AgentCycle.stream_text_hooks' reset()/process()/flush()
     protocol. Operates on accumulated text rather than raw provider chunks,
     so it's correct regardless of how a delta stream happens to split the
-    brackets, colon, or separator space across tokens.
+    brackets, colon, separator space, or newline across tokens.
+
+    Re-arms at the start of every line (not just the start of the stream),
+    since the model can repeat the "【label】: " pattern at the head of any
+    line, not only the first.
     """
 
     def __init__(self, max_buffer: int):
         self._max_buffer = max_buffer
-        self._buf = ""
-        self._resolved = False
+        self._buf = ""       # line-start candidate buffer, watched for a prefix
+        self._armed = True   # True while at a line-start still being checked
 
     def reset(self) -> None:
         self._buf = ""
-        self._resolved = False
+        self._armed = True
 
     def process(self, text: str) -> str:
-        if self._resolved:
-            return text
+        out_parts: list[str] = []
 
-        self._buf += text
-        if not self._buf.startswith("【"):
-            # Can never become a "【label】: " prefix -- no reason to
-            # hold ordinary replies back waiting for the cap or a newline.
-            self._resolved = True
-            out, self._buf = self._buf, ""
-            return out
+        while text:
+            if not self._armed:
+                # Mid-line, not currently checking for a prefix -- pass
+                # through up to (and including) the next newline, then
+                # re-arm for the line that follows it.
+                nl = text.find("\n")
+                if nl == -1:
+                    out_parts.append(text)
+                    text = ""
+                else:
+                    out_parts.append(text[: nl + 1])
+                    text = text[nl + 1 :]
+                    self._armed = True
+                    self._buf = ""
+                continue
 
-        if _LABEL_PREFIX_ONLY_RE.match(self._buf):
-            # Buffer is just "【label】:" (+ maybe partial trailing
-            # whitespace) with no body text yet -- keep waiting.
-            if len(self._buf) >= self._max_buffer:
-                self._resolved = True
-                out, self._buf = self._buf, ""
-                return out
-            return ""
+            self._buf += text
+            text = ""
 
-        stripped = _LABEL_PREFIX_STRIP_RE.sub("", self._buf, count=1)
-        if stripped != self._buf:
-            # Prefix matched with real body text after it -- drop the
-            # prefix, release the body.
-            self._resolved = True
-            self._buf = ""
-            return stripped
+            if not self._buf.startswith("【"):
+                # Can never become a "【label】: " prefix -- no reason to
+                # hold this line back waiting for the cap or a newline.
+                # Re-feed it through the unarmed path (rather than emitting
+                # directly) in case it already contains a "\n" that starts
+                # a new line needing its own check.
+                self._armed = False
+                text = self._buf
+                self._buf = ""
+                continue
 
-        if len(self._buf) >= self._max_buffer or "\n" in self._buf:
-            # No match possible within the buffer budget (or the model
-            # moved past the first line without opening with 【) -- give up
-            # waiting, release as-is.
-            self._resolved = True
-            out, self._buf = self._buf, ""
-            return out
+            if _LABEL_PREFIX_ONLY_RE.match(self._buf):
+                # Buffer is just "【label】:" (+ maybe partial trailing
+                # whitespace) with no body text yet -- keep waiting.
+                if len(self._buf) >= self._max_buffer:
+                    self._armed = False
+                    text = self._buf
+                    self._buf = ""
+                continue
 
-        return ""  # keep buffering, nothing to release yet
+            stripped = _LABEL_PREFIX_STRIP_RE.sub("", self._buf, count=1)
+            if stripped != self._buf:
+                # Prefix matched with real body text after it -- drop the
+                # prefix, release the body, then keep processing whatever
+                # of that body (possibly another newline) remains.
+                self._armed = False
+                text = stripped
+                self._buf = ""
+                continue
+
+            if len(self._buf) >= self._max_buffer or "\n" in self._buf:
+                # No match possible within the buffer budget (or the model
+                # moved past the first line of this segment without
+                # opening with 【) -- give up waiting, release as-is (again
+                # re-fed, in case a "\n" inside it starts a new line).
+                self._armed = False
+                text = self._buf
+                self._buf = ""
+                continue
+
+            # keep buffering, nothing to release yet this round
+
+        return "".join(out_parts)
 
     def flush(self) -> str:
-        # Stream ended (or errored) before the buffer resolved -- e.g. a
-        # short reply that finished mid-buffer with no newline. Apply the
-        # same check once more before releasing whatever's left.
-        if self._resolved or not self._buf:
+        # Stream ended (or errored) before the current line resolved --
+        # e.g. a short reply that finished mid-buffer with no newline.
+        # Apply the same check once more before releasing whatever's left.
+        if not self._armed or not self._buf:
             self._buf = ""
+            self._armed = True
             return ""
         stripped = _LABEL_PREFIX_STRIP_RE.sub("", self._buf, count=1)
         self._buf = ""
+        self._armed = True
         return stripped
