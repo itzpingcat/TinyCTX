@@ -21,16 +21,20 @@ them — you never call a registration function yourself.
 
 WHAT A MODULE BODY RECEIVES
 -----------------------------
-There is no AppContext/TurnContext facade. Method bodies take the same raw
-framework objects modules always have:
+Method bodies take these framework objects, depending on which decorator:
   - `runtime`  — the shared TinyCTX.runtime.Runtime (STARTUP only)
-  - `cycle`    — the live TinyCTX.agent.AgentCycle (per-turn hooks only)
   - `ctx`      — the assembly-pass Context (most hooks/prompts)
   - a plain `dict` (command handlers' `context` argument)
-`@tool` bodies are the one exception: they receive ONLY their own declared,
-model-visible arguments — no `ctx`/`cycle` at all (see the TURN_START
-section below for what to do when a tool genuinely needs live per-cycle
-state).
+`@tool` bodies are different: they receive ONLY their own declared,
+model-visible arguments (whatever you named in the method signature) — never
+`ctx`, `cycle`, or `runtime`. That's not a missing feature: the loader builds
+the JSON schema the LLM sees straight from your tool's signature, so any
+parameter you add is something the model has to invent a value for. There is
+no way to sneak a live framework object into that path, and there shouldn't
+be — it keeps the model from ever touching a live cycle or the database
+directly. If a tool needs something that changes every turn (who's calling,
+enabling another tool mid-turn, etc.), that's an advanced pattern — see
+for-contributors/ADVANCED.md rather than this template.
 """
 from __future__ import annotations
 
@@ -257,44 +261,19 @@ class ExampleModule(Module):
     #     return not (age > 50 and "debug" in (entry.content or ""))
     # ======================================================================
 
-    # ======================================================================
-    # TOOLS/HOOKS THAT NEED LIVE PER-CYCLE STATE
-    # ======================================================================
-    # @tool methods receive only their own declared arguments — no `cycle`,
-    # no `ctx`. If a tool genuinely needs something that changes per turn
-    # (cycle.caller, cycle.outbound_events, a live browser session, tool-
-    # enablement via cycle.tool_handler.enable(), ...), register it
-    # imperatively from a @hook(HookType.TURN_START) method instead — that
-    # DOES receive `cycle`, once per AgentCycle, and can close over it in a
-    # nested function the way the old register_agent(cycle) used to. This is
-    # the common case, not a workaround: modules/present, modules/sysops,
-    # modules/cron, and modules/filesystem all do this. See
-    # modules/present/__init__.py's own module docstring for the full
-    # rationale (a facade fixing this is deferred to a later plan phase).
-    #
-    # @hook(HookType.TURN_START)
-    # def wire_live_tool(self, cycle) -> None:
-    #     def needs_live_cycle(arg: str) -> str:
-    #         """Uses cycle state that changes every turn.
-    #
-    #         Args:
-    #             arg: Example argument.
-    #         """
-    #         return f"caller was {cycle.caller.username}: {arg}"
-    #
-    #     cycle.tool_handler.register_tool(
-    #         needs_live_cycle, always_on=False, required_permissions=None,
-    #     )
+    # A @tool can only take the plain arguments in its own signature — never
+    # something that changes per turn (who's calling, live browser/session
+    # state, enabling another tool mid-turn). If you think you need that,
+    # see for-contributors/ADVANCED.md before reaching for it; it's a
+    # deliberately fenced-off pattern, not something to copy by default.
 
     # ======================================================================
     # SLASH COMMANDS — @command-decorated methods. Only appropriate when the
     # handler needs nothing beyond self.* (process-lifetime state) plus the
     # per-call `context` dict CommandRegistry.dispatch() already passes
-    # every handler — see modules/sysops's /model for a real example. If
-    # your command needs live cycle state, there is no live cycle at
-    # dispatch time (commands run outside an AgentCycle) — resolve whatever
-    # you need from `context` itself (context["runtime"], a resolved
-    # caller, etc.), the same way /model does.
+    # every handler — see modules/sysops's /model for a real example.
+    # Commands run outside an AgentCycle, so resolve whatever you need from
+    # `context` itself (context["runtime"], a resolved caller, etc.).
     #
     # Handlers RETURN the string to send (or None for nothing to say) —
     # dispatch() delivers it via context["send"]/["console"] itself. Don't
@@ -308,77 +287,23 @@ class ExampleModule(Module):
         return f"example command called with args={args}"
 
     # ======================================================================
-    # SESSION STATE ("the State system")
+    # SESSION STATE — persisting a value across turns on the same branch
     # ======================================================================
-    # TinyCTX has no dedicated State class. "State" refers to two related
-    # but distinct things:
+    # From a hook or prompt provider (anything with `ctx`), read and write
+    # cross-turn state through ctx.db.get_state / ctx.db.set_state, using
+    # your own STATE_KEY:
     #
-    # (a) SESSION STATE — a plain dict reconstructed by walking a
-    #     conversation branch's ancestor chain in ConversationDB, merging
-    #     each node's `state_delta` JSON column (most-recent node wins per
-    #     key). This is how a value survives across multiple turns on the
-    #     same branch without a dedicated database table. Real examples:
-    #     modules/rag stores "rag_auto_targets" this way; modules/skills
-    #     stores "skills_expanded_categories" this way. Both write it from a
-    #     tool call and read it back in a prompt provider or hook on a later
-    #     turn.
+    #     value = ctx.db.get_state(ctx.tail_node_id, STATE_KEY, default=None)
+    #     ctx.db.set_state(ctx.tail_node_id, STATE_KEY, value)
     #
-    #     Use db.get_state / db.set_state — NOT the raw
-    #     load_session_state / update_node_state_delta primitives — for
-    #     anything module-level. Here's why: update_node_state_delta()
-    #     blindly REPLACES a node's entire state_delta column. If your tool
-    #     call does
-    #         db.update_node_state_delta(node_id, json.dumps({STATE_KEY: value}))
-    #     and some other module (or another tool call earlier in the same
-    #     turn) already wrote a different key onto that exact node_id, your
-    #     write silently erases it. set_state() avoids this by reading the
-    #     node's existing delta first and merging your key in before writing
-    #     it back — safe no matter who else touches that node. get_state()
-    #     is the matching single-key read (a thin wrapper over
-    #     load_session_state(), which walks the whole ancestor chain — only
-    #     the WRITE side needed fixing).
-    #
-    #     `ctx.db` is a public property (added alongside the Module system)
-    #     so a hook/prompt tagged against `ctx` alone can reach it without
-    #     needing live `cycle`:
-    #         value = ctx.db.get_state(ctx.tail_node_id, STATE_KEY, default=None)
-    #         ctx.db.set_state(ctx.tail_node_id, STATE_KEY, value)
-    #     From inside a @tool that needs live cycle state (see the TURN_START
-    #     section above), use cycle.db / cycle.context.tail_node_id instead.
-    #
-    # (b) ctx.state — a plain dict attribute on the live Context object,
-    #     scoped to a single assemble() call (a FRESH dict, dropped, every
-    #     time it runs — this is `scratch`'s older, coarser-grained cousin,
-    #     not the same mechanism: ctx.state persists across every assemble()
-    #     call within one AgentCycle, where Scratch is dropped after each
-    #     individual assemble() call — see modules/output_parser's
-    #     nudge-budget state for why that distinction matters). After
-    #     assemble() runs, ctx.state["session"] holds the SAME session-state
-    #     dict described in (a) — Context loads it internally via
-    #     db.load_session_state() for convenience — plus bookkeeping keys
-    #     like ctx.state["tokens_used"]. Hooks and prompt providers that only
-    #     need to READ session state (not write it) should use
-    #     ctx.state["session"] rather than calling load_session_state()
-    #     themselves — see status_prompt() above.
-
-    @tool(always_on=False, permissions=None)
-    def set_example_state(self, value: str) -> str:
-        """Persist a value in session state so future turns on this branch can read it.
-
-        This is a @tool, so it has no `ctx` — but set_example_state has no
-        need for live cycle state either (it only needs a node id and a DB
-        handle, both of which... wait, a plain @tool genuinely can't reach
-        ctx.tail_node_id at all. If you need this exact shape for real, wire
-        it from TURN_START instead, closing over `cycle`, the same as any
-        other tool needing live per-cycle state — see that section above.
-        This method is left here unregistered-in-practice, as a worked
-        example of the state read/write calls themselves, not a template to
-        copy verbatim.
-
-        Args:
-            value: The value to remember.
-        """
-        raise ToolError("see this method's docstring — wire from TURN_START instead")
+    # Always use these two — never the raw load_session_state /
+    # update_node_state_delta primitives. update_node_state_delta() REPLACES
+    # a node's whole state_delta column, so a raw write can silently erase a
+    # key another module wrote to the same node; set_state() merges instead.
+    # See modules/rag or modules/skills for real examples of reading state
+    # back in a prompt provider or hook on a later turn. (@tool methods have
+    # no `ctx`, so they can't do this directly — see ADVANCED.md if a tool
+    # genuinely needs to write session state.)
 
 
 # ======================================================================
@@ -394,21 +319,19 @@ class ExampleModule(Module):
 #    required `permissions=` — a set[Permission], None, or a classifier
 #    callable — never omit it (that's a startup assertion failure, not a
 #    silently-ungated tool).
-# 5. If a tool/hook genuinely needs live per-turn state (cycle.caller,
-#    cycle.outbound_events, tool_handler.enable(), ...), wire it
-#    imperatively from @hook(HookType.TURN_START) — see that section above.
+# 5. If a tool/hook genuinely needs live per-turn state (who's calling,
+#    enabling another tool mid-turn, ...), see for-contributors/ADVANCED.md
+#    before reaching for it — it's a deliberately fenced-off pattern.
 # 6. Register prompt providers via @prompt if the agent needs standing
 #    context injected every turn.
 # 7. Register context hooks via @hook(HookType.<STAGE>) only if you need to
 #    filter/transform/reshape history or prompt assembly. Use `scratch` to
 #    share data between your own hook methods within one assemble() pass.
-# 8. For cross-turn memory, use ctx.db.get_state / ctx.db.set_state (or
-#    cycle.db.../cycle.context.tail_node_id from a TURN_START-wired tool)
-#    with your own unique STATE_KEY — never write to the built-in keys
-#    (platform, author_id, agent_name, server_name, channel_name). Don't use
-#    db.update_node_state_delta / db.load_session_state directly from module
-#    code — set_state/get_state wrap them safely (see the SESSION STATE
-#    section above for why the raw write primitive is a footgun).
+# 8. For cross-turn memory, use ctx.db.get_state / ctx.db.set_state with
+#    your own unique STATE_KEY — never write to the built-in keys
+#    (platform, author_id, agent_name, server_name, channel_name), and never
+#    use db.update_node_state_delta / db.load_session_state directly (see
+#    the SESSION STATE section above for why).
 # 9. Raise TinyCTX.module.ToolError for expected failures instead of
 #    returning an ad-hoc "Error: ..." string — the framework renders it
 #    consistently.
