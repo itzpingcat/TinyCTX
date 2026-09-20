@@ -131,6 +131,11 @@ class ComfyUI(Module):
     """generate_image_comfyui tool. Runs an admin-provided ComfyUI workflow
     from config/comfyui/."""
 
+    # Keep the existing config namespace. The base class would derive
+    # ``comfy_ui`` from the class name, but the public config key is
+    # historically ``comfyui``.
+    name = "comfyui"
+
     settings = {
         "timeout":      {"default": 300, "type": "int", "description": "Seconds to wait for the job to finish."},
         "host":         {"default": "127.0.0.1", "type": "str", "description": "ComfyUI host."},

@@ -76,6 +76,16 @@ class TestResolveSettings:
         extra = {"notes": {"max_note_chars": 500}, "other_module": {"max_note_chars": 1}}
         assert m.resolve_settings(extra) == {"max_note_chars": 500}
 
+    def test_comfyui_keeps_existing_config_namespace(self):
+        from TinyCTX.modules.comfyui import ComfyUI
+
+        module = ComfyUI()
+        resolved = module.resolve_settings({"comfyui": {"host": "comfy", "port": 9000}})
+
+        assert module.name == "comfyui"
+        assert resolved["host"] == "comfy"
+        assert resolved["port"] == 9000
+
     def test_extra_for_a_different_module_is_ignored(self):
         class Notes(Module):
             settings = {"max_note_chars": {"default": 8000}}
