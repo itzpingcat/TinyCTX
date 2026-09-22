@@ -336,7 +336,7 @@ Fires periodic agent turns on a background DB branch. Slash command: `/heartbeat
 - **cot_strip** — strips `<think>` blocks per `trim_thinking` (`"all" | "auto" | "none"`, default `"auto"`)
 - **trim** — replaces/truncates old tool-result turns (`tool_output.trim_after`/`truncate_after`/`max_chars`)
 - **tokenade** — blocks turns over `tokenade_threshold` (default 20000) tokens
-- **label_prefix_strip** (`_LabelPrefixStripHook`) — wired into `cycle.stream_text_hooks` from a `@hook(HookType.TURN_START)` method, since `STREAM_TEXT`'s object-protocol (reset/process/flush) has no decorator path yet
+- **label_prefix_strip** (`_LabelPrefixStripHook`) — wired into `cycle.stream_text_hooks` from a `@hook(HookType.TURN_START)` method, since `STREAM_TEXT`'s object-protocol (reset/process/flush) has no decorator path yet; strips spoofed `【label】:` prefixes at the start of streamed reply lines
 - Special-token sanitizing (`<|im_start|>`, `[INST]`) is a baseline pass in `context.py`'s own `assemble()`, not a ctx_tools hook
 
 ### `equipment_manifest` (migrated to `Module`/decorators — MODULES-PLAN-P1.md P2)

@@ -41,7 +41,7 @@ CASES = [
     (["No leading bracket but contains 【weird】 mid-text"],
      "No leading bracket but contains 【weird】 mid-text"),
     (["a" * 50], "a" * 50),                            # well past the buffer cap, no bracket
-    (["line1\n", "【Yumeko】: fake"], "line1\n【Yumeko】: fake"),  # 【 not at true start
+    (["line1\n", "【Yumeko】: fake"], "line1\nfake"),  # labels are stripped at line starts
     (["【", "】", ":", "x"], "x"),                     # empty label
     (["【Yumeko】:", " ", " ", "Hi"], "Hi"),            # separator space split across deltas
     (["【Yumeko】: "], ""),                             # prefix + trailing space, stream ends there
