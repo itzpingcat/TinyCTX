@@ -149,7 +149,7 @@ User turns are prefixed `【author_id】: ` after the hook pipeline. Special-tok
 
 Returns `(messages, AssembleMeta)` with `tokens_pre_trim`, `tokens_used`, `was_trimmed`.
 
-Deferred (`role="user"`) prompt providers (equipment_manifest footer, concurrency roster) are spliced in right before the trailing run of consecutive user turns.
+Deferred (`role="user"`) prompt providers (equipment_manifest footer, concurrency roster) are anchored before the most recent consecutive user run, even when later assistant/tool entries have been appended during a tool loop; with no user turn, they follow the system block.
 
 Thinking (`<think>...</think>`) is stored inline on the assistant `content` (no separate column); `_render()` peels one leading block into `reasoning_content` for replay. `modules/ctx_tools`'s `trim_thinking` controls how much survives into later turns.
 

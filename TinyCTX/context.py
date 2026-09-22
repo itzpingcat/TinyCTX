@@ -790,21 +790,31 @@ class Context:
 
             entries.append(entry)
 
-        # Insert deferred non-system prompts (e.g. footer) as synthetic entries
-        # BEFORE the trailing run of consecutive user entries (i.e. ahead of
-        # the entire unread batch, not spliced in the middle of it) so the
-        # merge produces: <footer>\n\n[msg1]\n\n[msg2]\n\n... . Found by
-        # walking back from the end of `entries` while the role is
-        # ROLE_USER — this lands before ALL trailing user turns, not just
-        # the last one, and (unlike anchoring on "the last assistant entry
-        # anywhere in history") isn't fooled by tool-call/tool-result
-        # entries that sit between an earlier assistant turn and this
-        # trailing user run. Priority is respected within the deferred set.
+        # Insert deferred non-system prompts (e.g. footer) immediately before
+        # the most recent consecutive user run. The run is found by first
+        # locating the last user entry anywhere in the assembled history, then
+        # walking backward across preceding user entries. This remains stable
+        # when assistant/tool entries were appended after the user turn during
+        # a tool loop; simply walking backward from the end would otherwise
+        # append the footer after the latest tool result.
+        #
+        # If there is no user entry, insertion at the end of the system block
+        # is the natural fallback. Priority is respected within the deferred
+        # set.
         if deferred_prompts:
             sorted_deferred = sorted(deferred_prompts, key=lambda x: x[0].priority)
-            insert_at = len(entries)
-            while insert_at > 0 and entries[insert_at - 1].role == ROLE_USER:
-                insert_at -= 1
+            insert_at = next(
+                (i for i in range(len(entries) - 1, -1, -1) if entries[i].role == ROLE_USER),
+                None,
+            )
+            if insert_at is None:
+                insert_at = next(
+                    (i for i, entry in enumerate(entries) if entry.role != ROLE_SYSTEM),
+                    len(entries),
+                )
+            else:
+                while insert_at > 0 and entries[insert_at - 1].role == ROLE_USER:
+                    insert_at -= 1
             synthetic = [HistoryEntry(role=s.role, content=c) for s, c in sorted_deferred]
             entries[insert_at:insert_at] = synthetic
 

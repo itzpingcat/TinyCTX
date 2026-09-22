@@ -600,6 +600,32 @@ class TestDeferredPromptPlacement:
         assert len(user_msgs) == 1
         assert user_msgs[0].index("FOOTER") < user_msgs[0].index("hello")
 
+    def test_lands_before_latest_user_after_tool_results(self, ctx):
+        # Regression: a later assemble() pass during a tool loop has a tool
+        # result at the end of history. The footer must still stay before the
+        # user turn that initiated the loop, not append after that result.
+        _user(ctx, "hey ai can you do x and then y")
+        tc = ToolCall.make("x", {})
+        _assistant(ctx, "", tool_calls=[tc])
+        _tool_result(ctx, tc.call_id, "result of x")
+        self._register_footer(ctx)
+
+        messages, _ = ctx.assemble()
+        roles = [m["role"] for m in messages]
+        footer_i = next(i for i, m in enumerate(messages) if "FOOTER" in m.get("content", ""))
+        user_i = next(i for i, m in enumerate(messages) if m["role"] == ROLE_USER)
+        assert footer_i == user_i
+        assert roles[user_i + 1] == ROLE_ASSISTANT
+
+    def test_no_user_turn_inserts_after_system(self, ctx):
+        ctx.register_prompt("system", lambda c: "SYSTEM", role=ROLE_SYSTEM, priority=1)
+        self._register_footer(ctx)
+
+        messages, _ = ctx.assemble()
+        assert [m["role"] for m in messages] == [ROLE_SYSTEM, ROLE_USER]
+        assert messages[0]["content"] == "SYSTEM"
+        assert messages[1]["content"] == "FOOTER"
+
     def test_no_user_turn_yet_appends_after_system(self, ctx):
         # Very first turn in a lane: no user entry at all (e.g. a synthetic
         # trigger). Footer should land right after the system block, not
