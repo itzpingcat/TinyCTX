@@ -240,6 +240,8 @@ The detailed entries are actionable units, not a request for one enormous patch.
 
 ### AGT-01: Preserve real tool results at the cycle limit and terminate clearly
 
+**Status:** Done — final-cycle tool results are preserved and execution ends with one explicit limit message.
+
 **Priority:** P1  
 **Evidence:** C  
 **Source locations:** [AgentCycle generation loop][src-agent].

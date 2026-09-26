@@ -245,6 +245,7 @@ class AgentCycle:
         empty_retries = 0
 
         final_text = ""
+        terminated_at_limit = False
         streaming_active = False
         no_reply = False
         agent_name: str | None = state.get("agent_name")
@@ -410,14 +411,6 @@ class AgentCycle:
                 
                 result = await self._execute_tool(tc)
                 
-                if is_last_cycle:
-                    result = ToolResult(
-                        call_id=result.call_id,
-                        tool_name=result.tool_name,
-                        output="[Tool Limit Reached] Summarize now.",
-                        is_error=True,
-                    )
-
                 self.context.add_tool_result(result)
                 meta["tail_node_id"] = self.context.tail_node_id
 
@@ -433,6 +426,13 @@ class AgentCycle:
                     yield extra
                 self.outbound_events.clear()
 
+            if is_last_cycle:
+                terminated_at_limit = True
+                final_text = (
+                    "Tool execution limit reached after executing the requested "
+                    "tool call(s)."
+                )
+
             cycle_num += 1
 
         logger.debug("[agent] yielding AgentTextFinal, streaming_active=%s", streaming_active)
@@ -440,7 +440,7 @@ class AgentCycle:
         # bridges can advance their cursor to the correct node.
         final_tail = meta["tail_node_id"]
         yield AgentTextFinal(
-            text=final_text if not streaming_active else "",
+            text=final_text if (not streaming_active or terminated_at_limit) else "",
             suppressed=no_reply,
             **meta,
         )
