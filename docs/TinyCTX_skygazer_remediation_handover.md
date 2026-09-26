@@ -52,7 +52,7 @@ The detailed entries are actionable units, not a request for one enormous patch.
 | [SEC-02](#sec-02) | P1 | C + R | Close child-path escapes in grep and glob |
 | [SEC-03](#sec-03) | P1 | C | Authorise the actual shell execution location |
 | [SEC-04](#sec-04) | P1 | H: documented design decision | Make the gateway master-key trust model explicit |
-| [SEC-05](#sec-05) | P1 | V + H | Harden filesystem operations against check/open races |
+| [SEC-05](#sec-05) | P1 | V + H | Done — harden final-component filesystem access against symlink swaps |
 | [CTX-01](#ctx-01) | P1 | C + R | Preserve complete tool-call/result exchanges across every transform |
 | [CTX-02](#ctx-02) | P1 | C + R | Done — reject system prompts exceeding the configured context fraction |
 | [CTX-03](#ctx-03) | P1 | C + H | Make final payload budgets model-aware and truthful |
@@ -157,6 +157,8 @@ The detailed entries are actionable units, not a request for one enormous patch.
 <a id="sec-05"></a>
 
 ### SEC-05: Harden filesystem operations against check/open races
+
+**Status:** Done for the supported final-component boundary. Image/document reads and gateway workspace reads/writes now use no-follow opens; parent-component race resistance remains platform-dependent and is not claimed from path resolution alone.
 
 **Priority:** P1  
 **Evidence:** V + H  

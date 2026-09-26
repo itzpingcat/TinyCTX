@@ -52,6 +52,7 @@ import base64
 import hmac
 import json
 import logging
+import os
 import time
 from pathlib import Path
 
@@ -81,6 +82,30 @@ def _resolve_workspace_path(workspace_root: Path, rel: str) -> Path | None:
         return target
     except ValueError:
         return None
+
+
+def _read_workspace_text(path: Path) -> str:
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        with os.fdopen(fd, "r", encoding="utf-8") as stream:
+            return stream.read()
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _write_workspace_text(path: Path, content: str) -> None:
+    fd = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0),
+        0o666,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(content)
+    except Exception:
+        os.close(fd)
+        raise
 
 
 def _auth_middleware(api_key: str):
@@ -714,7 +739,7 @@ async def handle_workspace_get(request: web.Request) -> web.Response:
         raise web.HTTPNotFound(content_type="application/json",
                                body=json.dumps({"error": "file not found"}))
     try:
-        content = target.read_text(encoding="utf-8")
+        content = _read_workspace_text(target)
     except Exception as exc:
         raise web.HTTPInternalServerError(content_type="application/json",
                                           body=json.dumps({"error": str(exc)}))
@@ -754,7 +779,7 @@ async def handle_workspace_put(request: web.Request) -> web.Response:
                                  body=json.dumps({"error": "content required"}))
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
+        _write_workspace_text(target, content)
     except Exception as exc:
         raise web.HTTPInternalServerError(content_type="application/json",
                                           body=json.dumps({"error": str(exc)}))

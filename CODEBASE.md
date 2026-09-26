@@ -43,7 +43,7 @@ TinyCTX/
 │   ├── cli/__main__.py      Interactive terminal UI (rich TUI, session restore)
 │   └── discord/             Discord bridge (discord.py) — see below
 │
-├── gateway/__main__.py      HTTP/SSE gateway (aiohttp, /v1/chat endpoint)
+├── gateway/__main__.py      HTTP/SSE gateway (aiohttp, /v1/chat endpoint) with no-follow workspace file access
 │
 ├── onboard/            Interactive first-run setup wizard
 │   ├── __main__.py     Orchestrates setup steps

@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from TinyCTX.modules.filesystem import _run_py_grep, _validate_glob_pattern
+from TinyCTX.modules.filesystem import _read_bytes_nofollow, _run_py_grep, _validate_glob_pattern
 
 
 def test_python_grep_does_not_follow_file_symlinks(tmp_path):
@@ -35,3 +35,19 @@ def test_glob_rejects_parent_traversal():
 
 def test_glob_accepts_in_root_pattern():
     assert _validate_glob_pattern("**/*.py") is None
+
+
+def test_binary_read_rejects_final_symlink(tmp_path):
+    target = tmp_path / "outside.bin"
+    target.write_bytes(b"outside-marker")
+    link = tmp_path / "link.bin"
+    try:
+        link.symlink_to(target)
+    except (OSError, NotImplementedError):
+        return
+
+    try:
+        _read_bytes_nofollow(link)
+    except OSError:
+        return
+    raise AssertionError("final symlink was followed")

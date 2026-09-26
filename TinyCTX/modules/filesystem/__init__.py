@@ -125,6 +125,17 @@ _GREP_DEFAULT_LIMIT = 200
 _GLOB_DEFAULT_LIMIT = 100
 
 
+def _read_bytes_nofollow(path: Path) -> bytes:
+    """Read a regular file without following a swapped final symlink."""
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        with os.fdopen(fd, "rb") as stream:
+            return stream.read()
+    except Exception:
+        os.close(fd)
+        raise
+
+
 def _is_within_allowed_root(path: Path, roots: list[Path]) -> bool:
     """Return whether a path's resolved target is under an allowed root."""
     try:
@@ -417,7 +428,7 @@ class Filesystem(Module):
             mime = _image_mime(p)
             if mime:
                 try:
-                    raw = p.read_bytes()
+                    raw = _read_bytes_nofollow(p)
                 except OSError as exc:
                     return f"Error: could not read {p}: {exc}"
                 b64 = base64.b64encode(raw).decode()
@@ -446,7 +457,7 @@ class Filesystem(Module):
             ext = p.suffix.lower()
             if ext in _DOC_EXTRACTORS:
                 try:
-                    raw_doc = p.read_bytes()
+                    raw_doc = _read_bytes_nofollow(p)
                 except OSError as exc:
                     return f"Error: could not read {p}: {exc}"
                 from TinyCTX.utils import attachments
