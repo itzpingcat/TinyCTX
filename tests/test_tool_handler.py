@@ -559,10 +559,8 @@ class TestExecuteToolAsync:
 
 # ---------------------------------------------------------------------------
 # ToolError — MODULES-PLAN-P1.md's @tool section: an expected failure the
-# model should read and adapt to, not a crash. Rendered as a normal
-# successful call (success=True, message as the result text) rather than
-# success=False+error, so a caller doesn't need to special-case it — this is
-# what a tool raises instead of hand-writing its own "Error: ..." string.
+# model should read and adapt to, not a crash. It remains a structured failed
+# call so the agent can distinguish it from successful output.
 # ---------------------------------------------------------------------------
 
 class TestToolError:
@@ -570,7 +568,7 @@ class TestToolError:
         self.handler = ToolCallHandler()
 
     @pytest.mark.asyncio
-    async def test_sync_tool_error_renders_as_successful_call(self):
+    async def test_sync_tool_error_is_structured_failure(self):
         from TinyCTX.module import ToolError
 
         def picky(name: str) -> str:
@@ -582,11 +580,11 @@ class TestToolError:
             "id": "c1",
             "function": {"name": "picky", "arguments": '{"name": "foo"}'}
         }, _FakeCaller())
-        assert result["success"] is True
+        assert result["success"] is False
         assert result["result"] == "'foo' already exists; read it and edit instead"
 
     @pytest.mark.asyncio
-    async def test_async_tool_error_renders_as_successful_call(self):
+    async def test_async_tool_error_is_structured_failure(self):
         from TinyCTX.module import ToolError
 
         async def picky(name: str) -> str:
@@ -598,7 +596,7 @@ class TestToolError:
             "id": "c1",
             "function": {"name": "picky", "arguments": '{"name": "foo"}'}
         }, _FakeCaller())
-        assert result["success"] is True
+        assert result["success"] is False
         assert result["result"] == "'foo' already exists; read it and edit instead"
 
     @pytest.mark.asyncio

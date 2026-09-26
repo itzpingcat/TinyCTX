@@ -64,8 +64,8 @@ The detailed entries are actionable units, not a request for one enormous patch.
 | [AGT-04](#agt-04) | P1 | C | Keep retries, fallbacks and stream hooks from corrupting output |
 | [AGT-05](#agt-05) | P1 | C | Use one effective model identity for context, vision and execution |
 | [TOL-01](#tol-01) | P1 | C | Generate correct schemas and validate tool arguments once |
-| [TOL-02](#tol-02) | P1 | C | Use structured tool outcomes instead of scanning output text |
-| [TOL-03](#tol-03) | P2 | C | Respect discovery toggles and independent embedding models |
+| [TOL-02](#tol-02) | P1 | C | Done — use structured tool outcomes instead of scanning output text |
+| [TOL-03](#tol-03) | P2 | C | Done — respect discovery toggles and independent embedding models |
 | [TOL-04](#tol-04) | P2 | C | Namespace embedding caches by the complete embedding identity |
 | [TOL-05](#tol-05) | P2 | C + H | Align discovery visibility, execution requirements and deterministic ordering |
 | [ASY-01](#asy-01) | P1 | V: high-confidence failure hypothesis | Verify and repair streaming retry semantics |
@@ -336,6 +336,8 @@ The detailed entries are actionable units, not a request for one enormous patch.
 
 ### TOL-02: Use structured tool outcomes instead of scanning output text
 
+**Status:** Done. Expected tool failures now remain failed structured outcomes, and agent tool status no longer scans successful output text for error-like words.
+
 **Priority:** P1  
 **Evidence:** C  
 **Source locations:** [ToolError handling][src-handler]; [agent error heuristic][src-agent]; [shell output handling][src-shell]; [sandbox exit_code][src-sandbox].
@@ -349,6 +351,8 @@ The detailed entries are actionable units, not a request for one enormous patch.
 <a id="tol-03"></a>
 
 ### TOL-03: Respect discovery toggles and independent embedding models
+
+**Status:** Done. Passive discovery now honors BM25/vector combinations, and explicit/passive discovery can use independently configured embedders.
 
 **Priority:** P2  
 **Evidence:** C  

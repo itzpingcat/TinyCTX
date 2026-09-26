@@ -21,7 +21,7 @@ RequiredPermissions = Callable[..., "Iterable[Permission]"] | "set[Permission] |
 
 
 class ToolCallHandler:
-    def __init__(self, vector_store=None, embedder=None):
+    def __init__(self, vector_store=None, embedder=None, passive_embedder=None):
         """
         vector_store: TinyCTX.tool_handling.vector_store.ToolVectorStore | None.
             Process-wide singleton owned by Runtime (built once, reused across
@@ -38,6 +38,7 @@ class ToolCallHandler:
         self.enabled: set[str] = set()
         self.vector_store = vector_store
         self.embedder = embedder
+        self.passive_embedder = passive_embedder if passive_embedder is not None else embedder
         # ToolSearchConfig instance, set by agent.py after construction. Read
         # by _search_cfg() / tools_search(); left None in bare/test usage,
         # where _search_cfg()'s defaults apply.
@@ -458,9 +459,8 @@ class ToolCallHandler:
         min_score = getattr(passive_config, "auto_min_score", 0.0)
         rrf_k     = getattr(passive_config, "rrf_k", 60)
 
-        if self.vector_store is None or not bm25_on:
-            # No cache-backed store, or BM25-only requested: plain BM25 pass,
-            # no sync/embed cost.
+        if self.vector_store is None:
+            # Without a vector store, only the keyword backend is available.
             from TinyCTX.utils.bm25 import BM25
             from TinyCTX.tool_handling.search import _embed_text_for
             corpus = {
@@ -469,17 +469,24 @@ class ToolCallHandler:
             }
             scored = BM25(corpus).search(query, top_k=limit)
             hits = [name for name, score in scored if score >= min_score]
+        elif not vec_on:
+            from TinyCTX.utils.bm25 import BM25
+            from TinyCTX.tool_handling.search import _embed_text_for
+            corpus = {name: _embed_text_for(name, tool) for name, tool in self.tools.items()}
+            scored = BM25(corpus).search(query, top_k=limit)
+            hits = [name for name, score in scored if score >= min_score] if bm25_on else []
         else:
             from TinyCTX.tool_handling.search import sync_store, rank_tools
             embedding_model = getattr(passive_config, "embedding_model", "")
-            await sync_store(self.vector_store, self.tools, self.embedder if vec_on else None, embedding_model)
+            await sync_store(self.vector_store, self.tools, self.passive_embedder, embedding_model)
             hits = await rank_tools(
                 query,
                 self.tools,
                 self.vector_store,
-                embedder=self.embedder,
+                embedder=self.passive_embedder,
                 embedding_model=embedding_model,
                 vector_enabled=vec_on,
+                bm25_enabled=bm25_on,
                 top_k=limit,
                 min_score=min_score,
                 rrf_k=rrf_k,
@@ -647,16 +654,13 @@ class ToolCallHandler:
 
         except ToolError as e:
             # Expected failure the model should read and adapt to, not a
-            # crash (MODULES-PLAN-P1.md's @tool section) — rendered the same
-            # shape as a normal successful call (success=True, the message as
-            # the result text) so a caller doesn't need special-casing. This
-            # is what a tool body raises instead of hand-writing its own
-            # "Error: ..." string prefix; the framework owns the rendering.
+            # crash — preserve the model-readable message while marking the
+            # outcome as failed so callers do not infer status from text.
             return {
                 'tool_call_id': tool_call_id,
                 'function_name': function_name if 'function_name' in locals() else 'unknown',
                 'result': str(e),
-                'success': True
+                'success': False
             }
 
         except Exception as e:

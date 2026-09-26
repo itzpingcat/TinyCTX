@@ -176,14 +176,14 @@ class AgentCycle:
         passive_cfg = self.config.tools.passive
         # Prefer search's embedding_model for the shared embedder if set,
         # else passive's — either may be "" (unset). Both configs are read
-        # independently at call time in tools_search()/passive_search(), this
-        # only decides which single embedder instance backs both this turn.
-        embed_model_name = search_cfg.embedding_model or passive_cfg.embedding_model
-        tool_embedder = (
-            self._runtime.get_tool_embedder(embed_model_name)
-            if self._runtime and embed_model_name else None
+        # independently at call time in tools_search()/passive_search(), so
+        # each discovery path can use its configured embedding model.
+        search_embedder = self._runtime.get_tool_embedder(search_cfg.embedding_model) if self._runtime and search_cfg.embedding_model else None
+        passive_embedder = self._runtime.get_tool_embedder(passive_cfg.embedding_model) if self._runtime and passive_cfg.embedding_model else None
+        self.tool_handler = ToolCallHandler(
+            vector_store=tool_vector_store, embedder=search_embedder,
+            passive_embedder=passive_embedder,
         )
-        self.tool_handler = ToolCallHandler(vector_store=tool_vector_store, embedder=tool_embedder)
         self.tool_handler.search_config = search_cfg
         self.tool_handler.permissions_config = self.config.permissions
         # tools_search only toggles what's visible in this cycle's tool
@@ -629,8 +629,8 @@ class AgentCycle:
         result = await self.tool_handler.execute_tool_call(proxy, caller=self.caller)
         raw_output = str(result.get("result", result.get("error", "[no output]")))
         
-        # Determine if the tool failed based on the result flag or content analysis
-        is_error = (not result.get("success", False)) or self._looks_like_failed_tool_output(raw_output)
+        # The handler's structured status is authoritative; stdout is data.
+        is_error = not result.get("success", False)
 
         # --- vision unwrap ---
         # If the tool returned an IMAGE_BLOCK (e.g. from view()) and the model
@@ -714,8 +714,3 @@ class AgentCycle:
             output=raw_output,
             is_error=is_error,
         )
-
-    def _looks_like_failed_tool_output(self, text: str) -> bool:
-        """Helper to catch common error strings in stdout."""
-        lowered = text.lower()
-        return any(x in lowered for x in ["traceback (most recent call last):", "exception: ", "error: "])

@@ -99,6 +99,7 @@ async def rank_tools(
     embedder=None,
     embedding_model: str = "",
     vector_enabled: bool = False,
+    bm25_enabled: bool = True,
     top_k: int = 5,
     min_score: float = 0.0,
     rrf_w: float = 0.4,
@@ -128,7 +129,7 @@ async def rank_tools(
         # gather, so it doesn't front-load work onto the event loop before
         # the embed request has a chance to go out.
         ranks: dict[str, int] = {}
-        hits = BM25(corpus).search(query, top_k=len(corpus))
+        hits = BM25(corpus).search(query, top_k=len(corpus)) if bm25_enabled else []
         for rank, (name, score) in enumerate((h for h in hits if h[1] > 0.0), start=1):
             ranks[name] = rank
         return ranks
