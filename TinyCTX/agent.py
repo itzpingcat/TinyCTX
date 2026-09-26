@@ -606,11 +606,15 @@ class AgentCycle:
                 yield (chunks, calls, None)
                 return
             logger.warning("Model %s failed: %s", model_name, error)
-            fallback_on = self.config.llm.fallback_on
-            status = re.search(r"\bHTTP\s+(\d{3})\b", error)
-            if not fallback_on.any_error and (
-                status is None or int(status.group(1)) not in fallback_on.http_codes
-            ):
+            fallback_on = getattr(getattr(getattr(self, "config", None), "llm", None), "fallback_on", None)
+            if fallback_on is None:
+                should_fallback = True
+            else:
+                status = re.search(r"\bHTTP\s+(\d{3})\b", error)
+                should_fallback = fallback_on.any_error or (
+                    status is not None and int(status.group(1)) in fallback_on.http_codes
+                )
+            if not should_fallback:
                 break
 
         yield ([], [], error or "all models failed")
