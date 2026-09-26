@@ -333,6 +333,16 @@ class TestDispatchRouting:
     async def test_no_sandbox_url_runs_locally(self, tmp_path):
         agent = _register(tmp_path, sandbox_url=None)
         result = await _call(agent, command="echo local-ok")
+        assert "local shell execution requires backend_access=True" in result["result"]
+
+    @pytest.mark.asyncio
+    async def test_no_sandbox_url_requires_backend_capability(self, tmp_path):
+        agent = _register(
+            tmp_path,
+            granted_permissions={Permission.BACKEND_EXEC},
+            sandbox_url=None,
+        )
+        result = await _call(agent, command="echo local-ok", backend_access=True)
         assert "local-ok" in result["result"]
 
     @pytest.mark.asyncio

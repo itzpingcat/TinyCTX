@@ -325,7 +325,12 @@ class Shell(Module):
         max_timeout = self.config["max_timeout"]
         default_timeout = self.config["default_timeout"]
         effective_timeout = min(call_timeout, max_timeout) if call_timeout is not None else default_timeout
-        if local or not self._sandbox_url:
+        if not self._sandbox_url and not local:
+            return (
+                "Blocked: sandbox is unavailable; local shell execution "
+                "requires backend_access=True."
+            )
+        if local:
             return _run_local(command, self._workspace, effective_timeout)
         return _run_sandbox(command, self._sandbox_url, effective_timeout)
 
