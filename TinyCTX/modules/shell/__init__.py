@@ -287,9 +287,9 @@ class Shell(Module):
             self._sandbox_url = sandbox_cfg or None
 
         if self._sandbox_url:
-            logger.info("shell: dispatching via sandbox at %s", self._sandbox_url)
+            logger.info("[shell] dispatching via sandbox at %s", self._sandbox_url)
         else:
-            logger.info("shell: dispatching locally (no sandbox configured)")
+            logger.info("[shell] dispatching locally (no sandbox configured)")
 
         # SHAPE policy only — construct/redirect/glob-shape validation that runs
         # regardless of who's calling (§5.2). Built from builtin:allow's
@@ -315,7 +315,7 @@ class Shell(Module):
             )
         except policy_mod.PolicyError as exc:
             self._policy_error = str(exc)
-            logger.error("shell: shape policy failed to load — all commands blocked: %s", exc)
+            logger.error("[shell] shape policy failed to load — all commands blocked: %s", exc)
 
         # The tool's docstring feeds the model-visible schema description
         # (ToolCallHandler reads func.__doc__ at register_tool() time, which
