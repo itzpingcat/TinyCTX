@@ -59,7 +59,7 @@ TinyCTX/
     ├── concurrency/    Concurrent Forks — spawn_fork / nudge_fork
     ├── ctx_tools/      Context-assembly hooks: dedup, cot_strip, tool-output trim/truncate, tokenade
     ├── equipment_manifest/  Agent's self-description of available tools
-    ├── filesystem/     view / write_file / edit_file / grep / glob_search tools
+    ├── filesystem/     view / write_file / edit_file / grep / glob_search tools with resolved-root confinement
     ├── heartbeat/      Periodic agent turns on a background branch
     ├── mcp/            MCP server integration
     ├── memory/         Knowledge graph (LadybugDB property graph + librarian agents)

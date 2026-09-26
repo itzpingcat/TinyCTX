@@ -125,6 +125,23 @@ _GREP_DEFAULT_LIMIT = 200
 _GLOB_DEFAULT_LIMIT = 100
 
 
+def _is_within_allowed_root(path: Path, roots: list[Path]) -> bool:
+    """Return whether a path's resolved target is under an allowed root."""
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return False
+    return any(resolved == root or root in resolved.parents for root in roots)
+
+
+def _validate_glob_pattern(pattern: str) -> str | None:
+    """Reject glob syntax that can address outside the search root."""
+    normalized = pattern.replace("\\", "/")
+    if Path(normalized).is_absolute() or ".." in Path(normalized).parts:
+        return "Error: glob pattern must stay within the search directory"
+    return None
+
+
 def _run_rg(
     pattern: str,
     search_path: Path,
@@ -135,9 +152,10 @@ def _run_rg(
     context_lines: int,
     output_mode: str,
     limit: int,
+    allowed_roots: list[Path],
 ) -> str:
     """Run ripgrep and return raw stdout."""
-    args = ["rg", "--hidden", "--max-columns", "500"]
+    args = ["rg", "--hidden", "--no-follow", "--max-columns", "500"]
     for d in _VCS_DIRS:
         args += ["--glob", f"!{d}"]
     if case_insensitive:
@@ -146,6 +164,9 @@ def _run_rg(
         for g in include_glob.split(","):
             g = g.strip()
             if g:
+                invalid = _validate_glob_pattern(g)
+                if invalid:
+                    return invalid
                 args += ["--glob", g]
     if file_type:
         args += ["--type", file_type]
@@ -183,6 +204,7 @@ def _run_py_grep(
     context_lines: int,
     output_mode: str,
     limit: int,
+    allowed_roots: list[Path],
 ) -> str:
     """Pure-Python fallback when rg is not installed."""
     flags = re.IGNORECASE if case_insensitive else 0
@@ -194,6 +216,10 @@ def _run_py_grep(
     globs = []
     if include_glob:
         globs = [g.strip() for g in include_glob.split(",") if g.strip()]
+        for glob in globs:
+            invalid = _validate_glob_pattern(glob)
+            if invalid:
+                return invalid
 
     matches: list[str] = []
     file_hits: list[str] = []
@@ -206,6 +232,8 @@ def _run_py_grep(
             if globs and not any(fnmatch.fnmatch(fname, g) for g in globs):
                 continue
             fpath = Path(root) / fname
+            if not _is_within_allowed_root(fpath, allowed_roots):
+                continue
             try:
                 text = fpath.read_text(encoding="utf-8", errors="replace")
             except (OSError, UnicodeDecodeError):
@@ -588,6 +616,7 @@ class Filesystem(Module):
             if not search_path.exists():
                 return f"Error: path not found: {search_path}"
             effective_limit = limit if limit > 0 else _GREP_DEFAULT_LIMIT
+            allowed_roots = [workspace, *read_only_paths]
 
             if has_rg:
                 raw = _run_rg(
@@ -598,6 +627,7 @@ class Filesystem(Module):
                     context_lines=context_lines,
                     output_mode=output_mode,
                     limit=effective_limit,
+                    allowed_roots=allowed_roots,
                 )
             else:
                 raw = _run_py_grep(
@@ -607,6 +637,7 @@ class Filesystem(Module):
                     context_lines=context_lines,
                     output_mode=output_mode,
                     limit=effective_limit,
+                    allowed_roots=allowed_roots,
                 )
 
             if not raw:
@@ -661,6 +692,10 @@ class Filesystem(Module):
                 return f"Error: path not found: {search_path}"
             effective_limit = limit if limit > 0 else _GLOB_DEFAULT_LIMIT
 
+            invalid = _validate_glob_pattern(pattern)
+            if invalid:
+                return invalid
+
             try:
                 matches = list(search_path.glob(pattern))
             except ValueError as exc:
@@ -670,6 +705,7 @@ class Filesystem(Module):
             matches = [
                 m for m in matches
                 if not any(part in _VCS_DIRS for part in m.parts)
+                and _is_within_allowed_root(m, [workspace, *read_only_paths])
             ]
 
             # Sort by modification time (newest first), with name as tiebreaker

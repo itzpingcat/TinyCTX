@@ -110,6 +110,8 @@ The detailed entries are actionable units, not a request for one enormous patch.
 
 ### SEC-02: Close child-path escapes in grep and glob
 
+**Status:** Done — grep and glob now reject out-of-root symlink and parent-traversal results.
+
 **Priority:** P1  
 **Evidence:** C + R  
 **Source locations:** [Filesystem `_run_py_grep`, `resolve`, `grep`, `glob_search`][src-filesystem].
