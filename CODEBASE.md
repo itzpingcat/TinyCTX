@@ -65,7 +65,7 @@ TinyCTX/
     ├── memory/         Knowledge graph (LadybugDB property graph + librarian agents)
     ├── present/        present() tool — delivers files to users via bridges
     ├── rag/            Semantic search over workspace/memory/ (BM25 or embeddings)
-    ├── shell/          shell tool; sandbox is required unless backend execution is explicitly requested
+    ├── shell/          shell tool; sandbox is required unless backend execution is explicitly requested, with bounded timeout/output handling
     ├── skills/         use_skill tool
     ├── sysops/         User/permission management + /model command + set_active_model tool
     ├── system_prompt/  Injects SOUL.md, AGENTS.md into system prompt

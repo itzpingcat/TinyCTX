@@ -69,9 +69,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import signal
 import subprocess
+import tempfile
 import urllib.error
 import urllib.request
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 
@@ -130,7 +133,12 @@ _LOCAL_ENV = {k: v for k, v in os.environ.items() if k in _SAFE_KEYS}
 
 def _run_sandbox(command: str, sandbox_url: str, timeout: int) -> str:
     endpoint = sandbox_url.rstrip("/") + "/exec"
-    payload = json.dumps({"command": command}).encode()
+    payload = json.dumps({
+        "version": 1,
+        "request_id": str(uuid.uuid4()),
+        "command": command,
+        "timeout": timeout,
+    }).encode()
     req = urllib.request.Request(
         endpoint,
         data=payload,
@@ -138,7 +146,7 @@ def _run_sandbox(command: str, sandbox_url: str, timeout: int) -> str:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout + 5) as resp:
+        with urllib.request.urlopen(req, timeout=max(timeout + 5, 10)) as resp:
             body = json.loads(resp.read().decode())
             return body.get("output", "Error: sandbox returned no output field")
     except urllib.error.URLError as exc:
@@ -152,28 +160,49 @@ def _run_sandbox(command: str, sandbox_url: str, timeout: int) -> str:
 # ---------------------------------------------------------------------------
 
 def _run_local(command: str, cwd: Path, timeout: int) -> str:
+    max_output_bytes = 1024 * 1024
+    proc = None
     try:
-        result = subprocess.run(
-            ["bash", "-c", command], cwd=cwd,
-            capture_output=True, text=True, timeout=timeout,
-            encoding="utf-8", errors="replace",
-            env=_LOCAL_ENV,
-        )
+        with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+            proc = subprocess.Popen(
+                ["bash", "-c", command], cwd=cwd,
+                stdout=stdout_file, stderr=stderr_file,
+                env=_LOCAL_ENV,
+                start_new_session=True,
+            )
+            try:
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                _terminate_local_process(proc)
+                proc.wait()
+                return f"Error: timed out after {timeout}s"
+
+            stdout_file.seek(0)
+            stderr_file.seek(0)
+            stdout = stdout_file.read(max_output_bytes + 1)
+            stderr = stderr_file.read(max_output_bytes + 1)
         parts = []
-        if result.stdout:
-            parts.append(result.stdout.rstrip())
-        if result.stderr:
-            parts.append(f"stderr:\n{result.stderr.rstrip()}")
-        annotation = _annotate_exit(command, result.returncode)
+        if stdout:
+            parts.append(stdout.decode("utf-8", "replace").rstrip())
+        if stderr:
+            parts.append(f"stderr:\n{stderr.decode('utf-8', 'replace').rstrip()}")
+        if len(stdout) > max_output_bytes or len(stderr) > max_output_bytes:
+            parts.append(f"[output truncated at {max_output_bytes} bytes per stream]")
+        annotation = _annotate_exit(command, proc.returncode)
         if annotation:
             parts.append(annotation)
         return "\n".join(parts) if parts else "No output"
-    except subprocess.TimeoutExpired:
-        return f"Error: timed out after {timeout}s"
     except FileNotFoundError as exc:
         return f"Error: shell not found — {exc}"
     except Exception as exc:
         return f"Error: {exc}"
+
+
+def _terminate_local_process(proc: subprocess.Popen) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        proc.kill()
 
 
 _SHELL_DOC_TEMPLATE = """Run a shell command.
@@ -324,7 +353,16 @@ class Shell(Module):
 
         max_timeout = self.config["max_timeout"]
         default_timeout = self.config["default_timeout"]
-        effective_timeout = min(call_timeout, max_timeout) if call_timeout is not None else default_timeout
+        if max_timeout <= 0:
+            return "Blocked: shell max_timeout must be positive."
+        if call_timeout is not None and call_timeout <= 0:
+            return "Blocked: timeout must be positive."
+        effective_timeout = min(
+            call_timeout if call_timeout is not None else default_timeout,
+            max_timeout,
+        )
+        if effective_timeout <= 0:
+            return "Blocked: shell default_timeout must be positive."
         if not self._sandbox_url and not local:
             return (
                 "Blocked: sandbox is unavailable; local shell execution "

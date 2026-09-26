@@ -440,6 +440,8 @@ The detailed entries are actionable units, not a request for one enormous patch.
 
 ### SHL-01: Remove blocking subprocess execution from the sandbox HTTP loop
 
+**Status:** Done — sandbox commands now use async subprocesses while keeping the HTTP loop responsive.
+
 **Priority:** P1  
 **Evidence:** C  
 **Source locations:** [Sandbox `handle_exec()`][src-sandbox]; [Python asyncio subprocess reference][ref-python-subprocess].
@@ -454,6 +456,8 @@ The detailed entries are actionable units, not a request for one enormous patch.
 
 ### SHL-02: Carry timeout budgets through the sandbox protocol
 
+**Status:** Done — validated request timeouts and request IDs now cross the client/server boundary with a transport grace period.
+
 **Priority:** P1  
 **Evidence:** C  
 **Source locations:** [Shell timeout settings/dispatch][src-shell]; [sandbox fixed timeout][src-sandbox].
@@ -467,6 +471,8 @@ The detailed entries are actionable units, not a request for one enormous patch.
 <a id="shl-03"></a>
 
 ### SHL-03: Bound subprocess output and supervise whole process trees
+
+**Status:** Done — sandbox and local shell output is capped, truncation is reported, and timed-out process groups are terminated and reaped.
 
 **Priority:** P1  
 **Evidence:** H with source-backed gaps  

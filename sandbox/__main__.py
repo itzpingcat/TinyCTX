@@ -26,9 +26,12 @@ Environment variables:
 from __future__ import annotations
 
 import json
+import asyncio
 import logging
+import math
 import os
-import subprocess
+import signal
+import uuid
 from pathlib import Path
 
 try:
@@ -60,6 +63,7 @@ def drop_privileges(username: str = "tinyctx") -> None:
 HOST      = os.environ.get("SANDBOX_HOST", "0.0.0.0")
 PORT      = int(os.environ.get("SANDBOX_PORT", "8700"))
 TIMEOUT   = int(os.environ.get("SANDBOX_TIMEOUT", "60"))
+MAX_OUTPUT_BYTES = int(os.environ.get("SANDBOX_MAX_OUTPUT_BYTES", str(1024 * 1024)))
 WORKSPACE = Path(os.environ.get("WORKSPACE_PATH", "/workspace")).resolve()
 
 # Strip everything except what bash needs. No API keys, no tokens.
@@ -78,34 +82,99 @@ async def handle_exec(request: web.Request) -> web.Response:
     if not command:
         return web.Response(status=400, text="missing command")
 
-    log.info("exec: %.120s", command)
+    request_id = body.get("request_id") or str(uuid.uuid4())
+    requested_timeout = body.get("timeout", TIMEOUT)
+    if (
+        isinstance(requested_timeout, bool)
+        or not isinstance(requested_timeout, (int, float))
+        or not math.isfinite(requested_timeout)
+    ):
+        return web.Response(status=400, text="timeout must be a positive number")
+    if requested_timeout <= 0:
+        return web.Response(status=400, text="timeout must be positive")
+    timeout = min(float(requested_timeout), TIMEOUT)
 
+    log.info("exec %s: %.120s (timeout=%.3fs)", request_id, command, timeout)
+
+    process = None
     try:
-        result = subprocess.run(
-            ["bash", "-c", command],
+        process = await asyncio.create_subprocess_exec(
+            "bash", "-c", command,
             cwd=WORKSPACE,
-            capture_output=True,
-            text=True,
-            timeout=TIMEOUT,
-            encoding="utf-8",
-            errors="replace",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
             env=_ENV,
+            start_new_session=True,
         )
-        parts = []
-        if result.stdout:
-            parts.append(result.stdout.rstrip())
-        if result.stderr:
-            parts.append(f"[stderr]\n{result.stderr.rstrip()}")
-        if result.returncode != 0:
-            parts.append(f"[exit {result.returncode}]")
-        output = "\n".join(parts) if parts else "[no output]"
 
-        return _json({"output": output, "exit_code": result.returncode})
+        stdout_task = asyncio.create_task(_drain(process.stdout))
+        stderr_task = asyncio.create_task(_drain(process.stderr))
+        try:
+            await asyncio.wait_for(process.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            _terminate_process_group(process)
+            await process.wait()
+            (stdout, stdout_truncated), (stderr, stderr_truncated) = await asyncio.gather(
+                stdout_task, stderr_task
+            )
+            return _json({
+                "output": _format_output(stdout, stderr, -1, stdout_truncated, stderr_truncated),
+                "exit_code": -1,
+                "timed_out": True,
+                "request_id": request_id,
+            })
 
-    except subprocess.TimeoutExpired:
-        return _json({"output": f"[error: timed out after {TIMEOUT}s]", "exit_code": -1})
+        (stdout, stdout_truncated), (stderr, stderr_truncated) = await asyncio.gather(
+            stdout_task, stderr_task
+        )
+        output = _format_output(
+            stdout, stderr, process.returncode, stdout_truncated, stderr_truncated,
+        )
+
+        return _json({"output": output, "exit_code": process.returncode, "request_id": request_id})
+
     except Exception as exc:
-        return _json({"output": f"[error: {exc}]", "exit_code": -1})
+        if process is not None:
+            _terminate_process_group(process)
+            await process.wait()
+        return _json({"output": f"[error: {exc}]", "exit_code": -1, "request_id": request_id})
+
+
+async def _drain(stream) -> tuple[bytes, bool]:
+    chunks: list[bytes] = []
+    total = 0
+    truncated = False
+    while True:
+        chunk = await stream.read(65536)
+        if not chunk:
+            break
+        remaining = MAX_OUTPUT_BYTES - total
+        if remaining > 0:
+            chunks.append(chunk[:remaining])
+            total += min(len(chunk), remaining)
+        if len(chunk) > remaining:
+            truncated = True
+    return b"".join(chunks), truncated
+
+
+def _terminate_process_group(process) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def _format_output(stdout, stderr, returncode, stdout_truncated, stderr_truncated) -> str:
+    parts = []
+    if stdout:
+        parts.append(stdout.decode("utf-8", "replace").rstrip())
+    if stderr:
+        parts.append(f"[stderr]\n{stderr.decode('utf-8', 'replace').rstrip()}")
+    if stdout_truncated or stderr_truncated:
+        parts.append(f"[output truncated at {MAX_OUTPUT_BYTES} bytes per stream]")
+    if returncode != 0:
+        parts.append(f"[exit {returncode}]")
+    return "\n".join(parts) if parts else "[no output]"
 
 
 async def handle_health(request: web.Request) -> web.Response:
