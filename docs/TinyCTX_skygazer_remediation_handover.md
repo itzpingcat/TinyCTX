@@ -51,7 +51,7 @@ The detailed entries are actionable units, not a request for one enormous patch.
 | [SEC-01](#sec-01) | P1 | C + R | Done — reject ambiguous booleans at every authority boundary |
 | [SEC-02](#sec-02) | P1 | C + R | Close child-path escapes in grep and glob |
 | [SEC-03](#sec-03) | P1 | C | Authorise the actual shell execution location |
-| [SEC-04](#sec-04) | P1 | H: documented design decision | Make the gateway master-key trust model explicit |
+| [SEC-04](#sec-04) | P1 | H: documented design decision | Done — document the gateway master-key trust model |
 | [SEC-05](#sec-05) | P1 | V + H | Done — harden final-component filesystem access against symlink swaps |
 | [CTX-01](#ctx-01) | P1 | C + R | Preserve complete tool-call/result exchanges across every transform |
 | [CTX-02](#ctx-02) | P1 | C + R | Done — reject system prompts exceeding the configured context fraction |
@@ -143,6 +143,8 @@ The detailed entries are actionable units, not a request for one enormous patch.
 <a id="sec-04"></a>
 
 ### SEC-04: Make the gateway master-key trust model explicit
+
+**Status:** Done. The gateway API key is formally documented as a master shared secret for trusted internal components such as the sandbox and CLI bridge, with shared administrative trust across impersonation, elevation, workspace access, commands, and shutdown.
 
 **Priority:** P1  
 **Evidence:** H: documented design decision  

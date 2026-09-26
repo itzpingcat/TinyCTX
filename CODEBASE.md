@@ -255,7 +255,11 @@ Key config (`bridges.discord.options`): `token_env`, `allowed_users_dm`, `allowe
 `agent_name` comes from `_bot_display_name(guild)` (nickname, falls back to global display name). Thread branching forks a new DB branch per thread. Cursors (`dm:<uid>`, `group:<cid>`, `thread:<tid>`) persist in `discord.json`. Each trigger message gets its own `push()`; concurrent turns fork off `settled_tail` (see `concurrency` module).
 
 ### Gateway (`gateway/__main__.py`)
-aiohttp HTTP server: `/v1/chat` (OpenAI-compat SSE), `/v1/health`, `api_key` auth.
+aiohttp HTTP server: `/v1/chat` (OpenAI-compat SSE), `/v1/health`, and
+`api_key` auth. The API key is a master shared secret for trusted internal
+components such as the sandbox and CLI bridge, not a user credential; holders
+share administrative trust across impersonation, elevation, workspace,
+command, and shutdown endpoints.
 
 ---
 

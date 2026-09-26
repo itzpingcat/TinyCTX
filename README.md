@@ -384,6 +384,17 @@ gateway:
   api_key: "your-secret-token"
 ```
 
+The gateway `api_key` is a master shared secret for trusted internal
+components—not a user-facing credential or per-user token. It is intended for
+microservices such as the sandbox and CLI bridge to communicate with the
+gateway. Any component that possesses it is trusted to use gateway-level
+capabilities, including selecting a `cli_username`, issuing commands,
+elevating users, reading or writing workspace files, and requesting shutdown.
+Keep it in service configuration, use a strong random value, bind the gateway
+to localhost or a private network, and never distribute it to end users or
+untrusted external clients. The `/v1/health` endpoint is the only
+unauthenticated route; all other routes require the bearer key.
+
 ---
 
 ## CLI Commands
