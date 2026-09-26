@@ -56,7 +56,7 @@ The detailed entries are actionable units, not a request for one enormous patch.
 | [CTX-01](#ctx-01) | P1 | C + R | Preserve complete tool-call/result exchanges across every transform |
 | [CTX-02](#ctx-02) | P1 | C + R | Done — reject system prompts exceeding the configured context fraction |
 | [CTX-03](#ctx-03) | P1 | C + H | Make final payload budgets model-aware and truthful |
-| [CTX-04](#ctx-04) | P1 | C + R | Preserve author and parent metadata when copying history entries |
+| [CTX-04](#ctx-04) | P1 | C + R | Done — preserve author and parent metadata when copying history entries |
 | [CTX-05](#ctx-05) | P2 | H; static cost concern | Measure and bound context assembly cost |
 | [AGT-01](#agt-01) | P1 | C | Preserve real tool results at the cycle limit and terminate clearly |
 | [AGT-02](#agt-02) | P1 | C | Actually process corrective post-completion follow-ups |
@@ -213,6 +213,8 @@ The detailed entries are actionable units, not a request for one enormous patch.
 <a id="ctx-04"></a>
 
 ### CTX-04: Preserve author and parent metadata when copying history entries
+
+**Status:** Done. Context transforms now copy history entries with complete dataclass metadata, including attribution and ancestry.
 
 **Priority:** P1  
 **Evidence:** C + R  

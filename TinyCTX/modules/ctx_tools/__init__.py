@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from dataclasses import replace
 
 from TinyCTX.decorators import hook
 from TinyCTX.hooks import HookType
@@ -244,16 +245,9 @@ class CtxTools(Module):
 
 
 def _copy(entry, **overrides):
-    from TinyCTX.context import HistoryEntry
-    return HistoryEntry(
-        role=overrides.get("role", entry.role),
-        content=overrides.get("content", entry.content),
-        id=entry.id,
-        index=entry.index,
-        tool_calls=overrides.get("tool_calls", entry.tool_calls),
-        tool_call_id=entry.tool_call_id,
-        tags=overrides.get("tags", entry.tags),
-    )
+    # Preserve all HistoryEntry metadata, including attribution and ancestry.
+    # dataclasses.replace also keeps future fields from being lost here.
+    return replace(entry, **overrides)
 
 
 _COT_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)

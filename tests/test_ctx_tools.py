@@ -33,7 +33,7 @@ from TinyCTX.db import ConversationDB
 from TinyCTX.context import Context, HistoryEntry
 from TinyCTX.contracts import ToolCall, ToolResult
 from TinyCTX.module_registry import ModuleRegistry
-from TinyCTX.modules.ctx_tools import CtxTools, _strip_cot, _LabelPrefixStripHook
+from TinyCTX.modules.ctx_tools import CtxTools, _copy, _strip_cot, _LabelPrefixStripHook
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +100,26 @@ class TestSettings:
             assert key in defaults
         for key in ("trim_after", "truncate_after", "max_chars"):
             assert key in defaults["tool_output"]
+
+    def test_copy_preserves_history_metadata(self):
+        entry = HistoryEntry(
+            role="user",
+            content="hello",
+            id="entry-id",
+            index=7,
+            author_id="kamie",
+            parent_id="parent-id",
+            tags=frozenset({"tag"}),
+        )
+
+        copied = _copy(entry, content="changed")
+
+        assert copied.content == "changed"
+        assert copied.id == entry.id
+        assert copied.index == entry.index
+        assert copied.author_id == entry.author_id
+        assert copied.parent_id == entry.parent_id
+        assert copied.tags == entry.tags
 
 
 # ---------------------------------------------------------------------------
