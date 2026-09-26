@@ -108,6 +108,11 @@ def run(args: argparse.Namespace) -> None:
     instance_dir = resolve_instance_dir(getattr(args, "dir", None))
     config_path = Path(getattr(args, "config", None) or config_path_for(instance_dir)).resolve()
 
+    # The instance .env is the source of model/bridge secrets. Load it before
+    # parsing config; config.load() resolves and scrubs model keys by design.
+    load_instance_env(instance_dir)
+    compose_base_env = dict(os.environ)
+
     if not config_path.exists():
         print(f"error: no config.yaml found at {config_path}.", file=sys.stderr)
         print(
@@ -125,15 +130,12 @@ def run(args: argparse.Namespace) -> None:
     if _health_check(gateway_url):
         print(f"✓ TinyCTX already running — {gateway_url}")
         if getattr(args, "watch", False):
-            load_instance_env(instance_dir)
             project_name = project_name_for(instance_dir)
-            env = {**os.environ, **compose_env(instance_dir, port=cfg.gateway.port)}
+            env = {**compose_base_env, **compose_env(instance_dir, port=cfg.gateway.port)}
             _stream_logs(project_name, env)
         return
 
     _require_docker()
-
-    load_instance_env(instance_dir)
 
     # compose.yaml binds these into the container. Create them first —
     # Docker auto-creates a missing bind source as a ROOT-OWNED directory,
@@ -147,7 +149,7 @@ def run(args: argparse.Namespace) -> None:
     (instance_dir / "workspace").mkdir(parents=True, exist_ok=True)
 
     project_name = project_name_for(instance_dir)
-    env = {**os.environ, **compose_env(instance_dir, port=cfg.gateway.port)}
+    env = {**compose_base_env, **compose_env(instance_dir, port=cfg.gateway.port)}
 
     try:
         subprocess.run(
