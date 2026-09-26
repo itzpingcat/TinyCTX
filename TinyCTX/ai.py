@@ -499,10 +499,12 @@ class Embedder:
         self.document_template = document_template
 
     @classmethod
-    def from_config(cls, cfg: "ModelConfig", batch_size: int = 32, timeout: int = 60) -> "Embedder":  # noqa: F821
+    def from_config(cls, cfg: "ModelConfig", batch_size: int = 32, timeout: int | None = None) -> "Embedder":  # noqa: F821
         """Build an Embedder from a ModelConfig with kind='embedding'. Templates
         (query_template/document_template) come from the ModelConfig itself."""
         api_key = cfg.api_key  # resolves from env or returns "" for N/A
+        if timeout is None:
+            timeout = cfg.timeout
         return cls(
             base_url=cfg.base_url,
             api_key=api_key,

@@ -82,7 +82,7 @@ class Runtime:
         self._tool_embedders: dict[str, object] = {}  # model name -> ai.Embedder
 
         # Concurrency Management
-        max_workers = getattr(config, "max_workers", 8)
+        max_workers = config.max_workers
         self._semaphore = asyncio.Semaphore(max_workers)
         self._active: int = 0
         self._tasks: set[asyncio.Task] = set()

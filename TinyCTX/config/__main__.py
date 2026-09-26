@@ -442,6 +442,8 @@ class Config:
     parallel:        int                     = 3     # max concurrent LLM/embedding requests in flight
     system_prompt_max_fraction: float        = 2 / 3
     embed_cache_size: int                    = 2048  # max entries kept in ai.py's in-memory embedding cache (LRU)
+    max_workers:     int                     = 8
+    max_empty_retries: int                   = 2
     token_fuzz:      float                   = 1.1   # multiplier applied to counted tokens to account for tokenizer inaccuracy
     attachments:     AttachmentConfig        = field(default_factory=AttachmentConfig)
     permissions:     PermissionsConfig       = field(default_factory=PermissionsConfig)
@@ -636,6 +638,9 @@ def _parse_model(raw: dict, default_context: int = 16384) -> ModelConfig:
     context = int(raw.get("context", default_context))
     if context <= 0:
         raise ValueError(f"context must be > 0, got {context}")
+    timeout = int(raw.get("timeout", 60))
+    if timeout <= 0:
+        raise ValueError(f"timeout must be > 0, got {timeout}")
 
     return ModelConfig(
         model=raw["model"],
@@ -650,6 +655,7 @@ def _parse_model(raw: dict, default_context: int = 16384) -> ModelConfig:
         vision=vision,
         tokens_per_image=tokens_per_image,
         context=context,
+        timeout=timeout,
         query_template=raw.get("query_template", "{text}"),
         document_template=raw.get("document_template", "{text}"),
     )
@@ -661,6 +667,7 @@ _KNOWN_KEYS = {
     "logging", "max_tool_cycles", "parallel", "token_fuzz", "attachments", "permissions",
     "tools", "context",  # "context" is the deprecated legacy top-level key
     "error_introspection", "command_introspection", "system_prompt_max_fraction",
+    "embed_cache_size", "max_workers", "max_empty_retries",
 }
 
 
@@ -803,6 +810,15 @@ def load(path="config.yaml") -> Config:
     system_prompt_max_fraction = float(raw.get("system_prompt_max_fraction", 2 / 3))
     if not 0 < system_prompt_max_fraction <= 1:
         raise ValueError("system_prompt_max_fraction must be > 0 and <= 1")
+    embed_cache_size = int(raw.get("embed_cache_size", 2048))
+    if embed_cache_size < 0:
+        raise ValueError("embed_cache_size must be >= 0")
+    max_workers = int(raw.get("max_workers", 8))
+    if max_workers < 1:
+        raise ValueError("max_workers must be >= 1")
+    max_empty_retries = int(raw.get("max_empty_retries", 2))
+    if max_empty_retries < 0:
+        raise ValueError("max_empty_retries must be >= 0")
 
     # ------------------------------------------------------------------ tools
     tools = _parse_tools(raw.get("tools", {}))
@@ -825,6 +841,9 @@ def load(path="config.yaml") -> Config:
         max_tool_cycles=int(raw.get("max_tool_cycles", 20)),
         parallel=parallel,
         system_prompt_max_fraction=system_prompt_max_fraction,
+        embed_cache_size=embed_cache_size,
+        max_workers=max_workers,
+        max_empty_retries=max_empty_retries,
         token_fuzz=float(raw.get("token_fuzz", 1.1)),
         attachments=attachments,
         permissions=permissions,

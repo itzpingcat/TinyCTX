@@ -84,7 +84,7 @@ The detailed entries are actionable units, not a request for one enormous patch.
 | [DB-01](#db-01) | P1 | C + H | Make state, flags and checkpoints safe under concurrent writers |
 | [DB-02](#db-02) | P2 | C + H | Make migrations and corrupt-state handling explicit |
 | [CFG-01](#cfg-01) | P1 | C + R | Done — resolve shared API-key variables before scrubbing them |
-| [CFG-02](#cfg-02) | P1 | C | Make every supported configuration field reach its consumer |
+| [CFG-02](#cfg-02) | P1 | C | Done — make supported configuration fields reach their consumers |
 | [REL-01](#rel-01) | P2 | C + H | Run enforceable checks on the development branch |
 | [REL-02](#rel-02) | P2 | V + H | Verify distributable package assets and make releases reproducible |
 | [REL-03](#rel-03) | P2 | C | Reconcile operator documentation with executable behaviour |
@@ -619,6 +619,8 @@ The detailed entries are actionable units, not a request for one enormous patch.
 <a id="cfg-02"></a>
 
 ### CFG-02: Make every supported configuration field reach its consumer
+
+**Status:** Done. Supported model, embedding, cache, worker, retry, and fallback settings are loaded, validated, and forwarded to their consumers.
 
 **Priority:** P1  
 **Evidence:** C  

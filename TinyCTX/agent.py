@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import uuid
 from pathlib import Path
 from typing import AsyncIterator
@@ -253,7 +254,7 @@ class AgentCycle:
         # caller sees silence, with nothing logged as an error. Resend rather
         # than let that through — a fresh sample almost always produces real
         # content.
-        max_empty_retries = int(getattr(self.config, "max_empty_retries", 2))
+        max_empty_retries = self.config.max_empty_retries
         empty_retries = 0
 
         final_text = ""
@@ -526,6 +527,9 @@ class AgentCycle:
             max_tokens=mc.max_tokens,
             temperature=mc.temperature,
             timeout=mc.timeout,
+            budget_tokens=mc.budget_tokens,
+            reasoning_effort=mc.reasoning_effort,
+            cache_prompts=mc.cache_prompts,
         )
 
     async def _stream_inference(self, messages, tools, model_chain, abort_event, meta):
@@ -602,6 +606,12 @@ class AgentCycle:
                 yield (chunks, calls, None)
                 return
             logger.warning("Model %s failed: %s", model_name, error)
+            fallback_on = self.config.llm.fallback_on
+            status = re.search(r"\bHTTP\s+(\d{3})\b", error)
+            if not fallback_on.any_error and (
+                status is None or int(status.group(1)) not in fallback_on.http_codes
+            ):
+                break
 
         yield ([], [], error or "all models failed")
 
