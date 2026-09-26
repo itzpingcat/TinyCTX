@@ -95,6 +95,7 @@ class AgentCycle:
         self.db = None
         self.context = None
         self.models: dict[str, LLM] = {}
+        self.effective_model_name: str | None = None
         self.tool_handler = None
         self.caller = None        # User; set in run()
 
@@ -146,7 +147,17 @@ class AgentCycle:
 
         # Build LLMs based on primary + fallbacks
         primary_name = state.get("model") or self.config.llm.primary
-        model_chain = [primary_name] + list(self.config.llm.fallback)
+        if primary_name not in self.config.models:
+            logger.warning(
+                "[agent] saved model '%s' is unavailable; using configured primary '%s'",
+                primary_name, self.config.llm.primary,
+            )
+            primary_name = self.config.llm.primary
+        model_chain = list(dict.fromkeys(
+            name for name in [primary_name, *self.config.llm.fallback]
+            if name in self.config.models
+        ))
+        self.effective_model_name = primary_name
         
         self.models = {
             name: self._build_llm(self.config.models[name])
@@ -526,6 +537,7 @@ class AgentCycle:
         text a hook is still holding is not silently lost.
         """
         for model_name in model_chain:
+            self.effective_model_name = model_name
             llm = self.models[model_name]
             chunks: list[str] = []
             calls: list[ToolCall] = []
@@ -648,7 +660,8 @@ class AgentCycle:
                         _conversion_failed = True
 
                 if not _conversion_failed:
-                    primary_cfg = self.config.get_model_config(self.config.llm.primary)
+                    effective_name = self.effective_model_name or self.config.llm.primary
+                    primary_cfg = self.config.get_model_config(effective_name)
 
                     if primary_cfg.supports_vision:
                         return ToolResult(

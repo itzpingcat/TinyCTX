@@ -362,7 +362,13 @@ class Runtime:
         """
         # 1. Build message content — inline attachments or append reference notes.
         workspace = Path(self.config.workspace.path).expanduser().resolve()
-        primary_name = self.config.llm.primary
+        primary_name = self.db.get_state(msg.tail_node_id, "model", "") or self.config.llm.primary
+        if primary_name not in self.config.models:
+            logger.warning(
+                "[push] saved model '%s' is unavailable; using configured primary '%s'",
+                primary_name, self.config.llm.primary,
+            )
+            primary_name = self.config.llm.primary
         model_cfg = self.config.models.get(primary_name)
         effective_text = f"[Replying to {msg.reply_to_author}]\n{msg.text}" if msg.reply_to_author else msg.text
         content = _build_content_blocks(

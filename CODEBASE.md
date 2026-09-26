@@ -16,8 +16,8 @@ TinyCTX/
 ├── __main__.py         CLI entrypoint (tinyctx onboard|start|stop|status|launch)
 ├── main.py             Async application entrypoint; starts gateway + bridges
 ├── contracts.py        Pure data contracts (dataclasses, enums). No I/O. All other layers import from here.
-├── runtime.py          Runtime — owns DB, UserStore, ModuleRegistry, CommandRegistry; routes events
-├── agent.py            AgentCycle — one execution turn; streaming inference + bounded tool loop with truthful terminal results
+├── runtime.py          Runtime — owns DB, UserStore, ModuleRegistry, CommandRegistry; routes events and resolves session model overrides for attachments
+├── agent.py            AgentCycle — one execution turn; streaming inference + bounded tool loop with truthful terminal results and effective-model tracking
 ├── ai.py               LLM / Embedder async clients (OpenAI-compat SSE streaming)
 ├── context.py          Context — assembles message list for the LLM; hook pipeline; token budgeting
 ├── db.py               ConversationDB — SQLite-backed conversation tree

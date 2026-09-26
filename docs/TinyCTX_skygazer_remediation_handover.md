@@ -298,6 +298,8 @@ The detailed entries are actionable units, not a request for one enormous patch.
 
 ### AGT-05: Use one effective model identity for context, vision and execution
 
+**Status:** Done — model overrides, attachments, context budgeting, fallback attempts, and vision handling now share the effective model identity.
+
 **Priority:** P1  
 **Evidence:** C  
 **Source locations:** [Agent model selection and image unwrapping][src-agent]; [runtime attachment construction][src-runtime]; [model configuration][src-config].
