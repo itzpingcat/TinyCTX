@@ -440,6 +440,7 @@ class Config:
     logging:         LoggingConfig           = field(default_factory=LoggingConfig)
     max_tool_cycles: int                     = 20
     parallel:        int                     = 3     # max concurrent LLM/embedding requests in flight
+    system_prompt_max_fraction: float        = 2 / 3
     embed_cache_size: int                    = 2048  # max entries kept in ai.py's in-memory embedding cache (LRU)
     token_fuzz:      float                   = 1.1   # multiplier applied to counted tokens to account for tokenizer inaccuracy
     attachments:     AttachmentConfig        = field(default_factory=AttachmentConfig)
@@ -659,7 +660,7 @@ _KNOWN_KEYS = {
     "models", "llm", "router", "bridges", "gateway", "workspace", "data",
     "logging", "max_tool_cycles", "parallel", "token_fuzz", "attachments", "permissions",
     "tools", "context",  # "context" is the deprecated legacy top-level key
-    "error_introspection", "command_introspection",
+    "error_introspection", "command_introspection", "system_prompt_max_fraction",
 }
 
 
@@ -799,6 +800,9 @@ def load(path="config.yaml") -> Config:
     parallel = int(raw.get("parallel", 3))
     if parallel < 1:
         raise ValueError(f"parallel must be >= 1, got {parallel}")
+    system_prompt_max_fraction = float(raw.get("system_prompt_max_fraction", 2 / 3))
+    if not 0 < system_prompt_max_fraction <= 1:
+        raise ValueError("system_prompt_max_fraction must be > 0 and <= 1")
 
     # ------------------------------------------------------------------ tools
     tools = _parse_tools(raw.get("tools", {}))
@@ -820,6 +824,7 @@ def load(path="config.yaml") -> Config:
         logging=LoggingConfig(level=log_raw.get("level", "INFO")),
         max_tool_cycles=int(raw.get("max_tool_cycles", 20)),
         parallel=parallel,
+        system_prompt_max_fraction=system_prompt_max_fraction,
         token_fuzz=float(raw.get("token_fuzz", 1.1)),
         attachments=attachments,
         permissions=permissions,

@@ -54,7 +54,7 @@ The detailed entries are actionable units, not a request for one enormous patch.
 | [SEC-04](#sec-04) | P1 | H: documented design decision | Make the gateway master-key trust model explicit |
 | [SEC-05](#sec-05) | P1 | V + H | Harden filesystem operations against check/open races |
 | [CTX-01](#ctx-01) | P1 | C + R | Preserve complete tool-call/result exchanges across every transform |
-| [CTX-02](#ctx-02) | P1 | C + R | Protect the current task and fail explicitly on irreducible overflow |
+| [CTX-02](#ctx-02) | P1 | C + R | Done — reject system prompts exceeding the configured context fraction |
 | [CTX-03](#ctx-03) | P1 | C + H | Make final payload budgets model-aware and truthful |
 | [CTX-04](#ctx-04) | P1 | C + R | Preserve author and parent metadata when copying history entries |
 | [CTX-05](#ctx-05) | P2 | H; static cost concern | Measure and bound context assembly cost |
@@ -183,6 +183,8 @@ The detailed entries are actionable units, not a request for one enormous patch.
 <a id="ctx-02"></a>
 
 ### CTX-02: Protect the current task and fail explicitly on irreducible overflow
+
+**Status:** Done. System prompts exceeding the configurable context fraction are rejected and surfaced through the normal agent error event. Ordinary history trimming may still evict the originating user message by design; preserving it would require a separate history policy.
 
 **Priority:** P1  
 **Evidence:** C + R  

@@ -63,6 +63,10 @@ from TinyCTX.utils.sanitize import sanitize_special_tokens as _sanitize_special_
 
 logger = logging.getLogger(__name__)
 
+
+class ContextOverflowError(ValueError):
+    """The assembled system prompt exceeds its configured context share."""
+
 # ---------------------------------------------------------------------------
 # Roles
 # ---------------------------------------------------------------------------
@@ -287,12 +291,14 @@ class Context:
         token_limit: int = 16384,
         image_tokens_per_block: int | None = 280,
         token_fuzz: float = 1.1,
+        system_prompt_max_fraction: float = 2 / 3,
     ) -> None:
         self._db = db
         self._tail_node_id: str = tail_node_id
         self.token_limit = token_limit
         self._image_tokens_per_block: int | None = image_tokens_per_block
         self.token_fuzz = token_fuzz
+        self.system_prompt_max_fraction = system_prompt_max_fraction
 
         self.dialogue: list[HistoryEntry] = []
 
@@ -726,7 +732,14 @@ class Context:
         entries: list[HistoryEntry] = []
         system_lines = [c for s, c in resolved if s.role == ROLE_SYSTEM]
         if system_lines:
-            entries.append(HistoryEntry(role=ROLE_SYSTEM, content="\n\n".join(system_lines)))
+            system_entry = HistoryEntry(role=ROLE_SYSTEM, content="\n\n".join(system_lines))
+            system_tokens = self._count_tokens_entries([system_entry], None)
+            if system_tokens > self.token_limit * self.system_prompt_max_fraction:
+                raise ContextOverflowError(
+                    f"system prompt is too large ({system_tokens} tokens; maximum "
+                    f"{self.token_limit * self.system_prompt_max_fraction:.0f})"
+                )
+            entries.append(system_entry)
 
         # Non-system prompts (e.g. role=user footer) are deferred until after
         # dialogue history so they land on the latest user message, not the first.
@@ -873,6 +886,10 @@ class Context:
                     merged[i] = replace(e, content=new_blocks)
 
         # 5. Token budget enforcement (still HistoryEntry).
+        # Historical dialogue, including the originating user message, remains
+        # eligible for eviction here. That is intentional: CTX-02's narrow
+        # protection boundary is the system-prompt share check above; preserving
+        # every originating task would require a separate history policy.
         tokens_pre_trim = self._count_tokens_entries(merged, tools)
         tokens_used     = tokens_pre_trim
         was_trimmed     = False

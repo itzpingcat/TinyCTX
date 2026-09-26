@@ -21,6 +21,7 @@ import pytest
 from TinyCTX.db import ConversationDB
 from TinyCTX.context import (
     Context,
+    ContextOverflowError,
     HistoryEntry,
     AssembleMeta,
     ROLE_USER,
@@ -73,6 +74,25 @@ class TestHistoryEntry:
         e = HistoryEntry(role=ROLE_USER, content="hi")
         assert e.tags == frozenset()
         assert e.tool_calls == []
+
+
+class TestSystemPromptBudget:
+    def test_oversized_system_prompt_raises_before_assembly(self, db):
+        root = db.get_root()
+        ctx = Context(db, tail_node_id=root.id, token_limit=100, system_prompt_max_fraction=2 / 3)
+        ctx.register_prompt("large", lambda c: "system instructions " * 100, role=ROLE_SYSTEM)
+
+        with pytest.raises(ContextOverflowError, match="system prompt is too large"):
+            ctx.assemble()
+
+    def test_system_prompt_fraction_is_configurable(self, db):
+        root = db.get_root()
+        ctx = Context(db, tail_node_id=root.id, token_limit=100, system_prompt_max_fraction=1.0)
+        ctx.register_prompt("small", lambda c: "system instructions", role=ROLE_SYSTEM)
+
+        messages, _ = ctx.assemble()
+
+        assert messages[0]["role"] == ROLE_SYSTEM
         assert e.tool_call_id is None
         assert e.id  # auto-generated uuid string
 

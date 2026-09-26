@@ -11,7 +11,7 @@ from TinyCTX.contracts import (
     AgentThinkingChunk, AgentToolCall, AgentToolResult,
     ToolCall, ToolResult, IMAGE_BLOCK_PREFIX
 )
-from TinyCTX.context import Context, HistoryEntry, HOOK_PRE_ASSEMBLE_ASYNC, HOOK_POST_COMPLETION
+from TinyCTX.context import Context, ContextOverflowError, HistoryEntry, HOOK_PRE_ASSEMBLE_ASYNC, HOOK_POST_COMPLETION
 from TinyCTX.hooks import HookRegistry, HookListProxy, HookType
 from TinyCTX.ai import LLM, TextDelta, ThinkingDelta, ToolCallAssembled, LLMError
 from TinyCTX.tool_handling import ToolCallHandler
@@ -206,6 +206,7 @@ class AgentCycle:
             token_limit=getattr(primary_mc, "context", 16384),
             image_tokens_per_block=getattr(primary_mc, "tokens_per_image", 280),
             token_fuzz=self.config.token_fuzz,
+            system_prompt_max_fraction=getattr(self.config, "system_prompt_max_fraction", 2 / 3),
         )
 
         # Wire modules into this cycle turn
@@ -282,7 +283,13 @@ class AgentCycle:
                 caller=self.caller,
                 minimal_tokens=self.config.permissions.minimal_tokens,
             ) or None
-            messages, _ = self.context.assemble(tools=tools)
+            try:
+                messages, _ = self.context.assemble(tools=tools)
+            except ContextOverflowError as exc:
+                self._record_error_introspection(f"[context error: {exc}]")
+                meta["tail_node_id"] = self.context.tail_node_id
+                yield AgentError(message=f"[context error: {exc}]", **meta)
+                return
             logger.debug("[agent] assembled %d messages, starting inference", len(messages))
 
             # Inference with Fallback logic

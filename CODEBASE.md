@@ -385,6 +385,7 @@ YAML, loaded from `<instance>/config.yaml` by default (or `--config`). Key top-l
 - `context` — token budget
 - `max_tool_cycles`
 - `parallel` — max concurrent in-flight LLM/embedding requests (default 3)
+- `system_prompt_max_fraction` — maximum fraction of the model context allowed for the system prompt (default 2/3); oversized prompts fail before inference
 - `bridges.<name>.enabled` / `bridges.<name>.options`
 - `gateway.enabled` / `gateway.host` / `gateway.port` / `gateway.api_key`
 - `logging.level`
