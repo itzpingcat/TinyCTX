@@ -83,7 +83,7 @@ The detailed entries are actionable units, not a request for one enormous patch.
 | [RUN-01](#run-01) | P1 | C + H | Compute state from the actual attach point and isolate reset generations |
 | [DB-01](#db-01) | P1 | C + H | Make state, flags and checkpoints safe under concurrent writers |
 | [DB-02](#db-02) | P2 | C + H | Make migrations and corrupt-state handling explicit |
-| [CFG-01](#cfg-01) | P1 | C + R | Resolve shared API-key variables without destructive per-model reads |
+| [CFG-01](#cfg-01) | P1 | C + R | Done — resolve shared API-key variables before scrubbing them |
 | [CFG-02](#cfg-02) | P1 | C | Make every supported configuration field reach its consumer |
 | [REL-01](#rel-01) | P2 | C + H | Run enforceable checks on the development branch |
 | [REL-02](#rel-02) | P2 | V + H | Verify distributable package assets and make releases reproducible |
@@ -599,6 +599,8 @@ The detailed entries are actionable units, not a request for one enormous patch.
 <a id="cfg-01"></a>
 
 ### CFG-01: Resolve shared API-key variables without destructive per-model reads
+
+**Status:** Done. Shared API-key environment variables are resolved for all configured models before being scrubbed and cached.
 
 **Priority:** P1  
 **Evidence:** C + R  

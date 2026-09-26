@@ -71,7 +71,10 @@ class ModelConfig:
             return ""
         if self._resolved_api_key is not None:
             return self._resolved_api_key
-        key = os.environ.pop(self.api_key_env, "").strip()
+        # A loaded Config resolves shared variables for all models before
+        # scrubbing them; direct ModelConfig use retains the same one-instance
+        # caching behavior.
+        key = os.environ.get(self.api_key_env, "").strip()
         if not key:
             raise EnvironmentError(
                 f"API key not set. Export {self.api_key_env} before starting."
@@ -693,6 +696,24 @@ def load(path="config.yaml") -> Config:
             models[name] = _parse_model(m, default_context=default_context)
         except ValueError as exc:
             raise ValueError(f"models.{name}: {exc}") from exc
+
+    # Resolve every configured secret once per loaded configuration. Store the
+    # result on each model before scrubbing the environment, so shared
+    # variables are stable and no model depends on access order.
+    resolved_keys: dict[str, str] = {}
+    for name, model in models.items():
+        if not model.api_key_env or model.api_key_env.upper() == "N/A":
+            continue
+        if model.api_key_env not in resolved_keys:
+            resolved_keys[model.api_key_env] = os.environ.get(model.api_key_env, "").strip()
+        key = resolved_keys[model.api_key_env]
+        if not key:
+            raise EnvironmentError(
+                f"models.{name}: API key not set. Export {model.api_key_env} before starting."
+            )
+        object.__setattr__(model, "_resolved_api_key", key)
+    for api_key_env in resolved_keys:
+        os.environ.pop(api_key_env, None)
 
     # ------------------------------------------------------------------ llm routing
     chat_models = {n for n, m in models.items() if not m.is_embedding}

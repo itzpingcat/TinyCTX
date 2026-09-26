@@ -380,7 +380,7 @@ YAML, loaded from `<instance>/config.yaml` by default (or `--config`). Key top-l
 
 - `workspace.path` — default `<instance>/workspace`
 - `data.path` — default `<instance>/data`
-- `models` — dict of named model configs (`kind`, `base_url`, `api_key_env`, `model`, `max_tokens`, `temperature`, `supports_vision`, `tokens_per_image`)
+- `models` — dict of named model configs (`kind`, `base_url`, `api_key_env`, `model`, `max_tokens`, `temperature`, `supports_vision`, `tokens_per_image`); API-key variables are resolved for all models once per load, then scrubbed
 - `llm.primary` / `llm.fallback`
 - `context` — token budget
 - `max_tool_cycles`
