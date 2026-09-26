@@ -74,6 +74,8 @@ class TestHistoryEntry:
         e = HistoryEntry(role=ROLE_USER, content="hi")
         assert e.tags == frozenset()
         assert e.tool_calls == []
+        assert e.tool_call_id is None
+        assert e.id  # auto-generated uuid string
 
 
 class TestSystemPromptBudget:
@@ -93,8 +95,6 @@ class TestSystemPromptBudget:
         messages, _ = ctx.assemble()
 
         assert messages[0]["role"] == ROLE_SYSTEM
-        assert e.tool_call_id is None
-        assert e.id  # auto-generated uuid string
 
     def test_ids_are_unique(self):
         a = HistoryEntry(role=ROLE_USER, content="a")
