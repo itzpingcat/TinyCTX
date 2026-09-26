@@ -94,3 +94,25 @@ max_empty_retries: 1
     assert (model.timeout, model.budget_tokens, model.reasoning_effort, model.cache_prompts) == (17, 256, "high", True)
     assert (config.embed_cache_size, config.max_workers, config.max_empty_retries) == (33, 4, 1)
     assert config.llm.fallback_on.http_codes == [429]
+
+
+def test_quoted_security_boolean_is_rejected(tmp_path, monkeypatch):
+    monkeypatch.setenv("TINYCTX_BOOL_KEY", "dummy")
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """models:
+  primary:
+    model: test-model
+    base_url: http://localhost
+    api_key_env: TINYCTX_BOOL_KEY
+llm:
+  primary: primary
+permissions:
+  template:
+    file_write: "false"
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="must be a boolean"):
+        load(path)

@@ -23,7 +23,7 @@ TinyCTX/
 ├── db.py               ConversationDB — SQLite-backed conversation tree
 ├── module_registry.py  Loads modules from modules/ and custom_modules/ and wires them into each AgentCycle
 │
-├── config/             Config loading (YAML → dataclasses)
+├── config/             Config loading (YAML → dataclasses), including strict authority booleans
 ├── users/              UserStore + User/PlatformIdentity models (SQLite)
 ├── commands/
 │   ├── launch.py        tinyctx launch — attaches a bridge client

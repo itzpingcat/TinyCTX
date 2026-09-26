@@ -788,10 +788,7 @@ class TestRequiredPermissionsCallable:
         assert "PERMISSION DENIED" in result["error"] or "could not classify" in result["error"]
 
     @pytest.mark.asyncio
-    async def test_coercion_happens_before_classifier_sees_args(self):
-        """backend_access=True serialized as the string 'true' by a
-        forgetful LLM must reach the classifier as an actual bool, not the
-        literal string — see handler.py's _coerce_args ordering comment."""
+    async def test_non_boolean_tool_argument_is_rejected_before_invocation(self):
         seen = {}
 
         def classify(flag: bool = False, **_ignored):
@@ -805,12 +802,13 @@ class TestRequiredPermissionsCallable:
 
         self.handler.register_tool(fn, always_on=True, required_permissions=classify)
         caller = _FakeCaller()
-        await self.handler.execute_tool_call({
+        result = await self.handler.execute_tool_call({
             "id": "c1",
             "function": {"name": "fn", "arguments": '{"flag": "true"}'},
         }, caller)
-        assert seen["flag"] is True
-        assert seen["flag_type"] is bool
+        assert result["success"] is False
+        assert "JSON boolean" in result["error"]
+        assert seen == {}
 
 
 # ---------------------------------------------------------------------------

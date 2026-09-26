@@ -279,14 +279,12 @@ class ToolCallHandler:
             if isinstance(ann, _types.UnionType) or origin is _typing.Union:
                 non_none = [a for a in (ann.__args__ if hasattr(ann, '__args__') else type_args) if a is not type(None)]
                 ann = non_none[0] if len(non_none) == 1 else ann
+            if ann is bool and not isinstance(value, bool):
+                raise ValueError(f"{key} must be a JSON boolean")
             if ann in (int, float, bool, str) and not isinstance(value, ann):
                 try:
                     if ann is bool:
-                        # bool("false") == True in Python — handle string literals explicitly
-                        if isinstance(value, str):
-                            coerced[key] = value.strip().lower() not in ("false", "0", "no", "")
-                        else:
-                            coerced[key] = bool(value)
+                        coerced[key] = value
                     else:
                         coerced[key] = ann(value)
                 except (ValueError, TypeError):

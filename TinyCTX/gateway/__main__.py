@@ -661,7 +661,13 @@ async def handle_user_elevate(request: web.Request) -> web.Response:
     except Exception:
         pass
 
-    if bool(body.get("reset")):
+    reset = body.get("reset", False)
+    if not isinstance(reset, bool):
+        raise web.HTTPBadRequest(
+            content_type="application/json",
+            body=json.dumps({"error": "reset must be a JSON boolean"}),
+        )
+    if reset:
         user.permission_overrides = {}
         action = "reset"
     else:

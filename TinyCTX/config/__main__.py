@@ -14,6 +14,15 @@ from TinyCTX.permissions import Permission
 
 logger = logging.getLogger(__name__)
 
+
+def _strict_bool(value, field: str, default: bool = False) -> bool:
+    """Read a boolean configuration value without truthiness coercion."""
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        raise ValueError(f"{field} must be a boolean")
+    return value
+
 # Built-in default for the single global permissions template — used when
 # config.yaml doesn't override it under permissions.template. Empty: every
 # bool defaults to false (fail-closed), matching the old "guest" tier.
@@ -507,7 +516,7 @@ def resolve_log_level(level: str | int | None, *, default: int = logging.WARNING
 
 def _parse_fallback_on(raw: dict) -> FallbackOnConfig:
     return FallbackOnConfig(
-        any_error=bool(raw.get("any_error", False)),
+        any_error=_strict_bool(raw.get("any_error"), "llm.fallback_on.any_error"),
         http_codes=list(raw.get("http_codes", [429, 500, 502, 503, 504])),
     )
 
@@ -520,7 +529,7 @@ def _parse_tool_overrides(raw: dict) -> dict[str, ToolOverrideConfig]:
         always_on = o.get("always_on")
         min_permission = o.get("min_permission")
         if always_on is not None:
-            always_on = bool(always_on)
+            always_on = _strict_bool(always_on, f"tools.overrides.{tool_name}.always_on")
         if min_permission is not None:
             min_permission = int(min_permission)
         overrides[tool_name] = ToolOverrideConfig(
@@ -532,8 +541,8 @@ def _parse_tool_overrides(raw: dict) -> dict[str, ToolOverrideConfig]:
 
 def _parse_tool_passive(raw: dict) -> ToolPassiveConfig:
     return ToolPassiveConfig(
-        auto_bm25_enabled=bool(raw.get("auto_bm25_enabled", True)),
-        auto_vector_enabled=bool(raw.get("auto_vector_enabled", False)),
+        auto_bm25_enabled=_strict_bool(raw.get("auto_bm25_enabled"), "tools.passive.auto_bm25_enabled", True),
+        auto_vector_enabled=_strict_bool(raw.get("auto_vector_enabled"), "tools.passive.auto_vector_enabled"),
         embedding_model=str(raw.get("embedding_model", "")),
         auto_limit=int(raw.get("auto_limit", 2)),
         auto_min_score=float(raw.get("auto_min_score", 0.0)),
@@ -543,7 +552,7 @@ def _parse_tool_passive(raw: dict) -> ToolPassiveConfig:
 
 def _parse_tool_search(raw: dict) -> ToolSearchConfig:
     return ToolSearchConfig(
-        vector_enabled=bool(raw.get("vector_enabled", False)),
+        vector_enabled=_strict_bool(raw.get("vector_enabled"), "tools.search.vector_enabled"),
         embedding_model=str(raw.get("embedding_model", "")),
         top_k=int(raw.get("top_k", 5)),
         rrf_k=int(raw.get("rrf_k", 60)),
@@ -571,7 +580,9 @@ def _parse_permission_set(raw: dict) -> frozenset[Permission]:
                 f"permissions.template: unknown permission {perm_name!r}. "
                 f"Valid names: {valid}"
             )
-        if bool(value):
+        if not isinstance(value, bool):
+            raise ValueError(f"permissions.template.{perm_name} must be a boolean")
+        if value:
             granted.add(perm)
     return frozenset(granted)
 
@@ -592,7 +603,7 @@ def _parse_permissions(raw: dict) -> PermissionsConfig:
         _parse_permission_set(raw["template"]) if "template" in raw else _DEFAULT_TEMPLATE
     )
     return PermissionsConfig(
-        minimal_tokens=bool(raw.get("minimal_tokens", False)),
+        minimal_tokens=_strict_bool(raw.get("minimal_tokens"), "permissions.minimal_tokens"),
         template=template,
     )
 
@@ -633,7 +644,7 @@ def _parse_model(raw: dict, default_context: int = 16384) -> ModelConfig:
         if budget_tokens <= 0:
             raise ValueError(f"budget_tokens must be > 0, got {budget_tokens}")
 
-    vision = bool(raw.get("vision", False))
+    vision = _strict_bool(raw.get("vision"), "models.vision")
 
     context = int(raw.get("context", default_context))
     if context <= 0:
@@ -651,7 +662,7 @@ def _parse_model(raw: dict, default_context: int = 16384) -> ModelConfig:
         temperature=float(raw.get("temperature", 0.7)),
         budget_tokens=budget_tokens,
         reasoning_effort=reasoning_effort,
-        cache_prompts=bool(raw.get("cache_prompts", False)),
+        cache_prompts=_strict_bool(raw.get("cache_prompts"), "models.cache_prompts"),
         vision=vision,
         tokens_per_image=tokens_per_image,
         context=context,
@@ -773,7 +784,7 @@ def load(path="config.yaml") -> Config:
     bridges: dict[str, BridgeConfig] = {}
     for name, br in raw.get("bridges", {}).items():
         if isinstance(br, dict):
-            enabled = bool(br.get("enabled", False))
+            enabled = _strict_bool(br.get("enabled"), f"bridges.{name}.enabled")
             # Support both flat keys and a nested 'options:' sub-key.
             # If an 'options' dict is present, use it directly; otherwise
             # collect all non-'enabled' keys as the options dict.
@@ -786,7 +797,7 @@ def load(path="config.yaml") -> Config:
     # ------------------------------------------------------------------ gateway
     gw_raw  = raw.get("gateway", {})
     gateway = GatewayConfig(
-        enabled=bool(gw_raw.get("enabled", False)),
+        enabled=_strict_bool(gw_raw.get("enabled"), "gateway.enabled"),
         host=gw_raw.get("host", "127.0.0.1"),
         port=int(gw_raw.get("port", 8085)),
         api_key=gw_raw.get("api_key", ""),
@@ -848,8 +859,8 @@ def load(path="config.yaml") -> Config:
         attachments=attachments,
         permissions=permissions,
         tools=tools,
-        error_introspection=bool(raw.get("error_introspection", False)),
-        command_introspection=bool(raw.get("command_introspection", False)),
+        error_introspection=_strict_bool(raw.get("error_introspection"), "introspection.error_introspection"),
+        command_introspection=_strict_bool(raw.get("command_introspection"), "introspection.command_introspection"),
         extra=extra,
     )
     setattr(cfg, "_source_path", p.resolve())

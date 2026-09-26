@@ -48,7 +48,7 @@ The detailed entries are actionable units, not a request for one enormous patch.
 
 | ID | Priority | Evidence | Work item |
 |---|---|---|---|
-| [SEC-01](#sec-01) | P1 | C + R | Reject ambiguous booleans at every authority boundary |
+| [SEC-01](#sec-01) | P1 | C + R | Done — reject ambiguous booleans at every authority boundary |
 | [SEC-02](#sec-02) | P1 | C + R | Close child-path escapes in grep and glob |
 | [SEC-03](#sec-03) | P1 | C | Authorise the actual shell execution location |
 | [SEC-04](#sec-04) | P1 | H: documented design decision | Make the gateway master-key trust model explicit |
@@ -95,6 +95,8 @@ The detailed entries are actionable units, not a request for one enormous patch.
 <a id="sec-01"></a>
 
 ### SEC-01: Reject ambiguous booleans at every authority boundary
+
+**Status:** Done. Configuration, tool arguments, and gateway elevation now require native booleans; invalid values fail before permissions change or tools run.
 
 **Priority:** P1  
 **Evidence:** C + R  
