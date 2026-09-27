@@ -371,6 +371,64 @@ commands:
       - {any_flag: ["--files0-from"], add: [file_read]}
     known_flags: ["-l", "-w", "-c", "-m", "-L"]
 
+  - id: filters-grep
+    name: [grep, egrep, fgrep]
+    permissions: []
+    if_operands: [file_read]
+    known_flags:
+      - "-n"
+      - "-H"
+      - "-h"
+      - "-r"
+      - "-R"
+      - "-i"
+      - "-v"
+      - "-w"
+      - "-x"
+      - "-c"
+      - "-l"
+      - "-L"
+      - "-q"
+      - "-s"
+      - "-o"
+      - "-E"
+      - "-F"
+      - "-G"
+      - "-P"
+      - "-A"
+      - "-B"
+      - "-C"
+      - "--color"
+      - "--include"
+      - "--exclude"
+      - "--exclude-dir"
+      - "--line-buffered"
+      - "--binary-files"
+
+  - id: filters-ast-grep
+    name: [ast-grep, sg]
+    permissions: []
+    subcommand:
+      run: [file_read]
+      scan: [file_read]
+      test: [file_read]
+      new: [file_write]
+      rewrite: [file_read, file_write]
+      fix: [file_read, file_write]
+      lsp: [untrusted_exec]
+    subcommand_default: [untrusted_exec]
+    known_flags:
+      - "--pattern"
+      - "-p"
+      - "--lang"
+      - "-l"
+      - "--rule"
+      - "--config"
+      - "--json"
+      - "--json=stream"
+      - "--help"
+      - "--version"
+      
   - id: dd
     name: dd
     permissions: []

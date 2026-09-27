@@ -51,21 +51,48 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # Text processing
     pandoc \
     \
+    # Process / shell utilities
+    procps \
+    psmisc \
+    util-linux \
+    lsof \
+    tini \
+    tmux \
+    which \
+    shellcheck \
+    shfmt \
+    fd-find \
+    fzf \
+    watch \
+    rsync \
+    socat \
+    iproute2 \
+    strace \
+    libcap2-bin \
+    yq \
+    su-exec \
     # Node.js (LTS via nodesource)
     && curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     \
     && rm -rf /var/lib/apt/lists/*
 
-# ── npm globals ────────────────────────────────────────────────────────────
+# ── CLI tools for the agent ────────────────────────────────────────────────
 RUN npm install -g \
+    @ast-grep/cli \
     typescript \
     ts-node \
     prettier \
     eslint \
     nodemon \
     yarn \
-    pnpm
+    pnpm \
+ && ast-grep --version
+
+# Optional RTK
+RUN curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh | sh \
+ && install -m 0755 /root/.local/bin/rtk /usr/local/bin/rtk \
+ && rtk gain
 
 # ── python packages ────────────────────────────────────────────────────────
 # aiohttp for the service itself, plus a wide battery of commonly needed libs
